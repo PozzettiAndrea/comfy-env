@@ -190,9 +190,11 @@ class IsolatedEnvManager:
             index_url = "https://download.pytorch.org/whl/cpu"
             self.log("Installing PyTorch (CPU)")
 
-        # Build pip command
+        # Build uv pip command
+        uv = self._find_uv()
         pip_args = [
-            str(python_exe), "-m", "pip", "install",
+            str(uv), "pip", "install",
+            "--python", str(python_exe),
             "--index-url", index_url,
         ]
 
@@ -226,7 +228,8 @@ class IsolatedEnvManager:
             self.log("No requirements to install")
             return
 
-        pip_args = [str(python_exe), "-m", "pip", "install"]
+        uv = self._find_uv()
+        pip_args = [str(uv), "pip", "install", "--python", str(python_exe)]
 
         # Add wheel sources as --find-links
         for wheel_source in env.wheel_sources:
