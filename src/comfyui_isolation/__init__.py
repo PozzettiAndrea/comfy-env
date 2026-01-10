@@ -32,6 +32,13 @@ __version__ = "0.1.0"
 from .env.config import IsolatedEnv
 from .env.manager import IsolatedEnvManager
 from .env.detection import detect_cuda_version, detect_gpu_info, get_gpu_summary
+from .env.security import (
+    normalize_env_name,
+    validate_dependency,
+    validate_dependencies,
+    validate_path_within_root,
+    validate_wheel_url,
+)
 from .ipc.bridge import WorkerBridge
 from .ipc.worker import BaseWorker, register
 
@@ -50,6 +57,12 @@ __all__ = [
     "detect_cuda_version",
     "detect_gpu_info",
     "get_gpu_summary",
+    # Security validation
+    "normalize_env_name",
+    "validate_dependency",
+    "validate_dependencies",
+    "validate_path_within_root",
+    "validate_wheel_url",
     # IPC (subprocess-based)
     "WorkerBridge",
     "BaseWorker",

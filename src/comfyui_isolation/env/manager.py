@@ -12,6 +12,13 @@ from typing import Optional, Callable
 from .config import IsolatedEnv
 from .platform import get_platform, PlatformProvider
 from .detection import detect_cuda_version
+from .security import (
+    normalize_env_name,
+    validate_dependency,
+    validate_dependencies,
+    validate_path_within_root,
+    validate_wheel_url,
+)
 
 
 class IsolatedEnvManager:
@@ -85,7 +92,14 @@ class IsolatedEnvManager:
 
     def get_env_dir(self, env: IsolatedEnv) -> Path:
         """Get the environment directory path for a config."""
-        return env.get_default_env_dir(self.base_dir)
+        # Validate environment name to prevent directory traversal
+        safe_name = normalize_env_name(env.name)
+        env_dir = env.get_default_env_dir(self.base_dir)
+
+        # Ensure the resulting path is within base_dir
+        validate_path_within_root(env_dir, self.base_dir)
+
+        return env_dir
 
     def get_python(self, env: IsolatedEnv) -> Path:
         """Get the Python executable path for an environment."""
@@ -231,6 +245,18 @@ class IsolatedEnvManager:
         if not env.requirements and not env.requirements_file:
             self.log("No requirements to install")
             return
+
+        # Validate requirements for security
+        if env.requirements:
+            validate_dependencies(env.requirements)
+
+        # Validate wheel sources
+        for wheel_source in env.wheel_sources:
+            validate_wheel_url(wheel_source)
+
+        # Validate index URLs
+        for index_url in env.index_urls:
+            validate_wheel_url(index_url)
 
         uv = self._find_uv()
         pip_args = [str(uv), "pip", "install", "--python", str(python_exe)]
