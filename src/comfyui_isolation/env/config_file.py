@@ -160,6 +160,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     env_section = data.get("env", {})
     packages_section = data.get("packages", {})
     sources_section = data.get("sources", {})
+    worker_section = data.get("worker", {})
     variables = dict(data.get("variables", {}))  # Copy to avoid mutation
 
     # Handle CUDA version
@@ -196,6 +197,10 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
     wheel_sources = sources_section.get("wheel_sources", [])
     index_urls = sources_section.get("index_urls", [])
 
+    # Parse worker configuration
+    worker_package = worker_section.get("package")
+    worker_script = worker_section.get("script")
+
     return IsolatedEnv(
         name=env_section.get("name", base_dir.name),
         python=env_section.get("python", "3.10"),
@@ -205,6 +210,8 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
         requirements_file=requirements_file,
         wheel_sources=wheel_sources,
         index_urls=index_urls,
+        worker_package=worker_package,
+        worker_script=worker_script,
     )
 
 

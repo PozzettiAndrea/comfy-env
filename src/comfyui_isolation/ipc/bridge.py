@@ -117,7 +117,7 @@ class WorkerBridge:
     def from_config_file(
         cls,
         node_dir: Path,
-        worker_script: Path,
+        worker_script: Optional[Path] = None,
         config_file: Optional[str] = None,
         log_callback: Optional[Callable[[str], None]] = None,
         auto_start: bool = True,
@@ -130,7 +130,7 @@ class WorkerBridge:
 
         Args:
             node_dir: Directory containing the config file (and base_dir for env)
-            worker_script: Path to worker script
+            worker_script: Path to worker script (optional - auto-discovered from config or convention)
             config_file: Specific config file name (default: auto-discover)
             log_callback: Optional callback for logging
             auto_start: Whether to auto-start worker on first call (default: True)
@@ -139,21 +139,17 @@ class WorkerBridge:
             Configured WorkerBridge instance
 
         Raises:
-            FileNotFoundError: If no config file found
+            FileNotFoundError: If no config file found or worker script not found
             ImportError: If tomli not installed (Python < 3.11)
 
         Example:
-            # Auto-discover config file
-            bridge = WorkerBridge.from_config_file(
-                node_dir=Path(__file__).parent,
-                worker_script=Path(__file__).parent / "worker.py",
-            )
+            # Auto-discover everything (recommended)
+            bridge = WorkerBridge.from_config_file(node_dir=Path(__file__).parent)
 
-            # Specify config file explicitly
+            # Explicit worker script (backward compatible)
             bridge = WorkerBridge.from_config_file(
                 node_dir=Path(__file__).parent,
                 worker_script=Path(__file__).parent / "worker.py",
-                config_file="my_config.toml",
             )
         """
         from ..env.config_file import load_env_from_file, discover_env_config, CONFIG_FILE_NAMES
@@ -170,12 +166,76 @@ class WorkerBridge:
                     f"Create one of: {', '.join(CONFIG_FILE_NAMES)}"
                 )
 
+        # Resolve worker script from explicit param, config, or convention
+        if worker_script is None:
+            worker_script = cls._resolve_worker_script(node_dir, env)
+
         return cls(
             env=env,
             worker_script=worker_script,
             base_dir=node_dir,
             log_callback=log_callback,
             auto_start=auto_start,
+        )
+
+    @staticmethod
+    def _resolve_worker_script(node_dir: Path, env: "IsolatedEnv") -> Path:
+        """
+        Resolve worker script from config or convention.
+
+        Discovery order:
+        1. Explicit package in config ([worker] package = "worker")
+        2. Explicit script in config ([worker] script = "worker.py")
+        3. Convention: worker/ directory with __main__.py
+        4. Convention: worker.py file
+
+        Args:
+            node_dir: Node directory
+            env: IsolatedEnv with optional worker_package/worker_script
+
+        Returns:
+            Path to worker script
+
+        Raises:
+            FileNotFoundError: If no worker found
+        """
+        # 1. Explicit package in config
+        if env.worker_package:
+            pkg_dir = node_dir / env.worker_package
+            main_py = pkg_dir / "__main__.py"
+            if main_py.exists():
+                return main_py
+            raise FileNotFoundError(
+                f"Worker package '{env.worker_package}' not found. "
+                f"Expected: {main_py}"
+            )
+
+        # 2. Explicit script in config
+        if env.worker_script:
+            script = node_dir / env.worker_script
+            if script.exists():
+                return script
+            raise FileNotFoundError(
+                f"Worker script '{env.worker_script}' not found. "
+                f"Expected: {script}"
+            )
+
+        # 3. Convention: worker/ directory
+        worker_pkg = node_dir / "worker" / "__main__.py"
+        if worker_pkg.exists():
+            return worker_pkg
+
+        # 4. Convention: worker.py file
+        worker_file = node_dir / "worker.py"
+        if worker_file.exists():
+            return worker_file
+
+        raise FileNotFoundError(
+            f"No worker found in {node_dir}. "
+            f"Create worker/__main__.py, worker.py, or specify in config:\n"
+            f"  [worker]\n"
+            f"  package = \"worker\"  # or\n"
+            f"  script = \"worker.py\""
         )
 
     @property

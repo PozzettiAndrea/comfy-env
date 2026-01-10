@@ -23,6 +23,8 @@ class IsolatedEnv:
         index_urls: List of URLs for --extra-index-url
         env_dir: Custom directory for the venv (default: auto-generated)
         pytorch_version: Specific PyTorch version (auto-detected if None)
+        worker_package: Worker package directory (e.g., "worker" -> worker/__main__.py)
+        worker_script: Worker script file (e.g., "worker.py")
 
     Example:
         env = IsolatedEnv(
@@ -43,6 +45,9 @@ class IsolatedEnv:
     index_urls: list[str] = field(default_factory=list)
     env_dir: Optional[Path] = None
     pytorch_version: Optional[str] = None
+    # Worker configuration
+    worker_package: Optional[str] = None  # e.g., "worker" -> worker/__main__.py
+    worker_script: Optional[str] = None   # e.g., "worker.py" -> worker.py
 
     def __post_init__(self):
         """Validate and normalize configuration."""
