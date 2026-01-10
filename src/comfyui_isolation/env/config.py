@@ -74,26 +74,8 @@ class IsolatedEnv:
         """Get Python version without dots (e.g., '310' for '3.10')."""
         return self.python.replace(".", "")
 
-    def get_env_hash(self) -> str:
-        """
-        Generate a hash of the environment configuration.
-
-        Used for caching - same config = same hash = reuse existing venv.
-        """
-        import hashlib
-
-        parts = [
-            self.name,
-            self.python,
-            self.cuda or "cpu",
-            ",".join(sorted(self.requirements)),
-            ",".join(sorted(self.wheel_sources)),
-        ]
-        content = "|".join(parts)
-        return hashlib.sha256(content.encode()).hexdigest()[:12]
-
     def get_default_env_dir(self, base_dir: Path) -> Path:
         """Get the default environment directory path."""
         if self.env_dir is not None:
             return self.env_dir
-        return base_dir / f"_env_{self.name}_{self.get_env_hash()}"
+        return base_dir / f"_env_{self.name}"
