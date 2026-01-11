@@ -374,12 +374,14 @@ def isolated(
                         timeout=timeout,
                     )
                 else:
-                    # PersistentVenvWorker - call by module path
-                    result = worker.call_module(
-                        module=source_file.stem,
-                        func=func_name,
+                    # PersistentVenvWorker - call by module/class/method path
+                    result = worker.call_method(
+                        module_name=source_file.stem,
+                        class_name=cls.__name__,
+                        method_name=func_name,
+                        self_state=self.__dict__.copy() if hasattr(self, '__dict__') else None,
+                        kwargs=call_kwargs,
                         timeout=timeout,
-                        **call_kwargs,
                     )
 
                 # Clone result tensors defensively

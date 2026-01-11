@@ -41,11 +41,73 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .base import Worker, WorkerError
 
 
+def _serialize_for_ipc(obj, visited=None):
+    """
+    Convert objects with broken __module__ paths to dicts for IPC.
+
+    ComfyUI sets weird __module__ values (file paths) on custom node classes,
+    which breaks pickle deserialization in the worker. This converts such
+    objects to a serializable dict format.
+    """
+    if visited is None:
+        visited = set()
+
+    obj_id = id(obj)
+    if obj_id in visited:
+        return obj
+    visited.add(obj_id)
+
+    # Check if this is a custom object with broken module path
+    if (hasattr(obj, '__dict__') and
+        hasattr(obj, '__class__') and
+        not isinstance(obj, (dict, list, tuple, type)) and
+        obj.__class__.__name__ not in ('Tensor', 'ndarray', 'module')):
+
+        cls = obj.__class__
+        module = getattr(cls, '__module__', '')
+
+        # Check if module looks like a file path (contains / or \)
+        if '/' in module or '\\' in module:
+            # Convert to serializable dict
+            return {
+                '__isolated_object__': True,
+                '__class_name__': cls.__name__,
+                '__attrs__': {k: _serialize_for_ipc(v, visited) for k, v in obj.__dict__.items()},
+            }
+
+    # Recurse into containers
+    if isinstance(obj, dict):
+        return {k: _serialize_for_ipc(v, visited) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_serialize_for_ipc(v, visited) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_serialize_for_ipc(v, visited) for v in obj)
+
+    return obj
+
+
 # Worker script template - minimal, runs in target venv
 _WORKER_SCRIPT = '''
 import sys
 import json
 import traceback
+from types import SimpleNamespace
+
+def _deserialize_isolated_objects(obj):
+    """Reconstruct objects serialized with __isolated_object__ marker."""
+    if isinstance(obj, dict):
+        if obj.get("__isolated_object__"):
+            # Reconstruct as SimpleNamespace (supports .attr access)
+            attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
+            ns = SimpleNamespace(**attrs)
+            ns.__class_name__ = obj.get("__class_name__", "Unknown")
+            return ns
+        return {k: _deserialize_isolated_objects(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_deserialize_isolated_objects(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_deserialize_isolated_objects(v) for v in obj)
+    return obj
 
 def main():
     # Read request from file
@@ -68,6 +130,7 @@ def main():
         inputs_path = request.get("inputs_path")
         if inputs_path:
             inputs = torch.load(inputs_path, weights_only=False)
+            inputs = _deserialize_isolated_objects(inputs)
         else:
             inputs = {}
 
@@ -227,9 +290,11 @@ class VenvWorker(Worker):
 
         try:
             # Save inputs via torch.save (handles tensors natively)
+            # Serialize custom objects with broken __module__ paths first
             import torch
             if kwargs:
-                torch.save(kwargs, str(inputs_path))
+                serialized_kwargs = _serialize_for_ipc(kwargs)
+                torch.save(serialized_kwargs, str(inputs_path))
 
             # Build request
             request = {
@@ -375,6 +440,15 @@ class PersistentVenvWorker(Worker):
         self._shutdown = False
         self._lock = threading.Lock()
 
+    def _find_comfyui_base(self) -> Optional[Path]:
+        """Find ComfyUI base directory by walking up from working_dir."""
+        current = self.working_dir.resolve()
+        for _ in range(10):
+            if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            current = current.parent
+        return None
+
     def _ensure_started(self):
         """Start persistent worker process if not running."""
         if self._shutdown:
@@ -405,13 +479,22 @@ class PersistentVenvWorker(Worker):
         env.update(self.extra_env)
         env["COMFYUI_ISOLATION_WORKER"] = "1"
 
+        # Find ComfyUI base and set env var for folder_paths stub
+        comfyui_base = self._find_comfyui_base()
+        if comfyui_base:
+            env["COMFYUI_BASE"] = str(comfyui_base)
+
+        # Add stubs directory to sys_path for folder_paths etc.
+        stubs_dir = Path(__file__).parent.parent / "stubs"
+        all_sys_path = [str(stubs_dir), str(self.working_dir)] + self.sys_path
+
         self._process = subprocess.Popen(
             [
                 str(self.python),
                 str(worker_script),
                 str(self._socket_path),
                 str(self._shm_dir),
-                json.dumps([str(self.working_dir)] + self.sys_path),
+                json.dumps(all_sys_path),
             ],
             cwd=str(self.working_dir),
             env=env,
@@ -454,6 +537,85 @@ class PersistentVenvWorker(Worker):
             f"{self.name}: Use call_module(module='...', func='...') instead."
         )
 
+    def call_method(
+        self,
+        module_name: str,
+        class_name: str,
+        method_name: str,
+        self_state: Optional[Dict[str, Any]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """
+        Call a class method by module/class/method path.
+
+        Args:
+            module_name: Module containing the class (e.g., "depth_estimate").
+            class_name: Class name (e.g., "SAM3D_DepthEstimate").
+            method_name: Method name (e.g., "estimate_depth").
+            self_state: Optional dict to populate instance __dict__.
+            kwargs: Keyword arguments for the method.
+            timeout: Timeout in seconds.
+
+        Returns:
+            Return value of the method.
+        """
+        with self._lock:
+            self._ensure_started()
+
+            timeout = timeout or 600.0
+            call_id = str(uuid.uuid4())[:8]
+
+            import torch
+            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
+            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
+
+            try:
+                # Serialize kwargs
+                if kwargs:
+                    serialized_kwargs = _serialize_for_ipc(kwargs)
+                    torch.save(serialized_kwargs, str(inputs_path))
+
+                # Send request with class info
+                request = {
+                    "type": "call_method",
+                    "module": module_name,
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "self_state": self_state,
+                    "inputs_path": str(inputs_path) if kwargs else None,
+                    "outputs_path": str(outputs_path),
+                }
+                self._transport.send(request)
+
+                # Wait for response
+                import select
+                ready, _, _ = select.select([self._transport.fileno()], [], [], timeout)
+
+                if not ready:
+                    self._process.kill()
+                    self._shutdown = True
+                    raise TimeoutError(f"{self.name}: Call timed out")
+
+                response = self._transport.recv()
+
+                if response.get("status") == "error":
+                    raise WorkerError(
+                        response.get("error", "Unknown"),
+                        traceback=response.get("traceback"),
+                    )
+
+                if outputs_path.exists():
+                    return torch.load(str(outputs_path), weights_only=False)
+                return None
+
+            finally:
+                for p in [inputs_path, outputs_path]:
+                    try:
+                        p.unlink()
+                    except:
+                        pass
+
     def call_module(
         self,
         module: str,
@@ -475,10 +637,12 @@ class PersistentVenvWorker(Worker):
 
             try:
                 if kwargs:
-                    torch.save(kwargs, str(inputs_path))
+                    serialized_kwargs = _serialize_for_ipc(kwargs)
+                    torch.save(serialized_kwargs, str(inputs_path))
 
                 # Send request
                 request = {
+                    "type": "call_module",
                     "module": module,
                     "func": func,
                     "inputs_path": str(inputs_path) if kwargs else None,
@@ -554,6 +718,23 @@ import json
 import socket
 import struct
 import traceback
+from types import SimpleNamespace
+
+def _deserialize_isolated_objects(obj):
+    """Reconstruct objects serialized with __isolated_object__ marker."""
+    if isinstance(obj, dict):
+        if obj.get("__isolated_object__"):
+            # Reconstruct as SimpleNamespace (supports .attr access)
+            attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
+            ns = SimpleNamespace(**attrs)
+            ns.__class_name__ = obj.get("__class_name__", "Unknown")
+            return ns
+        return {k: _deserialize_isolated_objects(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_deserialize_isolated_objects(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_deserialize_isolated_objects(v) for v in obj)
+    return obj
 
 def main():
     socket_path = sys.argv[1]
@@ -597,21 +778,38 @@ def main():
             break
 
         try:
+            request_type = request.get("type", "call_module")
             module_name = request["module"]
-            func_name = request["func"]
             inputs_path = request.get("inputs_path")
             outputs_path = request.get("outputs_path")
 
             # Load inputs
             if inputs_path:
                 inputs = torch.load(inputs_path, weights_only=False)
+                inputs = _deserialize_isolated_objects(inputs)
             else:
                 inputs = {}
 
-            # Import and call
-            module = __import__(module_name, fromlist=[func_name])
-            func = getattr(module, func_name)
-            result = func(**inputs)
+            # Import module
+            module = __import__(module_name, fromlist=[""])
+
+            if request_type == "call_method":
+                # Call a method on a class instance
+                class_name = request["class_name"]
+                method_name = request["method_name"]
+                self_state = request.get("self_state")
+
+                cls = getattr(module, class_name)
+                instance = object.__new__(cls)
+                if self_state:
+                    instance.__dict__.update(self_state)
+                method = getattr(instance, method_name)
+                result = method(**inputs)
+            else:
+                # Call a module-level function
+                func_name = request["func"]
+                func = getattr(module, func_name)
+                result = func(**inputs)
 
             # Save result
             if outputs_path:

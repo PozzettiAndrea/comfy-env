@@ -33,7 +33,7 @@ The @isolated decorator and WorkerBridge are still available but the
 workers module above is simpler and more explicit.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .env.config import IsolatedEnv
 from .env.config_file import (
