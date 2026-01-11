@@ -37,10 +37,12 @@ Example:
 
 import os
 import sys
+import socket
 import inspect
 import threading
 import subprocess
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional
@@ -49,11 +51,21 @@ from .env.config import IsolatedEnv
 from .env.config_file import load_env_from_file
 from .env.manager import IsolatedEnvManager
 from .ipc.protocol import encode_object, decode_object
+from .ipc.transport import UnixSocketTransport, get_socket_path, cleanup_socket
 
 
-# Global cache for environment managers and subprocess handles
+@dataclass
+class WorkerProcess:
+    """Holds a worker subprocess and its transport."""
+    process: subprocess.Popen
+    transport: UnixSocketTransport
+    socket_path: str
+    server_socket: socket.socket
+
+
+# Global cache for environment managers and worker processes
 _env_cache: Dict[str, IsolatedEnvManager] = {}
-_process_cache: Dict[str, subprocess.Popen] = {}
+_process_cache: Dict[str, WorkerProcess] = {}
 _cache_lock = threading.Lock()
 
 
@@ -177,8 +189,8 @@ def _create_proxy_method(
 
     @wraps(original_method)
     def proxy(self, *args, timeout: Optional[float] = None, **kwargs):
-        # Get or create subprocess
-        process = _get_or_create_process(
+        # Get or create worker process with UDS transport
+        worker = _get_or_create_process(
             env_name=env_name,
             requirements=requirements,
             config_path=config_path,
@@ -219,33 +231,30 @@ def _create_proxy_method(
             "params": serialized_params,
         }
 
-        # Send request
-        request_json = json.dumps(request) + "\n"
-        process.stdin.write(request_json)
-        process.stdin.flush()
+        # Send request via transport
+        try:
+            worker.transport.send(request)
+        except (ConnectionError, BrokenPipeError) as e:
+            _remove_process(env_name, node_package_dir)
+            raise RuntimeError(f"Worker connection lost: {e}")
 
         # Read response with timeout
         actual_timeout = timeout if timeout is not None else default_timeout
 
         import select
-        ready, _, _ = select.select([process.stdout], [], [], actual_timeout)
+        ready, _, _ = select.select([worker.transport.fileno()], [], [], actual_timeout)
 
         if not ready:
             # Timeout - kill process and raise
-            process.kill()
+            worker.process.kill()
             _remove_process(env_name, node_package_dir)
             raise TimeoutError(f"Method {method_name} timed out after {actual_timeout}s")
 
-        response_line = process.stdout.readline()
-        if not response_line:
-            # Process died
+        try:
+            response = worker.transport.recv()
+        except ConnectionError:
             _remove_process(env_name, node_package_dir)
             raise RuntimeError(f"Worker process died unexpectedly")
-
-        try:
-            response = json.loads(response_line)
-        except json.JSONDecodeError as e:
-            raise RuntimeError(f"Invalid JSON from worker: {repr(response_line[:200])}\nError: {e}")
 
         # Check for error
         if "error" in response:
@@ -276,18 +285,19 @@ def _get_or_create_process(
     node_package_dir: Path,
     log_callback: Callable,
     import_paths: Optional[List[str]] = None,
-) -> subprocess.Popen:
-    """Get or create a subprocess for the given environment."""
+) -> WorkerProcess:
+    """Get or create a worker process with Unix Domain Socket transport."""
 
     cache_key = f"{env_name}:{node_package_dir}"
 
     with _cache_lock:
         if cache_key in _process_cache:
-            proc = _process_cache[cache_key]
-            if proc.poll() is None:  # Still running
-                return proc
+            worker = _process_cache[cache_key]
+            if worker.process.poll() is None:  # Still running
+                return worker
             else:
-                # Process died, remove from cache
+                # Process died, clean up
+                cleanup_socket(worker.socket_path)
                 del _process_cache[cache_key]
 
     # Ensure environment is set up
@@ -314,11 +324,22 @@ def _get_or_create_process(
     if import_paths:
         import_paths_str = ",".join(import_paths)
 
-    # Build command to run the runner module
+    # Create Unix Domain Socket for IPC
+    socket_path = get_socket_path(env_name)
+    cleanup_socket(socket_path)  # Remove any stale socket
+
+    # Create server socket
+    server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_socket.bind(socket_path)
+    server_socket.listen(1)
+    server_socket.settimeout(30)  # 30 second timeout for connection
+
+    # Build command to run the runner module with socket
     cmd = [
         str(python_exe),
         "-m", "comfyui_isolation.runner",
         "--node-dir", str(node_dir),
+        "--socket", socket_path,
     ]
 
     if comfyui_base:
@@ -329,54 +350,20 @@ def _get_or_create_process(
 
     log_callback(f"Starting worker process...")
     log_callback(f"  Python: {python_exe}")
+    log_callback(f"  Socket: {socket_path}")
 
-    # Spawn subprocess
+    # Spawn subprocess (stderr only, no stdin/stdout for IPC)
     process = subprocess.Popen(
         cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,  # Line buffered
         cwd=str(node_dir),
     )
 
-    # Wait for ready signal with timeout - DON'T start stderr thread yet
-    # so we can capture startup errors properly
-    import select
-    startup_timeout = 30  # 30 seconds to start up
-
-    ready, _, _ = select.select([process.stdout], [], [], startup_timeout)
-
-    if not ready:
-        # Timeout waiting for ready signal
-        process.kill()
-        stderr_output = process.stderr.read()
-        raise RuntimeError(f"Worker failed to start (timeout after {startup_timeout}s):\n{stderr_output}")
-
-    ready_line = process.stdout.readline()
-
-    if not ready_line:
-        # Process exited without sending ready signal
-        process.wait()  # Ensure process is done
-        stderr_output = process.stderr.read()
-        raise RuntimeError(f"Worker process failed to start:\n{stderr_output}")
-
-    try:
-        ready_msg = json.loads(ready_line)
-    except json.JSONDecodeError:
-        process.kill()
-        stderr_output = process.stderr.read()
-        raise RuntimeError(f"Worker sent invalid ready signal: {ready_line}\nStderr:\n{stderr_output}")
-
-    if ready_msg.get("status") != "ready":
-        process.kill()
-        stderr_output = process.stderr.read()
-        raise RuntimeError(f"Worker sent unexpected ready signal: {ready_msg}\nStderr:\n{stderr_output}")
-
-    log_callback(f"Worker ready")
-
-    # NOW start stderr forwarding thread (after successful startup)
+    # Start stderr forwarding thread immediately
     def forward_stderr():
         for line in process.stderr:
             log_callback(line.rstrip())
@@ -384,18 +371,59 @@ def _get_or_create_process(
     stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
     stderr_thread.start()
 
-    # Cache the process
-    with _cache_lock:
-        _process_cache[cache_key] = process
+    # Wait for worker to connect
+    try:
+        conn, _ = server_socket.accept()
+    except socket.timeout:
+        process.kill()
+        cleanup_socket(socket_path)
+        raise RuntimeError(f"Worker failed to connect (timeout after 30s)")
 
-    return process
+    # Create transport from connected socket
+    transport = UnixSocketTransport(conn)
+
+    # Wait for ready signal via transport
+    try:
+        ready_msg = transport.recv()
+    except (ConnectionError, json.JSONDecodeError) as e:
+        process.kill()
+        cleanup_socket(socket_path)
+        raise RuntimeError(f"Worker failed to send ready signal: {e}")
+
+    if ready_msg.get("status") != "ready":
+        process.kill()
+        cleanup_socket(socket_path)
+        raise RuntimeError(f"Worker sent unexpected ready signal: {ready_msg}")
+
+    log_callback(f"Worker ready (UDS transport)")
+
+    # Create worker process holder
+    worker = WorkerProcess(
+        process=process,
+        transport=transport,
+        socket_path=socket_path,
+        server_socket=server_socket,
+    )
+
+    # Cache the worker
+    with _cache_lock:
+        _process_cache[cache_key] = worker
+
+    return worker
 
 
 def _remove_process(env_name: str, node_package_dir: Path):
-    """Remove a process from cache."""
+    """Remove a process from cache and clean up resources."""
     cache_key = f"{env_name}:{node_package_dir}"
     with _cache_lock:
         if cache_key in _process_cache:
+            worker = _process_cache[cache_key]
+            try:
+                worker.transport.close()
+                worker.server_socket.close()
+                cleanup_socket(worker.socket_path)
+            except Exception:
+                pass
             del _process_cache[cache_key]
 
 
@@ -478,17 +506,24 @@ def _get_or_create_env(
 
 
 def shutdown_all_processes():
-    """Shutdown all cached processes."""
+    """Shutdown all cached worker processes."""
     with _cache_lock:
-        for process in _process_cache.values():
+        for worker in _process_cache.values():
             try:
-                # Send shutdown command
-                shutdown_req = json.dumps({"jsonrpc": "2.0", "id": 0, "method": "shutdown"}) + "\n"
-                process.stdin.write(shutdown_req)
-                process.stdin.flush()
-                process.wait(timeout=5)
+                # Send shutdown command via transport
+                shutdown_req = {"jsonrpc": "2.0", "id": 0, "method": "shutdown"}
+                worker.transport.send(shutdown_req)
+                worker.process.wait(timeout=5)
             except Exception:
-                process.kill()
+                worker.process.kill()
+            finally:
+                # Clean up resources
+                try:
+                    worker.transport.close()
+                    worker.server_socket.close()
+                    cleanup_socket(worker.socket_path)
+                except Exception:
+                    pass
         _process_cache.clear()
 
 
