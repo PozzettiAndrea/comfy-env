@@ -299,11 +299,18 @@ def isolated(
                 else:
                     _log(env, f"Warning: Config file not found: {config_file}")
             else:
-                # Auto-discover config file
-                from .env.config_file import discover_env_config
-                env_config = discover_env_config(node_package_dir)
-                if env_config:
-                    _log(env, f"Auto-discovered config: {env_config.name}")
+                # Auto-discover config file - try v2 API first
+                from .env.config_file import discover_config, discover_env_config
+                v2_config = discover_config(node_package_dir)
+                if v2_config and env in v2_config.envs:
+                    # v2 schema: get the named environment
+                    env_config = v2_config.envs[env]
+                    _log(env, f"Auto-discovered v2 config: {env_config.name}")
+                else:
+                    # Fall back to v1 API
+                    env_config = discover_env_config(node_package_dir)
+                    if env_config:
+                        _log(env, f"Auto-discovered config: {env_config.name}")
 
             # If we have a config, set up the venv
             if env_config:
