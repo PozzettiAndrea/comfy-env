@@ -63,22 +63,22 @@ PACKAGE_REGISTRY: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     "torch-scatter": {
         "method": "index",
-        "index_url": "https://data.pyg.org/whl/torch-{torch_mm}+cu{cuda_short}.html",
+        "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Scatter operations for PyTorch",
     },
     "torch-cluster": {
         "method": "index",
-        "index_url": "https://data.pyg.org/whl/torch-{torch_mm}+cu{cuda_short}.html",
+        "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Clustering algorithms for PyTorch",
     },
     "torch-sparse": {
         "method": "index",
-        "index_url": "https://data.pyg.org/whl/torch-{torch_mm}+cu{cuda_short}.html",
+        "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Sparse tensor operations for PyTorch",
     },
     "torch-spline-conv": {
         "method": "index",
-        "index_url": "https://data.pyg.org/whl/torch-{torch_mm}+cu{cuda_short}.html",
+        "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Spline convolutions for PyTorch",
     },
 

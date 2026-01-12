@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-envmanager"
-version = "0.0.3"
+version = "0.0.4"
 description = "Environment management for ComfyUI custom nodes - CUDA wheel resolution and process isolation"
 readme = "README.md"
 license = {text = "MIT"}
