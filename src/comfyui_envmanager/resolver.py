@@ -147,6 +147,9 @@ class RuntimeEnv:
             result["torch_version"] = self.torch_version
             result["torch_short"] = self.torch_short
             result["torch_mm"] = self.torch_mm
+            # torch_dotted_mm: "2.8" format (major.minor with dot) for flash-attn URLs
+            parts = self.torch_version.split(".")[:2]
+            result["torch_dotted_mm"] = ".".join(parts)
 
         return result
 

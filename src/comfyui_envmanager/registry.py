@@ -7,7 +7,9 @@ wheel_sources in their comfyui_env.toml.
 Install method types:
 - "index": Use pip --extra-index-url (PEP 503 simple repository)
 - "github_index": GitHub Pages index (--find-links)
+- "find_links": Use pip --find-links (for PyG, etc.)
 - "pypi_variant": Package name varies by CUDA version (e.g., spconv-cu124)
+- "github_release": Direct wheel URL from GitHub releases with fallback sources
 """
 
 from typing import Dict, Any, Optional
@@ -131,6 +133,39 @@ PACKAGE_REGISTRY: Dict[str, Dict[str, Any]] = {
         "method": "pypi_variant",
         "package_template": "spconv-cu{cuda_short2}",
         "description": "Sparse convolution library (use spconv-cu126 for CUDA 12.6+)",
+    },
+
+    # =========================================================================
+    # flash-attn - Multi-source prebuilt wheels
+    # Required for UniRig and other transformer-based models
+    # Sources: Dao-AILab (official), mjun0812 (Linux), bdashore3 (Windows)
+    # =========================================================================
+    "flash-attn": {
+        "method": "github_release",
+        "sources": [
+            # Linux: Dao-AILab official wheels (CUDA 12.x, PyTorch 2.4-2.8)
+            # Format: flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+            {
+                "name": "Dao-AILab",
+                "url_template": "https://github.com/Dao-AILab/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_major}torch{torch_dotted_mm}cxx11abiTRUE-{py_tag}-{py_tag}-linux_x86_64.whl",
+                "platforms": ["linux_x86_64"],
+            },
+            # Linux: mjun0812 prebuilt wheels (CUDA 12.4-13.0, PyTorch 2.5-2.9)
+            # Format: flash_attn-2.8.3+cu128torch2.8-cp310-cp310-linux_x86_64.whl
+            # Note: Release v0.7.2 contains multiple flash_attn versions
+            {
+                "name": "mjun0812",
+                "url_template": "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.2/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-linux_x86_64.whl",
+                "platforms": ["linux_x86_64"],
+            },
+            # Windows: bdashore3 prebuilt wheels (CUDA 12.4/12.8, PyTorch 2.6-2.8)
+            {
+                "name": "bdashore3",
+                "url_template": "https://github.com/bdashore3/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_short}torch{torch_version}cxx11abiFALSE-{py_tag}-{py_tag}-win_amd64.whl",
+                "platforms": ["win_amd64"],
+            },
+        ],
+        "description": "Flash Attention for fast transformer inference",
     },
 }
 

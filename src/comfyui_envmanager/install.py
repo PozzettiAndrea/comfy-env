@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from .env.config import IsolatedEnv
 from .env.config_file import discover_env_config, load_env_from_file
@@ -211,6 +211,10 @@ def _get_install_info(
                 vars_dict["cuda_short2"] = get_cuda_short2(env.cuda_version)
             actual_pkg = _substitute_template(config["package_template"], vars_dict)
             return {"method": method, "description": f"as {actual_pkg} from PyPI"}
+        elif method == "github_release":
+            sources = config.get("sources", [])
+            source_names = [s.get("name", "unknown") for s in sources]
+            return {"method": method, "description": f"from GitHub ({', '.join(source_names)})"}
     elif legacy_wheel_sources:
         return {"method": "legacy", "description": f"from config wheel_sources"}
     else:
@@ -262,6 +266,10 @@ def _install_cuda_package(
             pkg_spec = f"{actual_package}=={version}" if version else actual_package
             log(f"  Installing {package} as {actual_package}...")
             _pip_install([pkg_spec], no_deps=False, log=log)
+
+        elif method == "github_release":
+            # Direct wheel URL from GitHub releases with fallback sources
+            _install_from_github_release(package, version, env, config, log)
 
     elif legacy_wheel_sources:
         # Fall back to legacy wheel sources from config
@@ -350,6 +358,93 @@ def _pip_install_with_find_links(
             exit_code=result.returncode,
             stderr=result.stderr,
         )
+
+
+def _install_from_github_release(
+    package: str,
+    version: Optional[str],
+    env: RuntimeEnv,
+    config: Dict[str, Any],
+    log: Callable[[str], None],
+) -> None:
+    """Install package from GitHub release wheels with fallback sources.
+
+    This method handles packages like flash-attn that have multiple wheel
+    sources for different platforms (Linux: Dao-AILab, mjun0812; Windows: bdashore3).
+    """
+    if not version:
+        raise InstallError(
+            f"Package {package} requires explicit version for github_release method"
+        )
+
+    sources = config.get("sources", [])
+    if not sources:
+        raise InstallError(f"No sources configured for {package}")
+
+    # Build template variables
+    vars_dict = env.as_dict()
+    vars_dict["version"] = version
+
+    # Add py_tag (e.g., "cp310")
+    vars_dict["py_tag"] = f"cp{env.python_short}"
+
+    # Add cuda_major (e.g., "12") for Dao-AILab URL pattern
+    if env.cuda_version:
+        vars_dict["cuda_major"] = env.cuda_version.split(".")[0]
+
+    # Filter sources by platform
+    current_platform = env.platform_tag
+    compatible_sources = [
+        s for s in sources
+        if current_platform in s.get("platforms", [])
+    ]
+
+    if not compatible_sources:
+        available = set()
+        for s in sources:
+            available.update(s.get("platforms", []))
+        raise InstallError(
+            f"No {package} wheels available for platform {current_platform}. "
+            f"Available platforms: {', '.join(sorted(available))}"
+        )
+
+    # Try each source in order
+    errors = []
+    for source in compatible_sources:
+        source_name = source.get("name", "unknown")
+        url_template = source.get("url_template", "")
+
+        # Substitute template variables
+        url = url_template
+        for key, value in vars_dict.items():
+            if value is not None:
+                url = url.replace(f"{{{key}}}", str(value))
+
+        log(f"  Trying {source_name}: {package}=={version}...")
+
+        try:
+            pip_cmd = _get_pip_command()
+            args = pip_cmd + ["install", "--no-deps", url]
+
+            result = subprocess.run(args, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                log(f"    Successfully installed from {source_name}")
+                return
+            else:
+                error_msg = result.stderr.strip().split('\n')[-1] if result.stderr else "Unknown error"
+                errors.append(f"{source_name}: {error_msg}")
+                log(f"    Failed: {error_msg[:80]}...")
+
+        except Exception as e:
+            errors.append(f"{source_name}: {str(e)}")
+            log(f"    Error: {str(e)[:80]}...")
+
+    # All sources failed
+    raise InstallError(
+        f"Failed to install {package}=={version} from any source.\n"
+        f"Tried sources:\n" + "\n".join(f"  - {e}" for e in errors)
+    )
 
 
 def _get_cuda_packages(env_config: IsolatedEnv) -> List[str]:

@@ -40,7 +40,7 @@ This package provides:
 The @isolated decorator and WorkerBridge are still available.
 """
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 from .env.config import IsolatedEnv
 from .env.config_file import (
