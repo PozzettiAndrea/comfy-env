@@ -203,6 +203,8 @@ def _get_install_info(
             return {"method": method, "description": f"from index {index_url}"}
         elif method == "github_index":
             return {"method": method, "description": f"from {index_url}"}
+        elif method == "find_links":
+            return {"method": method, "description": f"from {index_url}"}
         elif method == "pypi_variant":
             vars_dict = env.as_dict()
             if env.cuda_version:
@@ -242,6 +244,13 @@ def _install_cuda_package(
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} from GitHub wheels...")
+            _pip_install_with_find_links(pkg_spec, index_url, log)
+
+        elif method == "find_links":
+            # Generic find-links (e.g., PyG) - use pip --find-links
+            index_url = _substitute_template(config["index_url"], env)
+            pkg_spec = f"{package}=={version}" if version else package
+            log(f"  Installing {package} from {index_url}...")
             _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "pypi_variant":

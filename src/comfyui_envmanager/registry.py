@@ -60,24 +60,25 @@ PACKAGE_REGISTRY: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # PyTorch Geometric (PyG) packages - official index
     # https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+    # Uses --find-links (not --extra-index-url) for proper wheel discovery
     # =========================================================================
     "torch-scatter": {
-        "method": "index",
+        "method": "find_links",
         "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Scatter operations for PyTorch",
     },
     "torch-cluster": {
-        "method": "index",
+        "method": "find_links",
         "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Clustering algorithms for PyTorch",
     },
     "torch-sparse": {
-        "method": "index",
+        "method": "find_links",
         "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Sparse tensor operations for PyTorch",
     },
     "torch-spline-conv": {
-        "method": "index",
+        "method": "find_links",
         "index_url": "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html",
         "description": "Spline convolutions for PyTorch",
     },
