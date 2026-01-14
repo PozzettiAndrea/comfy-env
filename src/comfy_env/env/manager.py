@@ -6,6 +6,7 @@ Uses uv for fast environment creation and package installation.
 
 import subprocess
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional, Callable
 
