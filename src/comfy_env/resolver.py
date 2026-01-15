@@ -218,21 +218,6 @@ class WheelSource:
         return package.lower() in [p.lower() for p in self.packages]
 
 
-# Default wheel sources for common CUDA packages
-DEFAULT_WHEEL_SOURCES = [
-    WheelSource(
-        name="nvdiffrast-wheels",
-        url_template="https://github.com/PozzettiAndrea/nvdiffrast-full-wheels/releases/download/v{version}/nvdiffrast-{version}%2Bcu{cuda_short}torch{torch_mm}-cp{py_short}-cp{py_short}-{platform}.whl",
-        packages=["nvdiffrast"],
-    ),
-    WheelSource(
-        name="cumesh-wheels",
-        url_template="https://github.com/PozzettiAndrea/cumesh-wheels/releases/download/v{version}/{package}-{version}%2Bcu{cuda_short}torch{torch_mm}-cp{py_short}-cp{py_short}-{platform}.whl",
-        packages=["pytorch3d", "torch-cluster", "torch-scatter", "torch-sparse"],
-    ),
-]
-
-
 class WheelResolver:
     """
     Resolves CUDA wheel URLs from package name and runtime environment.
@@ -255,10 +240,11 @@ class WheelResolver:
         Initialize resolver.
 
         Args:
-            sources: List of WheelSource configurations.
+            sources: List of WheelSource configurations. Defaults to empty
+                    (use PACKAGE_REGISTRY in install.py for actual sources).
             overrides: Package-specific URL overrides (package -> template).
         """
-        self.sources = sources or DEFAULT_WHEEL_SOURCES
+        self.sources = sources or []
         self.overrides = overrides or {}
 
     def resolve(
