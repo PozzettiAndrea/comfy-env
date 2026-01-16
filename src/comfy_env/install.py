@@ -87,13 +87,15 @@ def install(
         )
 
     # Install tools first (e.g., Blender)
+    # Tools are installed to ComfyUI root (shared across all nodes)
     if full_config.tools:
         log(f"Installing {len(full_config.tools)} tool(s)...")
+        comfyui_root = node_dir.parent.parent  # custom_nodes/../.. = ComfyUI/
         for name, tool_config in full_config.tools.items():
             if dry_run:
                 log(f"  Would install {name} {tool_config.version}")
             else:
-                install_tool(tool_config, log, node_dir)
+                install_tool(tool_config, log, comfyui_root)
 
     # Get environment config
     env_config = full_config.default_env
