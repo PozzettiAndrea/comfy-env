@@ -63,7 +63,7 @@ else:
     except ImportError:
         tomllib = None  # type: ignore
 
-from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, ToolConfig
+from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, SystemConfig, ToolConfig
 from .cuda_gpu_detection import detect_cuda_version
 
 
@@ -332,7 +332,7 @@ def _substitute_vars(s: str, variables: Dict[str, str]) -> str:
 # =============================================================================
 
 # Reserved table names that are NOT isolated environments
-RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools"}
+RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools", "system"}
 
 
 def load_config(
@@ -426,12 +426,14 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
         return _convert_simple_to_full(data, base_dir)
 
     # Parse full schema
+    system = _parse_system_section(data.get("system", {}))
     local = _parse_local_section(data.get("local", {}))
     envs = _parse_env_sections(data, base_dir)
     node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
     tools = _parse_tools_section(data.get("tools", {}))
 
     return EnvManagerConfig(
+        system=system,
         local=local,
         envs=envs,
         node_reqs=node_reqs,
@@ -613,6 +615,34 @@ def _parse_tools_section(tools_data: Dict[str, Any]) -> Dict[str, ToolConfig]:
     return tools
 
 
+def _parse_system_section(system_data: Dict[str, Any]) -> SystemConfig:
+    """Parse [system] section.
+
+    Supports:
+        [system]
+        linux = ["libgl1", "libopengl0"]
+        darwin = ["mesa"]  # future
+        windows = ["vcredist"]  # future
+    """
+    linux = system_data.get("linux", [])
+    darwin = system_data.get("darwin", [])
+    windows = system_data.get("windows", [])
+
+    # Ensure all are lists
+    if not isinstance(linux, list):
+        linux = [linux] if linux else []
+    if not isinstance(darwin, list):
+        darwin = [darwin] if darwin else []
+    if not isinstance(windows, list):
+        windows = [windows] if windows else []
+
+    return SystemConfig(
+        linux=linux,
+        darwin=darwin,
+        windows=windows,
+    )
+
+
 def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
     """Convert simple config format to full EnvManagerConfig.
 
@@ -622,8 +652,9 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
     # Parse using simple parser to get IsolatedEnv
     simple_env = _parse_config(data, base_dir)
 
-    # Parse tools section (shared between simple and full format)
+    # Parse tools and system sections (shared between simple and full format)
     tools = _parse_tools_section(data.get("tools", {}))
+    system = _parse_system_section(data.get("system", {}))
 
     # Check if this has explicit env settings (isolated venv) vs just CUDA packages (local install)
     env_section = data.get("env", {})
@@ -632,6 +663,7 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
     if has_explicit_env:
         # Isolated venv config
         return EnvManagerConfig(
+            system=system,
             local=LocalConfig(),
             envs={simple_env.name: simple_env},
             node_reqs=[],
@@ -648,6 +680,7 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
                 cuda_packages[req] = ""
 
         return EnvManagerConfig(
+            system=system,
             local=LocalConfig(
                 cuda_packages=cuda_packages,
                 requirements=simple_env.requirements,

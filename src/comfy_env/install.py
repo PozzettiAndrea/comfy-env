@@ -24,13 +24,111 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .env.config import IsolatedEnv, ToolConfig
+from .env.config import IsolatedEnv, SystemConfig
 from .env.config_file import discover_env_config, load_env_from_file, load_config, discover_config
 from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFoundError
 from .registry import PACKAGE_REGISTRY, get_cuda_short2, is_registered
 from .resolver import RuntimeEnv, WheelResolver, parse_wheel_requirement
-from .tools import install_tool
+
+
+def _install_system_packages(
+    system_config: SystemConfig,
+    log: Callable[[str], None],
+    dry_run: bool = False,
+) -> bool:
+    """
+    Install system-level packages (apt, brew, etc.).
+
+    Args:
+        system_config: SystemConfig with package lists per OS.
+        log: Logging callback.
+        dry_run: If True, show what would be installed without installing.
+
+    Returns:
+        True if installation succeeded or no packages needed.
+    """
+    platform = sys.platform
+
+    if platform.startswith("linux"):
+        packages = system_config.linux
+        if not packages:
+            return True
+
+        log(f"Installing {len(packages)} system package(s) via apt...")
+
+        if dry_run:
+            log(f"  Would install: {', '.join(packages)}")
+            return True
+
+        # Check if apt-get is available
+        if not shutil.which("apt-get"):
+            log("  Warning: apt-get not found. Cannot install system packages.")
+            log(f"  Please install manually: {', '.join(packages)}")
+            return True  # Don't fail - just warn
+
+        # Check if we can use sudo
+        sudo_available = shutil.which("sudo") is not None
+
+        try:
+            if sudo_available:
+                # Try with sudo
+                log("  Running apt-get update...")
+                update_result = subprocess.run(
+                    ["sudo", "apt-get", "update"],
+                    capture_output=True,
+                    text=True,
+                )
+                if update_result.returncode != 0:
+                    log(f"  Warning: apt-get update failed: {update_result.stderr.strip()}")
+                    # Continue anyway - packages might already be cached
+
+                log(f"  Installing: {', '.join(packages)}")
+                install_cmd = ["sudo", "apt-get", "install", "-y"] + packages
+                install_result = subprocess.run(
+                    install_cmd,
+                    capture_output=True,
+                    text=True,
+                )
+
+                if install_result.returncode != 0:
+                    log(f"  Warning: apt-get install failed: {install_result.stderr.strip()}")
+                    log(f"  Please install manually: sudo apt-get install {' '.join(packages)}")
+                    return True  # Don't fail - just warn
+                else:
+                    log("  System packages installed successfully.")
+                    return True
+            else:
+                log("  Warning: sudo not available. Cannot install system packages automatically.")
+                log(f"  Please install manually: sudo apt-get install {' '.join(packages)}")
+                return True  # Don't fail - just warn
+
+        except Exception as e:
+            log(f"  Warning: Failed to install system packages: {e}")
+            log(f"  Please install manually: sudo apt-get install {' '.join(packages)}")
+            return True  # Don't fail - just warn
+
+    elif platform == "darwin":
+        packages = system_config.darwin
+        if not packages:
+            return True
+
+        log(f"System packages for macOS: {', '.join(packages)}")
+        log("  Note: macOS system package installation not yet implemented.")
+        log(f"  Please install manually with Homebrew: brew install {' '.join(packages)}")
+        return True
+
+    elif platform == "win32":
+        packages = system_config.windows
+        if not packages:
+            return True
+
+        log(f"System packages for Windows: {', '.join(packages)}")
+        log("  Note: Windows system package installation not yet implemented.")
+        log(f"  Please install manually.")
+        return True
+
+    return True
 
 
 def install(
@@ -86,16 +184,10 @@ def install(
             "Create comfy-env.toml or specify path explicitly."
         )
 
-    # Install tools first (e.g., Blender)
-    # Tools are installed to ComfyUI root (shared across all nodes)
-    if full_config.tools:
-        log(f"Installing {len(full_config.tools)} tool(s)...")
-        comfyui_root = node_dir.parent.parent  # custom_nodes/../.. = ComfyUI/
-        for name, tool_config in full_config.tools.items():
-            if dry_run:
-                log(f"  Would install {name} {tool_config.version}")
-            else:
-                install_tool(tool_config, log, comfyui_root)
+    # Install system packages first (apt, brew, etc.)
+    # These need to be installed before Python packages that depend on them
+    if full_config.has_system:
+        _install_system_packages(full_config.system, log, dry_run)
 
     # Get environment config
     env_config = full_config.default_env

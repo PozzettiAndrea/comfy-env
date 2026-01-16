@@ -6,6 +6,18 @@ from typing import Dict, List, Optional
 
 
 @dataclass
+class SystemConfig:
+    """Configuration for system-level packages.
+
+    These are OS-level packages (apt, brew, etc.) that need to be installed
+    before Python packages can work properly.
+    """
+    linux: List[str] = field(default_factory=list)    # apt packages
+    darwin: List[str] = field(default_factory=list)   # brew packages (future)
+    windows: List[str] = field(default_factory=list)  # winget packages (future)
+
+
+@dataclass
 class LocalConfig:
     """Configuration for local (host environment) installs.
 
@@ -37,6 +49,7 @@ class EnvManagerConfig:
     Full configuration parsed from comfy-env.toml.
 
     Supports the v2 schema:
+        [system]            - System-level packages (apt, brew, etc.)
         [local.cuda]        - CUDA packages for host environment
         [local.packages]    - Regular packages for host environment
         [envname]           - Isolated env definition
@@ -45,10 +58,16 @@ class EnvManagerConfig:
         [node_reqs]         - Node dependencies
         [tools]             - External tools (e.g., blender = "4.2")
     """
+    system: SystemConfig = field(default_factory=SystemConfig)
     local: LocalConfig = field(default_factory=LocalConfig)
     envs: Dict[str, "IsolatedEnv"] = field(default_factory=dict)
     node_reqs: List[NodeReq] = field(default_factory=list)
     tools: Dict[str, ToolConfig] = field(default_factory=dict)
+
+    @property
+    def has_system(self) -> bool:
+        """Check if there are system packages to install."""
+        return bool(self.system.linux or self.system.darwin or self.system.windows)
 
     @property
     def has_local(self) -> bool:
