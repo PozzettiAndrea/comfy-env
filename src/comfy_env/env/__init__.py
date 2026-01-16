@@ -1,8 +1,17 @@
 """Environment management for comfyui-isolation."""
 
-from .config import IsolatedEnv
+from .config import IsolatedEnv, ToolConfig
 from .manager import IsolatedEnvManager
-from .detection import detect_cuda_version, detect_gpu_info, get_gpu_summary
+from .cuda_gpu_detection import (
+    GPUInfo,
+    CUDAEnvironment,
+    detect_cuda_environment,
+    detect_cuda_version,
+    detect_gpu_info,
+    detect_gpus,
+    get_gpu_summary,
+    get_recommended_cuda_version,
+)
 from .platform import get_platform, PlatformProvider, PlatformPaths
 from .security import (
     normalize_env_name,
@@ -15,9 +24,17 @@ from .security import (
 __all__ = [
     "IsolatedEnv",
     "IsolatedEnvManager",
+    "ToolConfig",
+    # GPU Detection
+    "GPUInfo",
+    "CUDAEnvironment",
+    "detect_cuda_environment",
     "detect_cuda_version",
     "detect_gpu_info",
+    "detect_gpus",
     "get_gpu_summary",
+    "get_recommended_cuda_version",
+    # Platform
     "get_platform",
     "PlatformProvider",
     "PlatformPaths",

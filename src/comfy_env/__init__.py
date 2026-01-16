@@ -1,46 +1,4 @@
-"""
-comfy-env: Environment management for ComfyUI custom nodes.
-
-This package provides:
-- CUDA wheel resolution and in-place installation (Type 2 nodes)
-- Process isolation with separate venvs (Type 1 nodes)
-
-## Quick Start - In-Place Installation
-
-    from comfy_env import install
-
-    # Auto-discover config and install CUDA wheels
-    install()
-
-    # Or with explicit config
-    install(config="comfyui_env.toml")
-
-## Quick Start - Process Isolation
-
-    from comfy_env.workers import get_worker, TorchMPWorker
-
-    # Same-venv isolation (zero-copy tensors)
-    worker = TorchMPWorker()
-    result = worker.call(my_gpu_function, image=tensor)
-
-    # Cross-venv isolation
-    from comfy_env.workers import PersistentVenvWorker
-    worker = PersistentVenvWorker(python="/path/to/venv/bin/python")
-    result = worker.call_module("my_module", "my_func", image=tensor)
-
-## CLI
-
-    comfy-env install          # Install from config
-    comfy-env info             # Show environment info
-    comfy-env resolve pkg==1.0 # Show resolved wheel URL
-    comfy-env doctor           # Verify installation
-
-## Legacy APIs (still supported)
-
-The @isolated decorator and WorkerBridge are still available.
-"""
-
-__version__ = "0.0.11"
+__version__ = "0.0.14"
 
 from .env.config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq
 from .env.config_file import (
@@ -51,7 +9,16 @@ from .env.config_file import (
     CONFIG_FILE_NAMES,
 )
 from .env.manager import IsolatedEnvManager
-from .env.detection import detect_cuda_version, detect_gpu_info, get_gpu_summary
+from .env.cuda_gpu_detection import (
+    GPUInfo,
+    CUDAEnvironment,
+    detect_cuda_environment,
+    detect_cuda_version,
+    detect_gpu_info,
+    detect_gpus,
+    get_gpu_summary,
+    get_recommended_cuda_version,
+)
 from .env.security import (
     normalize_env_name,
     validate_dependency,
@@ -134,9 +101,14 @@ __all__ = [
     "discover_config",
     "CONFIG_FILE_NAMES",
     # Detection
+    "GPUInfo",
+    "CUDAEnvironment",
+    "detect_cuda_environment",
     "detect_cuda_version",
     "detect_gpu_info",
+    "detect_gpus",
     "get_gpu_summary",
+    "get_recommended_cuda_version",
     # Security validation
     "normalize_env_name",
     "validate_dependency",

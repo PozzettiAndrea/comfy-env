@@ -63,8 +63,8 @@ else:
     except ImportError:
         tomllib = None  # type: ignore
 
-from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq
-from .detection import detect_cuda_version
+from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, ToolConfig
+from .cuda_gpu_detection import detect_cuda_version
 
 
 # Config file name
@@ -332,7 +332,7 @@ def _substitute_vars(s: str, variables: Dict[str, str]) -> str:
 # =============================================================================
 
 # Reserved table names that are NOT isolated environments
-RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker"}
+RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools"}
 
 
 def load_config(
@@ -429,11 +429,13 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
     local = _parse_local_section(data.get("local", {}))
     envs = _parse_env_sections(data, base_dir)
     node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
+    tools = _parse_tools_section(data.get("tools", {}))
 
     return EnvManagerConfig(
         local=local,
         envs=envs,
         node_reqs=node_reqs,
+        tools=tools,
     )
 
 
@@ -582,6 +584,35 @@ def _parse_node_reqs(node_reqs_data: Dict[str, Any]) -> List[NodeReq]:
     return reqs
 
 
+def _parse_tools_section(tools_data: Dict[str, Any]) -> Dict[str, ToolConfig]:
+    """Parse [tools] section.
+
+    Supports:
+        [tools]
+        blender = "4.2"
+
+    Or extended:
+        [tools.blender]
+        version = "4.2"
+        install_dir = "/custom/path"
+    """
+    tools = {}
+
+    for name, value in tools_data.items():
+        if isinstance(value, str):
+            # Simple format: blender = "4.2"
+            tools[name] = ToolConfig(name=name, version=value)
+        elif isinstance(value, dict):
+            # Extended format: [tools.blender] with version, install_dir
+            version = value.get("version", "latest")
+            install_dir = value.get("install_dir")
+            if install_dir:
+                install_dir = Path(install_dir)
+            tools[name] = ToolConfig(name=name, version=version, install_dir=install_dir)
+
+    return tools
+
+
 def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
     """Convert simple config format to full EnvManagerConfig.
 
@@ -590,6 +621,9 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
     """
     # Parse using simple parser to get IsolatedEnv
     simple_env = _parse_config(data, base_dir)
+
+    # Parse tools section (shared between simple and full format)
+    tools = _parse_tools_section(data.get("tools", {}))
 
     # Check if this has explicit env settings (isolated venv) vs just CUDA packages (local install)
     env_section = data.get("env", {})
@@ -601,6 +635,7 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             local=LocalConfig(),
             envs={simple_env.name: simple_env},
             node_reqs=[],
+            tools=tools,
         )
     else:
         # Local CUDA packages only (no isolated venv)
@@ -619,4 +654,5 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             ),
             envs={},
             node_reqs=[],
+            tools=tools,
         )

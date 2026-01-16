@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from .env.detection import detect_cuda_version, detect_gpu_info
+from .env.cuda_gpu_detection import detect_cuda_version, detect_gpu_info
 
 
 @dataclass

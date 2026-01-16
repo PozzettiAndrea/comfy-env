@@ -24,6 +24,14 @@ class NodeReq:
 
 
 @dataclass
+class ToolConfig:
+    """Configuration for an external tool like Blender."""
+    name: str
+    version: str = "latest"
+    install_dir: Optional[Path] = None
+
+
+@dataclass
 class EnvManagerConfig:
     """
     Full configuration parsed from comfyui_env.toml.
@@ -35,10 +43,12 @@ class EnvManagerConfig:
         [envname.cuda]      - CUDA packages for isolated env
         [envname.packages]  - Regular packages for isolated env
         [node_reqs]         - Node dependencies
+        [tools]             - External tools (e.g., blender = "4.2")
     """
     local: LocalConfig = field(default_factory=LocalConfig)
     envs: Dict[str, "IsolatedEnv"] = field(default_factory=dict)
     node_reqs: List[NodeReq] = field(default_factory=list)
+    tools: Dict[str, ToolConfig] = field(default_factory=dict)
 
     @property
     def has_local(self) -> bool:

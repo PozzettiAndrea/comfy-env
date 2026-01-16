@@ -12,7 +12,7 @@ from typing import Optional, Callable
 
 from .config import IsolatedEnv
 from .platform import get_platform, PlatformProvider
-from .detection import detect_cuda_version
+from .cuda_gpu_detection import detect_cuda_version
 from .security import (
     normalize_env_name,
     validate_dependency,

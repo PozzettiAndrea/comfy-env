@@ -24,12 +24,13 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .env.config import IsolatedEnv
-from .env.config_file import discover_env_config, load_env_from_file
+from .env.config import IsolatedEnv, ToolConfig
+from .env.config_file import discover_env_config, load_env_from_file, load_config, discover_config
 from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFoundError
 from .registry import PACKAGE_REGISTRY, get_cuda_short2, is_registered
 from .resolver import RuntimeEnv, WheelResolver, parse_wheel_requirement
+from .tools import install_tool
 
 
 def install(
@@ -77,20 +78,38 @@ def install(
     log = log_callback or print
     node_dir = Path(node_dir) if node_dir else Path.cwd()
 
-    # Load configuration
-    env_config = _load_config(config, node_dir)
-    if env_config is None:
+    # Load full configuration (includes tools)
+    full_config = _load_full_config(config, node_dir)
+    if full_config is None:
         raise FileNotFoundError(
             "No configuration file found. "
             "Create comfyui_env.toml or specify path explicitly."
         )
 
-    log(f"Found configuration: {env_config.name}")
+    # Install tools first (e.g., Blender)
+    if full_config.tools:
+        log(f"Installing {len(full_config.tools)} tool(s)...")
+        for name, tool_config in full_config.tools.items():
+            if dry_run:
+                log(f"  Would install {name} {tool_config.version}")
+            else:
+                install_tool(tool_config, log, node_dir)
 
-    if mode == "isolated":
+    # Get environment config
+    env_config = full_config.default_env
+    if env_config is None and not full_config.has_local:
+        log("No packages to install")
+        return True
+
+    if env_config:
+        log(f"Found configuration: {env_config.name}")
+
+    if mode == "isolated" and env_config:
         return _install_isolated(env_config, node_dir, log, dry_run)
-    else:
+    elif env_config:
         return _install_inplace(env_config, node_dir, log, dry_run, verify_wheels)
+    else:
+        return True
 
 
 def _load_config(
@@ -105,6 +124,17 @@ def _load_config(
         return load_env_from_file(config_path, node_dir)
 
     return discover_env_config(node_dir)
+
+
+def _load_full_config(config: Optional[Union[str, Path]], node_dir: Path):
+    """Load full EnvManagerConfig (includes tools)."""
+    from .env.config import EnvManagerConfig
+    if config is not None:
+        config_path = Path(config)
+        if not config_path.is_absolute():
+            config_path = node_dir / config_path
+        return load_config(config_path, node_dir)
+    return discover_config(node_dir)
 
 
 def _install_isolated(
@@ -139,6 +169,12 @@ def _install_inplace(
 ) -> bool:
     """Install in-place into current environment using the package registry."""
     log("Installing in-place mode")
+
+    # Install MSVC runtime on Windows (required for CUDA/PyTorch native extensions)
+    if sys.platform == "win32":
+        log("Installing MSVC runtime for Windows...")
+        if not dry_run:
+            _pip_install(["msvc-runtime"], no_deps=False, log=log)
 
     # Detect runtime environment
     env = RuntimeEnv.detect()
