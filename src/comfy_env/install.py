@@ -238,7 +238,11 @@ def _get_install_info(
         index_url = _substitute_template(config.get("index_url", ""), env)
 
         if method == "index":
-            return {"method": method, "description": f"from index {index_url}"}
+            version_info = ""
+            if "version_template" in config:
+                resolved_version = _substitute_template(config["version_template"], env)
+                version_info = f" (version {resolved_version})"
+            return {"method": method, "description": f"from index {index_url}{version_info}"}
         elif method == "github_index":
             return {"method": method, "description": f"from {index_url}"}
         elif method == "find_links":
@@ -277,8 +281,13 @@ def _install_cuda_package(
         if method == "index":
             # PEP 503 index - use pip --extra-index-url
             index_url = _substitute_template(config["index_url"], env)
-            pkg_spec = f"{package}=={version}" if version else package
-            log(f"  Installing {package} from PyG index...")
+            # Check for version_template (e.g., detectron2 with embedded torch/cuda version)
+            if "version_template" in config:
+                resolved_version = _substitute_template(config["version_template"], env)
+                pkg_spec = f"{package}=={resolved_version}"
+            else:
+                pkg_spec = f"{package}=={version}" if version else package
+            log(f"  Installing {package} from index...")
             _pip_install_with_index(pkg_spec, index_url, log)
 
         elif method == "github_index":

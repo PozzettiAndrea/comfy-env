@@ -121,6 +121,18 @@ packages:
     description: Triton compiler for custom CUDA kernels
 
   # ===========================================================================
+  # detectron2 - Facebook's detection library
+  # https://github.com/facebookresearch/detectron2
+  # Prebuilt wheels from miropsota's torch_packages_builder
+  # Version format: 0.6+<commit>pt<torch_version>cu<cuda_short>
+  # ===========================================================================
+  detectron2:
+    method: index
+    index_url: "https://miropsota.github.io/torch_packages_builder"
+    version_template: "0.6+2a420edpt{torch_version}cu{cuda_short}"
+    description: Detectron2 - Facebook's detection and segmentation library
+
+  # ===========================================================================
   # flash-attn - Multi-source prebuilt wheels
   # ===========================================================================
   flash-attn:
