@@ -6,13 +6,62 @@ on:
       - main
   workflow_dispatch:
 
-permissions:
-  contents: write
-  id-token: write
-
 jobs:
-  publish:
-    uses: PozzettiAndrea/comfy-test/.github/workflows/publish.yml@main
-    with:
-      python-version: '3.11'
-    secrets: inherit
+  bump-and-publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Get current version
+        id: get_version
+        run: |
+          current=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' | tr -d '\r')
+          echo "current=$current" >> $GITHUB_OUTPUT
+
+      - name: Bump patch version
+        id: bump_version
+        run: |
+          current="${{ steps.get_version.outputs.current }}"
+          IFS='.' read -r major minor patch <<< "$current"
+          new_patch=$((patch + 1))
+          new_version="${major}.${minor}.${new_patch}"
+          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" pyproject.toml
+          echo "new_version=$new_version" >> $GITHUB_OUTPUT
+          echo "Bumped version: $current -> $new_version"
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Bump version to ${{ steps.bump_version.outputs.new_version }} [skip ci]"
+          git tag "v${{ steps.bump_version.outputs.new_version }}"
+          git push origin main --tags
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.bump_version.outputs.new_version }}
+          name: v${{ steps.bump_version.outputs.new_version }}
+          generate_release_notes: true
+          files: dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
