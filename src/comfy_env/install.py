@@ -22,9 +22,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
-from .env.config import IsolatedEnv, SystemConfig
+from .env.config import IsolatedEnv, NodeReq, SystemConfig
 from .env.config_file import load_config, discover_config
 from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFoundError
@@ -132,6 +132,47 @@ def _install_system_packages(
     return True
 
 
+def _install_node_dependencies(
+    node_reqs: List[NodeReq],
+    node_dir: Path,
+    log: Callable[[str], None],
+    dry_run: bool = False,
+) -> bool:
+    """
+    Install node dependencies (other ComfyUI custom nodes).
+
+    Args:
+        node_reqs: List of NodeReq objects from [node_reqs] config section.
+        node_dir: Directory of the current node (used to find custom_nodes/).
+        log: Logging callback.
+        dry_run: If True, show what would be installed without installing.
+
+    Returns:
+        True if installation succeeded or no dependencies needed.
+    """
+    from .nodes import install_node_deps
+
+    # Detect custom_nodes directory (parent of current node)
+    custom_nodes_dir = node_dir.parent
+
+    log(f"\nInstalling {len(node_reqs)} node dependencies...")
+
+    if dry_run:
+        for req in node_reqs:
+            node_path = custom_nodes_dir / req.name
+            status = "exists" if node_path.exists() else "would clone"
+            log(f"  {req.name}: {status}")
+        return True
+
+    # Track visited nodes to prevent cycles
+    # Start with current node's directory name
+    visited: Set[str] = {node_dir.name}
+
+    install_node_deps(node_reqs, custom_nodes_dir, log, visited)
+
+    return True
+
+
 def install(
     config: Optional[Union[str, Path]] = None,
     mode: str = "inplace",
@@ -185,7 +226,12 @@ def install(
             "Create comfy-env.toml or specify path explicitly."
         )
 
-    # Install system packages first (apt, brew, etc.)
+    # Install node dependencies first (other ComfyUI custom nodes)
+    # These may have their own system packages and Python packages
+    if full_config.node_reqs:
+        _install_node_dependencies(full_config.node_reqs, node_dir, log, dry_run)
+
+    # Install system packages (apt, brew, etc.)
     # These need to be installed before Python packages that depend on them
     if full_config.has_system:
         _install_system_packages(full_config.system, log, dry_run)
