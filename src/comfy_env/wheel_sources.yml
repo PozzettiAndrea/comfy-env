@@ -58,38 +58,48 @@ packages:
     description: PyTorch3D - 3D deep learning library
 
   # ===========================================================================
-  # PozzettiAndrea wheel repos (GitHub Pages indexes)
+  # PozzettiAndrea cuda-wheels (unified PEP 503 index)
+  # https://pozzettiandrea.github.io/cuda-wheels
   # ===========================================================================
   nvdiffrast:
-    method: github_index
-    index_url: "https://pozzettiandrea.github.io/nvdiffrast-full-wheels/cu{cuda_short}-torch{torch_short}/"
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: NVIDIA differentiable rasterizer
 
   cumesh:
-    method: github_index
-    index_url: "https://pozzettiandrea.github.io/cumesh-wheels/cu{cuda_short}-torch{torch_short}/"
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: CUDA-accelerated mesh utilities
 
   o_voxel:
-    method: github_index
-    index_url: "https://pozzettiandrea.github.io/ovoxel-wheels/cu{cuda_short}-torch{torch_short}/"
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: O-Voxel CUDA extension for TRELLIS
 
   flex_gemm:
-    method: github_index
-    index_url: "https://pozzettiandrea.github.io/flexgemm-wheels/cu{cuda_short}-torch{torch_short}/"
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: Flexible GEMM operations
 
   nvdiffrec_render:
-    method: github_release
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: NVDiffRec rendering utilities
-    sources:
-      - name: PozzettiAndrea
-        url_template: "https://github.com/PozzettiAndrea/nvdiffrec_render-wheels/releases/download/cu{cuda_short}-torch{torch_short}/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-linux_x86_64.whl"
-        platforms: [linux_x86_64]
-      - name: PozzettiAndrea-windows
-        url_template: "https://github.com/PozzettiAndrea/nvdiffrec_render-wheels/releases/download/cu{cuda_short}-torch{torch_short}/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-win_amd64.whl"
-        platforms: [win_amd64]
+
+  gsplat:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    description: Gaussian splatting rasterization
+
+  cc_torch:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    description: GPU-accelerated connected components
+
+  torch_generic_nms:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    description: GPU-accelerated Non-Maximum Suppression
 
   # ===========================================================================
   # spconv - PyPI with CUDA-versioned package names
@@ -103,15 +113,9 @@ packages:
   # sageattention - Fast quantized attention
   # ===========================================================================
   sageattention:
-    method: github_release
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     description: SageAttention - 2-5x faster than FlashAttention with quantized kernels
-    sources:
-      - name: kijai-hf
-        url_template: "https://huggingface.co/Kijai/PrecompiledWheels/resolve/main/sageattention-{version}-cp312-cp312-linux_x86_64.whl"
-        platforms: [linux_x86_64]
-      - name: woct0rdho
-        url_template: "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0-windows.post3/sageattention-2.2.0%2Bcu{cuda_short}torch{torch_version}.post3-cp39-abi3-win_amd64.whl"
-        platforms: [win_amd64]
 
   # ===========================================================================
   # triton - Required for sageattention on Linux
