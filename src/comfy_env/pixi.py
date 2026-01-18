@@ -229,9 +229,9 @@ def create_pixi_toml(
     if env_config.requirements:
         pypi_deps.extend(env_config.requirements)
 
-    # Add CUDA packages (no_deps_requirements)
-    if env_config.no_deps_requirements:
-        pypi_deps.extend(env_config.no_deps_requirements)
+    # NOTE: CUDA packages (no_deps_requirements) are NOT added here.
+    # They require special wheel resolution and are installed separately
+    # by the comfy-env resolver after pixi install completes.
 
     # Add platform-specific requirements
     if sys.platform == "linux" and env_config.linux_requirements:
