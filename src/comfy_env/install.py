@@ -175,20 +175,23 @@ def _install_node_dependencies(
 
 def install(
     config: Optional[Union[str, Path]] = None,
-    mode: str = "inplace",
     node_dir: Optional[Path] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     dry_run: bool = False,
     verify_wheels: bool = False,
+    **kwargs,  # Accept but ignore deprecated 'mode' parameter
 ) -> bool:
     """
     Install dependencies from a comfy-env.toml configuration.
 
     This is the main entry point for installing CUDA dependencies.
+    Mode is auto-detected from config:
+    - [envname] with python = "X.X" → isolated (creates separate venv)
+    - [envname] without python → inplace (installs into current env)
+    - [local.cuda] → local (installs into current env)
 
     Args:
         config: Path to config file. If None, auto-discovers in node_dir.
-        mode: Installation mode - "inplace" (current env) or "isolated" (new venv).
         node_dir: Directory to search for config. Defaults to current directory.
         log_callback: Optional callback for logging. Defaults to print.
         dry_run: If True, show what would be installed without installing.
@@ -208,9 +211,6 @@ def install(
 
         # Explicit config file
         install(config="comfy-env.toml")
-
-        # Isolated mode
-        install(mode="isolated")
 
         # Dry run to see what would be installed
         install(dry_run=True)
@@ -250,10 +250,15 @@ def install(
         log(f"Environment uses conda packages - using pixi backend")
         return pixi_install(env_config, node_dir, log, dry_run)
 
-    if mode == "isolated" and env_config:
-        return _install_isolated(env_config, node_dir, log, dry_run)
-    elif env_config:
-        return _install_inplace(env_config, node_dir, log, dry_run, verify_wheels)
+    # Auto-detect mode based on config:
+    # - env_config.python set → isolated (creates separate venv)
+    # - env_config without python → inplace (installs into current env)
+    # - only [local.cuda] → local (installs into current env)
+    if env_config:
+        if env_config.python:
+            return _install_isolated(env_config, node_dir, log, dry_run)
+        else:
+            return _install_inplace(env_config, node_dir, log, dry_run, verify_wheels)
     elif full_config.has_local:
         # Handle [local.cuda] and [local.packages] without isolated env
         return _install_local(full_config.local, node_dir, log, dry_run)
