@@ -482,21 +482,27 @@ def _install_cuda_package(
                 pkg_spec = f"{package}=={resolved_version}"
             else:
                 pkg_spec = f"{package}=={version}" if version else package
-            log(f"  Installing {package} from index...")
+            log(f"  Installing {package} (index)...")
+            log(f"    Index: {index_url}")
+            log(f"    Package: {pkg_spec}")
             _pip_install_with_index(pkg_spec, index_url, log)
 
         elif method == "github_index":
             # GitHub Pages index - use pip --find-links
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
-            log(f"  Installing {package} from GitHub wheels...")
+            log(f"  Installing {package} (github_index)...")
+            log(f"    Find-links: {index_url}")
+            log(f"    Package: {pkg_spec}")
             _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "find_links":
             # Generic find-links (e.g., PyG) - use pip --find-links
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
-            log(f"  Installing {package} from {index_url}...")
+            log(f"  Installing {package} (find_links)...")
+            log(f"    Find-links: {index_url}")
+            log(f"    Package: {pkg_spec}")
             _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "pypi_variant":
@@ -506,7 +512,8 @@ def _install_cuda_package(
                 vars_dict["cuda_short2"] = get_cuda_short2(env.cuda_version)
             actual_package = _substitute_template(config["package_template"], vars_dict)
             pkg_spec = f"{actual_package}=={version}" if version else actual_package
-            log(f"  Installing {package} as {actual_package}...")
+            log(f"  Installing {package} (pypi_variant)...")
+            log(f"    PyPI variant: {pkg_spec}")
             _pip_install([pkg_spec], no_deps=False, log=log)
 
         elif method == "github_release":

@@ -388,6 +388,8 @@ class IsolatedEnvManager:
                     # PEP 503 index - use --extra-index-url
                     index_url = self._substitute_template(config["index_url"], vars_dict)
                     pkg_spec = f"{package}=={version}" if version else package
+                    self.log(f"    Index: {index_url}")
+                    self.log(f"    Package: {pkg_spec}")
                     result = subprocess.run(
                         pip_args + ["--extra-index-url", index_url, "--no-deps", pkg_spec],
                         capture_output=True, text=True,
@@ -397,6 +399,8 @@ class IsolatedEnvManager:
                     # GitHub Pages or generic find-links
                     index_url = self._substitute_template(config["index_url"], vars_dict)
                     pkg_spec = f"{package}=={version}" if version else package
+                    self.log(f"    Find-links: {index_url}")
+                    self.log(f"    Package: {pkg_spec}")
                     result = subprocess.run(
                         pip_args + ["--find-links", index_url, "--no-deps", pkg_spec],
                         capture_output=True, text=True,
@@ -406,7 +410,7 @@ class IsolatedEnvManager:
                     # Transform package name based on CUDA version
                     actual_package = self._substitute_template(config["package_template"], vars_dict)
                     pkg_spec = f"{actual_package}=={version}" if version else actual_package
-                    self.log(f"    -> {actual_package}")
+                    self.log(f"    PyPI variant: {pkg_spec}")
                     result = subprocess.run(
                         pip_args + ["--no-deps", pkg_spec],
                         capture_output=True, text=True,
