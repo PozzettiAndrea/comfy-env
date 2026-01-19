@@ -123,6 +123,13 @@ packages:
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/lietorch/lietorch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Lie group operations for PyTorch (DPVO dependency)
 
+  dpvo-cuda:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/dpvo_cuda/dpvo_cuda-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "1.0.0"
+    description: DPVO CUDA extensions (cuda_corr, cuda_ba, lietorch_backends)
+
   # ===========================================================================
   # spconv - PyPI with CUDA-versioned package names
   # ===========================================================================
