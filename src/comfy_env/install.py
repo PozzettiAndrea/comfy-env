@@ -31,6 +31,7 @@ from .errors import CUDANotFoundError, DependencyError, InstallError, WheelNotFo
 from .pixi import pixi_install
 from .registry import PACKAGE_REGISTRY, get_cuda_short2
 from .resolver import RuntimeEnv, WheelResolver, parse_wheel_requirement
+from .index_resolver import resolve_wheel_from_index
 
 
 def _install_system_packages(
@@ -483,8 +484,15 @@ def _install_cuda_package(
             else:
                 pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (index)...")
-            log(f"    Index: {index_url}")
-            log(f"    Package: {pkg_spec}")
+            # Try to resolve exact wheel URL from index
+            actual_version = resolved_version if "version_template" in config else version
+            vars_dict = env.as_dict()
+            wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, actual_version)
+            if wheel_url:
+                log(f"    Wheel: {wheel_url}")
+            else:
+                log(f"    Index: {index_url}")
+                log(f"    Package: {pkg_spec}")
             _pip_install_with_index(pkg_spec, index_url, log)
 
         elif method == "github_index":
@@ -492,8 +500,14 @@ def _install_cuda_package(
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (github_index)...")
-            log(f"    Find-links: {index_url}")
-            log(f"    Package: {pkg_spec}")
+            # Try to resolve exact wheel URL from find-links page
+            vars_dict = env.as_dict()
+            wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
+            if wheel_url:
+                log(f"    Wheel: {wheel_url}")
+            else:
+                log(f"    Find-links: {index_url}")
+                log(f"    Package: {pkg_spec}")
             _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "find_links":
@@ -501,8 +515,14 @@ def _install_cuda_package(
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (find_links)...")
-            log(f"    Find-links: {index_url}")
-            log(f"    Package: {pkg_spec}")
+            # Try to resolve exact wheel URL from find-links page
+            vars_dict = env.as_dict()
+            wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
+            if wheel_url:
+                log(f"    Wheel: {wheel_url}")
+            else:
+                log(f"    Find-links: {index_url}")
+                log(f"    Package: {pkg_spec}")
             _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "pypi_variant":

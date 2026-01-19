@@ -60,50 +60,60 @@ packages:
   # ===========================================================================
   # PozzettiAndrea cuda-wheels (unified PEP 503 index)
   # https://pozzettiandrea.github.io/cuda-wheels
+  # Wheel naming: {package}-{version}+cu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl
   # ===========================================================================
   nvdiffrast:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrast/nvdiffrast-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: NVIDIA differentiable rasterizer
 
   cumesh:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cumesh/cumesh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: CUDA-accelerated mesh utilities
 
   o_voxel:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/o-voxel/o_voxel-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: O-Voxel CUDA extension for TRELLIS
 
   flex_gemm:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/flex-gemm/flex_gemm-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Flexible GEMM operations
 
   nvdiffrec_render:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrec-render/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: NVDiffRec rendering utilities
 
   gsplat:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/gsplat/gsplat-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Gaussian splatting rasterization
 
   cc_torch:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cc-torch/cc_torch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: GPU-accelerated connected components
 
   torch_generic_nms:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/torch-generic-nms/torch_generic_nms-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: GPU-accelerated Non-Maximum Suppression
 
   lietorch:
     method: index
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/lietorch/lietorch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Lie group operations for PyTorch (DPVO dependency)
 
   # ===========================================================================

@@ -22,6 +22,7 @@ from .security import (
 )
 from ..registry import PACKAGE_REGISTRY, is_registered, get_cuda_short2
 from ..resolver import RuntimeEnv, parse_wheel_requirement
+from ..index_resolver import resolve_wheel_from_index
 
 
 class IsolatedEnvManager:
@@ -388,8 +389,13 @@ class IsolatedEnvManager:
                     # PEP 503 index - use --extra-index-url
                     index_url = self._substitute_template(config["index_url"], vars_dict)
                     pkg_spec = f"{package}=={version}" if version else package
-                    self.log(f"    Index: {index_url}")
-                    self.log(f"    Package: {pkg_spec}")
+                    # Try to resolve exact wheel URL from index
+                    wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
+                    if wheel_url:
+                        self.log(f"    Wheel: {wheel_url}")
+                    else:
+                        self.log(f"    Index: {index_url}")
+                        self.log(f"    Package: {pkg_spec}")
                     result = subprocess.run(
                         pip_args + ["--extra-index-url", index_url, "--no-deps", pkg_spec],
                         capture_output=True, text=True,
@@ -399,8 +405,13 @@ class IsolatedEnvManager:
                     # GitHub Pages or generic find-links
                     index_url = self._substitute_template(config["index_url"], vars_dict)
                     pkg_spec = f"{package}=={version}" if version else package
-                    self.log(f"    Find-links: {index_url}")
-                    self.log(f"    Package: {pkg_spec}")
+                    # Try to resolve exact wheel URL from find-links page
+                    wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
+                    if wheel_url:
+                        self.log(f"    Wheel: {wheel_url}")
+                    else:
+                        self.log(f"    Find-links: {index_url}")
+                        self.log(f"    Package: {pkg_spec}")
                     result = subprocess.run(
                         pip_args + ["--find-links", index_url, "--no-deps", pkg_spec],
                         capture_output=True, text=True,
