@@ -11,7 +11,7 @@ from pathlib import Path
 _comfyui_base = None
 
 def _find_comfyui_base():
-    """Find ComfyUI base from COMFYUI_BASE env var or by walking up."""
+    """Find ComfyUI base from COMFYUI_BASE env var, child dirs, or by walking up."""
     global _comfyui_base
     if _comfyui_base:
         return _comfyui_base
@@ -21,8 +21,18 @@ def _find_comfyui_base():
         _comfyui_base = Path(os.environ["COMFYUI_BASE"])
         return _comfyui_base
 
+    # Check common child directories (for test environments)
+    # Also check parent's children (isolated venv is sibling to .comfy-test-env)
+    cwd = Path.cwd().resolve()
+    for base in [cwd, cwd.parent]:
+        for child in [".comfy-test-env/ComfyUI", "ComfyUI"]:
+            candidate = base / child
+            if (candidate / "main.py").exists() and (candidate / "comfy").exists():
+                _comfyui_base = candidate
+                return _comfyui_base
+
     # Walk up from cwd looking for ComfyUI
-    current = Path.cwd().resolve()
+    current = cwd
     for _ in range(10):
         if (current / "main.py").exists() and (current / "comfy").exists():
             _comfyui_base = current

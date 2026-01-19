@@ -594,7 +594,16 @@ class PersistentVenvWorker(Worker):
         self._worker_script.write_text(_PERSISTENT_WORKER_SCRIPT)
 
     def _find_comfyui_base(self) -> Optional[Path]:
-        """Find ComfyUI base directory by walking up from working_dir."""
+        """Find ComfyUI base directory."""
+        # Check common child directories (for test environments)
+        # Also check parent's children (isolated venv is sibling to .comfy-test-env)
+        for base in [self.working_dir, self.working_dir.parent]:
+            for child in [".comfy-test-env/ComfyUI", "ComfyUI"]:
+                candidate = base / child
+                if (candidate / "main.py").exists() and (candidate / "comfy").exists():
+                    return candidate
+
+        # Walk up from working_dir (standard ComfyUI custom_nodes layout)
         current = self.working_dir.resolve()
         for _ in range(10):
             if (current / "main.py").exists() and (current / "comfy").exists():
