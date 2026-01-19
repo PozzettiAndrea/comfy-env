@@ -31,7 +31,7 @@ from .ipc.worker import BaseWorker, register
 from .decorator import isolated, shutdown_all_processes
 
 # New in-place installation API
-from .install import install, verify_installation
+from .install import install, verify_installation, setup
 from .resolver import RuntimeEnv, WheelResolver
 
 # Pixi integration (for conda packages)

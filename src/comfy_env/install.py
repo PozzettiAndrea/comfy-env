@@ -18,6 +18,7 @@ Example:
     install(config="comfy-env.toml", mode="isolated")
 """
 
+import inspect
 import shutil
 import subprocess
 import sys
@@ -828,3 +829,42 @@ def verify_installation(
             all_ok = False
 
     return all_ok
+
+
+def setup(
+    log_callback: Optional[Callable[[str], None]] = None,
+    dry_run: bool = False,
+) -> bool:
+    """
+    One-liner setup that auto-discovers config from caller's directory.
+
+    This is the simplest way to install dependencies - just call setup()
+    from your install.py and it will find the comfy-env.toml in the same
+    directory as the calling script.
+
+    Example:
+        # install.py (entire file)
+        from comfy_env import setup
+        setup()
+
+    Args:
+        log_callback: Optional callback for logging. Defaults to print.
+        dry_run: If True, show what would be installed without installing.
+
+    Returns:
+        True if installation succeeded.
+
+    Raises:
+        FileNotFoundError: If no config file found.
+        InstallError: If installation fails.
+    """
+    # Get the caller's directory by inspecting the stack
+    frame = inspect.stack()[1]
+    caller_file = frame.filename
+    caller_dir = Path(caller_file).parent.resolve()
+
+    return install(
+        node_dir=caller_dir,
+        log_callback=log_callback,
+        dry_run=dry_run,
+    )
