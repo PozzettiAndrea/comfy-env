@@ -475,7 +475,7 @@ def _install_cuda_package(
         method = config["method"]
 
         if method == "index":
-            # PEP 503 index - use pip --extra-index-url
+            # PEP 503 index - try to resolve exact wheel URL first
             index_url = _substitute_template(config["index_url"], env)
             # Check for version_template (e.g., detectron2 with embedded torch/cuda version)
             if "version_template" in config:
@@ -489,14 +489,17 @@ def _install_cuda_package(
             vars_dict = env.as_dict()
             wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, actual_version)
             if wheel_url:
+                # Install from resolved URL directly (guarantees we get what we resolved)
                 log(f"    Wheel: {wheel_url}")
+                _pip_install([wheel_url], no_deps=True, log=log)
             else:
+                # Fallback to index-based resolution
                 log(f"    Index: {index_url}")
                 log(f"    Package: {pkg_spec}")
-            _pip_install_with_index(pkg_spec, index_url, log)
+                _pip_install_with_index(pkg_spec, index_url, log)
 
         elif method == "github_index":
-            # GitHub Pages index - use pip --find-links
+            # GitHub Pages index - try to resolve exact wheel URL first
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (github_index)...")
@@ -504,14 +507,17 @@ def _install_cuda_package(
             vars_dict = env.as_dict()
             wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
             if wheel_url:
+                # Install from resolved URL directly (guarantees we get what we resolved)
                 log(f"    Wheel: {wheel_url}")
+                _pip_install([wheel_url], no_deps=True, log=log)
             else:
+                # Fallback to find-links based resolution
                 log(f"    Find-links: {index_url}")
                 log(f"    Package: {pkg_spec}")
-            _pip_install_with_find_links(pkg_spec, index_url, log)
+                _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "find_links":
-            # Generic find-links (e.g., PyG) - use pip --find-links
+            # Generic find-links (e.g., PyG) - try to resolve exact wheel URL first
             index_url = _substitute_template(config["index_url"], env)
             pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (find_links)...")
@@ -519,11 +525,14 @@ def _install_cuda_package(
             vars_dict = env.as_dict()
             wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
             if wheel_url:
+                # Install from resolved URL directly (guarantees we get what we resolved)
                 log(f"    Wheel: {wheel_url}")
+                _pip_install([wheel_url], no_deps=True, log=log)
             else:
+                # Fallback to find-links based resolution
                 log(f"    Find-links: {index_url}")
                 log(f"    Package: {pkg_spec}")
-            _pip_install_with_find_links(pkg_spec, index_url, log)
+                _pip_install_with_find_links(pkg_spec, index_url, log)
 
         elif method == "pypi_variant":
             # Transform package name based on CUDA version

@@ -386,20 +386,26 @@ class IsolatedEnvManager:
                 self.log(f"  Installing {package} ({method})...")
 
                 if method == "index":
-                    # PEP 503 index - use --extra-index-url
+                    # PEP 503 index - try to resolve exact wheel URL first
                     index_url = self._substitute_template(config["index_url"], vars_dict)
                     pkg_spec = f"{package}=={version}" if version else package
                     # Try to resolve exact wheel URL from index
                     wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
                     if wheel_url:
+                        # Install from resolved URL directly (guarantees we get what we resolved)
                         self.log(f"    Wheel: {wheel_url}")
+                        result = subprocess.run(
+                            pip_args + ["--no-deps", wheel_url],
+                            capture_output=True, text=True,
+                        )
                     else:
+                        # Fallback to index-based resolution
                         self.log(f"    Index: {index_url}")
                         self.log(f"    Package: {pkg_spec}")
-                    result = subprocess.run(
-                        pip_args + ["--extra-index-url", index_url, "--no-deps", pkg_spec],
-                        capture_output=True, text=True,
-                    )
+                        result = subprocess.run(
+                            pip_args + ["--extra-index-url", index_url, "--no-deps", pkg_spec],
+                            capture_output=True, text=True,
+                        )
 
                 elif method in ("github_index", "find_links"):
                     # GitHub Pages or generic find-links
@@ -408,14 +414,20 @@ class IsolatedEnvManager:
                     # Try to resolve exact wheel URL from find-links page
                     wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
                     if wheel_url:
+                        # Install from resolved URL directly (guarantees we get what we resolved)
                         self.log(f"    Wheel: {wheel_url}")
+                        result = subprocess.run(
+                            pip_args + ["--no-deps", wheel_url],
+                            capture_output=True, text=True,
+                        )
                     else:
+                        # Fallback to find-links based resolution
                         self.log(f"    Find-links: {index_url}")
                         self.log(f"    Package: {pkg_spec}")
-                    result = subprocess.run(
-                        pip_args + ["--find-links", index_url, "--no-deps", pkg_spec],
-                        capture_output=True, text=True,
-                    )
+                        result = subprocess.run(
+                            pip_args + ["--find-links", index_url, "--no-deps", pkg_spec],
+                            capture_output=True, text=True,
+                        )
 
                 elif method == "pypi_variant":
                     # Transform package name based on CUDA version
