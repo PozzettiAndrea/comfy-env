@@ -276,6 +276,7 @@ def create_pixi_toml(
 
 def clean_pixi_artifacts(
     node_dir: Path,
+    env_name: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> None:
     """
@@ -286,6 +287,7 @@ def clean_pixi_artifacts(
 
     Args:
         node_dir: Directory containing the pixi artifacts.
+        env_name: Environment name (for removing _env_ symlink).
         log: Logging callback.
     """
     pixi_toml = node_dir / "pixi.toml"
@@ -301,6 +303,13 @@ def clean_pixi_artifacts(
     if pixi_dir.exists():
         shutil.rmtree(pixi_dir)
         log("  Removed previous .pixi/ directory")
+
+    # Remove _env_ symlink if it exists
+    if env_name:
+        symlink_path = node_dir / f"_env_{env_name}"
+        if symlink_path.is_symlink():
+            symlink_path.unlink()
+            log(f"  Removed previous _env_{env_name} symlink")
 
 
 def pixi_install(
@@ -344,7 +353,7 @@ def pixi_install(
         return True
 
     # Clean previous pixi artifacts
-    clean_pixi_artifacts(node_dir, log)
+    clean_pixi_artifacts(node_dir, env_config.name, log)
 
     # Ensure pixi is installed
     pixi_path = ensure_pixi(log=log)
@@ -373,6 +382,22 @@ def pixi_install(
                 log(f"  {line}")
 
     log("pixi install completed successfully!")
+
+    # Create _env_{name} symlink for compatibility with uv backend
+    # This ensures code that expects _env_envname/bin/python works with pixi
+    symlink_path = node_dir / f"_env_{env_config.name}"
+    pixi_env_path = node_dir / ".pixi" / "envs" / "default"
+
+    if pixi_env_path.exists():
+        # Remove existing symlink or directory if present
+        if symlink_path.is_symlink():
+            symlink_path.unlink()
+        elif symlink_path.exists():
+            shutil.rmtree(symlink_path)
+
+        symlink_path.symlink_to(pixi_env_path)
+        log(f"Created symlink: _env_{env_config.name} -> .pixi/envs/default")
+
     return True
 
 

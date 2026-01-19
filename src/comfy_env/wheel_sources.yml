@@ -49,12 +49,12 @@ packages:
     description: Spline convolutions for PyTorch
 
   # ===========================================================================
-  # pytorch3d - Facebook's official wheels
-  # https://github.com/facebookresearch/pytorch3d/blob/main/INSTALL.md
+  # pytorch3d - MiroPsota's torch_packages_builder
+  # https://github.com/MiroPsota/torch_packages_builder
   # ===========================================================================
   pytorch3d:
     method: index
-    index_url: "https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py3{py_minor}_cu{cuda_short}_pyt{torch_short}/download.html"
+    index_url: "https://miropsota.github.io/torch_packages_builder/pytorch3d/"
     description: PyTorch3D - 3D deep learning library
 
   # ===========================================================================
