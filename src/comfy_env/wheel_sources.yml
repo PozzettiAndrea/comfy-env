@@ -49,13 +49,13 @@ packages:
     description: Spline convolutions for PyTorch
 
   # ===========================================================================
-  # pytorch3d - MiroPsota's torch_packages_builder
-  # https://github.com/MiroPsota/torch_packages_builder
+  # pytorch3d - PyTorch3D 3D deep learning library
+  # https://pozzettiandrea.github.io/cuda-wheels
   # ===========================================================================
   pytorch3d:
     method: index
-    index_url: "https://miropsota.github.io/torch_packages_builder/pytorch3d/"
-    wheel_template: "https://miropsota.github.io/torch_packages_builder/pytorch3d/pytorch3d-{version}%2Bpt{torch_version}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/pytorch3d/pytorch3d-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     default_version: "0.7.9"
     description: PyTorch3D - 3D deep learning library
 
@@ -75,6 +75,11 @@ packages:
     index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cumesh/cumesh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: CUDA-accelerated mesh utilities
+
+  cubvh:
+    method: index
+    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    description: CUDA BVH acceleration for mesh operations and marching cubes
 
   o_voxel:
     method: index
