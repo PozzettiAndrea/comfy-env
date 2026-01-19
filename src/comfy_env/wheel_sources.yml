@@ -56,6 +56,7 @@ packages:
     method: index
     index_url: "https://miropsota.github.io/torch_packages_builder/pytorch3d/"
     wheel_template: "https://miropsota.github.io/torch_packages_builder/pytorch3d/pytorch3d-{version}%2Bpt{torch_version}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.7.9"
     description: PyTorch3D - 3D deep learning library
 
   # ===========================================================================

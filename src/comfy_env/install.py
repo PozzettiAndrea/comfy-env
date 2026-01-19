@@ -484,19 +484,31 @@ def _install_cuda_package(
             else:
                 pkg_spec = f"{package}=={version}" if version else package
             log(f"  Installing {package} (index)...")
-            # Try to resolve exact wheel URL from index
-            actual_version = resolved_version if "version_template" in config else version
-            vars_dict = env.as_dict()
-            wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, actual_version)
-            if wheel_url:
-                # Install from resolved URL directly (guarantees we get what we resolved)
+
+            # Resolve version: use provided version, default_version, or None
+            effective_version = version if version and version != "*" else config.get("default_version")
+
+            # Check for wheel_template first (direct URL construction, no index parsing)
+            if "wheel_template" in config and effective_version:
+                vars_dict = env.as_dict()
+                vars_dict["version"] = effective_version
+                wheel_url = _substitute_template(config["wheel_template"], vars_dict)
                 log(f"    Wheel: {wheel_url}")
                 _pip_install([wheel_url], no_deps=True, log=log)
             else:
-                # Fallback to index-based resolution
-                log(f"    Index: {index_url}")
-                log(f"    Package: {pkg_spec}")
-                _pip_install_with_index(pkg_spec, index_url, log)
+                # Try to resolve exact wheel URL from index
+                actual_version = resolved_version if "version_template" in config else version
+                vars_dict = env.as_dict()
+                wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, actual_version)
+                if wheel_url:
+                    # Install from resolved URL directly (guarantees we get what we resolved)
+                    log(f"    Wheel: {wheel_url}")
+                    _pip_install([wheel_url], no_deps=True, log=log)
+                else:
+                    raise InstallError(
+                        f"Failed to resolve wheel URL for {package} from index {index_url}. "
+                        "No matching wheel found and PyPI fallback is disabled.",
+                    )
 
         elif method == "github_index":
             # GitHub Pages index - try to resolve exact wheel URL first
