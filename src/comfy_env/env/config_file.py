@@ -219,7 +219,7 @@ def _parse_config(data: Dict[str, Any], base_dir: Path) -> IsolatedEnv:
 
     # Handle pytorch version - auto-derive if "auto" or not specified
     pytorch_version = env_section.get("pytorch_version") or env_section.get("pytorch")
-    if pytorch_version == "auto" or (pytorch_version is None and cuda):
+    if pytorch_version == "auto" or pytorch_version is None:
         pytorch_version = _get_default_pytorch_version(cuda)
 
     if pytorch_version:
@@ -332,7 +332,7 @@ def _substitute_vars(s: str, variables: Dict[str, str]) -> str:
 # =============================================================================
 
 # Reserved table names that are NOT isolated environments
-RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools", "system"}
+RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools", "system", "wheel_sources"}
 
 
 def load_config(
@@ -415,6 +415,7 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
         [envname.cuda]      - CUDA packages for env
         [envname.packages]  - Packages for env
         [node_reqs]         - Node dependencies
+        [wheel_sources]     - Custom wheel URL templates
 
     Also supports simple format ([env] + [packages]) for backward compatibility.
     """
@@ -431,6 +432,7 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
     envs = _parse_env_sections(data, base_dir)
     node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
     tools = _parse_tools_section(data.get("tools", {}))
+    wheel_sources = _parse_wheel_sources_section(data.get("wheel_sources", {}))
 
     return EnvManagerConfig(
         system=system,
@@ -438,6 +440,7 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
         envs=envs,
         node_reqs=node_reqs,
         tools=tools,
+        wheel_sources=wheel_sources,
     )
 
 
@@ -656,6 +659,24 @@ def _parse_system_section(system_data: Dict[str, Any]) -> SystemConfig:
     )
 
 
+def _parse_wheel_sources_section(wheel_sources_data: Dict[str, Any]) -> Dict[str, str]:
+    """Parse [wheel_sources] section.
+
+    Supports:
+        [wheel_sources]
+        nvdiffrast = "https://example.com/nvdiffrast-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"
+        my-package = "https://my-server.com/my-package-{version}.whl"
+
+    Returns:
+        Dict mapping package name (lowercase) to wheel URL template
+    """
+    wheel_sources = {}
+    for name, url_template in wheel_sources_data.items():
+        if isinstance(url_template, str):
+            wheel_sources[name.lower()] = url_template
+    return wheel_sources
+
+
 def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig:
     """Convert simple config format to full EnvManagerConfig.
 
@@ -665,9 +686,10 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
     # Parse using simple parser to get IsolatedEnv
     simple_env = _parse_config(data, base_dir)
 
-    # Parse tools and system sections (shared between simple and full format)
+    # Parse tools, system, and wheel_sources sections (shared between simple and full format)
     tools = _parse_tools_section(data.get("tools", {}))
     system = _parse_system_section(data.get("system", {}))
+    wheel_sources = _parse_wheel_sources_section(data.get("wheel_sources", {}))
 
     # Check if this has explicit env settings (isolated venv) vs just CUDA packages (local install)
     env_section = data.get("env", {})
@@ -681,6 +703,7 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             envs={simple_env.name: simple_env},
             node_reqs=[],
             tools=tools,
+            wheel_sources=wheel_sources,
         )
     else:
         # Local CUDA packages only (no isolated venv)
@@ -701,4 +724,5 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             envs={},
             node_reqs=[],
             tools=tools,
+            wheel_sources=wheel_sources,
         )

@@ -1,9 +1,12 @@
 # Wheel sources registry for CUDA packages
 #
+# Each package has a single wheel_template that resolves to a direct .whl URL.
+# Users can override these in their comfy-env.toml [wheel_sources] section.
+#
 # Template variables:
+#   {version}        - Package version (e.g., "0.4.0")
 #   {cuda_version}   - Full CUDA version (e.g., "12.8")
 #   {cuda_short}     - CUDA without dot (e.g., "128")
-#   {cuda_short2}    - CUDA short for spconv (e.g., "124" not "1240")
 #   {cuda_major}     - CUDA major version (e.g., "12")
 #   {torch_version}  - Full PyTorch version (e.g., "2.8.0")
 #   {torch_short}    - PyTorch without dots (e.g., "280")
@@ -14,173 +17,108 @@
 #   {py_minor}       - Python minor version only (e.g., "10")
 #   {py_tag}         - Python tag (e.g., "cp310")
 #   {platform}       - Platform tag (e.g., "linux_x86_64")
-#
-# Install methods:
-#   index          - pip --extra-index-url (PEP 503)
-#   find_links     - pip --find-links
-#   github_index   - GitHub Pages index (--find-links)
-#   pypi_variant   - Package name varies by CUDA (e.g., spconv-cu124)
-#   github_release - Direct wheel URL from GitHub releases
-#   pypi           - Standard PyPI install
 
 packages:
   # ===========================================================================
-  # PyTorch Geometric (PyG) - official index
+  # PyTorch Geometric (PyG) - official wheels
   # https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
   # ===========================================================================
   torch-scatter:
-    method: find_links
-    index_url: "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html"
+    wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_scatter-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
     description: Scatter operations for PyTorch
 
   torch-cluster:
-    method: find_links
-    index_url: "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html"
+    wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_cluster-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
     description: Clustering algorithms for PyTorch
 
   torch-sparse:
-    method: find_links
-    index_url: "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html"
+    wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_sparse-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
     description: Sparse tensor operations for PyTorch
 
   torch-spline-conv:
-    method: find_links
-    index_url: "https://data.pyg.org/whl/torch-{torch_version}+cu{cuda_short}.html"
+    wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_spline_conv-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
     description: Spline convolutions for PyTorch
-
-  # ===========================================================================
-  # pytorch3d - PyTorch3D 3D deep learning library
-  # https://pozzettiandrea.github.io/cuda-wheels
-  # ===========================================================================
-  pytorch3d:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/pytorch3d/pytorch3d-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
-    default_version: "0.7.9"
-    description: PyTorch3D - 3D deep learning library
 
   # ===========================================================================
   # PozzettiAndrea cuda-wheels (unified PEP 503 index)
   # https://pozzettiandrea.github.io/cuda-wheels
-  # Wheel naming: {package}-{version}+cu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl
   # ===========================================================================
+  pytorch3d:
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/pytorch3d/pytorch3d-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.7.9"
+    description: PyTorch3D - 3D deep learning library
+
   nvdiffrast:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrast/nvdiffrast-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: NVIDIA differentiable rasterizer
 
   cumesh:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cumesh/cumesh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: CUDA-accelerated mesh utilities
 
   cubvh:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cubvh/cubvh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: CUDA BVH acceleration for mesh operations and marching cubes
 
   o_voxel:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/o-voxel/o_voxel-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: O-Voxel CUDA extension for TRELLIS
 
   flex_gemm:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/flex-gemm/flex_gemm-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Flexible GEMM operations
 
   nvdiffrec_render:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrec-render/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: NVDiffRec rendering utilities
 
   gsplat:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/gsplat/gsplat-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Gaussian splatting rasterization
 
   cc_torch:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cc-torch/cc_torch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: GPU-accelerated connected components
 
   torch_generic_nms:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/torch-generic-nms/torch_generic_nms-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: GPU-accelerated Non-Maximum Suppression
 
   lietorch:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/lietorch/lietorch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: Lie group operations for PyTorch (DPVO dependency)
 
   dpvo-cuda:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
     wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/dpvo_cuda/dpvo_cuda-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     default_version: "1.0.0"
     description: DPVO CUDA extensions (cuda_corr, cuda_ba, lietorch_backends)
 
-  # ===========================================================================
-  # spconv - PyPI with CUDA-versioned package names
-  # ===========================================================================
-  spconv:
-    method: pypi_variant
-    package_template: "spconv-cu{cuda_short2}"
-    description: Sparse convolution library (use spconv-cu126 for CUDA 12.6+)
-
-  # ===========================================================================
-  # sageattention - Fast quantized attention
-  # ===========================================================================
   sageattention:
-    method: index
-    index_url: "https://pozzettiandrea.github.io/cuda-wheels"
+    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/sageattention/sageattention-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     description: SageAttention - 2-5x faster than FlashAttention with quantized kernels
-
-  # ===========================================================================
-  # triton - Required for sageattention on Linux
-  # ===========================================================================
-  triton:
-    method: pypi
-    description: Triton compiler for custom CUDA kernels
 
   # ===========================================================================
   # detectron2 - Facebook's detection library
   # https://github.com/facebookresearch/detectron2
   # Prebuilt wheels from miropsota's torch_packages_builder
-  # Version format: 0.6+<commit>pt<torch_version>cu<cuda_short>
   # ===========================================================================
   detectron2:
-    method: index
-    index_url: "https://miropsota.github.io/torch_packages_builder"
-    version_template: "0.6+2a420edpt{torch_version}cu{cuda_short}"
+    wheel_template: "https://miropsota.github.io/torch_packages_builder/detectron2/detectron2-0.6%2B2a420edpt{torch_version}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
     description: Detectron2 - Facebook's detection and segmentation library
 
   # ===========================================================================
-  # flash-attn - Multi-source prebuilt wheels
+  # flash-attn - Dao-AILab (Linux x86_64)
+  # For other platforms, users should add custom wheel_source in their config
   # ===========================================================================
   flash-attn:
-    method: github_release
-    description: Flash Attention for fast transformer inference
-    sources:
-      - name: Dao-AILab
-        url_template: "https://github.com/Dao-AILab/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_major}torch{torch_dotted_mm}cxx11abiTRUE-{py_tag}-{py_tag}-linux_x86_64.whl"
-        platforms: [linux_x86_64]
-      - name: mjun0812
-        url_template: "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.7/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-linux_x86_64.whl"
-        platforms: [linux_x86_64]
-      - name: mjun0812-windows
-        url_template: "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.7/flash_attn-{version}%2Bcu{cuda_short}torch{torch_dotted_mm}-{py_tag}-{py_tag}-win_amd64.whl"
-        platforms: [win_amd64]
-      - name: bdashore3
-        url_template: "https://github.com/bdashore3/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_short}torch{torch_version}cxx11abiFALSE-{py_tag}-{py_tag}-win_amd64.whl"
-        platforms: [win_amd64]
+    wheel_template: "https://github.com/Dao-AILab/flash-attention/releases/download/v{version}/flash_attn-{version}%2Bcu{cuda_major}torch{torch_dotted_mm}cxx11abiTRUE-{py_tag}-{py_tag}-linux_x86_64.whl"
+    description: Flash Attention for fast transformer inference (Linux x86_64)
+
+  # ===========================================================================
+  # spconv - Sparse convolution library
+  # PyPI with CUDA-versioned package names (spconv-cu124, spconv-cu126, etc.)
+  # Note: This uses a special package_name field, not wheel_template
+  # ===========================================================================
+  spconv:
+    package_name: "spconv-cu{cuda_short2}"
+    description: Sparse convolution library (installs spconv-cu124, spconv-cu126, etc.)

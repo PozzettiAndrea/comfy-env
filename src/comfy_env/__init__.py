@@ -1,4 +1,9 @@
-__version__ = "0.0.14"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("comfy-env")
+except PackageNotFoundError:
+    __version__ = "0.0.0-dev"  # Fallback for editable installs
 
 from .env.config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, CondaConfig
 from .env.config_file import (
@@ -31,8 +36,8 @@ from .ipc.worker import BaseWorker, register
 from .decorator import isolated, shutdown_all_processes
 
 # New in-place installation API
-from .install import install, verify_installation, setup
-from .resolver import RuntimeEnv, WheelResolver
+from .install import install, verify_installation
+from .resolver import RuntimeEnv
 
 # Pixi integration (for conda packages)
 from .pixi import (
@@ -82,7 +87,6 @@ __all__ = [
     "install",
     "verify_installation",
     "RuntimeEnv",
-    "WheelResolver",
     # Pixi integration (for conda packages)
     "ensure_pixi",
     "get_pixi_path",

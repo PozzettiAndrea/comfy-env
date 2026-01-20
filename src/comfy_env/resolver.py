@@ -1,30 +1,20 @@
 """
-Wheel URL resolver for CUDA-compiled packages.
+Runtime environment detection for wheel resolution.
 
-This module provides deterministic wheel URL construction based on the runtime
-environment (CUDA version, PyTorch version, Python version, platform).
-
-Unlike pip's constraint solver, this module constructs exact URLs from templates
-and validates that they exist. If a wheel doesn't exist, it fails fast with
-a clear error message.
+This module provides RuntimeEnv for detecting the current system environment
+(CUDA version, PyTorch version, Python version, platform).
 
 Example:
-    from comfy_env.resolver import WheelResolver, RuntimeEnv
+    from comfy_env.resolver import RuntimeEnv
 
     env = RuntimeEnv.detect()
-    resolver = WheelResolver()
-
-    url = resolver.resolve("nvdiffrast", version="0.4.0", env=env)
-    # Returns: https://github.com/.../nvdiffrast-0.4.0+cu128torch28-cp310-...-linux_x86_64.whl
+    print(f"CUDA: {env.cuda_version}, PyTorch: {env.torch_version}")
 """
 
 import platform
-import re
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 from .env.cuda_gpu_detection import detect_cuda_version, detect_gpu_info
 
@@ -106,8 +96,8 @@ class RuntimeEnv:
         try:
             gpu_info = detect_gpu_info()
             if gpu_info:
-                gpu_name = gpu_info.get("name")
-                gpu_compute = gpu_info.get("compute_capability")
+                gpu_name = gpu_info[0].get("name") if isinstance(gpu_info, list) else gpu_info.get("name")
+                gpu_compute = gpu_info[0].get("compute_capability") if isinstance(gpu_info, list) else gpu_info.get("compute_capability")
         except Exception:
             pass
 
@@ -127,7 +117,6 @@ class RuntimeEnv:
 
     def as_dict(self) -> Dict[str, str]:
         """Convert to dict for template substitution."""
-        # Extract py_minor from python_version (e.g., "3.10" -> "10")
         py_minor = self.python_version.split(".")[-1] if self.python_version else ""
 
         result = {
@@ -137,20 +126,18 @@ class RuntimeEnv:
             "py_version": self.python_version,
             "py_short": self.python_short,
             "py_minor": py_minor,
-            "py_tag": f"cp{self.python_short}",  # e.g., cp310, cp311
+            "py_tag": f"cp{self.python_short}",
         }
 
         if self.cuda_version:
             result["cuda_version"] = self.cuda_version
             result["cuda_short"] = self.cuda_short
-            # cuda_major: just the major version (e.g., "12" from "12.8")
             result["cuda_major"] = self.cuda_version.split(".")[0]
 
         if self.torch_version:
             result["torch_version"] = self.torch_version
             result["torch_short"] = self.torch_short
             result["torch_mm"] = self.torch_mm
-            # torch_dotted_mm: "2.8" format (major.minor with dot) for flash-attn URLs
             parts = self.torch_version.split(".")[:2]
             result["torch_dotted_mm"] = ".".join(parts)
 
@@ -173,7 +160,6 @@ def _get_platform_tag() -> str:
     machine = platform.machine().lower()
 
     if sys.platform.startswith('linux'):
-        # Use manylinux tag
         if machine in ('x86_64', 'amd64'):
             return 'linux_x86_64'
         elif machine == 'aarch64':
@@ -186,7 +172,6 @@ def _get_platform_tag() -> str:
         return 'win32'
 
     elif sys.platform == 'darwin':
-        # macOS - use generic tag
         if machine == 'arm64':
             return 'macosx_11_0_arm64'
         return 'macosx_10_9_x86_64'
@@ -199,172 +184,11 @@ def _detect_torch_version() -> Optional[str]:
     try:
         import torch
         version = torch.__version__
-        # Strip CUDA suffix (e.g., "2.8.0+cu128" -> "2.8.0")
         if '+' in version:
             version = version.split('+')[0]
         return version
     except ImportError:
         return None
-
-
-@dataclass
-class WheelSource:
-    """Configuration for a wheel source (GitHub releases, custom index, etc.)."""
-    name: str
-    url_template: str
-    packages: List[str] = field(default_factory=list)  # Empty = all packages
-
-    def supports(self, package: str) -> bool:
-        """Check if this source provides the given package."""
-        if not self.packages:
-            return True  # Empty list = supports all
-        return package.lower() in [p.lower() for p in self.packages]
-
-
-class WheelResolver:
-    """
-    Resolves CUDA wheel URLs from package name and runtime environment.
-
-    Resolution strategy:
-    1. Check explicit overrides in config
-    2. Try configured wheel sources in order
-    3. Fail with actionable error message
-
-    This is NOT a constraint solver. It constructs deterministic URLs
-    based on exact version matches.
-    """
-
-    def __init__(
-        self,
-        sources: Optional[List[WheelSource]] = None,
-        overrides: Optional[Dict[str, str]] = None,
-    ):
-        """
-        Initialize resolver.
-
-        Args:
-            sources: List of WheelSource configurations. Defaults to empty
-                    (use PACKAGE_REGISTRY in install.py for actual sources).
-            overrides: Package-specific URL overrides (package -> template).
-        """
-        self.sources = sources or []
-        self.overrides = overrides or {}
-
-    def resolve(
-        self,
-        package: str,
-        version: str,
-        env: RuntimeEnv,
-        verify: bool = False,
-    ) -> str:
-        """
-        Resolve wheel URL for a package.
-
-        Args:
-            package: Package name (e.g., "nvdiffrast").
-            version: Package version (e.g., "0.4.0").
-            env: Runtime environment for template expansion.
-
-        Returns:
-            Fully resolved wheel URL.
-
-        Raises:
-            WheelNotFoundError: If no wheel URL could be constructed or verified.
-        """
-        from .errors import WheelNotFoundError
-
-        # Prepare template variables
-        variables = env.as_dict()
-        variables["package"] = package
-        variables["version"] = version
-
-        # 1. Check explicit override
-        if package.lower() in self.overrides:
-            url = self._substitute(self.overrides[package.lower()], variables)
-            if verify and not self._url_exists(url):
-                raise WheelNotFoundError(
-                    package=package,
-                    version=version,
-                    env=env,
-                    tried_urls=[url],
-                    reason="Override URL returned 404",
-                )
-            return url
-
-        # 2. Try wheel sources
-        tried_urls = []
-        for source in self.sources:
-            if not source.supports(package):
-                continue
-
-            url = self._substitute(source.url_template, variables)
-            tried_urls.append(url)
-
-            if verify:
-                if self._url_exists(url):
-                    return url
-            else:
-                return url
-
-        # 3. Fail with helpful error
-        raise WheelNotFoundError(
-            package=package,
-            version=version,
-            env=env,
-            tried_urls=tried_urls,
-            reason="No wheel source found for package",
-        )
-
-    def resolve_all(
-        self,
-        packages: Dict[str, str],
-        env: RuntimeEnv,
-        verify: bool = False,
-    ) -> Dict[str, str]:
-        """
-        Resolve URLs for multiple packages.
-
-        Args:
-            packages: Dict of package -> version.
-            env: Runtime environment.
-            verify: Whether to verify URLs exist.
-
-        Returns:
-            Dict of package -> resolved URL.
-
-        Raises:
-            WheelNotFoundError: If any package cannot be resolved.
-        """
-        results = {}
-        for package, version in packages.items():
-            results[package] = self.resolve(package, version, env, verify=verify)
-        return results
-
-    def _substitute(self, template: str, variables: Dict[str, str]) -> str:
-        """
-        Substitute variables into URL template.
-
-        Handles both {var} and {var_name} style placeholders.
-        Missing variables are left as-is (caller should validate).
-        """
-        result = template
-        for key, value in variables.items():
-            result = result.replace(f"{{{key}}}", str(value))
-        return result
-
-    def _url_exists(self, url: str, timeout: float = 10.0) -> bool:
-        """
-        Check if a URL exists using HTTP HEAD request.
-
-        Returns True if URL returns 200 OK.
-        """
-        try:
-            import urllib.request
-            request = urllib.request.Request(url, method='HEAD')
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status == 200
-        except Exception:
-            return False
 
 
 def parse_wheel_requirement(req: str) -> Tuple[str, Optional[str]]:
@@ -379,7 +203,6 @@ def parse_wheel_requirement(req: str) -> Tuple[str, Optional[str]]:
     Returns:
         Tuple of (package_name, version_or_None).
     """
-    # Handle version specifiers
     for op in ['==', '>=', '<=', '~=', '!=', '>', '<']:
         if op in req:
             parts = req.split(op, 1)

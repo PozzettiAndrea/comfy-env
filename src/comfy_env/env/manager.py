@@ -22,7 +22,6 @@ from .security import (
 )
 from ..registry import PACKAGE_REGISTRY, is_registered, get_cuda_short2
 from ..resolver import RuntimeEnv, parse_wheel_requirement
-from ..index_resolver import resolve_wheel_from_index
 
 
 class IsolatedEnvManager:
@@ -373,7 +372,6 @@ class IsolatedEnvManager:
         vars_dict = runtime_env.as_dict()
         if env.cuda:
             vars_dict["cuda_short2"] = get_cuda_short2(env.cuda)
-        # Add py_tag for wheel filename templates (e.g., cp310)
         vars_dict["py_tag"] = f"cp{env.python.replace('.', '')}"
 
         for req in env.no_deps_requirements:
@@ -382,142 +380,45 @@ class IsolatedEnvManager:
 
             if pkg_lower in PACKAGE_REGISTRY:
                 config = PACKAGE_REGISTRY[pkg_lower]
-                method = config["method"]
-                self.log(f"  Installing {package} ({method})...")
 
-                if method == "index":
-                    # PEP 503 index - try to resolve exact wheel URL first
-                    index_url = self._substitute_template(config["index_url"], vars_dict)
-                    pkg_spec = f"{package}=={version}" if version else package
-                    # Try to resolve exact wheel URL from index
-                    wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
-                    if wheel_url:
-                        # Install from resolved URL directly (guarantees we get what we resolved)
-                        self.log(f"    Wheel: {wheel_url}")
-                        result = subprocess.run(
-                            pip_args + ["--no-deps", wheel_url],
-                            capture_output=True, text=True,
-                        )
-                    else:
-                        # Fallback to index-based resolution
-                        self.log(f"    Index: {index_url}")
-                        self.log(f"    Package: {pkg_spec}")
-                        result = subprocess.run(
-                            pip_args + ["--extra-index-url", index_url, "--no-deps", pkg_spec],
-                            capture_output=True, text=True,
-                        )
+                if "wheel_template" in config:
+                    # Direct wheel URL from template
+                    effective_version = version or config.get("default_version")
+                    if not effective_version:
+                        raise RuntimeError(f"Package {package} requires version (no default in registry)")
 
-                elif method in ("github_index", "find_links"):
-                    # GitHub Pages or generic find-links
-                    index_url = self._substitute_template(config["index_url"], vars_dict)
-                    pkg_spec = f"{package}=={version}" if version else package
-                    # Try to resolve exact wheel URL from find-links page
-                    wheel_url = resolve_wheel_from_index(index_url, package, vars_dict, version)
-                    if wheel_url:
-                        # Install from resolved URL directly (guarantees we get what we resolved)
-                        self.log(f"    Wheel: {wheel_url}")
-                        result = subprocess.run(
-                            pip_args + ["--no-deps", wheel_url],
-                            capture_output=True, text=True,
-                        )
-                    else:
-                        # Fallback to find-links based resolution
-                        self.log(f"    Find-links: {index_url}")
-                        self.log(f"    Package: {pkg_spec}")
-                        result = subprocess.run(
-                            pip_args + ["--find-links", index_url, "--no-deps", pkg_spec],
-                            capture_output=True, text=True,
-                        )
-
-                elif method == "pypi_variant":
-                    # Transform package name based on CUDA version
-                    actual_package = self._substitute_template(config["package_template"], vars_dict)
-                    pkg_spec = f"{actual_package}=={version}" if version else actual_package
-                    self.log(f"    PyPI variant: {pkg_spec}")
+                    vars_dict["version"] = effective_version
+                    wheel_url = self._substitute_template(config["wheel_template"], vars_dict)
+                    self.log(f"  Installing {package}=={effective_version}...")
+                    self.log(f"    URL: {wheel_url}")
                     result = subprocess.run(
-                        pip_args + ["--no-deps", pkg_spec],
+                        pip_args + ["--no-deps", wheel_url],
                         capture_output=True, text=True,
                     )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to install {package}: {result.stderr}")
 
-                elif method == "github_release":
-                    # Direct wheel URL from GitHub releases
-                    release_vars = vars_dict.copy()
-                    release_vars["version"] = version or ""
-                    self._install_from_github_release(
-                        package, version, release_vars, config, pip_args
+                elif "package_name" in config:
+                    # PyPI variant (e.g., spconv-cu124)
+                    pkg_name = self._substitute_template(config["package_name"], vars_dict)
+                    pkg_spec = f"{pkg_name}=={version}" if version else pkg_name
+                    self.log(f"  Installing {package} as {pkg_spec}...")
+                    result = subprocess.run(
+                        pip_args + [pkg_spec],
+                        capture_output=True, text=True,
                     )
-                    continue  # Already handled
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to install {package}: {result.stderr}")
 
                 else:
-                    # Unknown method - try regular install
-                    self.log(f"    Unknown method '{method}', trying regular install")
-                    pkg_spec = f"{package}=={version}" if version else package
-                    result = subprocess.run(
-                        pip_args + ["--no-deps", pkg_spec],
-                        capture_output=True, text=True,
-                    )
+                    raise RuntimeError(f"Package {package} in registry but missing wheel_template or package_name")
 
-                if result.returncode != 0:
-                    raise RuntimeError(f"Failed to install {package}: {result.stderr}")
             else:
-                # Not in registry - try regular pip install (e.g., spconv-cu126)
-                self.log(f"  Installing {package} (PyPI)...")
-                pkg_spec = f"{package}=={version}" if version else package
-                result = subprocess.run(
-                    pip_args + ["--no-deps", pkg_spec],
-                    capture_output=True, text=True,
+                # Not in registry - error
+                raise RuntimeError(
+                    f"Package {package} not found in registry. "
+                    f"Add wheel_template to [wheel_sources] in comfy-env.toml"
                 )
-                if result.returncode != 0:
-                    raise RuntimeError(f"Failed to install {package}: {result.stderr}")
-
-    def _install_from_github_release(
-        self,
-        package: str,
-        version: str,
-        vars_dict: dict,
-        config: dict,
-        pip_args: list,
-    ) -> None:
-        """Install package from GitHub release wheels with fallback sources."""
-        import platform as plat
-        import sys
-        # Use consistent platform tags (win_amd64, linux_x86_64, etc.)
-        if sys.platform == 'win32':
-            machine = plat.machine().lower()
-            current_platform = 'win_amd64' if machine in ('amd64', 'x86_64') else f'win_{machine}'
-        elif sys.platform == 'darwin':
-            current_platform = f"macosx_{plat.machine()}"
-        else:
-            current_platform = f"linux_{plat.machine()}"
-
-        sources = config.get("sources", [])
-        errors = []
-
-        for source in sources:
-            # Check platform compatibility
-            platforms = source.get("platforms", [])
-            if platforms and not any(p in current_platform for p in platforms):
-                continue
-
-            url_template = source["url_template"]
-            url = self._substitute_template(url_template, vars_dict)
-
-            self.log(f"    Trying {source.get('name', 'unknown')}: {url}")
-            result = subprocess.run(
-                pip_args + ["--no-deps", url],
-                capture_output=True, text=True,
-            )
-
-            if result.returncode == 0:
-                return  # Success!
-
-            errors.append(f"{source.get('name', 'unknown')}: {result.stderr.strip()}")
-
-        # All sources failed
-        raise RuntimeError(
-            f"Failed to install {package}=={version} from any source:\n"
-            + "\n".join(errors)
-        )
 
     def _substitute_template(self, template: str, vars_dict: dict) -> str:
         """Substitute template variables with environment values."""

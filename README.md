@@ -39,17 +39,12 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Create a `comfy-env.toml` in your node directory:
 
 ```toml
-[env]
-name = "my-node"
-python = "3.10"
-cuda = "auto"
+[cuda]
+nvdiffrast = "0.4.0"
+pytorch3d = "0.7.9"
 
 [packages]
 requirements = ["transformers>=4.56", "pillow"]
-no_deps = ["nvdiffrast==0.4.0", "pytorch3d>=0.7.8"]
-
-[sources]
-wheel_sources = ["https://github.com/PozzettiAndrea/nvdiffrast-full-wheels/releases/download/"]
 ```
 
 Then in your `__init__.py`:
@@ -94,55 +89,123 @@ comfy-env install --dry-run
 # Resolve wheel URLs without installing
 comfy-env resolve nvdiffrast==0.4.0
 
+# List all packages in the built-in registry
+comfy-env list-packages
+
 # Verify installation
 comfy-env doctor
 ```
 
-## Configurations
+## Configuration
 
-### comfy-env.toml
+### Simple Format (comfy-env.toml)
 
 ```toml
-[env]
-name = "my-node"          # Unique name for caching
-python = "3.10"           # Python version
-cuda = "auto"             # "auto", "12.8", "12.4", or null
+# CUDA packages (uses built-in registry)
+[cuda]
+nvdiffrast = "0.4.0"
+pytorch3d = "0.7.9"
+torch-scatter = "2.1.2"
 
+# Regular pip packages
 [packages]
-requirements = [          # Regular pip packages
-    "transformers>=4.56",
-    "pillow",
-]
-no_deps = [               # CUDA packages (installed with --no-deps)
-    "nvdiffrast==0.4.0",
-    "pytorch3d>=0.7.8",
-]
-
-[sources]
-wheel_sources = [         # GitHub releases with pre-built wheels
-    "https://github.com/.../releases/download/",
-]
-index_urls = [            # Extra pip index URLs
-    "https://pypi.org/simple/",
-]
-
-[worker]                  # For isolation mode
-package = "worker"        # worker/__main__.py
+requirements = ["transformers>=4.56", "pillow"]
 ```
+
+### Full Format
+
+```toml
+[system]
+linux = ["libgl1", "libopengl0"]  # apt packages
+
+[local.cuda]
+nvdiffrast = "0.4.0"
+
+[local.packages]
+requirements = ["pillow", "numpy"]
+
+# For isolated environments (creates separate venv)
+[myenv]
+python = "3.10"
+cuda = "12.8"
+
+[myenv.cuda]
+torch-scatter = "2.1.2"
+
+[myenv.packages]
+requirements = ["transformers>=4.56"]
+
+# Custom wheel templates (override built-in registry)
+[wheel_sources]
+my-custom-pkg = "https://my-server.com/my-pkg-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"
+```
+
+## Writing Wheel Templates
 
 ### Template Variables
 
-Wheel URLs support these template variables:
-
 | Variable | Example | Description |
 |----------|---------|-------------|
+| `{version}` | `0.4.0` | Package version |
 | `{cuda_version}` | `12.8` | Full CUDA version |
 | `{cuda_short}` | `128` | CUDA without dot |
-| `{torch_version}` | `2.8.0` | PyTorch version |
-| `{torch_mm}` | `28` | PyTorch major.minor |
+| `{cuda_major}` | `12` | CUDA major only |
+| `{torch_version}` | `2.8.0` | Full PyTorch version |
+| `{torch_mm}` | `28` | PyTorch major.minor no dot |
+| `{torch_dotted_mm}` | `2.8` | PyTorch major.minor with dot |
 | `{py_version}` | `3.10` | Python version |
 | `{py_short}` | `310` | Python without dot |
+| `{py_tag}` | `cp310` | Python wheel tag |
 | `{platform}` | `linux_x86_64` | Platform tag |
+
+### Common Wheel URL Patterns
+
+**Pattern 1: Simple CUDA + Python**
+```
+https://example.com/{package}-{version}+cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl
+```
+
+**Pattern 2: CUDA + PyTorch**
+```
+https://example.com/{package}-{version}+cu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl
+```
+
+**Pattern 3: GitHub Releases**
+```
+https://github.com/org/repo/releases/download/v{version}/{package}-{version}+cu{cuda_short}-{py_tag}-{platform}.whl
+```
+
+### How to Find the Right Template
+
+1. Download a wheel manually from the source
+2. Look at the filename pattern: `nvdiffrast-0.4.0+cu128torch28-cp310-cp310-linux_x86_64.whl`
+3. Replace values with variables: `nvdiffrast-{version}+cu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl`
+4. Prepend the base URL
+
+### Testing Your Template
+
+```bash
+comfy-env resolve my-package==1.0.0
+```
+
+This shows the resolved URL without installing.
+
+### Adding Custom Wheel Sources
+
+If a package isn't in the built-in registry, add it to your `comfy-env.toml`:
+
+```toml
+[cuda]
+my-custom-pkg = "1.0.0"
+
+[wheel_sources]
+my-custom-pkg = "https://my-server.com/my-custom-pkg-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"
+```
+
+Resolution order:
+1. User's `[wheel_sources]` in comfy-env.toml (highest priority)
+2. Built-in `wheel_sources.yml` registry
+3. Error if not found
 
 ## API Reference
 
@@ -157,23 +220,22 @@ install()
 # Explicit config
 install(config="comfy-env.toml")
 
-# Isolated mode (creates separate venv)
-install(mode="isolated")
-
 # Dry run
 install(dry_run=True)
 ```
 
-### WheelResolver
+### RuntimeEnv
 
 ```python
-from comfy_env import RuntimeEnv, WheelResolver
+from comfy_env import RuntimeEnv
 
 env = RuntimeEnv.detect()
-resolver = WheelResolver()
+print(env)
+# Python 3.10, CUDA 12.8, PyTorch 2.8.0, GPU: NVIDIA GeForce RTX 4090
 
-url = resolver.resolve("nvdiffrast", "0.4.0", env)
-print(url)  # https://github.com/.../nvdiffrast-0.4.0+cu128torch28-...whl
+# Get template variables
+vars_dict = env.as_dict()
+# {'cuda_version': '12.8', 'cuda_short': '128', 'torch_mm': '28', ...}
 ```
 
 ### Workers (for isolation)
@@ -195,6 +257,16 @@ cuda = detect_cuda_version()  # "12.8", "12.4", or None
 print(get_gpu_summary())
 # GPU 0: NVIDIA GeForce RTX 5090 (sm_120) [Blackwell - CUDA 12.8]
 ```
+
+## Built-in Package Registry
+
+Run `comfy-env list-packages` to see all packages in the built-in registry.
+
+The registry includes:
+- PyTorch Geometric packages (torch-scatter, torch-cluster, torch-sparse)
+- NVIDIA packages (nvdiffrast, pytorch3d, gsplat)
+- Flash Attention (flash-attn)
+- And more
 
 ## License
 

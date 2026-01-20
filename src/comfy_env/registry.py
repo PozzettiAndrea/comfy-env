@@ -3,13 +3,9 @@
 This module loads package configurations from wheel_sources.yml and provides
 lookup functions for the install module.
 
-Install method types:
-- "index": Use pip --extra-index-url (PEP 503 simple repository)
-- "github_index": GitHub Pages index (--find-links)
-- "find_links": Use pip --find-links (for PyG, etc.)
-- "pypi_variant": Package name varies by CUDA version (e.g., spconv-cu124)
-- "github_release": Direct wheel URL from GitHub releases with fallback sources
-- "pypi": Standard PyPI install
+Each package has either:
+- wheel_template: Direct URL template for .whl file
+- package_name: PyPI package name template (for packages like spconv-cu124)
 """
 
 from pathlib import Path
@@ -34,8 +30,6 @@ def get_cuda_short2(cuda_version: str) -> str:
         '124'
         >>> get_cuda_short2("12.8")
         '128'
-        >>> get_cuda_short2("11.8")
-        '118'
     """
     parts = cuda_version.split(".")
     major = parts[0]
@@ -89,3 +83,48 @@ def is_registered(package: str) -> bool:
         True if package is registered
     """
     return package.lower() in PACKAGE_REGISTRY
+
+
+def get_wheel_template(package: str) -> Optional[str]:
+    """Get wheel_template for a package.
+
+    Args:
+        package: Package name (case-insensitive)
+
+    Returns:
+        wheel_template string or None if not found/not available
+    """
+    info = get_package_info(package)
+    if info:
+        return info.get("wheel_template")
+    return None
+
+
+def get_package_name_template(package: str) -> Optional[str]:
+    """Get package_name template for PyPI variant packages (like spconv).
+
+    Args:
+        package: Package name (case-insensitive)
+
+    Returns:
+        package_name template string or None if not found/not available
+    """
+    info = get_package_info(package)
+    if info:
+        return info.get("package_name")
+    return None
+
+
+def get_default_version(package: str) -> Optional[str]:
+    """Get default_version for a package.
+
+    Args:
+        package: Package name (case-insensitive)
+
+    Returns:
+        default_version string or None if not specified
+    """
+    info = get_package_info(package)
+    if info:
+        return info.get("default_version")
+    return None
