@@ -310,7 +310,7 @@ def _install_local(
 
     cuda_packages = []
     for pkg, ver in local_config.cuda_packages.items():
-        if ver:
+        if ver and ver != "*":
             cuda_packages.append(f"{pkg}=={ver}")
         else:
             cuda_packages.append(pkg)
@@ -445,6 +445,9 @@ def _pip_install(
     pip_cmd = _get_pip_command()
 
     args = pip_cmd + ["install"]
+    # uv requires --system when not in a venv (CI environments)
+    if _is_using_uv():
+        args.append("--system")
     if no_deps:
         args.append("--no-deps")
     args.extend(packages)
@@ -467,6 +470,11 @@ def _get_pip_command() -> List[str]:
     if uv_path:
         return [uv_path, "pip"]
     return [sys.executable, "-m", "pip"]
+
+
+def _is_using_uv() -> bool:
+    """Check if we're using uv for pip commands."""
+    return shutil.which("uv") is not None
 
 
 def verify_installation(

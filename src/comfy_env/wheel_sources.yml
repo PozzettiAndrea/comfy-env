@@ -40,62 +40,73 @@ packages:
     description: Spline convolutions for PyTorch
 
   # ===========================================================================
-  # PozzettiAndrea cuda-wheels (unified PEP 503 index)
-  # https://pozzettiandrea.github.io/cuda-wheels
+  # PozzettiAndrea cuda-wheels (GitHub releases)
+  # https://github.com/PozzettiAndrea/cuda-wheels/releases
   # ===========================================================================
   pytorch3d:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/pytorch3d/pytorch3d-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/pytorch3d-latest/pytorch3d-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     default_version: "0.7.9"
     description: PyTorch3D - 3D deep learning library
 
   nvdiffrast:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrast/nvdiffrast-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/nvdiffrast-latest/nvdiffrast-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.4.0"
     description: NVIDIA differentiable rasterizer
 
   cumesh:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cumesh/cumesh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/cumesh-latest/cumesh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.0.1"
     description: CUDA-accelerated mesh utilities
 
   cubvh:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cubvh/cubvh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/cubvh-latest/cubvh-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.1.2"
     description: CUDA BVH acceleration for mesh operations and marching cubes
 
   o_voxel:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/o-voxel/o_voxel-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/o_voxel-latest/o_voxel-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.0.1"
     description: O-Voxel CUDA extension for TRELLIS
 
   flex_gemm:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/flex-gemm/flex_gemm-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flex_gemm-latest/flex_gemm-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "1.0.0"
     description: Flexible GEMM operations
 
   nvdiffrec_render:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/nvdiffrec-render/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/nvdiffrec_render-latest/nvdiffrec_render-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.0.1"
     description: NVDiffRec rendering utilities
 
   gsplat:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/gsplat/gsplat-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/gsplat-latest/gsplat-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "1.5.3"
     description: Gaussian splatting rasterization
 
   cc_torch:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/cc-torch/cc_torch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/cc_torch-latest/cc_torch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.2"
     description: GPU-accelerated connected components
 
   torch_generic_nms:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/torch-generic-nms/torch_generic_nms-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/torch_generic_nms-latest/torch_generic_nms-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.1"
     description: GPU-accelerated Non-Maximum Suppression
 
   lietorch:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/lietorch/lietorch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/lietorch-latest/lietorch-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.3"
     description: Lie group operations for PyTorch (DPVO dependency)
 
-  dpvo-cuda:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/dpvo_cuda/dpvo_cuda-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
-    default_version: "1.0.0"
-    description: DPVO CUDA extensions (cuda_corr, cuda_ba, lietorch_backends)
-
   sageattention:
-    wheel_template: "https://pozzettiandrea.github.io/cuda-wheels/sageattention/sageattention-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/sageattention-latest/sageattention-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "2.2.0"
     description: SageAttention - 2-5x faster than FlashAttention with quantized kernels
+
+  dpvo_cuda:
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/dpvo_cuda-latest/dpvo_cuda-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.0.0"
+    description: DPVO CUDA extensions (cuda_corr, cuda_ba, lietorch_backends) - torch 2.4 only
 
   # ===========================================================================
   # detectron2 - Facebook's detection library
