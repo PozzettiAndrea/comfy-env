@@ -25,18 +25,22 @@ packages:
   # ===========================================================================
   torch-scatter:
     wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_scatter-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "2.1.2"
     description: Scatter operations for PyTorch
 
   torch-cluster:
     wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_cluster-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "1.6.3"
     description: Clustering algorithms for PyTorch
 
   torch-sparse:
     wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_sparse-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "0.6.18"
     description: Sparse tensor operations for PyTorch
 
   torch-spline-conv:
     wheel_template: "https://data.pyg.org/whl/torch-{torch_version}%2Bcu{cuda_short}/torch_spline_conv-{version}%2Bpt{torch_mm}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "1.2.2"
     description: Spline convolutions for PyTorch
 
   # ===========================================================================
@@ -114,7 +118,8 @@ packages:
   # Prebuilt wheels from miropsota's torch_packages_builder
   # ===========================================================================
   detectron2:
-    wheel_template: "https://miropsota.github.io/torch_packages_builder/detectron2/detectron2-0.6%2B2a420edpt{torch_version}cu{cuda_short}-{py_tag}-{py_tag}-{platform}.whl"
+    find_links: "https://miropsota.github.io/torch_packages_builder/detectron2/"
+    default_version: "0.6"
     description: Detectron2 - Facebook's detection and segmentation library
 
   # ===========================================================================
@@ -131,5 +136,6 @@ packages:
   # Note: This uses a special package_name field, not wheel_template
   # ===========================================================================
   spconv:
-    package_name: "spconv-cu{cuda_short2}"
-    description: Sparse convolution library (installs spconv-cu124, spconv-cu126, etc.)
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/spconv_cu{cuda_short}-latest/spconv-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    default_version: "2.3.8"
+    description: Sparse convolution library

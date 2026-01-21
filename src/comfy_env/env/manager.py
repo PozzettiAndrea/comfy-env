@@ -383,16 +383,35 @@ class IsolatedEnvManager:
 
                 if "wheel_template" in config:
                     # Direct wheel URL from template
-                    effective_version = version or config.get("default_version")
-                    if not effective_version:
-                        raise RuntimeError(f"Package {package} requires version (no default in registry)")
+                    template = config["wheel_template"]
 
-                    vars_dict["version"] = effective_version
-                    wheel_url = self._substitute_template(config["wheel_template"], vars_dict)
-                    self.log(f"  Installing {package}=={effective_version}...")
+                    # Only require version if template uses {version}
+                    effective_version = None
+                    if "{version}" in template:
+                        effective_version = version or config.get("default_version")
+                        if not effective_version:
+                            raise RuntimeError(f"Package {package} requires version (no default in registry)")
+                        vars_dict["version"] = effective_version
+
+                    wheel_url = self._substitute_template(template, vars_dict)
+                    version_str = f"=={effective_version}" if effective_version else ""
+                    self.log(f"  Installing {package}{version_str}...")
                     self.log(f"    URL: {wheel_url}")
                     result = subprocess.run(
                         pip_args + ["--no-deps", wheel_url],
+                        capture_output=True, text=True,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to install {package}: {result.stderr}")
+
+                elif "find_links" in config:
+                    # find_links: pip resolves wheel from index URL
+                    find_links_url = config["find_links"]
+                    effective_version = version or config.get("default_version")
+                    pkg_spec = f"{package}=={effective_version}" if effective_version else package
+                    self.log(f"  Installing {pkg_spec} from {find_links_url}...")
+                    result = subprocess.run(
+                        pip_args + ["--no-deps", "--find-links", find_links_url, pkg_spec],
                         capture_output=True, text=True,
                     )
                     if result.returncode != 0:
@@ -411,7 +430,7 @@ class IsolatedEnvManager:
                         raise RuntimeError(f"Failed to install {package}: {result.stderr}")
 
                 else:
-                    raise RuntimeError(f"Package {package} in registry but missing wheel_template or package_name")
+                    raise RuntimeError(f"Package {package} in registry but missing wheel_template, find_links, or package_name")
 
             else:
                 # Not in registry - error

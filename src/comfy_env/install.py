@@ -367,11 +367,25 @@ def _resolve_wheel_url(
 
         # wheel_template: direct URL
         if "wheel_template" in config:
+            template = config["wheel_template"]
+
+            # Only require version if template uses {version}
+            if "{version}" in template:
+                effective_version = version or config.get("default_version")
+                if not effective_version:
+                    raise InstallError(f"Package {package} requires version (no default in registry)")
+                vars_dict["version"] = effective_version
+
+            return _substitute_template(template, vars_dict)
+
+        # find_links: pip resolves wheel from index (e.g., miropsota's detectron2)
+        if "find_links" in config:
+            find_links_url = config["find_links"]
             effective_version = version or config.get("default_version")
-            if not effective_version:
-                raise InstallError(f"Package {package} requires version (no default in registry)")
-            vars_dict["version"] = effective_version
-            return _substitute_template(config["wheel_template"], vars_dict)
+            if effective_version:
+                return f"find_links:{find_links_url}:{package}=={effective_version}"
+            else:
+                return f"find_links:{find_links_url}:{package}"
 
         # package_name: PyPI variant (e.g., spconv-cu124)
         if "package_name" in config:
@@ -406,6 +420,11 @@ def _install_cuda_package(
         pkg_spec = f"{pkg_name}=={version}" if version else pkg_name
         log(f"  Installing {package} as {pkg_spec} from PyPI...")
         _pip_install([pkg_spec], no_deps=False, log=log)
+    elif url_or_marker.startswith("find_links:"):
+        # find_links: pip resolves from index URL
+        _, find_links_url, pkg_spec = url_or_marker.split(":", 2)
+        log(f"  Installing {pkg_spec} from {find_links_url}...")
+        _pip_install([pkg_spec, "--find-links", find_links_url], no_deps=True, log=log)
     else:
         # Direct wheel URL
         log(f"  Installing {package}...")
