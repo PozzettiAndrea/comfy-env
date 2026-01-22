@@ -136,6 +136,6 @@ packages:
   # Note: This uses a special package_name field, not wheel_template
   # ===========================================================================
   spconv:
-    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/spconv_cu{cuda_short}-latest/spconv-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
+    wheel_template: "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/spconv_cu{cuda_short}-latest/spconv_cu{cuda_short}-{version}%2Bcu{cuda_short}torch{torch_mm}-{py_tag}-{py_tag}-{platform}.whl"
     default_version: "2.3.8"
     description: Sparse convolution library

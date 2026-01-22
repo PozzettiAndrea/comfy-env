@@ -4,6 +4,7 @@ IsolatedEnvManager - Creates and manages isolated Python environments.
 Uses uv for fast environment creation and package installation.
 """
 
+import os
 import subprocess
 import shutil
 import sys
@@ -453,10 +454,24 @@ class IsolatedEnvManager:
         uv = self._find_uv()
 
         self.log("Installing comfy-env (for worker support)...")
+
+        # Check for local wheel in COMFY_LOCAL_WHEELS directory (set by comfy-test --local)
+        install_target = "comfy-env @ git+https://github.com/PozzettiAndrea/comfy-env"
+        wheels_dir = os.environ.get("COMFY_LOCAL_WHEELS")
+        self.log(f"  COMFY_LOCAL_WHEELS={wheels_dir}")
+        if wheels_dir:
+            wheels_path = Path(wheels_dir)
+            self.log(f"  Wheels dir exists: {wheels_path.exists()}")
+            if wheels_path.exists():
+                local_wheels = list(wheels_path.glob("comfy_env-*.whl"))
+                self.log(f"  Found wheels: {[w.name for w in local_wheels]}")
+                if local_wheels:
+                    install_target = str(local_wheels[0])
+                    self.log(f"  Using local wheel: {local_wheels[0].name}")
+
         result = subprocess.run(
             [str(uv), "pip", "install", "--python", str(python_exe),
-             "--upgrade", "--no-cache",
-             "comfy-env @ git+https://github.com/PozzettiAndrea/comfy-env"],
+             "--upgrade", "--no-cache", install_target],
             capture_output=True,
             text=True,
         )
