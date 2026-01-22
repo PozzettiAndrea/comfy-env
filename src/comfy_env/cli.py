@@ -42,6 +42,18 @@ def main(args: Optional[List[str]] = None) -> int:
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
+    # init command
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Create a default comfy-env.toml config file",
+        description="Initialize a new comfy-env.toml configuration file in the current directory",
+    )
+    init_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing config file",
+    )
+
     # install command
     install_parser = subparsers.add_parser(
         "install",
@@ -134,7 +146,9 @@ def main(args: Optional[List[str]] = None) -> int:
         return 0
 
     try:
-        if parsed.command == "install":
+        if parsed.command == "init":
+            return cmd_init(parsed)
+        elif parsed.command == "install":
             return cmd_install(parsed)
         elif parsed.command == "info":
             return cmd_info(parsed)
@@ -153,6 +167,42 @@ def main(args: Optional[List[str]] = None) -> int:
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
+
+DEFAULT_CONFIG = """\
+# comfy-env.toml - Environment configuration for ComfyUI custom nodes
+# Documentation: https://github.com/PozzettiAndrea/comfy-env
+
+[system]
+# System packages required (apt on Linux, brew on macOS)
+linux = []
+
+[environment]
+python = "3.11"
+cuda_version = "auto"
+pytorch_version = "auto"
+
+[environment.cuda]
+# CUDA packages from comfy-env registry
+# Example: nvdiffrast = "0.4.0"
+
+[environment.packages]
+requirements = []
+"""
+
+
+def cmd_init(args) -> int:
+    """Handle init command."""
+    config_path = Path.cwd() / "comfy-env.toml"
+
+    if config_path.exists() and not args.force:
+        print(f"Config file already exists: {config_path}", file=sys.stderr)
+        print("Use --force to overwrite", file=sys.stderr)
+        return 1
+
+    config_path.write_text(DEFAULT_CONFIG)
+    print(f"Created {config_path}")
+    return 0
 
 
 def cmd_install(args) -> int:
