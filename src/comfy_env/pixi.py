@@ -224,6 +224,21 @@ def create_pixi_toml(
 
     # PyPI dependencies section
     pypi_deps = []
+    special_deps = {}  # For dependencies that need special syntax (path, etc.)
+
+    # Always include comfy-env for worker support
+    # Use local wheel if available (for ct test --local)
+    local_wheels_dir = os.environ.get("COMFY_LOCAL_WHEELS")
+    if local_wheels_dir:
+        local_wheels = list(Path(local_wheels_dir).glob("comfy_env-*.whl"))
+        if local_wheels:
+            # Use relative path from node_dir
+            rel_path = os.path.relpath(local_wheels[0], node_dir)
+            special_deps["comfy-env"] = f'{{ path = "{rel_path}" }}'
+        else:
+            pypi_deps.append("comfy-env")
+    else:
+        pypi_deps.append("comfy-env")
 
     # Add regular requirements
     if env_config.requirements:
@@ -241,8 +256,13 @@ def create_pixi_toml(
     elif sys.platform == "win32" and env_config.windows_requirements:
         pypi_deps.extend(env_config.windows_requirements)
 
-    if pypi_deps:
+    if pypi_deps or special_deps:
         lines.append("[pypi-dependencies]")
+
+        # Add special dependencies first (path-based, etc.)
+        for name, value in special_deps.items():
+            lines.append(f'{name} = {value}')
+
         for dep in pypi_deps:
             # Parse pip requirement format to pixi format
             dep_clean = dep.strip()
