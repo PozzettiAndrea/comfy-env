@@ -475,6 +475,12 @@ class VenvWorker(Worker):
             env.update(self.extra_env)
             env["COMFYUI_ISOLATION_WORKER"] = "1"
 
+            # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH
+            lib_dir = self.python.parent.parent / "lib"
+            if lib_dir.is_dir():
+                existing = env.get("LD_LIBRARY_PATH", "")
+                env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+
             # Run subprocess
             cmd = [
                 str(self.python),
@@ -842,6 +848,13 @@ class PersistentVenvWorker(Worker):
         env = os.environ.copy()
         env.update(self.extra_env)
         env["COMFYUI_ISOLATION_WORKER"] = "1"
+
+        # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH
+        # This ensures libraries like libstdc++ from the env are used
+        lib_dir = self.python.parent.parent / "lib"
+        if lib_dir.is_dir():
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
 
         # On Windows, pass host Python directory so worker can add it via os.add_dll_directory()
         # This fixes "DLL load failed" errors for packages like opencv-python-headless
