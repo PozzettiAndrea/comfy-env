@@ -1,0 +1,211 @@
+# =============================================================================
+# comfy-env.toml - Environment configuration for ComfyUI custom nodes
+# Documentation: https://github.com/PozzettiAndrea/comfy-env
+# =============================================================================
+#
+# This file configures dependencies for your ComfyUI custom node.
+# comfy-env handles two main challenges:
+#   1. Installing CUDA packages that require compilation (nvdiffrast, pytorch3d, etc.)
+#   2. Running nodes in isolated environments with their own dependencies
+#
+# Quick start:
+#   pip install comfy-env
+#   comfy-env init          # Creates this template
+#   comfy-env install       # Installs dependencies
+#   comfy-env doctor        # Verifies installation
+
+
+# =============================================================================
+# SYSTEM PACKAGES (optional)
+# =============================================================================
+# System-level packages installed via apt (Linux) before Python packages.
+# Useful for packages that need system libraries to compile or run.
+
+[system]
+linux = []
+# Examples:
+# linux = ["libgl1", "libopengl0"]     # For OpenGL rendering (nvdiffrast)
+# linux = ["python3-dev"]               # For packages that compile C extensions
+# linux = ["ffmpeg"]                    # For video processing nodes
+
+
+# =============================================================================
+# CUDA PACKAGES
+# =============================================================================
+# CUDA packages from the built-in registry. These are pre-compiled wheels
+# that install without needing a compiler. Run `comfy-env list-packages`
+# to see all available packages.
+
+[cuda]
+# Use exact package names from `comfy-env list-packages` (hyphens vs underscores matter!)
+# nvdiffrast = "0.4.0"       # NVIDIA differentiable rasterizer
+# pytorch3d = "0.7.9"        # PyTorch3D - 3D deep learning
+# gsplat = "1.5.3"           # Gaussian splatting rasterization
+# torch-scatter = "2.1.2"    # PyG scatter operations
+# torch-cluster = "1.6.3"    # PyG clustering algorithms
+# flash-attn = "2.7.4"       # Flash Attention (Linux x86_64 only)
+# spconv = "2.3.8"           # Sparse convolution library
+# sageattention = "2.2.0"    # SageAttention - faster than FlashAttention
+# dpvo_cuda = "0.0.0"        # DPVO CUDA extensions
+
+
+# =============================================================================
+# REGULAR PACKAGES
+# =============================================================================
+# Standard pip packages (no special CUDA handling needed).
+
+[packages]
+requirements = []
+# Examples:
+# requirements = [
+#     "transformers>=4.56",
+#     "pillow",
+#     "opencv-python-headless",
+#     "trimesh",
+# ]
+
+
+# =============================================================================
+# CUSTOM WHEEL SOURCES (optional)
+# =============================================================================
+# Override built-in wheel URLs or add packages not in the registry.
+# Template variables: {version}, {cuda_short}, {torch_mm}, {py_tag}, {platform}
+
+[wheel_sources]
+# my-custom-package = "https://my-server.com/my-package-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"
+
+
+# =============================================================================
+# NODE DEPENDENCIES (optional)
+# =============================================================================
+# Other ComfyUI custom nodes this node depends on.
+
+[node_reqs]
+# VideoHelperSuite = "Kosinkadink/ComfyUI-VideoHelperSuite"
+# ComfyUI-Impact-Pack = "ltdrdata/ComfyUI-Impact-Pack"
+
+
+# =============================================================================
+# EXTERNAL TOOLS (optional)
+# =============================================================================
+# External applications required by the node.
+
+[tools]
+# blender = "4.2"
+
+
+# #############################################################################
+#
+#                       PROCESS ISOLATION (ADVANCED)
+#
+# #############################################################################
+#
+# For nodes that need completely isolated dependencies (different PyTorch
+# version, conflicting native libraries, etc.), define isolated environments.
+#
+# How it works:
+#   1. Define an environment below with its own Python/CUDA/packages
+#   2. Use the @isolated decorator on your node class
+#   3. The node runs in a separate subprocess with its own venv
+#
+# Example in __init__.py:
+#
+#     from comfy_env import isolated
+#
+#     @isolated(env="myenv")
+#     class MyIsolatedNode:
+#         FUNCTION = "process"
+#         RETURN_TYPES = ("IMAGE",)
+#
+#         def process(self, image):
+#             # This runs in isolated subprocess with its own dependencies
+#             import conflicting_package
+#             return (result,)
+#
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Example: Simple isolation (same Python, different process)
+# -----------------------------------------------------------------------------
+# Use when you just need process isolation but no venv (fastest option).
+# In your code: @isolated(env="simple", same_venv=True)
+
+# [simple]
+# python = "3.11"
+# cuda_version = "auto"
+# pytorch_version = "auto"
+
+
+# -----------------------------------------------------------------------------
+# Example: Full venv isolation
+# -----------------------------------------------------------------------------
+# Use when you need completely different dependencies.
+# Creates a separate virtual environment with its own packages.
+
+# [myenv]
+# python = "3.10"
+# cuda_version = "12.8"
+# pytorch_version = "2.8.0"
+#
+# [myenv.cuda]
+# nvdiffrast = "0.4.0"
+# pytorch3d = "0.7.9"
+#
+# [myenv.packages]
+# requirements = ["trimesh", "scipy"]
+
+
+# -----------------------------------------------------------------------------
+# Example: Multiple isolated environments
+# -----------------------------------------------------------------------------
+# Some nodes need multiple different environments for different operations.
+
+# [env-preprocessing]
+# python = "3.11"
+# cuda_version = "12.8"
+# pytorch_version = "2.8.0"
+#
+# [env-preprocessing.packages]
+# requirements = ["opencv-python-headless", "pillow"]
+
+# [env-inference]
+# python = "3.10"
+# cuda_version = "12.4"
+# pytorch_version = "2.5.1"
+#
+# [env-inference.cuda]
+# torch-scatter = "2.1.2"  # Use exact name from `comfy-env list-packages`
+
+
+# -----------------------------------------------------------------------------
+# Example: Platform-specific packages
+# -----------------------------------------------------------------------------
+# Different packages for Windows vs Linux.
+
+# [crossplatform]
+# python = "3.11"
+# cuda_version = "auto"
+#
+# [crossplatform.packages]
+# requirements = ["numpy", "pillow"]
+#
+# [crossplatform.packages.windows]
+# requirements = ["pywin32"]
+#
+# [crossplatform.packages.linux]
+# requirements = ["python-xlib"]
+
+
+# -----------------------------------------------------------------------------
+# Example: Conda packages (uses pixi backend)
+# -----------------------------------------------------------------------------
+# For packages that are easier to install via conda (e.g., CUDA toolkit).
+
+# [blender-env]
+# python = "3.11"
+# cuda_version = "12.8"
+#
+# [blender-env.conda]
+# channels = ["conda-forge", "nvidia"]
+# packages = ["cuda-toolkit=12.8", "bpy"]

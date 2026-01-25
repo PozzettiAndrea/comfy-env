@@ -178,7 +178,10 @@ def _get_or_create_worker(config: WorkerConfig, log_fn: Callable):
             # Same Python - use TorchMPWorker (fast, zero-copy)
             from .workers import TorchMPWorker
             log_fn(f"Creating TorchMPWorker (same Python, zero-copy tensors)")
-            worker = TorchMPWorker(name=config.env_name, sys_path=config.sys_path)
+            worker = TorchMPWorker(
+                name=config.env_name,
+                sys_path=config.sys_path,
+            )
         else:
             # Different Python - use PersistentVenvWorker
             from .workers.venv import PersistentVenvWorker

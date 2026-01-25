@@ -50,8 +50,12 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None):
     - _SHUTDOWN: Shutdown the worker
 
     Runs until receiving _SHUTDOWN sentinel.
+
+    Args:
+        queue_in: Input queue for receiving work items
+        queue_out: Output queue for sending results
+        sys_path_additions: Paths to add to sys.path
     """
-    import importlib
     import os
     import sys
     from pathlib import Path

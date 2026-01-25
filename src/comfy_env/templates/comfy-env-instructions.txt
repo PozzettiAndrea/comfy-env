@@ -1,0 +1,82 @@
+comfy-env Setup Instructions
+============================
+
+comfy-env handles CUDA wheel installation and process isolation for ComfyUI
+custom nodes.
+
+QUICK START
+-----------
+1. Install comfy-env:
+   pip install comfy-env
+
+2. Initialize config in your node directory:
+   comfy-env init
+
+3. Edit comfy-env.toml to add your dependencies
+
+4. Add to your __init__.py (at the top, before other imports):
+   from comfy_env import install
+   install()
+
+5. Test locally:
+   comfy-env install --dry-run  # Preview what will be installed
+   comfy-env install            # Actually install
+   comfy-env doctor             # Verify all packages work
+
+
+COMMON USE CASES
+----------------
+
+Case 1: Just need CUDA packages (nvdiffrast, pytorch3d, etc.)
+  - Add packages to [cuda] section
+  - Call install() in your __init__.py
+
+Case 2: Need process isolation (conflicting dependencies)
+  - Define an isolated environment section like [myenv]
+  - Use @isolated(env="myenv") decorator on your node class
+
+Case 3: Need system packages (apt)
+  - Add to [system] linux = ["package1", "package2"]
+
+
+CLI COMMANDS
+------------
+  comfy-env init           Create comfy-env.toml template
+  comfy-env install        Install dependencies from config
+  comfy-env install --dry-run  Preview without installing
+  comfy-env info           Show detected environment (Python, CUDA, PyTorch)
+  comfy-env resolve PKG    Show resolved wheel URL for a package
+  comfy-env doctor         Verify installation
+  comfy-env list-packages  Show all packages in built-in registry
+
+
+PROCESS ISOLATION
+-----------------
+For nodes that need isolated dependencies:
+
+  from comfy_env import isolated
+
+  @isolated(env="myenv")
+  class MyNode:
+      FUNCTION = "process"
+      RETURN_TYPES = ("IMAGE",)
+
+      def process(self, image):
+          # This runs in isolated subprocess
+          import conflicting_lib
+          return (result,)
+
+The decorator:
+  - Runs your node's FUNCTION method in a separate Python process
+  - Transfers tensors efficiently via PyTorch IPC (zero-copy for CUDA)
+  - Uses the venv defined in your comfy-env.toml [myenv] section
+
+
+TROUBLESHOOTING
+---------------
+- "Package X not found in registry": Add custom wheel URL to [wheel_sources]
+- "CUDA not detected": Ensure PyTorch with CUDA is installed in ComfyUI
+- "Worker failed to connect": Check the isolated env was set up correctly
+- Import errors: Run `comfy-env doctor` to verify packages
+
+For more help: https://github.com/PozzettiAndrea/comfy-env

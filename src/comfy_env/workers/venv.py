@@ -912,7 +912,9 @@ class PersistentVenvWorker(Worker):
         self._transport = SocketTransport(client_sock)
 
         # Send config
-        config = {"sys_paths": all_sys_path}
+        config = {
+            "sys_paths": all_sys_path,
+        }
         self._transport.send(config)
 
         # Wait for ready signal
