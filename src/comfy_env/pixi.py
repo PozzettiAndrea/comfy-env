@@ -233,6 +233,13 @@ def create_pixi_toml(
     elif sys.platform == "win32":
         lines.append('platforms = ["win-64"]')
 
+    # System requirements - specify glibc version for proper wheel resolution
+    # Ubuntu 22.04+ has glibc 2.35, enabling manylinux_2_35 wheels
+    if sys.platform == "linux":
+        lines.append("")
+        lines.append("[system-requirements]")
+        lines.append('libc = { family = "glibc", version = "2.35" }')
+
     lines.append("")
 
     # Dependencies section (conda packages)

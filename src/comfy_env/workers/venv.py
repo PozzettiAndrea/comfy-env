@@ -572,7 +572,12 @@ import json
 import socket
 import struct
 import traceback
+import faulthandler
 from types import SimpleNamespace
+
+# Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
+faulthandler.enable(file=sys.stderr, all_threads=True)
+print("[worker] Faulthandler enabled", flush=True)
 
 # On Windows, add host Python's DLL directories so packages like opencv can find VC++ runtime
 if sys.platform == "win32":
@@ -741,20 +746,24 @@ def _deserialize_isolated_objects(obj):
 
 
 def main():
+    print("[worker] Starting...", flush=True)
     # Get socket address from command line
     if len(sys.argv) < 2:
         print("Usage: worker.py <socket_addr>", file=sys.stderr)
         sys.exit(1)
     socket_addr = sys.argv[1]
+    print(f"[worker] Connecting to {socket_addr}...", flush=True)
 
     # Connect to host process
     sock = _connect(socket_addr)
     transport = SocketTransport(sock)
+    print("[worker] Connected, waiting for config...", flush=True)
 
     # Read config as first message
     config = transport.recv()
     if not config:
         return
+    print("[worker] Got config, setting up paths...", flush=True)
 
     # Setup sys.path
     for p in config.get("sys_paths", []):
@@ -762,10 +771,13 @@ def main():
             sys.path.insert(0, p)
 
     # Import torch after path setup
+    print("[worker] Importing torch...", flush=True)
     import torch
+    print(f"[worker] Torch imported: {torch.__version__}", flush=True)
 
     # Signal ready
     transport.send({"status": "ready"})
+    print("[worker] Ready, entering request loop...", flush=True)
 
     # Process requests
     while True:
@@ -784,30 +796,41 @@ def main():
             module_name = request["module"]
             inputs_path = request.get("inputs_path")
             outputs_path = request.get("outputs_path")
+            print(f"[worker] Request: {request_type} {module_name}", flush=True)
 
             # Load inputs
             if inputs_path:
+                print(f"[worker] Loading inputs from {inputs_path}...", flush=True)
                 inputs = torch.load(inputs_path, weights_only=False)
+                print(f"[worker] Deserializing isolated objects...", flush=True)
                 inputs = _deserialize_isolated_objects(inputs)
                 # Resolve any object references from previous node calls
+                print(f"[worker] Resolving object references...", flush=True)
                 inputs = _deserialize_input(inputs)
+                print(f"[worker] Inputs ready: {list(inputs.keys())}", flush=True)
             else:
                 inputs = {}
 
             # Import module
+            print(f"[worker] Importing module {module_name}...", flush=True)
             module = __import__(module_name, fromlist=[""])
+            print(f"[worker] Module imported", flush=True)
 
             if request_type == "call_method":
                 class_name = request["class_name"]
                 method_name = request["method_name"]
                 self_state = request.get("self_state")
+                print(f"[worker] Getting class {class_name}...", flush=True)
 
                 cls = getattr(module, class_name)
+                print(f"[worker] Creating instance...", flush=True)
                 instance = object.__new__(cls)
                 if self_state:
                     instance.__dict__.update(self_state)
+                print(f"[worker] Calling {method_name}...", flush=True)
                 method = getattr(instance, method_name)
                 result = method(**inputs)
+                print(f"[worker] Method returned", flush=True)
             else:
                 func_name = request["func"]
                 func = getattr(module, func_name)
@@ -892,6 +915,10 @@ class PersistentVenvWorker(Worker):
         self._socket_addr: Optional[str] = None
         self._transport: Optional[SocketTransport] = None
 
+        # Stderr buffer for crash diagnostics
+        self._stderr_buffer: List[str] = []
+        self._stderr_lock = threading.Lock()
+
         # Write worker script to temp file
         self._worker_script = self._temp_dir / "persistent_worker.py"
         self._worker_script.write_text(_PERSISTENT_WORKER_SCRIPT)
@@ -964,13 +991,17 @@ class PersistentVenvWorker(Worker):
             [str(self.python), str(self._worker_script), self._socket_addr],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # Merge stdout/stderr for forwarding
+            stderr=subprocess.PIPE,  # Capture stderr separately for crash diagnostics
             cwd=str(self.working_dir),
             env=env,
         )
 
-        # Start output forwarding thread
-        def forward_output():
+        # Clear stderr buffer for new process
+        with self._stderr_lock:
+            self._stderr_buffer.clear()
+
+        # Start stdout forwarding thread
+        def forward_stdout():
             try:
                 for line in self._process.stdout:
                     if isinstance(line, bytes):
@@ -979,22 +1010,43 @@ class PersistentVenvWorker(Worker):
                     sys.stderr.flush()
             except:
                 pass
-        self._output_thread = threading.Thread(target=forward_output, daemon=True)
-        self._output_thread.start()
+        self._stdout_thread = threading.Thread(target=forward_stdout, daemon=True)
+        self._stdout_thread.start()
+
+        # Start stderr capture thread (buffer for crash diagnostics)
+        def capture_stderr():
+            try:
+                for line in self._process.stderr:
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8', errors='replace')
+                    # Print to terminal AND buffer for crash reporting
+                    sys.stderr.write(f"  [stderr] {line}")
+                    sys.stderr.flush()
+                    with self._stderr_lock:
+                        self._stderr_buffer.append(line.rstrip())
+                        # Keep last 50 lines
+                        if len(self._stderr_buffer) > 50:
+                            self._stderr_buffer.pop(0)
+            except:
+                pass
+        self._stderr_thread = threading.Thread(target=capture_stderr, daemon=True)
+        self._stderr_thread.start()
 
         # Accept connection from worker with timeout
         self._server_socket.settimeout(60)
         try:
             client_sock, _ = self._server_socket.accept()
         except socket.timeout:
-            stderr = ""
+            # Collect stderr from buffer
+            time.sleep(0.2)  # Give stderr thread time to capture
+            with self._stderr_lock:
+                stderr = "\n".join(self._stderr_buffer) if self._stderr_buffer else "(no stderr captured)"
             try:
                 self._process.kill()
-                stdout, _ = self._process.communicate(timeout=5)
-                stderr = stdout.decode('utf-8', errors='replace') if stdout else ""
+                self._process.wait(timeout=5)
             except:
                 pass
-            raise RuntimeError(f"{self.name}: Worker failed to connect (timeout). output: {stderr}")
+            raise RuntimeError(f"{self.name}: Worker failed to connect (timeout).\nStderr:\n{stderr}")
         finally:
             self._server_socket.settimeout(None)
 
@@ -1035,7 +1087,33 @@ class PersistentVenvWorker(Worker):
         self._transport.send(request)
 
         # Read response with timeout
-        response = self._transport.recv(timeout=timeout)
+        try:
+            response = self._transport.recv(timeout=timeout)
+        except ConnectionError as e:
+            # Socket closed - check if worker process died
+            self._shutdown = True
+            time.sleep(0.2)  # Give process time to fully exit and stderr to flush
+            exit_code = None
+            if self._process:
+                exit_code = self._process.poll()
+
+            # Get captured stderr
+            with self._stderr_lock:
+                stderr_output = "\n".join(self._stderr_buffer) if self._stderr_buffer else "(no stderr captured)"
+
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"{self.name}: Worker process died with exit code {exit_code}. "
+                    f"This usually indicates a crash in native code (CGAL, pymeshlab, etc.).\n"
+                    f"Stderr:\n{stderr_output}"
+                ) from e
+            else:
+                # Process still alive but socket closed - something weird
+                raise RuntimeError(
+                    f"{self.name}: Socket closed but worker process still running. "
+                    f"This may indicate a protocol error or worker bug.\n"
+                    f"Stderr:\n{stderr_output}"
+                ) from e
 
         if response is None:
             # Timeout - kill process
