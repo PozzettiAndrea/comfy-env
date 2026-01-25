@@ -100,82 +100,71 @@ requirements = []
 #
 # #############################################################################
 #
-# For nodes that need completely isolated dependencies (different PyTorch
-# version, conflicting native libraries, etc.), define isolated environments.
+# For nodes that need completely isolated dependencies (different Python
+# version, conda packages, conflicting native libraries), define an isolated
+# environment with `isolated = true`.
 #
-# How it works:
-#   1. Define an environment below with its own Python/CUDA/packages
-#   2. Use the @isolated decorator on your node class
-#   3. The node runs in a separate subprocess with its own venv
+# RECOMMENDED: Pack-wide isolation (all nodes in one environment)
+# ----------------------------------------------------------------
+# This is the simplest approach - all your nodes run in the same isolated env.
 #
-# Example in __init__.py:
+# Step 1: Define environment in comfy-env.toml (this file)
+# Step 2: In __init__.py:
 #
-#     from comfy_env import isolated
+#     from comfy_env import setup_isolated_imports, enable_isolation
 #
-#     @isolated(env="myenv")
-#     class MyIsolatedNode:
-#         FUNCTION = "process"
-#         RETURN_TYPES = ("IMAGE",)
+#     # Setup import stubs BEFORE importing nodes
+#     setup_isolated_imports(__file__)
 #
-#         def process(self, image):
-#             # This runs in isolated subprocess with its own dependencies
-#             import conflicting_package
-#             return (result,)
+#     from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+#
+#     # Enable isolation for all nodes
+#     enable_isolation(NODE_CLASS_MAPPINGS)
 #
 # =============================================================================
 
 
 # -----------------------------------------------------------------------------
-# Example: Simple isolation (same Python, different process)
+# Example: Full pack isolation with conda packages (RECOMMENDED)
 # -----------------------------------------------------------------------------
-# Use when you just need process isolation but no venv (fastest option).
-# In your code: @isolated(env="simple", same_venv=True)
+# Uses pixi to create an isolated environment with conda + pip packages.
 
-# [simple]
+# [mypack]
 # python = "3.11"
-# cuda_version = "auto"
-# pytorch_version = "auto"
-
-
-# -----------------------------------------------------------------------------
-# Example: Full venv isolation
-# -----------------------------------------------------------------------------
-# Use when you need completely different dependencies.
-# Creates a separate virtual environment with its own packages.
-
-# [myenv]
-# python = "3.10"
-# cuda_version = "12.8"
-# pytorch_version = "2.8.0"
+# isolated = true           # Required for enable_isolation()
 #
-# [myenv.cuda]
-# nvdiffrast = "0.4.0"
-# pytorch3d = "0.7.9"
+# [mypack.conda]
+# channels = ["conda-forge"]
+# packages = ["cgal", "openmesh"]
 #
-# [myenv.packages]
-# requirements = ["trimesh", "scipy"]
+# [mypack.packages]
+# requirements = ["trimesh[easy]>=4.0", "numpy", "scipy"]
 
 
 # -----------------------------------------------------------------------------
-# Example: Multiple isolated environments
+# Example: Multiple isolated environments (per-node control)
 # -----------------------------------------------------------------------------
-# Some nodes need multiple different environments for different operations.
+# Use @isolated(env="envname") decorator when different nodes need different envs.
+#
+#     from comfy_env import isolated
+#
+#     @isolated(env="env-preprocessing")
+#     class PreprocessNode: ...
+#
+#     @isolated(env="env-inference")
+#     class InferenceNode: ...
 
 # [env-preprocessing]
 # python = "3.11"
-# cuda_version = "12.8"
-# pytorch_version = "2.8.0"
 #
 # [env-preprocessing.packages]
 # requirements = ["opencv-python-headless", "pillow"]
 
 # [env-inference]
 # python = "3.10"
-# cuda_version = "12.4"
-# pytorch_version = "2.5.1"
 #
 # [env-inference.cuda]
-# torch-scatter = "2.1.2"  # Use exact name from `comfy-env list-packages`
+# torch-scatter = "2.1.2"
 
 
 # -----------------------------------------------------------------------------
@@ -185,7 +174,7 @@ requirements = []
 
 # [crossplatform]
 # python = "3.11"
-# cuda_version = "auto"
+# isolated = true
 #
 # [crossplatform.packages]
 # requirements = ["numpy", "pillow"]
@@ -195,17 +184,3 @@ requirements = []
 #
 # [crossplatform.packages.linux]
 # requirements = ["python-xlib"]
-
-
-# -----------------------------------------------------------------------------
-# Example: Conda packages (uses pixi backend)
-# -----------------------------------------------------------------------------
-# For packages that are easier to install via conda (e.g., CUDA toolkit).
-
-# [blender-env]
-# python = "3.11"
-# cuda_version = "12.8"
-#
-# [blender-env.conda]
-# channels = ["conda-forge", "nvidia"]
-# packages = ["cuda-toolkit=12.8", "bpy"]

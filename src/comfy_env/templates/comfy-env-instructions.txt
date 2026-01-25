@@ -31,9 +31,10 @@ Case 1: Just need CUDA packages (nvdiffrast, pytorch3d, etc.)
   - Add packages to [cuda] section
   - Call install() in your __init__.py
 
-Case 2: Need process isolation (conflicting dependencies)
-  - Define an isolated environment section like [myenv]
-  - Use @isolated(env="myenv") decorator on your node class
+Case 2: Need process isolation (conflicting dependencies, conda packages)
+  - Define an isolated environment with `isolated = true`
+  - Use enable_isolation(NODE_CLASS_MAPPINGS) in your __init__.py
+  - See PROCESS ISOLATION section below
 
 Case 3: Need system packages (apt)
   - Add to [system] linux = ["package1", "package2"]
@@ -54,22 +55,42 @@ PROCESS ISOLATION
 -----------------
 For nodes that need isolated dependencies:
 
+RECOMMENDED: Pack-wide isolation (all nodes in same isolated env)
+
+  from comfy_env import setup_isolated_imports, enable_isolation
+
+  # Setup import stubs BEFORE importing nodes
+  setup_isolated_imports(__file__)
+
+  from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+  # Enable isolation for all nodes
+  enable_isolation(NODE_CLASS_MAPPINGS)
+
+Requires `isolated = true` in comfy-env.toml:
+
+  [mypack]
+  python = "3.11"
+  isolated = true
+
+  [mypack.packages]
+  requirements = ["trimesh", "scipy"]
+
+ALTERNATIVE: Per-node isolation (for multiple isolated envs)
+
   from comfy_env import isolated
 
   @isolated(env="myenv")
   class MyNode:
       FUNCTION = "process"
-      RETURN_TYPES = ("IMAGE",)
-
       def process(self, image):
-          # This runs in isolated subprocess
           import conflicting_lib
           return (result,)
 
-The decorator:
-  - Runs your node's FUNCTION method in a separate Python process
-  - Transfers tensors efficiently via PyTorch IPC (zero-copy for CUDA)
-  - Uses the venv defined in your comfy-env.toml [myenv] section
+How it works:
+  - Runs FUNCTION methods in a separate Python process
+  - Tensors/numpy arrays passed by value (efficient)
+  - Complex objects (meshes, etc.) passed by reference
 
 
 TROUBLESHOOTING

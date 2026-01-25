@@ -154,6 +154,8 @@ class IsolatedEnv:
     worker_script: Optional[str] = None   # e.g., "worker.py" -> worker.py
     # Conda configuration (uses pixi backend when present)
     conda: Optional["CondaConfig"] = None
+    # Runtime isolation - run node FUNCTION methods in isolated subprocess
+    isolated: bool = False
 
     def __post_init__(self):
         """Validate and normalize configuration."""

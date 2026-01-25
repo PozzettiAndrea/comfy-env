@@ -56,9 +56,47 @@ from comfy_env import install
 install()
 ```
 
-### Process Isolation (Type 1 - Separate Venv)
+### Process Isolation (Type 1 - Separate Environment)
 
-For nodes that need completely separate dependencies:
+For nodes that need completely separate dependencies (different Python version, conda packages, conflicting libraries).
+
+#### Recommended: Pack-Wide Isolation
+
+For node packs where ALL nodes run in the same isolated environment:
+
+**Step 1: Configure comfy-env.toml**
+
+```toml
+[mypack]
+python = "3.11"
+isolated = true          # All nodes run in this env
+
+[mypack.conda]
+packages = ["cgal"]      # Conda packages (uses pixi)
+
+[mypack.packages]
+requirements = ["trimesh[easy]>=4.0", "bpy>=4.2"]
+```
+
+**Step 2: Enable in __init__.py**
+
+```python
+from comfy_env import setup_isolated_imports, enable_isolation
+
+# Setup import stubs BEFORE importing nodes
+setup_isolated_imports(__file__)
+
+from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+
+# Enable isolation for all nodes
+enable_isolation(NODE_CLASS_MAPPINGS)
+```
+
+**That's it!** All nodes run in an isolated Python 3.11 environment with their own dependencies.
+
+#### Alternative: Per-Node Isolation
+
+For cases where different nodes need different environments:
 
 ```python
 from comfy_env import isolated
@@ -238,7 +276,27 @@ vars_dict = env.as_dict()
 # {'cuda_version': '12.8', 'cuda_short': '128', 'torch_mm': '28', ...}
 ```
 
-### Workers (for isolation)
+### enable_isolation()
+
+```python
+from comfy_env import enable_isolation
+
+enable_isolation(NODE_CLASS_MAPPINGS)
+```
+
+Wraps all node classes so their FUNCTION methods run in the isolated environment specified in comfy-env.toml. Requires `isolated = true` in the environment config.
+
+### setup_isolated_imports()
+
+```python
+from comfy_env import setup_isolated_imports
+
+setup_isolated_imports(__file__)
+```
+
+Sets up import stubs for packages that exist only in the isolated pixi environment. Call this BEFORE importing your nodes module. Packages available in both host and isolated environment are not stubbed.
+
+### Workers (for custom isolation)
 
 ```python
 from comfy_env import TorchMPWorker

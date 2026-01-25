@@ -10,12 +10,13 @@ See: https://pixi.sh/
 
 import os
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .env.config import IsolatedEnv, CondaConfig
 
@@ -144,6 +145,42 @@ def ensure_pixi(
     return pixi_path
 
 
+def _parse_pypi_requirement(dep: str) -> Tuple[str, Optional[str], List[str]]:
+    """
+    Parse a pip requirement into (name, version_spec, extras).
+
+    Examples:
+        "trimesh[easy]>=4.0.0" -> ("trimesh", ">=4.0.0", ["easy"])
+        "numpy>=1.21.0" -> ("numpy", ">=1.21.0", [])
+        "torch" -> ("torch", None, [])
+        "pkg[a,b]" -> ("pkg", None, ["a", "b"])
+
+    Returns:
+        Tuple of (package_name, version_spec_or_None, list_of_extras)
+    """
+    dep = dep.strip()
+
+    # Match: name[extras]version_spec or name version_spec
+    # Package names can contain letters, numbers, underscores, hyphens, and dots
+    match = re.match(r'^([a-zA-Z0-9._-]+)(?:\[([^\]]+)\])?(.*)$', dep)
+    if not match:
+        return dep, None, []
+
+    name = match.group(1)
+    extras_str = match.group(2)
+    version_spec = match.group(3).strip() if match.group(3) else None
+
+    extras = []
+    if extras_str:
+        extras = [e.strip() for e in extras_str.split(',')]
+
+    # Return None instead of empty string for version_spec
+    if version_spec == "":
+        version_spec = None
+
+    return name, version_spec, extras
+
+
 def create_pixi_toml(
     env_config: IsolatedEnv,
     node_dir: Path,
@@ -227,7 +264,7 @@ def create_pixi_toml(
     special_deps = {}  # For dependencies that need special syntax (path, etc.)
 
     # Always include comfy-env for worker support
-    # Use local wheel if available (for ct test --local)
+    # Priority: 1. COMFY_LOCAL_WHEELS env var, 2. ~/utils/comfy-env, 3. PyPI
     local_wheels_dir = os.environ.get("COMFY_LOCAL_WHEELS")
     if local_wheels_dir:
         local_wheels = list(Path(local_wheels_dir).glob("comfy_env-*.whl"))
@@ -238,15 +275,78 @@ def create_pixi_toml(
         else:
             pypi_deps.append("comfy-env")
     else:
-        pypi_deps.append("comfy-env")
+        # Check for local editable comfy-env at ~/utils/comfy-env
+        local_comfy_env = Path.home() / "utils" / "comfy-env"
+        if local_comfy_env.exists() and (local_comfy_env / "pyproject.toml").exists():
+            special_deps["comfy-env"] = f'{{ path = "{local_comfy_env}", editable = true }}'
+        else:
+            pypi_deps.append("comfy-env")
 
     # Add regular requirements
     if env_config.requirements:
         pypi_deps.extend(env_config.requirements)
 
-    # NOTE: CUDA packages (no_deps_requirements) are NOT added here.
-    # They require special wheel resolution and are installed separately
-    # by the comfy-env resolver after pixi install completes.
+    # Add CUDA packages with resolved wheel URLs
+    if env_config.no_deps_requirements:
+        from .registry import PACKAGE_REGISTRY
+
+        # Use fixed CUDA 12.8 / PyTorch 2.8 for pixi environments (modern GPU default)
+        # This ensures wheels match what pixi will install, not what the host has
+        vars_dict = {
+            "cuda_version": "12.8",
+            "cuda_short": "128",
+            "cuda_short2": "128",
+            "cuda_major": "12",
+            "torch_version": "2.8.0",
+            "torch_short": "280",
+            "torch_mm": "28",
+            "torch_dotted_mm": "2.8",
+        }
+
+        # Platform detection
+        if sys.platform == "linux":
+            vars_dict["platform"] = "linux_x86_64"
+        elif sys.platform == "darwin":
+            vars_dict["platform"] = "macosx_arm64" if platform.machine() == "arm64" else "macosx_x86_64"
+        elif sys.platform == "win32":
+            vars_dict["platform"] = "win_amd64"
+
+        # Python version from pixi env config
+        if env_config.python:
+            py_parts = env_config.python.split(".")
+            py_major = py_parts[0]
+            py_minor = py_parts[1] if len(py_parts) > 1 else "0"
+            vars_dict["py_version"] = env_config.python
+            vars_dict["py_short"] = f"{py_major}{py_minor}"
+            vars_dict["py_minor"] = py_minor
+            vars_dict["py_tag"] = f"cp{py_major}{py_minor}"
+
+        for req in env_config.no_deps_requirements:
+            # Parse requirement (e.g., "cumesh" or "cumesh==0.0.1")
+            if "==" in req:
+                pkg_name, version = req.split("==", 1)
+            else:
+                pkg_name = req
+                version = None
+
+            pkg_lower = pkg_name.lower()
+            if pkg_lower in PACKAGE_REGISTRY:
+                config = PACKAGE_REGISTRY[pkg_lower]
+                template = config.get("wheel_template")
+                if template:
+                    # Use version from requirement or default
+                    v = version or config.get("default_version")
+                    if v:
+                        vars_dict["version"] = v
+
+                    # Resolve URL
+                    url = template
+                    for key, value in vars_dict.items():
+                        if value:
+                            url = url.replace(f"{{{key}}}", str(value))
+
+                    special_deps[pkg_name] = f'{{ url = "{url}" }}'
+                    log(f"  CUDA package {pkg_name}: resolved wheel URL")
 
     # Add platform-specific requirements
     if sys.platform == "linux" and env_config.linux_requirements:
@@ -265,25 +365,23 @@ def create_pixi_toml(
 
         for dep in pypi_deps:
             # Parse pip requirement format to pixi format
-            dep_clean = dep.strip()
-            if ">=" in dep_clean:
-                name, version = dep_clean.split(">=", 1)
-                # Handle complex version specs like ">=1.0,<2.0"
-                name = name.strip()
-                version = version.strip()
-                lines.append(f'{name} = ">={version}"')
-            elif "==" in dep_clean:
-                name, version = dep_clean.split("==", 1)
-                lines.append(f'{name.strip()} = "=={version.strip()}"')
-            elif ">" in dep_clean:
-                name, version = dep_clean.split(">", 1)
-                lines.append(f'{name.strip()} = ">{version.strip()}"')
-            elif "<" in dep_clean:
-                name, version = dep_clean.split("<", 1)
-                lines.append(f'{name.strip()} = "<{version.strip()}"')
+            # Handles extras like trimesh[easy]>=4.0.0
+            name, version_spec, extras = _parse_pypi_requirement(dep)
+
+            if extras:
+                # Use table syntax for packages with extras
+                # e.g., trimesh = { version = ">=4.0.0", extras = ["easy"] }
+                extras_json = "[" + ", ".join(f'"{e}"' for e in extras) + "]"
+                if version_spec:
+                    lines.append(f'{name} = {{ version = "{version_spec}", extras = {extras_json} }}')
+                else:
+                    lines.append(f'{name} = {{ version = "*", extras = {extras_json} }}')
             else:
-                # No version spec
-                lines.append(f'{dep_clean} = "*"')
+                # Simple syntax for packages without extras
+                if version_spec:
+                    lines.append(f'{name} = "{version_spec}"')
+                else:
+                    lines.append(f'{name} = "*"')
 
     content = "\n".join(lines) + "\n"
 
@@ -370,6 +468,8 @@ def pixi_install(
             log(f"  - Install {len(env_config.conda.packages)} conda packages")
         if env_config.requirements:
             log(f"  - Install {len(env_config.requirements)} pip packages")
+        if env_config.no_deps_requirements:
+            log(f"  - Install {len(env_config.no_deps_requirements)} CUDA packages: {', '.join(env_config.no_deps_requirements)}")
         return True
 
     # Clean previous pixi artifacts

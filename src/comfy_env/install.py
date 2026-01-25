@@ -1,21 +1,18 @@
 """
 Installation API for comfy-env.
 
-This module provides the main `install()` function that handles both:
-- In-place installation (CUDA wheels into current environment)
-- Isolated installation (create separate venv with dependencies)
+This module provides the main `install()` function that handles:
+- Named environments [envname] → pixi (isolated Python environment)
+- Local packages [local] → uv/pip (in-place to current Python)
 
 Example:
     from comfy_env import install
 
-    # In-place install (auto-discovers config)
+    # Auto-discovers config and installs
     install()
 
-    # In-place with explicit config
+    # With explicit config path
     install(config="comfy-env.toml")
-
-    # Isolated environment
-    install(config="comfy-env.toml", mode="isolated")
 """
 
 import inspect
@@ -27,7 +24,6 @@ from typing import Callable, Dict, List, Optional, Set, Union
 
 from .env.config import IsolatedEnv, LocalConfig, NodeReq, SystemConfig
 from .env.config_file import load_config, discover_config
-from .env.manager import IsolatedEnvManager
 from .errors import CUDANotFoundError, InstallError
 from .pixi import pixi_install
 from .registry import PACKAGE_REGISTRY, get_cuda_short2
@@ -139,31 +135,36 @@ def _install_node_dependencies(
 
 
 def install(
+    config: Optional[Union[str, Path]] = None,
+    node_dir: Optional[Path] = None,
     log_callback: Optional[Callable[[str], None]] = None,
     dry_run: bool = False,
 ) -> bool:
     """
-    Install dependencies from comfy-env.toml, auto-discovered from caller's directory.
+    Install dependencies from comfy-env.toml.
 
     Example:
         from comfy_env import install
         install()
 
     Args:
+        config: Optional path to comfy-env.toml. Auto-discovered if not provided.
+        node_dir: Optional node directory. Auto-discovered from caller if not provided.
         log_callback: Optional callback for logging. Defaults to print.
         dry_run: If True, show what would be installed without installing.
 
     Returns:
         True if installation succeeded.
     """
-    # Auto-discover caller's directory
-    frame = inspect.stack()[1]
-    caller_file = frame.filename
-    node_dir = Path(caller_file).parent.resolve()
+    # Auto-discover caller's directory if not provided
+    if node_dir is None:
+        frame = inspect.stack()[1]
+        caller_file = frame.filename
+        node_dir = Path(caller_file).parent.resolve()
 
     log = log_callback or print
 
-    full_config = _load_full_config(None, node_dir)
+    full_config = _load_full_config(config, node_dir)
     if full_config is None:
         raise FileNotFoundError(
             f"No comfy-env.toml found in {node_dir}. "
@@ -177,28 +178,36 @@ def install(
         _install_system_packages(full_config.system, log, dry_run)
 
     env_config = full_config.default_env
-    if env_config is None and not full_config.has_local:
-        log("No packages to install")
-        return True
-
-    if env_config:
-        log(f"Found configuration: {env_config.name}")
-
-    if env_config and env_config.uses_conda:
-        log("Environment uses conda packages - using pixi backend")
-        return pixi_install(env_config, node_dir, log, dry_run)
 
     # Get user wheel_sources overrides
     user_wheel_sources = full_config.wheel_sources if hasattr(full_config, 'wheel_sources') else {}
 
     if env_config:
-        if env_config.python:
-            return _install_isolated(env_config, node_dir, log, dry_run)
-        else:
-            return _install_inplace(env_config, node_dir, log, dry_run, user_wheel_sources)
+        # Named environment → always pixi
+        log(f"Found environment: {env_config.name}")
+        python_ver = env_config.python or "3.11"  # Default to 3.11 if not specified
+        if not env_config.python:
+            log(f"  No Python version specified, defaulting to {python_ver}")
+            env_config = IsolatedEnv(
+                name=env_config.name,
+                python=python_ver,
+                cuda=env_config.cuda,
+                pytorch=env_config.pytorch,
+                requirements=env_config.requirements,
+                no_deps_requirements=env_config.no_deps_requirements,
+                linux_requirements=env_config.linux_requirements,
+                darwin_requirements=env_config.darwin_requirements,
+                windows_requirements=env_config.windows_requirements,
+                conda=env_config.conda,
+                isolated=env_config.isolated,
+            )
+        log(f"  Using pixi backend (Python {python_ver})")
+        return pixi_install(env_config, node_dir, log, dry_run)
     elif full_config.has_local:
+        # [local] section → uv in-place install
         return _install_local(full_config.local, node_dir, log, dry_run, user_wheel_sources)
     else:
+        log("No packages to install")
         return True
 
 
@@ -210,81 +219,6 @@ def _load_full_config(config: Optional[Union[str, Path]], node_dir: Path):
             config_path = node_dir / config_path
         return load_config(config_path, node_dir)
     return discover_config(node_dir)
-
-
-def _install_isolated(
-    env_config: IsolatedEnv,
-    node_dir: Path,
-    log: Callable[[str], None],
-    dry_run: bool,
-) -> bool:
-    """Install in isolated mode using IsolatedEnvManager."""
-    log(f"Installing in isolated mode: {env_config.name}")
-
-    if dry_run:
-        log("Dry run - would create isolated environment:")
-        log(f"  Python: {env_config.python}")
-        log(f"  CUDA: {env_config.cuda or 'auto-detect'}")
-        if env_config.requirements:
-            log(f"  Requirements: {len(env_config.requirements)} packages")
-        return True
-
-    manager = IsolatedEnvManager(base_dir=node_dir, log_callback=log)
-    env_dir = manager.setup(env_config)
-    log(f"Isolated environment ready: {env_dir}")
-    return True
-
-
-def _install_inplace(
-    env_config: IsolatedEnv,
-    node_dir: Path,
-    log: Callable[[str], None],
-    dry_run: bool,
-    user_wheel_sources: Dict[str, str],
-) -> bool:
-    """Install in-place into current environment."""
-    log("Installing in-place mode")
-
-    if sys.platform == "win32":
-        log("Installing MSVC runtime for Windows...")
-        if not dry_run:
-            _pip_install(["msvc-runtime"], no_deps=False, log=log)
-
-    env = RuntimeEnv.detect()
-    log(f"Detected environment: {env}")
-
-    if not env.cuda_version:
-        cuda_packages = env_config.no_deps_requirements or []
-        if cuda_packages:
-            raise CUDANotFoundError(package=", ".join(cuda_packages))
-
-    cuda_packages = env_config.no_deps_requirements or []
-    regular_packages = env_config.requirements or []
-
-    if dry_run:
-        log("\nDry run - would install:")
-        for req in cuda_packages:
-            package, version = parse_wheel_requirement(req)
-            url = _resolve_wheel_url(package, version, env, user_wheel_sources)
-            log(f"  {package}: {url[:80]}...")
-        if regular_packages:
-            log("  Regular packages:")
-            for pkg in regular_packages:
-                log(f"    {pkg}")
-        return True
-
-    if cuda_packages:
-        log(f"\nInstalling {len(cuda_packages)} CUDA packages...")
-        for req in cuda_packages:
-            package, version = parse_wheel_requirement(req)
-            _install_cuda_package(package, version, env, user_wheel_sources, log)
-
-    if regular_packages:
-        log(f"\nInstalling {len(regular_packages)} regular packages...")
-        _pip_install(regular_packages, no_deps=False, log=log)
-
-    log("\nInstallation complete!")
-    return True
 
 
 def _install_local(

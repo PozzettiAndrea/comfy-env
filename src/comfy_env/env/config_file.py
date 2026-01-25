@@ -572,6 +572,9 @@ def _parse_single_env(name: str, env_data: Dict[str, Any], base_dir: Path) -> Is
         elif isinstance(darwin_section, list):
             darwin_reqs = darwin_section
 
+    # Parse isolated flag for runtime process isolation
+    isolated = env_data.get("isolated", False)
+
     return IsolatedEnv(
         name=name,
         python=python,
@@ -583,6 +586,7 @@ def _parse_single_env(name: str, env_data: Dict[str, Any], base_dir: Path) -> Is
         linux_requirements=linux_reqs,
         darwin_requirements=darwin_reqs,
         conda=conda_config,
+        isolated=isolated,
     )
 
 

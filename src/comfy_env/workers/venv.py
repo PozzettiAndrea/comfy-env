@@ -587,6 +587,92 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+# =============================================================================
+# Object Reference System - keep complex objects in worker, pass refs to host
+# =============================================================================
+
+_object_cache = {}  # Maps ref_id -> object
+_object_ids = {}    # Maps id(obj) -> ref_id (for deduplication)
+_ref_counter = 0
+
+def _cache_object(obj):
+    """Store object in cache, return reference ID. Deduplicates by object id."""
+    global _ref_counter
+    obj_id = id(obj)
+
+    # Return existing ref if we've seen this object
+    if obj_id in _object_ids:
+        return _object_ids[obj_id]
+
+    ref_id = f"ref_{_ref_counter:08x}"
+    _ref_counter += 1
+    _object_cache[ref_id] = obj
+    _object_ids[obj_id] = ref_id
+    return ref_id
+
+def _resolve_ref(ref_id):
+    """Get object from cache by reference ID."""
+    return _object_cache.get(ref_id)
+
+def _should_use_reference(obj):
+    """Check if object should be passed by reference instead of value."""
+    if obj is None:
+        return False
+    # Primitives - pass by value
+    if isinstance(obj, (bool, int, float, str, bytes)):
+        return False
+    # NumPy arrays and torch tensors - pass by value (they serialize well)
+    obj_type = type(obj).__name__
+    if obj_type in ('ndarray', 'Tensor'):
+        return False
+    # Dicts, lists, tuples - recurse into contents (don't ref the container)
+    if isinstance(obj, (dict, list, tuple)):
+        return False
+    # Everything else (trimesh, custom classes) - pass by reference
+    return True
+
+def _serialize_result(obj, visited=None):
+    """Convert result for IPC - complex objects become references."""
+    if visited is None:
+        visited = set()
+
+    obj_id = id(obj)
+    if obj_id in visited:
+        # Circular reference - use existing ref or create one
+        if obj_id in _object_ids:
+            return {"__comfy_ref__": _object_ids[obj_id], "__class__": type(obj).__name__}
+        return None  # Skip circular refs to primitives
+
+    if _should_use_reference(obj):
+        ref_id = _cache_object(obj)
+        return {"__comfy_ref__": ref_id, "__class__": type(obj).__name__}
+
+    visited.add(obj_id)
+
+    if isinstance(obj, dict):
+        return {k: _serialize_result(v, visited) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_serialize_result(v, visited) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_serialize_result(v, visited) for v in obj)
+    return obj
+
+def _deserialize_input(obj):
+    """Convert input from IPC - references become real objects."""
+    if isinstance(obj, dict):
+        if "__comfy_ref__" in obj:
+            ref_id = obj["__comfy_ref__"]
+            real_obj = _resolve_ref(ref_id)
+            if real_obj is None:
+                raise ValueError(f"Object reference not found: {ref_id}")
+            return real_obj
+        return {k: _deserialize_input(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_deserialize_input(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_deserialize_input(v) for v in obj)
+    return obj
+
 
 class SocketTransport:
     """Length-prefixed JSON transport."""
@@ -703,6 +789,8 @@ def main():
             if inputs_path:
                 inputs = torch.load(inputs_path, weights_only=False)
                 inputs = _deserialize_isolated_objects(inputs)
+                # Resolve any object references from previous node calls
+                inputs = _deserialize_input(inputs)
             else:
                 inputs = {}
 
@@ -725,9 +813,10 @@ def main():
                 func = getattr(module, func_name)
                 result = func(**inputs)
 
-            # Save result
+            # Save result - convert complex objects to references
             if outputs_path:
-                torch.save(result, outputs_path)
+                serialized_result = _serialize_result(result)
+                torch.save(serialized_result, outputs_path)
 
             transport.send({"status": "ok"})
 

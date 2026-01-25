@@ -34,6 +34,8 @@ from .env.security import (
 from .ipc.bridge import WorkerBridge
 from .ipc.worker import BaseWorker, register
 from .decorator import isolated, shutdown_all_processes
+from .isolation import enable_isolation
+from .stub_imports import setup_isolated_imports, cleanup_stubs
 
 # New in-place installation API
 from .install import install, verify_installation
@@ -144,6 +146,11 @@ __all__ = [
     # Legacy Decorator API
     "isolated",
     "shutdown_all_processes",
+    # New: Enable isolation for entire node pack
+    "enable_isolation",
+    # Import stubbing for isolated packages
+    "setup_isolated_imports",
+    "cleanup_stubs",
 ]
 
 # Add torch-based IPC if available

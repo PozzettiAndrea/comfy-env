@@ -41,7 +41,7 @@ import time
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("comfy_env")
 
@@ -447,3 +447,254 @@ def isolated(
         return cls
 
     return decorator
+
+
+# ---------------------------------------------------------------------------
+# The @auto_isolate Decorator (Function-level)
+# ---------------------------------------------------------------------------
+
+def _parse_import_error(e: ImportError) -> Optional[str]:
+    """Extract the module name from an ImportError."""
+    # Python's ImportError has a 'name' attribute with the module name
+    if hasattr(e, 'name') and e.name:
+        return e.name
+
+    # Fallback: parse from message "No module named 'xxx'"
+    msg = str(e)
+    if "No module named" in msg:
+        # Extract 'xxx' from "No module named 'xxx'" or "No module named 'xxx.yyy'"
+        import re
+        match = re.search(r"No module named ['\"]([^'\"\.]+)", msg)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def _find_env_for_module(
+    module_name: str,
+    source_file: Path,
+) -> Optional[Tuple[str, Path, Path]]:
+    """
+    Find which isolated environment contains the given module.
+
+    Searches comfy-env.toml configs starting from the source file's directory,
+    looking for the module in cuda packages, requirements, etc.
+
+    Args:
+        module_name: The module that failed to import (e.g., "cumesh")
+        source_file: Path to the source file containing the function
+
+    Returns:
+        Tuple of (env_name, python_path, node_dir) or None if not found
+    """
+    from .env.config_file import discover_config, CONFIG_FILE_NAMES
+
+    # Normalize module name (cumesh, pytorch3d, etc.)
+    module_lower = module_name.lower().replace("-", "_").replace(".", "_")
+
+    # Search for config file starting from source file's directory
+    node_dir = source_file.parent
+    while node_dir != node_dir.parent:
+        for config_name in CONFIG_FILE_NAMES:
+            config_path = node_dir / config_name
+            if config_path.exists():
+                # Found a config, check if it has our module
+                config = discover_config(node_dir)
+                if config is None:
+                    continue
+
+                # Check all environments in the config
+                for env_name, env_config in config.envs.items():
+                    # Check cuda/no_deps_requirements
+                    if env_config.no_deps_requirements:
+                        for req in env_config.no_deps_requirements:
+                            req_name = req.split("==")[0].split(">=")[0].split("<")[0].strip()
+                            req_lower = req_name.lower().replace("-", "_")
+                            if req_lower == module_lower:
+                                # Found it! Get the python path
+                                env_path = node_dir / f"_env_{env_name}"
+                                if not env_path.exists():
+                                    # Try pixi path
+                                    env_path = node_dir / ".pixi" / "envs" / "default"
+
+                                if env_path.exists():
+                                    python_path = env_path / "bin" / "python"
+                                    if not python_path.exists():
+                                        python_path = env_path / "Scripts" / "python.exe"
+                                    if python_path.exists():
+                                        return (env_name, python_path, node_dir)
+
+                    # Check regular requirements too
+                    if env_config.requirements:
+                        for req in env_config.requirements:
+                            req_name = req.split("==")[0].split(">=")[0].split("<")[0].split("[")[0].strip()
+                            req_lower = req_name.lower().replace("-", "_")
+                            if req_lower == module_lower:
+                                env_path = node_dir / f"_env_{env_name}"
+                                if not env_path.exists():
+                                    env_path = node_dir / ".pixi" / "envs" / "default"
+
+                                if env_path.exists():
+                                    python_path = env_path / "bin" / "python"
+                                    if not python_path.exists():
+                                        python_path = env_path / "Scripts" / "python.exe"
+                                    if python_path.exists():
+                                        return (env_name, python_path, node_dir)
+
+                # Config found but module not in it, stop searching
+                break
+
+        node_dir = node_dir.parent
+
+    return None
+
+
+# Cache for auto_isolate workers
+_auto_isolate_workers: Dict[str, Any] = {}
+_auto_isolate_lock = threading.Lock()
+
+
+def _get_auto_isolate_worker(env_name: str, python_path: Path, node_dir: Path):
+    """Get or create a worker for auto_isolate."""
+    cache_key = f"{env_name}:{python_path}"
+
+    with _auto_isolate_lock:
+        if cache_key in _auto_isolate_workers:
+            worker = _auto_isolate_workers[cache_key]
+            if worker.is_alive():
+                return worker
+
+        # Create new PersistentVenvWorker
+        from .workers.venv import PersistentVenvWorker
+
+        worker = PersistentVenvWorker(
+            python=str(python_path),
+            working_dir=node_dir,
+            sys_path=[str(node_dir)],
+            name=f"auto-{env_name}",
+        )
+
+        _auto_isolate_workers[cache_key] = worker
+        return worker
+
+
+def auto_isolate(func: Callable) -> Callable:
+    """
+    Decorator that automatically runs a function in an isolated environment
+    when an ImportError occurs for a package that exists in the isolated env.
+
+    This provides seamless isolation - just write normal code with imports,
+    and if the import fails in the host environment but the package is
+    configured in comfy-env.toml, the function automatically retries in
+    the isolated environment.
+
+    Example:
+        from comfy_env import auto_isolate
+
+        @auto_isolate
+        def process_with_cumesh(mesh, target_faces):
+            import cumesh  # If this fails, function retries in isolated env
+            import torch
+
+            v = torch.tensor(mesh.vertices).cuda()
+            f = torch.tensor(mesh.faces).cuda()
+
+            cm = cumesh.CuMesh()
+            cm.init(v, f)
+            cm.simplify(target_faces)
+
+            result_v, result_f = cm.read()
+            return result_v.cpu().numpy(), result_f.cpu().numpy()
+
+    How it works:
+        1. Function runs normally in the host environment
+        2. If ImportError occurs, decorator catches it
+        3. Extracts the module name from the error (e.g., "cumesh")
+        4. Searches comfy-env.toml for which env has that module
+        5. Re-runs the entire function in that isolated environment
+        6. Returns the result as if nothing happened
+
+    Benefits:
+        - Zero overhead when imports succeed (fast path)
+        - Auto-detects which environment to use from the failed import
+        - Function is the isolation boundary (clean, debuggable)
+        - Works with any import pattern (top of function, conditional, etc.)
+
+    Note:
+        Arguments and return values are serialized via torch.save/load,
+        so they should be tensors, numpy arrays, or pickle-able objects.
+    """
+    # Get source file for environment detection
+    source_file = Path(inspect.getfile(func))
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            # Fast path: try running in host environment
+            return func(*args, **kwargs)
+
+        except ImportError as e:
+            # Extract module name from error
+            module_name = _parse_import_error(e)
+            if module_name is None:
+                # Can't determine module, re-raise
+                raise
+
+            # Find which env has this module
+            env_info = _find_env_for_module(module_name, source_file)
+            if env_info is None:
+                # Module not in any known isolated env, re-raise
+                raise
+
+            env_name, python_path, node_dir = env_info
+
+            _log(env_name, f"Import '{module_name}' failed in host, retrying in isolated env...")
+            _log(env_name, f"  Python: {python_path}")
+
+            # Get or create worker
+            worker = _get_auto_isolate_worker(env_name, python_path, node_dir)
+
+            # Prepare arguments - convert numpy arrays to lists for IPC
+            import numpy as np
+
+            def convert_for_ipc(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif hasattr(obj, 'vertices') and hasattr(obj, 'faces'):
+                    # Trimesh-like object - convert to dict
+                    return {
+                        '__trimesh__': True,
+                        'vertices': obj.vertices.tolist() if hasattr(obj.vertices, 'tolist') else list(obj.vertices),
+                        'faces': obj.faces.tolist() if hasattr(obj.faces, 'tolist') else list(obj.faces),
+                    }
+                elif isinstance(obj, (list, tuple)):
+                    converted = [convert_for_ipc(x) for x in obj]
+                    return type(obj)(converted) if isinstance(obj, tuple) else converted
+                elif isinstance(obj, dict):
+                    return {k: convert_for_ipc(v) for k, v in obj.items()}
+                return obj
+
+            converted_args = [convert_for_ipc(arg) for arg in args]
+            converted_kwargs = {k: convert_for_ipc(v) for k, v in kwargs.items()}
+
+            # Call via worker
+            start_time = time.time()
+
+            result = worker.call_module(
+                module=source_file.stem,
+                func=func.__name__,
+                *converted_args,
+                **converted_kwargs,
+            )
+
+            elapsed = time.time() - start_time
+            _log(env_name, f"← {func.__name__} completed in isolated env [{elapsed:.2f}s]")
+
+            return result
+
+    # Mark the function as auto-isolate enabled
+    wrapper._auto_isolate = True
+    wrapper._source_file = source_file
+
+    return wrapper
