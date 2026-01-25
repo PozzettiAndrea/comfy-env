@@ -246,6 +246,10 @@ def create_pixi_toml(
     lines.append("[dependencies]")
     lines.append(f'python = "{env_config.python}.*"')
 
+    # On Windows, use MKL BLAS to avoid OpenBLAS crashes (numpy blas_fpe_check issue)
+    if sys.platform == "win32":
+        lines.append('libblas = { version = "*", build = "*mkl" }')
+
     for pkg in conda.packages:
         # Parse package spec (name=version or name>=version or just name)
         if "=" in pkg and not pkg.startswith("="):

@@ -156,19 +156,26 @@ def _get_import_names_from_pixi(node_dir: Path) -> Set[str]:
     """
     import_names = set()
 
-    # Find the pixi site-packages
-    pixi_lib = node_dir / ".pixi" / "envs" / "default" / "lib"
+    pixi_base = node_dir / ".pixi" / "envs" / "default"
 
-    if not pixi_lib.exists():
-        return import_names
+    # Find site-packages (different paths on Windows vs Linux)
+    # Linux: .pixi/envs/default/lib/python3.x/site-packages
+    # Windows: .pixi/envs/default/Lib/site-packages
+    site_packages = None
 
-    # Find the python version directory (e.g., python3.11)
-    python_dirs = list(pixi_lib.glob("python3.*"))
-    if not python_dirs:
-        return import_names
+    # Try Windows path first (Lib/site-packages)
+    win_site = pixi_base / "Lib" / "site-packages"
+    if win_site.exists():
+        site_packages = win_site
+    else:
+        # Try Linux path (lib/python3.x/site-packages)
+        pixi_lib = pixi_base / "lib"
+        if pixi_lib.exists():
+            python_dirs = list(pixi_lib.glob("python3.*"))
+            if python_dirs:
+                site_packages = python_dirs[0] / "site-packages"
 
-    site_packages = python_dirs[0] / "site-packages"
-    if not site_packages.exists():
+    if site_packages is None or not site_packages.exists():
         return import_names
 
     # Scan for importable modules

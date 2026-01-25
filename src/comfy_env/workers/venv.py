@@ -252,9 +252,28 @@ def _serialize_for_ipc(obj, visited=None):
 # Worker script template - minimal, runs in target venv
 _WORKER_SCRIPT = '''
 import sys
+import os
 import json
 import traceback
 from types import SimpleNamespace
+
+# On Windows, add DLL directories for proper library loading
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    _host_python_dir = os.environ.get("COMFYUI_HOST_PYTHON_DIR")
+    if _host_python_dir:
+        try:
+            os.add_dll_directory(_host_python_dir)
+            _dlls_dir = os.path.join(_host_python_dir, "DLLs")
+            if os.path.isdir(_dlls_dir):
+                os.add_dll_directory(_dlls_dir)
+        except Exception:
+            pass
+    _pixi_library_bin = os.environ.get("COMFYUI_PIXI_LIBRARY_BIN")
+    if _pixi_library_bin:
+        try:
+            os.add_dll_directory(_pixi_library_bin)
+        except Exception:
+            pass
 
 def _deserialize_isolated_objects(obj):
     """Reconstruct objects serialized with __isolated_object__ marker."""
@@ -475,11 +494,28 @@ class VenvWorker(Worker):
             env.update(self.extra_env)
             env["COMFYUI_ISOLATION_WORKER"] = "1"
 
-            # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH
+            # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH (Linux)
             lib_dir = self.python.parent.parent / "lib"
             if lib_dir.is_dir():
                 existing = env.get("LD_LIBRARY_PATH", "")
                 env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+
+            # On Windows, pass host Python directory and pixi Library/bin for DLL loading
+            if sys.platform == "win32":
+                env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
+
+                # For pixi environments with MKL, add Library/bin to PATH for DLL loading
+                # Pixi has python.exe directly in env dir, not in Scripts/
+                env_dir = self.python.parent
+                library_bin = env_dir / "Library" / "bin"
+                if library_bin.is_dir():
+                    existing_path = env.get("PATH", "")
+                    env["PATH"] = f"{env_dir};{library_bin};{existing_path}"
+                    env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin)
+                    # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
+                    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                    # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
+                    env["PYTHONIOENCODING"] = "utf-8"
 
             # Run subprocess
             cmd = [
@@ -591,6 +627,15 @@ if sys.platform == "win32":
                 os.add_dll_directory(_dlls_dir)
         except Exception:
             pass
+
+    # For pixi environments with MKL, add Library/bin for MKL DLLs
+    _pixi_library_bin = os.environ.get("COMFYUI_PIXI_LIBRARY_BIN")
+    if _pixi_library_bin and hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(_pixi_library_bin)
+            print(f"[worker] Added pixi Library/bin to DLL search: {_pixi_library_bin}", flush=True)
+        except Exception as e:
+            print(f"[worker] Failed to add pixi Library/bin: {e}", flush=True)
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -976,6 +1021,22 @@ class PersistentVenvWorker(Worker):
         # This fixes "DLL load failed" errors for packages like opencv-python-headless
         if sys.platform == "win32":
             env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
+
+            # For pixi environments with MKL, add Library/bin to PATH for DLL loading
+            # MKL DLLs are in .pixi/envs/default/Library/bin/
+            # Pixi has python.exe directly in env dir, not in Scripts/
+            env_dir = self.python.parent
+            library_bin = env_dir / "Library" / "bin"
+            if library_bin.is_dir():
+                existing_path = env.get("PATH", "")
+                # Add env dir and Library/bin to PATH
+                env["PATH"] = f"{env_dir};{library_bin};{existing_path}"
+                # Also pass as env var so worker can use os.add_dll_directory()
+                env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin)
+                # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
+                env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
+                env["PYTHONIOENCODING"] = "utf-8"
 
         # Find ComfyUI base and set env var for folder_paths stub
         comfyui_base = self._find_comfyui_base()
