@@ -2,8 +2,8 @@
 Installation API for comfy-env.
 
 This module provides the main `install()` function that handles:
-- Named environments [envname] → pixi (isolated Python environment)
-- Local packages [local] → uv/pip (in-place to current Python)
+- Named environments [envname] -> pixi (isolated Python environment)
+- Local packages [local] -> uv/pip (in-place to current Python)
 
 Example:
     from comfy_env import install
@@ -183,7 +183,7 @@ def install(
     user_wheel_sources = full_config.wheel_sources if hasattr(full_config, 'wheel_sources') else {}
 
     if env_config:
-        # Named environment → always pixi
+        # Named environment -> always pixi
         log(f"Found environment: {env_config.name}")
         python_ver = env_config.python or "3.11"  # Default to 3.11 if not specified
         if not env_config.python:
@@ -204,7 +204,7 @@ def install(
         log(f"  Using pixi backend (Python {python_ver})")
         return pixi_install(env_config, node_dir, log, dry_run)
     elif full_config.has_local:
-        # [local] section → uv in-place install
+        # [local] section -> uv in-place install
         return _install_local(full_config.local, node_dir, log, dry_run, user_wheel_sources)
     else:
         log("No packages to install")

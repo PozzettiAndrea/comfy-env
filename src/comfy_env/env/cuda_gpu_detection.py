@@ -1,7 +1,7 @@
 """
 Robust CUDA/GPU detection with multiple fallback methods.
 
-Detection priority: NVML → PyTorch → nvidia-smi → sysfs → env vars
+Detection priority: NVML -> PyTorch -> nvidia-smi -> sysfs -> env vars
 """
 
 from __future__ import annotations

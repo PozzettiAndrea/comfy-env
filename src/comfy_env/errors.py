@@ -229,7 +229,7 @@ class DependencyError(EnvManagerError):
             # Skip empty lines and progress bars
             if not line.strip():
                 continue
-            if line.startswith("  ") and ("%" in line or "━" in line):
+            if line.startswith("  ") and "%" in line:
                 continue
 
             # Keep error lines and important info

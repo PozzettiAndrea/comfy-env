@@ -382,7 +382,7 @@ def isolated(
 
             # Log entry with argument descriptions
             if VERBOSE_LOGGING:
-                log_fn(f"→ {cls.__name__}.{func_name}({_describe_args(call_kwargs)})")
+                log_fn(f"-> {cls.__name__}.{func_name}({_describe_args(call_kwargs)})")
 
             start_time = time.time()
 
@@ -425,13 +425,13 @@ def isolated(
                 elapsed = time.time() - start_time
                 if VERBOSE_LOGGING:
                     result_desc = _describe_tensor(result) if not isinstance(result, tuple) else f"tuple({len(result)} items)"
-                    log_fn(f"← {cls.__name__}.{func_name} returned {result_desc} [{elapsed:.2f}s]")
+                    log_fn(f"<- {cls.__name__}.{func_name} returned {result_desc} [{elapsed:.2f}s]")
 
                 return result
 
             except Exception as e:
                 elapsed = time.time() - start_time
-                log_fn(f"✗ {cls.__name__}.{func_name} failed after {elapsed:.2f}s: {e}")
+                log_fn(f"[FAIL] {cls.__name__}.{func_name} failed after {elapsed:.2f}s: {e}")
                 raise
 
         # Store original method before replacing (for worker to access)
@@ -689,7 +689,7 @@ def auto_isolate(func: Callable) -> Callable:
             )
 
             elapsed = time.time() - start_time
-            _log(env_name, f"← {func.__name__} completed in isolated env [{elapsed:.2f}s]")
+            _log(env_name, f"<- {func.__name__} completed in isolated env [{elapsed:.2f}s]")
 
             return result
 
