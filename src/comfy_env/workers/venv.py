@@ -671,8 +671,12 @@ def _should_use_reference(obj):
     # Primitives - pass by value
     if isinstance(obj, (bool, int, float, str, bytes)):
         return False
-    # NumPy arrays and torch tensors - pass by value (they serialize well)
+    # NumPy scalars - pass by value (convert to Python primitives)
     obj_type = type(obj).__name__
+    if obj_type in ('float16', 'float32', 'float64', 'int8', 'int16', 'int32', 'int64',
+                    'uint8', 'uint16', 'uint32', 'uint64', 'bool_'):
+        return False
+    # NumPy arrays and torch tensors - pass by value (they serialize well)
     if obj_type in ('ndarray', 'Tensor'):
         return False
     # Dicts, lists, tuples - recurse into contents (don't ref the container)
@@ -705,6 +709,16 @@ def _serialize_result(obj, visited=None):
         return [_serialize_result(v, visited) for v in obj]
     if isinstance(obj, tuple):
         return tuple(_serialize_result(v, visited) for v in obj)
+
+    # Convert numpy scalars to Python primitives for JSON serialization
+    obj_type = type(obj).__name__
+    if obj_type in ('float16', 'float32', 'float64'):
+        return float(obj)
+    if obj_type in ('int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'):
+        return int(obj)
+    if obj_type == 'bool_':
+        return bool(obj)
+
     return obj
 
 def _deserialize_input(obj):

@@ -203,10 +203,12 @@ def create_pixi_toml(
     Returns:
         Path to the generated pixi.toml file.
     """
-    if not env_config.conda:
-        raise ValueError("Environment has no conda configuration")
-
-    conda = env_config.conda
+    # Conda is optional - use defaults if not present
+    if env_config.conda:
+        conda = env_config.conda
+    else:
+        from comfy_env.env.config import CondaConfig
+        conda = CondaConfig(channels=["conda-forge"], packages=[])
     pixi_toml_path = node_dir / "pixi.toml"
 
     # Build pixi.toml content
@@ -375,6 +377,34 @@ def create_pixi_toml(
             lines.append(f'{name} = {value}')
 
         for dep in pypi_deps:
+            # Handle git dependencies in two formats:
+            # 1. pkg @ git+https://github.com/user/repo.git@commit
+            # 2. git+https://github.com/user/repo.git@commit (extract name from URL)
+            if "git+" in dep:
+                if " @ git+" in dep:
+                    # Format: pkg @ git+URL@commit
+                    match = re.match(r'^([a-zA-Z0-9._-]+)\s*@\s*git\+(.+?)(?:@([a-f0-9]+))?$', dep)
+                    if match:
+                        pkg_name = match.group(1)
+                        git_url = match.group(2)
+                        rev = match.group(3)
+                else:
+                    # Format: git+URL@commit (extract package name from repo name)
+                    match = re.match(r'^git\+(.+?)(?:@([a-f0-9]+))?$', dep)
+                    if match:
+                        git_url = match.group(1)
+                        rev = match.group(2)
+                        # Extract package name from URL (repo name without .git)
+                        repo_match = re.search(r'/([^/]+?)(?:\.git)?$', git_url)
+                        pkg_name = repo_match.group(1) if repo_match else git_url.split('/')[-1].replace('.git', '')
+
+                if match:
+                    if rev:
+                        lines.append(f'{pkg_name} = {{ git = "{git_url}", rev = "{rev}" }}')
+                    else:
+                        lines.append(f'{pkg_name} = {{ git = "{git_url}" }}')
+                    continue
+
             # Parse pip requirement format to pixi format
             # Handles extras like trimesh[easy]>=4.0.0
             name, version_spec, extras = _parse_pypi_requirement(dep)
