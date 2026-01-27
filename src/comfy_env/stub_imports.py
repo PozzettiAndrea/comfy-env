@@ -5,9 +5,9 @@ This module provides automatic import stubbing for packages that exist only
 in the isolated pixi environment, not in the host ComfyUI Python.
 
 How it works:
-1. Read package names from comfy-env.toml
-2. Look up their import names from top_level.txt in the pixi environment
-3. Register import hooks that provide stub modules for those imports
+1. Scan pixi environment's site-packages for installed packages
+2. Look up import names from top_level.txt in .dist-info directories
+3. Inject stub modules directly into sys.modules for missing packages
 4. Stubs allow class definitions to parse without the real packages
 5. Real packages are used when FUNCTION runs in the isolated worker
 
@@ -22,13 +22,16 @@ Usage:
 import sys
 import types
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import List, Set
+
+
+def _log(msg: str) -> None:
+    """Log with immediate flush to stderr (visible on Windows subprocess)."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 class _StubModule(types.ModuleType):
-    """
-    A stub module that accepts any attribute access or call.
-    """
+    """A stub module that accepts any attribute access or call."""
 
     def __init__(self, name: str):
         super().__init__(name)
@@ -46,9 +49,7 @@ class _StubModule(types.ModuleType):
 
 
 class _StubObject:
-    """
-    A stub object that accepts any operation.
-    """
+    """A stub object that accepts any operation."""
 
     def __init__(self, name: str = "stub"):
         self._stub_name = name
@@ -99,57 +100,12 @@ class _StubObject:
     def __contains__(self, item): return False
 
 
-class _StubFinder:
-    """Import hook finder that provides stub modules for specified packages."""
-
-    def __init__(self, stub_packages: Set[str]):
-        self.stub_packages = stub_packages
-
-    def find_module(self, fullname: str, path=None):
-        top_level = fullname.split('.')[0]
-        if top_level in self.stub_packages:
-            return _StubLoader(self.stub_packages)
-        return None
-
-
-class _StubLoader:
-    """Import hook loader that creates stub modules."""
-
-    def __init__(self, stub_packages: Set[str]):
-        self.stub_packages = stub_packages
-
-    def load_module(self, fullname: str):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-
-        module = _StubModule(fullname)
-        module.__loader__ = self
-
-        if '.' in fullname:
-            parent = fullname.rsplit('.', 1)[0]
-            module.__package__ = parent
-            if parent not in sys.modules:
-                self.load_module(parent)
-        else:
-            module.__package__ = fullname
-
-        sys.modules[fullname] = module
-        return module
-
-
-def _normalize_package_name(name: str) -> str:
-    """Normalize package name for comparison (PEP 503)."""
-    return name.lower().replace('-', '_').replace('.', '_')
-
-
 def _get_import_names_from_pixi(node_dir: Path) -> Set[str]:
     """
-    Get import names by scanning the pixi environment's site-packages.
+    Get import names from pixi environment using top_level.txt metadata.
 
-    Finds all importable packages by looking for:
-    1. Directories with __init__.py (packages)
-    2. .py files (single-file modules)
-    3. .so/.pyd files (extension modules)
+    This properly maps package names to import names (e.g., libigl -> igl,
+    PyYAML -> yaml) by reading the canonical top_level.txt files.
 
     Returns:
         Set of import names that should be stubbed.
@@ -159,16 +115,11 @@ def _get_import_names_from_pixi(node_dir: Path) -> Set[str]:
     pixi_base = node_dir / ".pixi" / "envs" / "default"
 
     # Find site-packages (different paths on Windows vs Linux)
-    # Linux: .pixi/envs/default/lib/python3.x/site-packages
-    # Windows: .pixi/envs/default/Lib/site-packages
     site_packages = None
-
-    # Try Windows path first (Lib/site-packages)
     win_site = pixi_base / "Lib" / "site-packages"
     if win_site.exists():
         site_packages = win_site
     else:
-        # Try Linux path (lib/python3.x/site-packages)
         pixi_lib = pixi_base / "lib"
         if pixi_lib.exists():
             python_dirs = list(pixi_lib.glob("python3.*"))
@@ -178,25 +129,44 @@ def _get_import_names_from_pixi(node_dir: Path) -> Set[str]:
     if site_packages is None or not site_packages.exists():
         return import_names
 
-    # Scan for importable modules
+    _log(f"[comfy-env] Scanning: {site_packages}")
+
+    # PRIMARY: Read top_level.txt from all .dist-info directories
+    for dist_info in site_packages.glob("*.dist-info"):
+        top_level_file = dist_info / "top_level.txt"
+        if top_level_file.exists():
+            try:
+                for line in top_level_file.read_text(encoding="utf-8").splitlines():
+                    name = line.strip()
+                    if name and not name.startswith('#'):
+                        # Extract just the top-level name
+                        top_name = name.replace('\\', '/').split('/')[0]
+                        if top_name:
+                            import_names.add(top_name)
+            except Exception:
+                pass
+
+    # FALLBACK: Scan for packages/modules not covered by dist-info
     for item in site_packages.iterdir():
         name = item.name
 
-        # Skip private/internal items
         if name.startswith('_') or name.startswith('.'):
             continue
-
-        # Skip dist-info and egg-info directories
         if name.endswith('.dist-info') or name.endswith('.egg-info'):
             continue
-
-        # Skip common non-module items
         if name in {'bin', 'share', 'include', 'etc'}:
             continue
 
         # Package directory (has __init__.py)
+        if item.is_dir() and (item / "__init__.py").exists():
+            import_names.add(name)
+            continue
+
+        # Namespace package (directory without __init__.py but has submodules)
         if item.is_dir():
-            if (item / "__init__.py").exists():
+            has_py = any(item.glob("*.py"))
+            has_subpkg = any((item / d / "__init__.py").exists() for d in item.iterdir() if d.is_dir())
+            if has_py or has_subpkg:
                 import_names.add(name)
             continue
 
@@ -206,11 +176,9 @@ def _get_import_names_from_pixi(node_dir: Path) -> Set[str]:
             continue
 
         # Extension module (.so on Linux, .pyd on Windows)
-        if '.cpython-' in name and (name.endswith('.so') or name.endswith('.pyd')):
-            # Extract module name: foo.cpython-311-x86_64-linux-gnu.so -> foo
+        if name.endswith('.so') or name.endswith('.pyd'):
             module_name = name.split('.')[0]
             import_names.add(module_name)
-            continue
 
     return import_names
 
@@ -230,14 +198,14 @@ def _filter_to_missing(import_names: Set[str]) -> Set[str]:
         except ImportError:
             missing.add(name)
         except Exception:
-            # Other errors - don't stub, let real error surface
-            pass
+            # Other errors (DLL load, etc.) - stub these too
+            missing.add(name)
 
     return missing
 
 
-# Track whether we've already set up stubs
-_stub_finder: Optional[_StubFinder] = None
+# Track what we stubbed for cleanup
+_stubbed_modules: Set[str] = set()
 
 
 def setup_isolated_imports(init_file: str) -> List[str]:
@@ -258,7 +226,7 @@ def setup_isolated_imports(init_file: str) -> List[str]:
 
         from .nodes import NODE_CLASS_MAPPINGS  # Now works!
     """
-    global _stub_finder
+    global _stubbed_modules
 
     node_dir = Path(init_file).resolve().parent
 
@@ -266,52 +234,37 @@ def setup_isolated_imports(init_file: str) -> List[str]:
     pixi_imports = _get_import_names_from_pixi(node_dir)
 
     if not pixi_imports:
-        print("[comfy-env] No pixi environment found, skipping import stubbing")
+        _log("[comfy-env] No pixi environment found")
         return []
 
     # Filter to only those missing in host
     missing = _filter_to_missing(pixi_imports)
 
     if not missing:
-        print("[comfy-env] All pixi packages available in host, no stubbing needed")
+        _log("[comfy-env] All packages available in host")
         return []
 
-    # Remove old finder if exists
-    if _stub_finder is not None:
-        try:
-            sys.meta_path.remove(_stub_finder)
-        except ValueError:
-            pass
+    # Direct injection into sys.modules - simple and reliable
+    for name in missing:
+        if name not in sys.modules:
+            sys.modules[name] = _StubModule(name)
+            _stubbed_modules.add(name)
 
-    # Register new finder
-    _stub_finder = _StubFinder(missing)
-    sys.meta_path.insert(0, _stub_finder)
-
-    stubbed = sorted(missing)
+    stubbed = sorted(_stubbed_modules)
     if len(stubbed) <= 10:
-        print(f"[comfy-env] Stubbed {len(stubbed)} imports: {', '.join(stubbed)}")
+        _log(f"[comfy-env] Injected {len(stubbed)} stubs: {', '.join(stubbed)}")
     else:
-        print(f"[comfy-env] Stubbed {len(stubbed)} imports: {', '.join(stubbed[:10])}... and {len(stubbed)-10} more")
+        _log(f"[comfy-env] Injected {len(stubbed)} stubs: {', '.join(stubbed[:10])}... +{len(stubbed)-10} more")
 
     return stubbed
 
 
 def cleanup_stubs():
-    """Remove the stub import hooks."""
-    global _stub_finder
+    """Remove injected stub modules from sys.modules."""
+    global _stubbed_modules
 
-    if _stub_finder is not None:
-        try:
-            sys.meta_path.remove(_stub_finder)
-        except ValueError:
-            pass
-
-        # Remove stubbed modules from sys.modules
-        to_remove = [
-            name for name in sys.modules
-            if isinstance(sys.modules[name], _StubModule)
-        ]
-        for name in to_remove:
+    for name in list(_stubbed_modules):
+        if name in sys.modules and isinstance(sys.modules[name], _StubModule):
             del sys.modules[name]
 
-        _stub_finder = None
+    _stubbed_modules.clear()

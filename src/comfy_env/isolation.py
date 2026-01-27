@@ -158,7 +158,11 @@ def _wrap_node_class(
 
     @wraps(original_method)
     def proxy(self, **kwargs):
+        print(f"[comfy-env] PROXY CALLED: {cls.__name__}.{func_name}", flush=True)
+        print(f"[comfy-env]   kwargs keys: {list(kwargs.keys())}", flush=True)
+
         worker = _get_worker(env_name, python_path, working_dir, sys_path)
+        print(f"[comfy-env]   worker alive: {worker.is_alive()}", flush=True)
 
         # Clone tensors for IPC if needed
         try:
@@ -168,6 +172,7 @@ def _wrap_node_class(
         except ImportError:
             pass  # No torch available, skip cloning
 
+        print(f"[comfy-env]   calling worker.call_method...", flush=True)
         result = worker.call_method(
             module_name=module_name,
             class_name=cls.__name__,
@@ -176,6 +181,7 @@ def _wrap_node_class(
             kwargs=kwargs,
             timeout=600.0,
         )
+        print(f"[comfy-env]   call_method returned", flush=True)
 
         # Clone result tensors
         try:

@@ -613,7 +613,77 @@ from types import SimpleNamespace
 
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
 faulthandler.enable(file=sys.stderr, all_threads=True)
-print("[worker] Faulthandler enabled", flush=True)
+
+# Pre-import bpy FIRST to avoid DLL conflicts with numpy/torch/MKL
+# bpy's DLLs must be loaded before other packages load conflicting versions
+try:
+    import bpy
+    print("[worker] Pre-imported bpy successfully", file=sys.stderr, flush=True)
+except ImportError as e:
+    # bpy not available in this environment - that's fine
+    pass
+except Exception as e:
+    print(f"[worker] bpy pre-import warning: {e}", file=sys.stderr, flush=True)
+
+# Watchdog: dump all thread stacks every 60 seconds to catch hangs
+import threading
+import tempfile as _tempfile
+_watchdog_log = os.path.join(_tempfile.gettempdir(), "comfy_worker_watchdog.log")
+def _watchdog():
+    import time
+    import io
+    tick = 0
+    while True:
+        time.sleep(60)
+        tick += 1
+        # Capture stack dump to string
+        buf = io.StringIO()
+        faulthandler.dump_traceback(file=buf, all_threads=True)
+        dump = buf.getvalue()
+
+        # Write to file
+        with open(_watchdog_log, "a", encoding="utf-8") as f:
+            f.write(f"\\n=== WATCHDOG TICK {tick} ({time.strftime('%H:%M:%S')}) ===\\n")
+            f.write(dump)
+            f.write("=== END ===\\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Also print
+        print(f"\\n=== WATCHDOG TICK {tick} ===", flush=True)
+        print(dump, flush=True)
+        print("=== END ===\\n", flush=True)
+
+_watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+_watchdog_thread.start()
+print(f"[worker] Watchdog started, logging to: {_watchdog_log}", flush=True)
+
+# File-based logging for debugging (persists even if stdout/stderr are swallowed)
+import tempfile
+_worker_log_file = os.path.join(tempfile.gettempdir(), "comfy_worker_debug.log")
+def wlog(msg):
+    """Log to file only - stdout causes pipe buffer deadlock after many requests."""
+    try:
+        with open(_worker_log_file, "a", encoding="utf-8") as f:
+            import time
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+    # NOTE: Don't print to stdout here! After 50+ requests the pipe buffer
+    # fills up and causes deadlock (parent blocked on recv, worker blocked on print)
+
+wlog(f"[worker] === Worker starting, log file: {_worker_log_file} ===")
+
+# Debug: print PATH at startup
+_path_sep = ";" if sys.platform == "win32" else ":"
+_path_parts = os.environ.get("PATH", "").split(_path_sep)
+print(f"[worker] PATH has {len(_path_parts)} entries:", file=sys.stderr, flush=True)
+for _i, _p in enumerate(_path_parts[:15]):
+    print(f"[worker]   [{_i}] {_p}", file=sys.stderr, flush=True)
+if len(_path_parts) > 15:
+    print(f"[worker]   ... and {len(_path_parts) - 15} more", file=sys.stderr, flush=True)
 
 # On Windows, add host Python's DLL directories so packages like opencv can find VC++ runtime
 if sys.platform == "win32":
@@ -633,9 +703,9 @@ if sys.platform == "win32":
     if _pixi_library_bin and hasattr(os, "add_dll_directory"):
         try:
             os.add_dll_directory(_pixi_library_bin)
-            print(f"[worker] Added pixi Library/bin to DLL search: {_pixi_library_bin}", flush=True)
+            wlog(f"[worker] Added pixi Library/bin to DLL search: {_pixi_library_bin}")
         except Exception as e:
-            print(f"[worker] Failed to add pixi Library/bin: {e}", flush=True)
+            wlog(f"[worker] Failed to add pixi Library/bin: {e}")
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -805,24 +875,25 @@ def _deserialize_isolated_objects(obj):
 
 
 def main():
-    print("[worker] Starting...", flush=True)
+    wlog("[worker] Starting...")
     # Get socket address from command line
     if len(sys.argv) < 2:
-        print("Usage: worker.py <socket_addr>", file=sys.stderr)
+        wlog("Usage: worker.py <socket_addr>")
         sys.exit(1)
     socket_addr = sys.argv[1]
-    print(f"[worker] Connecting to {socket_addr}...", flush=True)
+    wlog(f"[worker] Connecting to {socket_addr}...")
 
     # Connect to host process
     sock = _connect(socket_addr)
     transport = SocketTransport(sock)
-    print("[worker] Connected, waiting for config...", flush=True)
+    wlog("[worker] Connected, waiting for config...")
 
     # Read config as first message
     config = transport.recv()
     if not config:
+        wlog("[worker] No config received, exiting")
         return
-    print("[worker] Got config, setting up paths...", flush=True)
+    wlog("[worker] Got config, setting up paths...")
 
     # Setup sys.path
     for p in config.get("sys_paths", []):
@@ -830,66 +901,77 @@ def main():
             sys.path.insert(0, p)
 
     # Import torch after path setup
-    print("[worker] Importing torch...", flush=True)
+    wlog("[worker] Importing torch...")
     import torch
-    print(f"[worker] Torch imported: {torch.__version__}", flush=True)
+    wlog(f"[worker] Torch imported: {torch.__version__}")
 
     # Signal ready
     transport.send({"status": "ready"})
-    print("[worker] Ready, entering request loop...", flush=True)
+    wlog("[worker] Ready, entering request loop...")
 
     # Process requests
+    request_num = 0
     while True:
+        request_num += 1
+        wlog(f"[worker] Waiting for request #{request_num}...")
         try:
             request = transport.recv()
             if not request:
+                wlog("[worker] Empty request received, exiting loop")
                 break
-        except Exception:
+        except Exception as e:
+            wlog(f"[worker] Exception receiving request: {e}")
             break
 
         if request.get("method") == "shutdown":
+            wlog("[worker] Shutdown requested")
             break
+
+        if request.get("method") == "ping":
+            # Health check - respond immediately
+            transport.send({"status": "pong"})
+            continue
 
         try:
             request_type = request.get("type", "call_module")
             module_name = request["module"]
             inputs_path = request.get("inputs_path")
             outputs_path = request.get("outputs_path")
-            print(f"[worker] Request: {request_type} {module_name}", flush=True)
+            wlog(f"[worker] Request: {request_type} {module_name}")
 
             # Load inputs
             if inputs_path:
-                print(f"[worker] Loading inputs from {inputs_path}...", flush=True)
+                wlog(f"[worker] Loading inputs from {inputs_path}...")
                 inputs = torch.load(inputs_path, weights_only=False)
-                print(f"[worker] Deserializing isolated objects...", flush=True)
+                wlog(f"[worker] Deserializing isolated objects...")
                 inputs = _deserialize_isolated_objects(inputs)
                 # Resolve any object references from previous node calls
-                print(f"[worker] Resolving object references...", flush=True)
+                wlog(f"[worker] Resolving object references...")
                 inputs = _deserialize_input(inputs)
-                print(f"[worker] Inputs ready: {list(inputs.keys())}", flush=True)
+                wlog(f"[worker] Inputs ready: {list(inputs.keys())}")
             else:
                 inputs = {}
 
             # Import module
-            print(f"[worker] Importing module {module_name}...", flush=True)
+            wlog(f"[worker] Importing module {module_name}...")
             module = __import__(module_name, fromlist=[""])
-            print(f"[worker] Module imported", flush=True)
+            wlog(f"[worker] Module imported")
 
             if request_type == "call_method":
                 class_name = request["class_name"]
                 method_name = request["method_name"]
                 self_state = request.get("self_state")
-                print(f"[worker] Getting class {class_name}...", flush=True)
+                wlog(f"[worker] Getting class {class_name}...")
 
                 cls = getattr(module, class_name)
-                print(f"[worker] Creating instance...", flush=True)
+                wlog(f"[worker] Creating instance...")
                 instance = object.__new__(cls)
                 if self_state:
                     instance.__dict__.update(self_state)
-                print(f"[worker] Calling {method_name}...", flush=True)
+                wlog(f"[worker] Calling {method_name}...")
                 method = getattr(instance, method_name)
                 result = method(**inputs)
-                print(f"[worker] Method returned", flush=True)
+                wlog(f"[worker] Method returned")
             else:
                 func_name = request["func"]
                 func = getattr(module, func_name)
@@ -1000,13 +1082,53 @@ class PersistentVenvWorker(Worker):
             current = current.parent
         return None
 
+    def _check_socket_health(self) -> bool:
+        """Check if socket connection is healthy using a quick ping."""
+        if not self._transport:
+            return False
+        try:
+            # Send a ping request with short timeout
+            self._transport.send({"method": "ping"})
+            response = self._transport.recv(timeout=2.0)
+            return response is not None and response.get("status") == "pong"
+        except Exception as e:
+            print(f"[{self.name}] Socket health check failed: {e}", file=sys.stderr, flush=True)
+            return False
+
+    def _kill_worker(self) -> None:
+        """Kill the worker process and clean up resources."""
+        if self._process:
+            try:
+                self._process.kill()
+                self._process.wait(timeout=5)
+            except:
+                pass
+            self._process = None
+        if self._transport:
+            try:
+                self._transport.close()
+            except:
+                pass
+            self._transport = None
+        if self._server_socket:
+            try:
+                self._server_socket.close()
+            except:
+                pass
+            self._server_socket = None
+
     def _ensure_started(self):
         """Start persistent worker subprocess if not running."""
         if self._shutdown:
             raise RuntimeError(f"{self.name}: Worker has been shut down")
 
         if self._process is not None and self._process.poll() is None:
-            return  # Already running
+            # Process is running, but check if socket is healthy
+            if self._transport and self._check_socket_health():
+                return  # All good
+            # Socket is dead/unhealthy - restart worker
+            print(f"[{self.name}] Socket unhealthy, restarting worker...", file=sys.stderr, flush=True)
+            self._kill_worker()
 
         # Clean up any previous socket
         if self._transport:
@@ -1041,16 +1163,28 @@ class PersistentVenvWorker(Worker):
             # Pixi has python.exe directly in env dir, not in Scripts/
             env_dir = self.python.parent
             library_bin = env_dir / "Library" / "bin"
+
+            # COMPLETE DLL ISOLATION: Build minimal PATH from scratch
+            # Only include Windows system directories + pixi environment
+            # This prevents DLL conflicts from mingw, conda, etc.
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            minimal_path_parts = [
+                str(env_dir),  # Pixi env (python.exe location)
+                str(env_dir / "Scripts"),  # Pixi Scripts
+                str(env_dir / "Lib" / "site-packages" / "bpy"),  # bpy DLLs
+                f"{windir}\\System32",  # Core Windows DLLs
+                f"{windir}",  # Windows directory
+                f"{windir}\\System32\\Wbem",  # WMI tools
+            ]
             if library_bin.is_dir():
-                existing_path = env.get("PATH", "")
-                # Add env dir and Library/bin to PATH
-                env["PATH"] = f"{env_dir};{library_bin};{existing_path}"
-                # Also pass as env var so worker can use os.add_dll_directory()
-                env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin)
-                # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
-                env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-                # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
-                env["PYTHONIOENCODING"] = "utf-8"
+                minimal_path_parts.insert(1, str(library_bin))  # MKL DLLs
+
+            env["PATH"] = ";".join(minimal_path_parts)
+            env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
+            # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
+            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+            # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
+            env["PYTHONIOENCODING"] = "utf-8"
 
         # Find ComfyUI base and set env var for folder_paths stub
         comfyui_base = self._find_comfyui_base()
@@ -1062,31 +1196,61 @@ class PersistentVenvWorker(Worker):
         all_sys_path = [str(stubs_dir), str(self.working_dir)] + self.sys_path
 
         # Launch subprocess with the venv Python, passing socket address
+        # For pixi environments, use "pixi run python" to get proper environment activation
+        # (CONDA_PREFIX, Library paths, etc.) which fixes DLL loading issues with bpy
+        is_pixi = '.pixi' in str(self.python)
+        print(f"[PersistentVenvWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
+        if is_pixi:
+            # Find pixi project root (parent of .pixi directory)
+            pixi_project = self.python
+            while pixi_project.name != '.pixi' and pixi_project.parent != pixi_project:
+                pixi_project = pixi_project.parent
+            pixi_project = pixi_project.parent  # Go up from .pixi to project root
+            pixi_toml = pixi_project / "pixi.toml"
+            print(f"[PersistentVenvWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
+
+            if pixi_toml.exists():
+                cmd = ["pixi", "run", "--manifest-path", str(pixi_toml),
+                       "python", str(self._worker_script), self._socket_addr]
+                # Clean PATH to remove ct-env entries that have conflicting DLLs
+                # Pixi will add its own environment paths
+                path_sep = ";" if sys.platform == "win32" else ":"
+                current_path = env.get("PATH", "")
+                # Filter out ct-envs and conda/mamba paths that could conflict
+                clean_path_parts = [
+                    p for p in current_path.split(path_sep)
+                    if not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+                ]
+                env["PATH"] = path_sep.join(clean_path_parts)
+                launch_env = env
+            else:
+                cmd = [str(self.python), str(self._worker_script), self._socket_addr]
+                launch_env = env
+        else:
+            cmd = [str(self.python), str(self._worker_script), self._socket_addr]
+            launch_env = env
+
+        print(f"[PersistentVenvWorker] launching cmd={cmd[:3]}...", flush=True)
+        if launch_env:
+            path_sep = ";" if sys.platform == "win32" else ":"
+            path_parts = launch_env.get("PATH", "").split(path_sep)
+            print(f"[PersistentVenvWorker] PATH has {len(path_parts)} entries:", flush=True)
+            for i, p in enumerate(path_parts[:10]):  # Show first 10
+                print(f"[PersistentVenvWorker]   [{i}] {p}", flush=True)
+            if len(path_parts) > 10:
+                print(f"[PersistentVenvWorker]   ... and {len(path_parts) - 10} more", flush=True)
         self._process = subprocess.Popen(
-            [str(self.python), str(self._worker_script), self._socket_addr],
+            cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,  # DEVNULL to prevent pipe buffer deadlock
             stderr=subprocess.PIPE,  # Capture stderr separately for crash diagnostics
             cwd=str(self.working_dir),
-            env=env,
+            env=launch_env,
         )
 
         # Clear stderr buffer for new process
         with self._stderr_lock:
             self._stderr_buffer.clear()
-
-        # Start stdout forwarding thread
-        def forward_stdout():
-            try:
-                for line in self._process.stdout:
-                    if isinstance(line, bytes):
-                        line = line.decode('utf-8', errors='replace')
-                    sys.stderr.write(f"  {line}")
-                    sys.stderr.flush()
-            except:
-                pass
-        self._stdout_thread = threading.Thread(target=forward_stdout, daemon=True)
-        self._stdout_thread.start()
 
         # Start stderr capture thread (buffer for crash diagnostics)
         def capture_stderr():
@@ -1224,8 +1388,13 @@ class PersistentVenvWorker(Worker):
         Returns:
             Return value of the method.
         """
+        import sys
+        print(f"[PersistentVenvWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
+
         with self._lock:
+            print(f"[PersistentVenvWorker] acquired lock, ensuring started...", file=sys.stderr, flush=True)
             self._ensure_started()
+            print(f"[PersistentVenvWorker] worker started/confirmed", file=sys.stderr, flush=True)
 
             timeout = timeout or 600.0
             call_id = str(uuid.uuid4())[:8]
@@ -1237,8 +1406,11 @@ class PersistentVenvWorker(Worker):
             try:
                 # Serialize kwargs
                 if kwargs:
+                    print(f"[PersistentVenvWorker] serializing kwargs...", file=sys.stderr, flush=True)
                     serialized_kwargs = _serialize_for_ipc(kwargs)
+                    print(f"[PersistentVenvWorker] saving to {inputs_path}...", file=sys.stderr, flush=True)
                     torch.save(serialized_kwargs, str(inputs_path))
+                    print(f"[PersistentVenvWorker] saved inputs", file=sys.stderr, flush=True)
 
                 # Send request with class info
                 request = {
@@ -1250,7 +1422,9 @@ class PersistentVenvWorker(Worker):
                     "inputs_path": str(inputs_path) if kwargs else None,
                     "outputs_path": str(outputs_path),
                 }
+                print(f"[PersistentVenvWorker] sending request via socket...", file=sys.stderr, flush=True)
                 response = self._send_request(request, timeout)
+                print(f"[PersistentVenvWorker] got response: {response.get('status')}", file=sys.stderr, flush=True)
 
                 if response.get("status") == "error":
                     raise WorkerError(

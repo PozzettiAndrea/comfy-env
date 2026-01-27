@@ -253,19 +253,26 @@ def create_pixi_toml(
         lines.append('libblas = { version = "*", build = "*mkl" }')
 
     for pkg in conda.packages:
-        # Parse package spec (name=version or name>=version or just name)
-        if "=" in pkg and not pkg.startswith("="):
-            # Has version spec
-            if ">=" in pkg:
-                name, version = pkg.split(">=", 1)
-                lines.append(f'{name} = ">={version}"')
-            elif "==" in pkg:
-                name, version = pkg.split("==", 1)
-                lines.append(f'{name} = "=={version}"')
-            else:
-                # Single = means exact version in conda
-                name, version = pkg.split("=", 1)
-                lines.append(f'{name} = "=={version}"')
+        # Parse package spec (name=version or name>=version or name<version or just name)
+        if ">=" in pkg:
+            name, version = pkg.split(">=", 1)
+            lines.append(f'{name} = ">={version}"')
+        elif "<=" in pkg:
+            name, version = pkg.split("<=", 1)
+            lines.append(f'{name} = "<={version}"')
+        elif "==" in pkg:
+            name, version = pkg.split("==", 1)
+            lines.append(f'{name} = "=={version}"')
+        elif ">" in pkg:
+            name, version = pkg.split(">", 1)
+            lines.append(f'{name} = ">{version}"')
+        elif "<" in pkg:
+            name, version = pkg.split("<", 1)
+            lines.append(f'{name} = "<{version}"')
+        elif "=" in pkg and not pkg.startswith("="):
+            # Single = means exact version in conda
+            name, version = pkg.split("=", 1)
+            lines.append(f'{name} = "=={version}"')
         else:
             # No version, use any
             lines.append(f'{pkg} = "*"')
@@ -282,16 +289,22 @@ def create_pixi_toml(
     if local_wheels_dir:
         local_wheels = list(Path(local_wheels_dir).glob("comfy_env-*.whl"))
         if local_wheels:
-            # Use relative path from node_dir
-            rel_path = os.path.relpath(local_wheels[0], node_dir)
-            special_deps["comfy-env"] = f'{{ path = "{rel_path}" }}'
+            # Copy wheel to node_dir (next to pixi.toml) for simple relative path
+            wheel_name = local_wheels[0].name
+            wheel_dest = node_dir / wheel_name
+            if not wheel_dest.exists():
+                shutil.copy(local_wheels[0], wheel_dest)
+            # Reference with simple relative path (forward slashes, no backslash issues)
+            special_deps["comfy-env"] = f'{{ path = "./{wheel_name}" }}'
         else:
             pypi_deps.append("comfy-env")
     else:
         # Check for local editable comfy-env at ~/utils/comfy-env
         local_comfy_env = Path.home() / "utils" / "comfy-env"
         if local_comfy_env.exists() and (local_comfy_env / "pyproject.toml").exists():
-            special_deps["comfy-env"] = f'{{ path = "{local_comfy_env}", editable = true }}'
+            # Use forward slashes for TOML compatibility
+            path_str = local_comfy_env.as_posix()
+            special_deps["comfy-env"] = f'{{ path = "{path_str}", editable = true }}'
         else:
             pypi_deps.append("comfy-env")
 
@@ -544,20 +557,38 @@ def pixi_install(
 
     log("pixi install completed successfully!")
 
-    # Create _env_{name} symlink for compatibility with uv backend
+    # Create _env_{name} link for compatibility with uv backend
     # This ensures code that expects _env_envname/bin/python works with pixi
     symlink_path = node_dir / f"_env_{env_config.name}"
     pixi_env_path = node_dir / ".pixi" / "envs" / "default"
 
     if pixi_env_path.exists():
-        # Remove existing symlink or directory if present
-        if symlink_path.is_symlink():
-            symlink_path.unlink()
+        # Remove existing symlink/junction or directory if present
+        if symlink_path.is_symlink() or (sys.platform == "win32" and symlink_path.is_dir()):
+            # On Windows, junctions appear as directories but can be removed with rmdir
+            try:
+                symlink_path.unlink()
+            except (OSError, PermissionError):
+                # Junction on Windows - remove with rmdir (doesn't delete contents)
+                subprocess.run(["cmd", "/c", "rmdir", str(symlink_path)], capture_output=True)
         elif symlink_path.exists():
             shutil.rmtree(symlink_path)
 
-        symlink_path.symlink_to(pixi_env_path)
-        log(f"Created symlink: _env_{env_config.name} -> .pixi/envs/default")
+        # On Windows, use directory junctions (no admin required) instead of symlinks
+        if sys.platform == "win32":
+            # mklink /J creates a directory junction (no admin privileges needed)
+            result = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(symlink_path), str(pixi_env_path)],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                log(f"Created junction: _env_{env_config.name} -> .pixi/envs/default")
+            else:
+                log(f"Warning: Failed to create junction: {result.stderr}")
+        else:
+            symlink_path.symlink_to(pixi_env_path)
+            log(f"Created symlink: _env_{env_config.name} -> .pixi/envs/default")
 
     return True
 
