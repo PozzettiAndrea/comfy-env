@@ -188,16 +188,31 @@ def _build_cuda_vars(env_config: IsolatedEnv) -> dict:
     Returns a dict with CUDA, PyTorch, Python, and platform variables
     for template substitution.
     """
-    # Use fixed CUDA 12.8 / PyTorch 2.8 for pixi environments (modern GPU default)
+    # Get CUDA/PyTorch versions from env_config (resolved from "auto" based on GPU arch)
+    # Pascal or below: CUDA 12.4, PyTorch 2.4.0
+    # Turing+: CUDA 12.8, PyTorch 2.8.0
+    cuda_version = env_config.cuda_version or "12.8"
+    torch_version = env_config.pytorch_version or "2.8.0"
+
+    # Parse CUDA version
+    cuda_parts = cuda_version.split(".")
+    cuda_short = "".join(cuda_parts[:2])  # "12.8" -> "128"
+
+    # Parse PyTorch version
+    torch_parts = torch_version.split(".")
+    torch_short = "".join(torch_parts)  # "2.8.0" -> "280"
+    torch_mm = "".join(torch_parts[:2])  # "2.8.0" -> "28"
+    torch_dotted_mm = ".".join(torch_parts[:2])  # "2.8.0" -> "2.8"
+
     vars_dict = {
-        "cuda_version": "12.8",
-        "cuda_short": "128",
-        "cuda_short2": "128",
-        "cuda_major": "12",
-        "torch_version": "2.8.0",
-        "torch_short": "280",
-        "torch_mm": "28",
-        "torch_dotted_mm": "2.8",
+        "cuda_version": cuda_version,
+        "cuda_short": cuda_short,
+        "cuda_short2": cuda_short,
+        "cuda_major": cuda_parts[0],
+        "torch_version": torch_version,
+        "torch_short": torch_short,
+        "torch_mm": torch_mm,
+        "torch_dotted_mm": torch_dotted_mm,
     }
 
     # Platform detection
@@ -314,19 +329,25 @@ def create_pixi_toml(
     lines.append(f'name = "{env_config.name}"')
     lines.append('version = "0.1.0"')
 
-    # Channels
-    channels = conda.channels or ["conda-forge"]
+    # Channels - add pytorch channel, and nvidia if CUDA GPU detected
+    base_channels = conda.channels or ["conda-forge"]
+    if env_config.cuda_version:
+        # GPU detected - add pytorch and nvidia channels for CUDA support
+        channels = ["pytorch", "nvidia"] + [ch for ch in base_channels if ch not in ["pytorch", "nvidia"]]
+    else:
+        # No GPU - just add pytorch channel for CPU-only pytorch
+        channels = ["pytorch"] + [ch for ch in base_channels if ch != "pytorch"]
     channels_str = ", ".join(f'"{ch}"' for ch in channels)
     lines.append(f"channels = [{channels_str}]")
 
     # Platforms
-    # Note: On macOS we always use osx-64 (x86_64) even on ARM64 Macs.
-    # This runs under Rosetta 2 but ensures compatibility with packages
-    # that only have x86_64 wheels (e.g., embreex for trimesh raytracing).
     if sys.platform == "linux":
         lines.append('platforms = ["linux-64"]')
     elif sys.platform == "darwin":
-        lines.append('platforms = ["osx-64"]')
+        if platform.machine() == "arm64":
+            lines.append('platforms = ["osx-arm64"]')
+        else:
+            lines.append('platforms = ["osx-64"]')
     elif sys.platform == "win32":
         lines.append('platforms = ["win-64"]')
 
@@ -343,6 +364,20 @@ def create_pixi_toml(
     lines.append("[dependencies]")
     lines.append(f'python = "{env_config.python}.*"')
     lines.append('pip = "*"')  # Required for installing CUDA packages with --no-deps
+
+    # Add PyTorch via conda
+    # - With GPU: pytorch + pytorch-cuda for CUDA support
+    # - No GPU: pytorch 2.8.0 CPU-only (default)
+    torch_version = env_config.pytorch_version or "2.8.0"
+    torch_parts = torch_version.split(".")
+    torch_mm = ".".join(torch_parts[:2])  # "2.8.0" -> "2.8"
+    lines.append(f'pytorch = "{torch_mm}.*"')
+
+    if env_config.cuda_version:
+        # GPU detected - add pytorch-cuda for CUDA runtime
+        cuda_parts = env_config.cuda_version.split(".")
+        cuda_mm = ".".join(cuda_parts[:2])  # "12.8" -> "12.8"
+        lines.append(f'pytorch-cuda = "{cuda_mm}"')
 
     # On Windows, use MKL BLAS to avoid OpenBLAS crashes (numpy blas_fpe_check issue)
     if sys.platform == "win32":
