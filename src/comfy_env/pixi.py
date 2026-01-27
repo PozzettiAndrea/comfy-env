@@ -580,6 +580,9 @@ def pixi_install(
     install_env = os.environ.copy()
     if env_config.env_vars:
         install_env.update(env_config.env_vars)
+        # Disable build isolation so CMAKE_ARGS propagates to builds
+        if 'CMAKE_ARGS' in env_config.env_vars:
+            install_env['UV_NO_BUILD_ISOLATION'] = '1'
         log(f"  Using custom env vars: {list(env_config.env_vars.keys())}")
 
     result = subprocess.run(
