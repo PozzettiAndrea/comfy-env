@@ -191,7 +191,7 @@ def _build_cuda_vars(env_config: IsolatedEnv) -> dict:
     # Get CUDA/PyTorch versions from env_config (resolved from "auto" based on GPU arch)
     # Pascal or below: CUDA 12.4, PyTorch 2.4.0
     # Turing+: CUDA 12.8, PyTorch 2.8.0
-    cuda_version = env_config.cuda_version or "12.8"
+    cuda_version = env_config.cuda or "12.8"
     torch_version = env_config.pytorch_version or "2.8.0"
 
     # Parse CUDA version
@@ -331,7 +331,7 @@ def create_pixi_toml(
 
     # Channels - add pytorch channel, and nvidia if CUDA GPU detected
     base_channels = conda.channels or ["conda-forge"]
-    if env_config.cuda_version:
+    if env_config.cuda:
         # GPU detected - add pytorch and nvidia channels for CUDA support
         channels = ["pytorch", "nvidia"] + [ch for ch in base_channels if ch not in ["pytorch", "nvidia"]]
     else:
@@ -373,9 +373,9 @@ def create_pixi_toml(
     torch_mm = ".".join(torch_parts[:2])  # "2.8.0" -> "2.8"
     lines.append(f'pytorch = "{torch_mm}.*"')
 
-    if env_config.cuda_version:
+    if env_config.cuda:
         # GPU detected - add pytorch-cuda for CUDA runtime
-        cuda_parts = env_config.cuda_version.split(".")
+        cuda_parts = env_config.cuda.split(".")
         cuda_mm = ".".join(cuda_parts[:2])  # "12.8" -> "12.8"
         lines.append(f'pytorch-cuda = "{cuda_mm}"')
 
