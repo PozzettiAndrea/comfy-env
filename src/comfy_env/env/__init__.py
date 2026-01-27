@@ -1,6 +1,6 @@
 """Environment management for comfyui-isolation."""
 
-from .config import IsolatedEnv, ToolConfig
+from .config import IsolatedEnv
 from .manager import IsolatedEnvManager
 from .cuda_gpu_detection import (
     GPUInfo,
@@ -24,7 +24,6 @@ from .security import (
 __all__ = [
     "IsolatedEnv",
     "IsolatedEnvManager",
-    "ToolConfig",
     # GPU Detection
     "GPUInfo",
     "CUDAEnvironment",

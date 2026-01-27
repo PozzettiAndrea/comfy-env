@@ -85,15 +85,6 @@ requirements = []
 # ComfyUI-Impact-Pack = "ltdrdata/ComfyUI-Impact-Pack"
 
 
-# =============================================================================
-# EXTERNAL TOOLS (optional)
-# =============================================================================
-# External applications required by the node.
-
-[tools]
-# blender = "4.2"
-
-
 # #############################################################################
 #
 #                       PROCESS ISOLATION (ADVANCED)

@@ -47,14 +47,6 @@ class NodeReq:
 
 
 @dataclass
-class ToolConfig:
-    """Configuration for an external tool like Blender."""
-    name: str
-    version: str = "latest"
-    install_dir: Optional[Path] = None
-
-
-@dataclass
 class EnvManagerConfig:
     """
     Full configuration parsed from comfy-env.toml.
@@ -67,14 +59,12 @@ class EnvManagerConfig:
         [envname.cuda]      - CUDA packages for isolated env
         [envname.packages]  - Regular packages for isolated env
         [node_reqs]         - Node dependencies
-        [tools]             - External tools (e.g., blender = "4.2")
         [wheel_sources]     - Custom wheel URL templates (override registry)
     """
     system: SystemConfig = field(default_factory=SystemConfig)
     local: LocalConfig = field(default_factory=LocalConfig)
     envs: Dict[str, "IsolatedEnv"] = field(default_factory=dict)
     node_reqs: List[NodeReq] = field(default_factory=list)
-    tools: Dict[str, ToolConfig] = field(default_factory=dict)
     wheel_sources: Dict[str, str] = field(default_factory=dict)  # package -> wheel_template URL
 
     @property

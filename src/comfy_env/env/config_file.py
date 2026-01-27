@@ -63,7 +63,7 @@ else:
     except ImportError:
         tomllib = None  # type: ignore
 
-from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, SystemConfig, ToolConfig, CondaConfig
+from .config import IsolatedEnv, EnvManagerConfig, LocalConfig, NodeReq, SystemConfig, CondaConfig
 from .cuda_gpu_detection import detect_cuda_version
 
 
@@ -168,7 +168,7 @@ def _get_default_pytorch_version(cuda_version: Optional[str]) -> str:
         - CUDA 12.8 (Turing+): PyTorch 2.8.0
     """
     if cuda_version == "12.4":
-        return "2.5.1"  # Full: Pascal GPUs
+        return "2.4.0"  # Pascal GPUs (last PyTorch with sm_60/61 support)
     return "2.8.0"  # Modern: Turing through Blackwell
 
 
@@ -332,7 +332,7 @@ def _substitute_vars(s: str, variables: Dict[str, str]) -> str:
 # =============================================================================
 
 # Reserved table names that are NOT isolated environments
-RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "tools", "system", "wheel_sources"}
+RESERVED_TABLES = {"local", "node_reqs", "env", "packages", "sources", "cuda", "variables", "worker", "system", "wheel_sources"}
 
 
 def load_config(
@@ -431,7 +431,6 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
     local = _parse_local_section(data.get("local", {}))
     envs = _parse_env_sections(data, base_dir)
     node_reqs = _parse_node_reqs(data.get("node_reqs", {}))
-    tools = _parse_tools_section(data.get("tools", {}))
     wheel_sources = _parse_wheel_sources_section(data.get("wheel_sources", {}))
 
     return EnvManagerConfig(
@@ -439,7 +438,6 @@ def _parse_full_config(data: Dict[str, Any], base_dir: Path) -> EnvManagerConfig
         local=local,
         envs=envs,
         node_reqs=node_reqs,
-        tools=tools,
         wheel_sources=wheel_sources,
     )
 
@@ -614,35 +612,6 @@ def _parse_node_reqs(node_reqs_data: Dict[str, Any]) -> List[NodeReq]:
     return reqs
 
 
-def _parse_tools_section(tools_data: Dict[str, Any]) -> Dict[str, ToolConfig]:
-    """Parse [tools] section.
-
-    Supports:
-        [tools]
-        blender = "4.2"
-
-    Or extended:
-        [tools.blender]
-        version = "4.2"
-        install_dir = "/custom/path"
-    """
-    tools = {}
-
-    for name, value in tools_data.items():
-        if isinstance(value, str):
-            # Simple format: blender = "4.2"
-            tools[name] = ToolConfig(name=name, version=value)
-        elif isinstance(value, dict):
-            # Extended format: [tools.blender] with version, install_dir
-            version = value.get("version", "latest")
-            install_dir = value.get("install_dir")
-            if install_dir:
-                install_dir = Path(install_dir)
-            tools[name] = ToolConfig(name=name, version=version, install_dir=install_dir)
-
-    return tools
-
-
 def _parse_system_section(system_data: Dict[str, Any]) -> SystemConfig:
     """Parse [system] section.
 
@@ -698,8 +667,7 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
     # Parse using simple parser to get IsolatedEnv
     simple_env = _parse_config(data, base_dir)
 
-    # Parse tools, system, and wheel_sources sections (shared between simple and full format)
-    tools = _parse_tools_section(data.get("tools", {}))
+    # Parse system and wheel_sources sections (shared between simple and full format)
     system = _parse_system_section(data.get("system", {}))
     wheel_sources = _parse_wheel_sources_section(data.get("wheel_sources", {}))
 
@@ -714,7 +682,6 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             local=LocalConfig(),
             envs={simple_env.name: simple_env},
             node_reqs=[],
-            tools=tools,
             wheel_sources=wheel_sources,
         )
     else:
@@ -735,6 +702,5 @@ def _convert_simple_to_full(data: Dict[str, Any], base_dir: Path) -> EnvManagerC
             ),
             envs={},
             node_reqs=[],
-            tools=tools,
             wheel_sources=wheel_sources,
         )

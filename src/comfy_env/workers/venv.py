@@ -204,6 +204,11 @@ def _serialize_for_ipc(obj, visited=None):
     if obj_id in visited:
         return visited[obj_id]  # Return cached serialized result
 
+    # Handle Path objects - convert to string for JSON serialization
+    from pathlib import PurePath
+    if isinstance(obj, PurePath):
+        return str(obj)
+
     # Check if this is a custom object with broken module path
     if (hasattr(obj, '__dict__') and
         hasattr(obj, '__class__') and
@@ -762,7 +767,10 @@ def _should_use_reference(obj):
     # Dicts, lists, tuples - recurse into contents (don't ref the container)
     if isinstance(obj, (dict, list, tuple)):
         return False
-    # Everything else (trimesh, custom classes) - pass by reference
+    # Trimesh - pass by value (pickle handles it well across Python versions)
+    if obj_type == 'Trimesh':
+        return False
+    # Everything else (custom classes) - pass by reference
     return True
 
 def _serialize_result(obj, visited=None):
@@ -1435,12 +1443,14 @@ class PersistentVenvWorker(Worker):
                         print(f"[PersistentVenvWorker] saved inputs", file=sys.stderr, flush=True)
 
                 # Send request with class info
+                # Serialize self_state to handle Path objects and other non-JSON types
+                serialized_self_state = _serialize_for_ipc(self_state) if self_state else None
                 request = {
                     "type": "call_method",
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
-                    "self_state": self_state,
+                    "self_state": serialized_self_state,
                     "inputs_path": str(inputs_path) if kwargs else None,
                     "outputs_path": str(outputs_path),
                 }
