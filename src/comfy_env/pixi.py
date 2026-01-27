@@ -320,13 +320,13 @@ def create_pixi_toml(
     lines.append(f"channels = [{channels_str}]")
 
     # Platforms
+    # Note: On macOS we always use osx-64 (x86_64) even on ARM64 Macs.
+    # This runs under Rosetta 2 but ensures compatibility with packages
+    # that only have x86_64 wheels (e.g., embreex for trimesh raytracing).
     if sys.platform == "linux":
         lines.append('platforms = ["linux-64"]')
     elif sys.platform == "darwin":
-        if platform.machine() == "arm64":
-            lines.append('platforms = ["osx-arm64"]')
-        else:
-            lines.append('platforms = ["osx-64"]')
+        lines.append('platforms = ["osx-64"]')
     elif sys.platform == "win32":
         lines.append('platforms = ["win-64"]')
 
@@ -342,6 +342,7 @@ def create_pixi_toml(
     # Dependencies section (conda packages)
     lines.append("[dependencies]")
     lines.append(f'python = "{env_config.python}.*"')
+    lines.append('pip = "*"')  # Required for installing CUDA packages with --no-deps
 
     # On Windows, use MKL BLAS to avoid OpenBLAS crashes (numpy blas_fpe_check issue)
     if sys.platform == "win32":
