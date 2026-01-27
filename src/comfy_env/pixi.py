@@ -575,11 +575,19 @@ def pixi_install(
 
     # Run pixi install
     log("Running pixi install...")
+
+    # Build environment with custom vars from config
+    install_env = os.environ.copy()
+    if env_config.env_vars:
+        install_env.update(env_config.env_vars)
+        log(f"  Using custom env vars: {list(env_config.env_vars.keys())}")
+
     result = subprocess.run(
         [str(pixi_path), "install"],
         cwd=node_dir,
         capture_output=True,
         text=True,
+        env=install_env,
     )
 
     if result.returncode != 0:

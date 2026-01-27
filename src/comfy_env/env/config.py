@@ -156,6 +156,8 @@ class IsolatedEnv:
     conda: Optional["CondaConfig"] = None
     # Runtime isolation - run node FUNCTION methods in isolated subprocess
     isolated: bool = False
+    # Environment variables for install (e.g., CMAKE_ARGS for build flags)
+    env_vars: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate and normalize configuration."""

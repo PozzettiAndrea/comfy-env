@@ -575,6 +575,13 @@ def _parse_single_env(name: str, env_data: Dict[str, Any], base_dir: Path) -> Is
     # Parse isolated flag for runtime process isolation
     isolated = env_data.get("isolated", False)
 
+    # Parse environment variables section [envname.env]
+    env_vars = {}
+    env_section = env_data.get("env", {})
+    if isinstance(env_section, dict):
+        # Filter to only string/numeric values (avoid nested tables like cuda/packages)
+        env_vars = {k: str(v) for k, v in env_section.items() if isinstance(v, (str, int, float))}
+
     return IsolatedEnv(
         name=name,
         python=python,
@@ -587,6 +594,7 @@ def _parse_single_env(name: str, env_data: Dict[str, Any], base_dir: Path) -> Is
         darwin_requirements=darwin_reqs,
         conda=conda_config,
         isolated=isolated,
+        env_vars=env_vars,
     )
 
 
