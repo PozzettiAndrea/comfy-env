@@ -329,15 +329,10 @@ def create_pixi_toml(
     lines.append(f'name = "{env_config.name}"')
     lines.append('version = "0.1.0"')
 
-    # Channels - add pytorch channel, and nvidia if CUDA GPU detected
+    # Channels - use conda-forge only (pytorch channel is deprecated)
+    # PyTorch is installed via PyPI with extra-index-urls for proper CUDA version support
     base_channels = conda.channels or ["conda-forge"]
-    if env_config.cuda:
-        # GPU detected - add pytorch and nvidia channels for CUDA support
-        channels = ["pytorch", "nvidia"] + [ch for ch in base_channels if ch not in ["pytorch", "nvidia"]]
-    else:
-        # No GPU - just add pytorch channel for CPU-only pytorch
-        channels = ["pytorch"] + [ch for ch in base_channels if ch != "pytorch"]
-    channels_str = ", ".join(f'"{ch}"' for ch in channels)
+    channels_str = ", ".join(f'"{ch}"' for ch in base_channels)
     lines.append(f"channels = [{channels_str}]")
 
     # Platforms
@@ -364,20 +359,6 @@ def create_pixi_toml(
     lines.append("[dependencies]")
     lines.append(f'python = "{env_config.python}.*"')
     lines.append('pip = "*"')  # Required for installing CUDA packages with --no-deps
-
-    # Add PyTorch via conda
-    # - With GPU: pytorch + pytorch-cuda for CUDA support
-    # - No GPU: pytorch 2.8.0 CPU-only (default)
-    torch_version = env_config.pytorch_version or "2.8.0"
-    torch_parts = torch_version.split(".")
-    torch_mm = ".".join(torch_parts[:2])  # "2.8.0" -> "2.8"
-    lines.append(f'pytorch = "{torch_mm}.*"')
-
-    if env_config.cuda:
-        # GPU detected - add pytorch-cuda for CUDA runtime
-        cuda_parts = env_config.cuda.split(".")
-        cuda_mm = ".".join(cuda_parts[:2])  # "12.8" -> "12.8"
-        lines.append(f'pytorch-cuda = "{cuda_mm}"')
 
     # On Windows, use MKL BLAS to avoid OpenBLAS crashes (numpy blas_fpe_check issue)
     if sys.platform == "win32":
@@ -454,6 +435,23 @@ def create_pixi_toml(
         pypi_deps.extend(env_config.darwin_requirements)
     elif sys.platform == "win32" and env_config.windows_requirements:
         pypi_deps.extend(env_config.windows_requirements)
+
+    # PyPI options for PyTorch - use CUDA index for GPU, plain PyPI for CPU
+    # The pytorch conda channel is deprecated, so we use PyPI wheels
+    if env_config.cuda:
+        # GPU detected - use CUDA-enabled PyTorch wheels
+        cuda_parts = env_config.cuda.split(".")
+        cuda_short = "".join(cuda_parts[:2])  # "12.8" -> "128"
+        lines.append("[pypi-options]")
+        lines.append(f'extra-index-urls = ["https://download.pytorch.org/whl/cu{cuda_short}"]')
+        lines.append("")
+    # For CPU-only, no extra index needed - plain torch from PyPI works
+
+    # Add torch to pypi dependencies
+    torch_version = env_config.pytorch_version or "2.8.0"
+    torch_parts = torch_version.split(".")
+    torch_mm = ".".join(torch_parts[:2])  # "2.8.0" -> "2.8"
+    pypi_deps.insert(0, f"torch>={torch_mm},<{torch_parts[0]}.{int(torch_parts[1])+1}")
 
     if pypi_deps or special_deps:
         lines.append("[pypi-dependencies]")
