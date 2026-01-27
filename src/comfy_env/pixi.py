@@ -181,6 +181,97 @@ def _parse_pypi_requirement(dep: str) -> Tuple[str, Optional[str], List[str]]:
     return name, version_spec, extras
 
 
+def _build_cuda_vars(env_config: IsolatedEnv) -> dict:
+    """
+    Build variable dict for CUDA wheel URL resolution.
+
+    Returns a dict with CUDA, PyTorch, Python, and platform variables
+    for template substitution.
+    """
+    # Use fixed CUDA 12.8 / PyTorch 2.8 for pixi environments (modern GPU default)
+    vars_dict = {
+        "cuda_version": "12.8",
+        "cuda_short": "128",
+        "cuda_short2": "128",
+        "cuda_major": "12",
+        "torch_version": "2.8.0",
+        "torch_short": "280",
+        "torch_mm": "28",
+        "torch_dotted_mm": "2.8",
+    }
+
+    # Platform detection
+    if sys.platform == "linux":
+        vars_dict["platform"] = "linux_x86_64"
+    elif sys.platform == "darwin":
+        vars_dict["platform"] = "macosx_arm64" if platform.machine() == "arm64" else "macosx_x86_64"
+    elif sys.platform == "win32":
+        vars_dict["platform"] = "win_amd64"
+
+    # Python version from env config
+    if env_config.python:
+        py_parts = env_config.python.split(".")
+        py_major = py_parts[0]
+        py_minor = py_parts[1] if len(py_parts) > 1 else "0"
+        vars_dict["py_version"] = env_config.python
+        vars_dict["py_short"] = f"{py_major}{py_minor}"
+        vars_dict["py_minor"] = py_minor
+        vars_dict["py_tag"] = f"cp{py_major}{py_minor}"
+
+    return vars_dict
+
+
+def _resolve_cuda_wheel_url(
+    req: str,
+    vars_dict: dict,
+    log: Callable[[str], None] = print,
+) -> Optional[str]:
+    """
+    Resolve a CUDA package requirement to a wheel URL.
+
+    Args:
+        req: Package requirement (e.g., "cumesh" or "cumesh==0.0.1")
+        vars_dict: Variable dict for URL template substitution
+        log: Logging callback
+
+    Returns:
+        Resolved wheel URL, or None if package not in registry.
+    """
+    from .registry import PACKAGE_REGISTRY
+
+    # Parse requirement (e.g., "cumesh" or "cumesh==0.0.1")
+    if "==" in req:
+        pkg_name, version = req.split("==", 1)
+    else:
+        pkg_name = req
+        version = None
+
+    pkg_lower = pkg_name.lower()
+    if pkg_lower not in PACKAGE_REGISTRY:
+        log(f"  Warning: CUDA package {pkg_name} not in registry")
+        return None
+
+    config = PACKAGE_REGISTRY[pkg_lower]
+    template = config.get("wheel_template")
+    if not template:
+        log(f"  Warning: No wheel template for {pkg_name}")
+        return None
+
+    # Use version from requirement or default
+    v = version or config.get("default_version")
+    if v:
+        vars_dict = vars_dict.copy()  # Don't mutate original
+        vars_dict["version"] = v
+
+    # Resolve URL template
+    url = template
+    for key, value in vars_dict.items():
+        if value:
+            url = url.replace(f"{{{key}}}", str(value))
+
+    return url
+
+
 def create_pixi_toml(
     env_config: IsolatedEnv,
     node_dir: Path,
@@ -193,7 +284,11 @@ def create_pixi_toml(
     - Project metadata
     - Conda channels
     - Conda dependencies
-    - PyPI dependencies (from requirements + no_deps_requirements)
+    - PyPI dependencies (from requirements)
+
+    Note: CUDA packages (no_deps_requirements) are NOT included in pixi.toml.
+    They are installed separately with pip --no-deps after pixi install
+    to avoid transitive dependency conflicts.
 
     Args:
         env_config: The isolated environment configuration.
@@ -312,67 +407,9 @@ def create_pixi_toml(
     if env_config.requirements:
         pypi_deps.extend(env_config.requirements)
 
-    # Add CUDA packages with resolved wheel URLs
-    if env_config.no_deps_requirements:
-        from .registry import PACKAGE_REGISTRY
-
-        # Use fixed CUDA 12.8 / PyTorch 2.8 for pixi environments (modern GPU default)
-        # This ensures wheels match what pixi will install, not what the host has
-        vars_dict = {
-            "cuda_version": "12.8",
-            "cuda_short": "128",
-            "cuda_short2": "128",
-            "cuda_major": "12",
-            "torch_version": "2.8.0",
-            "torch_short": "280",
-            "torch_mm": "28",
-            "torch_dotted_mm": "2.8",
-        }
-
-        # Platform detection
-        if sys.platform == "linux":
-            vars_dict["platform"] = "linux_x86_64"
-        elif sys.platform == "darwin":
-            vars_dict["platform"] = "macosx_arm64" if platform.machine() == "arm64" else "macosx_x86_64"
-        elif sys.platform == "win32":
-            vars_dict["platform"] = "win_amd64"
-
-        # Python version from pixi env config
-        if env_config.python:
-            py_parts = env_config.python.split(".")
-            py_major = py_parts[0]
-            py_minor = py_parts[1] if len(py_parts) > 1 else "0"
-            vars_dict["py_version"] = env_config.python
-            vars_dict["py_short"] = f"{py_major}{py_minor}"
-            vars_dict["py_minor"] = py_minor
-            vars_dict["py_tag"] = f"cp{py_major}{py_minor}"
-
-        for req in env_config.no_deps_requirements:
-            # Parse requirement (e.g., "cumesh" or "cumesh==0.0.1")
-            if "==" in req:
-                pkg_name, version = req.split("==", 1)
-            else:
-                pkg_name = req
-                version = None
-
-            pkg_lower = pkg_name.lower()
-            if pkg_lower in PACKAGE_REGISTRY:
-                config = PACKAGE_REGISTRY[pkg_lower]
-                template = config.get("wheel_template")
-                if template:
-                    # Use version from requirement or default
-                    v = version or config.get("default_version")
-                    if v:
-                        vars_dict["version"] = v
-
-                    # Resolve URL
-                    url = template
-                    for key, value in vars_dict.items():
-                        if value:
-                            url = url.replace(f"{{{key}}}", str(value))
-
-                    special_deps[pkg_name] = f'{{ url = "{url}" }}'
-                    log(f"  CUDA package {pkg_name}: resolved wheel URL")
+    # NOTE: CUDA packages (no_deps_requirements) are NOT added to pixi.toml.
+    # They are installed separately with pip --no-deps after pixi install
+    # to avoid transitive dependency conflicts. See pixi_install().
 
     # Add platform-specific requirements
     if sys.platform == "linux" and env_config.linux_requirements:
@@ -556,6 +593,36 @@ def pixi_install(
                 log(f"  {line}")
 
     log("pixi install completed successfully!")
+
+    # Phase 2: Install CUDA packages with pip --no-deps
+    # These are kept out of pixi.toml to avoid transitive dependency conflicts
+    # Skip on macOS - CUDA is not supported
+    if env_config.no_deps_requirements:
+        if sys.platform == "darwin":
+            log("Skipping CUDA packages (not supported on macOS)")
+        else:
+            log("Installing CUDA packages with --no-deps...")
+            python_path = get_pixi_python(node_dir)
+            if not python_path:
+                raise RuntimeError("Failed to find Python in pixi environment")
+
+            vars_dict = _build_cuda_vars(env_config)
+
+            for req in env_config.no_deps_requirements:
+                url = _resolve_cuda_wheel_url(req, vars_dict, log)
+                if url:
+                    log(f"  Installing {req} (--no-deps)...")
+                    result = subprocess.run(
+                        [str(python_path), "-m", "pip", "install", "--no-deps", url],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.returncode != 0:
+                        log(f"  Failed to install {req}:")
+                        log(result.stderr)
+                        raise RuntimeError(f"Failed to install {req} with --no-deps: {result.stderr}")
+                else:
+                    log(f"  Warning: Could not resolve wheel URL for {req}, skipping")
 
     # Create _env_{name} link for compatibility with uv backend
     # This ensures code that expects _env_envname/bin/python works with pixi
