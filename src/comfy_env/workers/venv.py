@@ -41,7 +41,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .base import Worker, WorkerError
+from ..pixi import get_pixi_path
 
+# Debug logging (set COMFY_ENV_DEBUG=1 to enable)
+_DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
 # =============================================================================
 # Socket IPC utilities - cross-platform with TCP fallback
@@ -614,16 +617,21 @@ from types import SimpleNamespace
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
+# Debug logging (set COMFY_ENV_DEBUG=1 to enable)
+_DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+
 # Pre-import bpy FIRST to avoid DLL conflicts with numpy/torch/MKL
 # bpy's DLLs must be loaded before other packages load conflicting versions
 try:
     import bpy
-    print("[worker] Pre-imported bpy successfully", file=sys.stderr, flush=True)
+    if _DEBUG:
+        print("[worker] Pre-imported bpy successfully", file=sys.stderr, flush=True)
 except ImportError as e:
     # bpy not available in this environment - that's fine
     pass
 except Exception as e:
-    print(f"[worker] bpy pre-import warning: {e}", file=sys.stderr, flush=True)
+    if _DEBUG:
+        print(f"[worker] bpy pre-import warning: {e}", file=sys.stderr, flush=True)
 
 # Watchdog: dump all thread stacks every 60 seconds to catch hangs
 import threading
@@ -656,7 +664,8 @@ def _watchdog():
 
 _watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
 _watchdog_thread.start()
-print(f"[worker] Watchdog started, logging to: {_watchdog_log}", flush=True)
+if _DEBUG:
+    print(f"[worker] Watchdog started, logging to: {_watchdog_log}", flush=True)
 
 # File-based logging for debugging (persists even if stdout/stderr are swallowed)
 import tempfile
@@ -676,14 +685,15 @@ def wlog(msg):
 
 wlog(f"[worker] === Worker starting, log file: {_worker_log_file} ===")
 
-# Debug: print PATH at startup
-_path_sep = ";" if sys.platform == "win32" else ":"
-_path_parts = os.environ.get("PATH", "").split(_path_sep)
-print(f"[worker] PATH has {len(_path_parts)} entries:", file=sys.stderr, flush=True)
-for _i, _p in enumerate(_path_parts[:15]):
-    print(f"[worker]   [{_i}] {_p}", file=sys.stderr, flush=True)
-if len(_path_parts) > 15:
-    print(f"[worker]   ... and {len(_path_parts) - 15} more", file=sys.stderr, flush=True)
+# Debug: print PATH at startup (only if debug enabled)
+if _DEBUG:
+    _path_sep = ";" if sys.platform == "win32" else ":"
+    _path_parts = os.environ.get("PATH", "").split(_path_sep)
+    print(f"[worker] PATH has {len(_path_parts)} entries:", file=sys.stderr, flush=True)
+    for _i, _p in enumerate(_path_parts[:15]):
+        print(f"[worker]   [{_i}] {_p}", file=sys.stderr, flush=True)
+    if len(_path_parts) > 15:
+        print(f"[worker]   ... and {len(_path_parts) - 15} more", file=sys.stderr, flush=True)
 
 # On Windows, add host Python's DLL directories so packages like opencv can find VC++ runtime
 if sys.platform == "win32":
@@ -1199,7 +1209,8 @@ class PersistentVenvWorker(Worker):
         # For pixi environments, use "pixi run python" to get proper environment activation
         # (CONDA_PREFIX, Library paths, etc.) which fixes DLL loading issues with bpy
         is_pixi = '.pixi' in str(self.python)
-        print(f"[PersistentVenvWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
+        if _DEBUG:
+            print(f"[PersistentVenvWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
             # Find pixi project root (parent of .pixi directory)
             pixi_project = self.python
@@ -1207,10 +1218,14 @@ class PersistentVenvWorker(Worker):
                 pixi_project = pixi_project.parent
             pixi_project = pixi_project.parent  # Go up from .pixi to project root
             pixi_toml = pixi_project / "pixi.toml"
-            print(f"[PersistentVenvWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
+            if _DEBUG:
+                print(f"[PersistentVenvWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
 
             if pixi_toml.exists():
-                cmd = ["pixi", "run", "--manifest-path", str(pixi_toml),
+                pixi_exe = get_pixi_path()
+                if pixi_exe is None:
+                    raise WorkerError("pixi not found - required for isolated environment execution")
+                cmd = [str(pixi_exe), "run", "--manifest-path", str(pixi_toml),
                        "python", str(self._worker_script), self._socket_addr]
                 # Clean PATH to remove ct-env entries that have conflicting DLLs
                 # Pixi will add its own environment paths
@@ -1230,15 +1245,16 @@ class PersistentVenvWorker(Worker):
             cmd = [str(self.python), str(self._worker_script), self._socket_addr]
             launch_env = env
 
-        print(f"[PersistentVenvWorker] launching cmd={cmd[:3]}...", flush=True)
-        if launch_env:
-            path_sep = ";" if sys.platform == "win32" else ":"
-            path_parts = launch_env.get("PATH", "").split(path_sep)
-            print(f"[PersistentVenvWorker] PATH has {len(path_parts)} entries:", flush=True)
-            for i, p in enumerate(path_parts[:10]):  # Show first 10
-                print(f"[PersistentVenvWorker]   [{i}] {p}", flush=True)
-            if len(path_parts) > 10:
-                print(f"[PersistentVenvWorker]   ... and {len(path_parts) - 10} more", flush=True)
+        if _DEBUG:
+            print(f"[PersistentVenvWorker] launching cmd={cmd[:3]}...", flush=True)
+            if launch_env:
+                path_sep = ";" if sys.platform == "win32" else ":"
+                path_parts = launch_env.get("PATH", "").split(path_sep)
+                print(f"[PersistentVenvWorker] PATH has {len(path_parts)} entries:", flush=True)
+                for i, p in enumerate(path_parts[:10]):  # Show first 10
+                    print(f"[PersistentVenvWorker]   [{i}] {p}", flush=True)
+                if len(path_parts) > 10:
+                    print(f"[PersistentVenvWorker]   ... and {len(path_parts) - 10} more", flush=True)
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -1389,12 +1405,15 @@ class PersistentVenvWorker(Worker):
             Return value of the method.
         """
         import sys
-        print(f"[PersistentVenvWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
+        if _DEBUG:
+            print(f"[PersistentVenvWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
 
         with self._lock:
-            print(f"[PersistentVenvWorker] acquired lock, ensuring started...", file=sys.stderr, flush=True)
+            if _DEBUG:
+                print(f"[PersistentVenvWorker] acquired lock, ensuring started...", file=sys.stderr, flush=True)
             self._ensure_started()
-            print(f"[PersistentVenvWorker] worker started/confirmed", file=sys.stderr, flush=True)
+            if _DEBUG:
+                print(f"[PersistentVenvWorker] worker started/confirmed", file=sys.stderr, flush=True)
 
             timeout = timeout or 600.0
             call_id = str(uuid.uuid4())[:8]
@@ -1406,11 +1425,14 @@ class PersistentVenvWorker(Worker):
             try:
                 # Serialize kwargs
                 if kwargs:
-                    print(f"[PersistentVenvWorker] serializing kwargs...", file=sys.stderr, flush=True)
+                    if _DEBUG:
+                        print(f"[PersistentVenvWorker] serializing kwargs...", file=sys.stderr, flush=True)
                     serialized_kwargs = _serialize_for_ipc(kwargs)
-                    print(f"[PersistentVenvWorker] saving to {inputs_path}...", file=sys.stderr, flush=True)
+                    if _DEBUG:
+                        print(f"[PersistentVenvWorker] saving to {inputs_path}...", file=sys.stderr, flush=True)
                     torch.save(serialized_kwargs, str(inputs_path))
-                    print(f"[PersistentVenvWorker] saved inputs", file=sys.stderr, flush=True)
+                    if _DEBUG:
+                        print(f"[PersistentVenvWorker] saved inputs", file=sys.stderr, flush=True)
 
                 # Send request with class info
                 request = {
@@ -1422,9 +1444,11 @@ class PersistentVenvWorker(Worker):
                     "inputs_path": str(inputs_path) if kwargs else None,
                     "outputs_path": str(outputs_path),
                 }
-                print(f"[PersistentVenvWorker] sending request via socket...", file=sys.stderr, flush=True)
+                if _DEBUG:
+                    print(f"[PersistentVenvWorker] sending request via socket...", file=sys.stderr, flush=True)
                 response = self._send_request(request, timeout)
-                print(f"[PersistentVenvWorker] got response: {response.get('status')}", file=sys.stderr, flush=True)
+                if _DEBUG:
+                    print(f"[PersistentVenvWorker] got response: {response.get('status')}", file=sys.stderr, flush=True)
 
                 if response.get("status") == "error":
                     raise WorkerError(
