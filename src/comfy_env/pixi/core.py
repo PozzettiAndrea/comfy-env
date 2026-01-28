@@ -172,7 +172,6 @@ def pixi_install(
     cfg: ComfyEnvConfig,
     node_dir: Path,
     log: Callable[[str], None] = print,
-    create_env_link: bool = False,
 ) -> bool:
     """
     Install all packages via pixi.
@@ -188,7 +187,6 @@ def pixi_install(
         cfg: ComfyEnvConfig with packages to install.
         node_dir: Directory to install in.
         log: Logging callback.
-        create_env_link: If True, create _env_<name> symlink for isolation.
 
     Returns:
         True if installation succeeded.
@@ -217,8 +215,30 @@ def pixi_install(
         else:
             log("Warning: CUDA packages requested but no GPU detected")
 
+    # Install system dependencies on Linux (OpenGL, build tools)
+    if sys.platform == "linux":
+        log("Installing system dependencies...")
+        subprocess.run(
+            ["sudo", "apt-get", "update"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["sudo", "apt-get", "install", "-y",
+             "python3-dev",      # Build deps for C extensions
+             "libgl1-mesa-glx",  # OpenGL
+             "libglu1-mesa",     # GLU
+            ],
+            capture_output=True,
+        )
+
     # Clean previous artifacts
     clean_pixi_artifacts(node_dir, log)
+
+    # Create .pixi/config.toml to ensure inline (non-detached) environments
+    pixi_config_dir = node_dir / ".pixi"
+    pixi_config_dir.mkdir(parents=True, exist_ok=True)
+    pixi_config_file = pixi_config_dir / "config.toml"
+    pixi_config_file.write_text("detached-environments = false\n")
 
     # Ensure pixi is installed
     pixi_path = ensure_pixi(log=log)
@@ -323,28 +343,6 @@ def pixi_install(
                 raise RuntimeError(f"CUDA package install failed: {result.stderr}")
 
         log("CUDA packages installed")
-
-    # Create symlink/junction to _env_<name> for discovery (only for isolated subdirs)
-    if create_env_link:
-        env_dir = node_dir / ".pixi" / "envs" / "default"
-        env_link = node_dir / f"_env_{node_dir.name}"
-        if env_dir.exists():
-            # Remove existing link/dir if present
-            if env_link.is_symlink() or env_link.exists():
-                if env_link.is_symlink():
-                    env_link.unlink()
-                else:
-                    shutil.rmtree(env_link)
-            # Create symlink (Linux/Mac) or junction (Windows)
-            if sys.platform == "win32":
-                # Use junction on Windows
-                subprocess.run(
-                    ["cmd", "/c", "mklink", "/J", str(env_link), str(env_dir)],
-                    capture_output=True,
-                )
-            else:
-                env_link.symlink_to(env_dir)
-            log(f"Linked: {env_link.name} -> .pixi/envs/default")
 
     log("Installation complete!")
     return True

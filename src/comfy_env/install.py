@@ -151,7 +151,7 @@ def _install_isolated_subdirs(
             log(f"  (dry run)")
             continue
 
-        pixi_install(sub_cfg, sub_dir, log, create_env_link=True)
+        pixi_install(sub_cfg, sub_dir, log)
 
 
 def verify_installation(
