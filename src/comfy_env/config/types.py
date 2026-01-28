@@ -53,6 +53,9 @@ class ComfyEnvConfig:
     # [cuda] - CUDA packages (installed via find-links index)
     cuda_packages: List[str] = field(default_factory=list)
 
+    # [apt] - System packages to install via apt (Linux only)
+    apt_packages: List[str] = field(default_factory=list)
+
     # [node_reqs] - other ComfyUI nodes to clone
     node_reqs: List[NodeReq] = field(default_factory=list)
 

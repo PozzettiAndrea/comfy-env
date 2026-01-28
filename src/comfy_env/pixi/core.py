@@ -215,19 +215,12 @@ def pixi_install(
         else:
             log("Warning: CUDA packages requested but no GPU detected")
 
-    # Install system dependencies on Linux (OpenGL, build tools)
-    if sys.platform == "linux":
-        log("Installing system dependencies...")
+    # Install system dependencies on Linux via apt
+    if sys.platform == "linux" and cfg.apt_packages:
+        log(f"Installing apt packages: {cfg.apt_packages}")
+        subprocess.run(["sudo", "apt-get", "update"], capture_output=True)
         subprocess.run(
-            ["sudo", "apt-get", "update"],
-            capture_output=True,
-        )
-        subprocess.run(
-            ["sudo", "apt-get", "install", "-y",
-             "python3-dev",      # Build deps for C extensions
-             "libgl1-mesa-glx",  # OpenGL
-             "libglu1-mesa",     # GLU
-            ],
+            ["sudo", "apt-get", "install", "-y"] + cfg.apt_packages,
             capture_output=True,
         )
 

@@ -49,7 +49,7 @@ from .types import ComfyEnvConfig, NodeReq
 CONFIG_FILE_NAME = "comfy-env.toml"
 
 # Sections we handle specially (not passed through to pixi.toml)
-CUSTOM_SECTIONS = {"python", "cuda", "node_reqs"}
+CUSTOM_SECTIONS = {"python", "cuda", "node_reqs", "apt"}
 
 
 def load_config(path: Path) -> ComfyEnvConfig:
@@ -116,6 +116,10 @@ def _parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
     cuda_data = data.pop("cuda", {})
     cuda_packages = _ensure_list(cuda_data.get("packages", []))
 
+    # Extract [apt] section
+    apt_data = data.pop("apt", {})
+    apt_packages = _ensure_list(apt_data.get("packages", []))
+
     # Extract [node_reqs] section
     node_reqs_data = data.pop("node_reqs", {})
     node_reqs = _parse_node_reqs(node_reqs_data)
@@ -126,6 +130,7 @@ def _parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
     return ComfyEnvConfig(
         python=python_version,
         cuda_packages=cuda_packages,
+        apt_packages=apt_packages,
         node_reqs=node_reqs,
         pixi_passthrough=pixi_passthrough,
     )
