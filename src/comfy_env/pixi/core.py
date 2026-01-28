@@ -321,7 +321,7 @@ def pixi_install(
         pip_cmd = [
             str(python_path), "-m", "pip", "install",
             "--no-deps",
-            "--find-links", CUDA_WHEELS_INDEX,
+            "--index-url", CUDA_WHEELS_INDEX,
         ] + cfg.cuda_packages
 
         result = subprocess.run(pip_cmd, capture_output=True, text=True)

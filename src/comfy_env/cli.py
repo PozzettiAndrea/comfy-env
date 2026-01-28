@@ -6,9 +6,7 @@ Provides the `comfy-env` command with subcommands:
 - generate: Generate pixi.toml from comfy-env.toml
 - install: Install dependencies from config
 - info: Show runtime environment information
-- resolve: Show resolved wheel URLs
 - doctor: Verify installation
-- list-packages: Show all packages in the built-in registry
 
 Usage:
     comfy-env init ---> creates template comfy-env.toml
@@ -18,12 +16,7 @@ Usage:
 
     comfy-env info
 
-    comfy-env resolve nvdiffrast==0.4.0
-    comfy-env resolve --all
-
     comfy-env doctor
-
-    comfy-env list-packages
 """
 
 import argparse
@@ -109,28 +102,6 @@ def main(args: Optional[List[str]] = None) -> int:
         help="Output as JSON",
     )
 
-    # resolve command
-    resolve_parser = subparsers.add_parser(
-        "resolve",
-        help="Resolve wheel URLs for packages",
-        description="Show resolved wheel URLs without installing",
-    )
-    resolve_parser.add_argument(
-        "packages",
-        nargs="*",
-        help="Package specs (e.g., nvdiffrast==0.4.0)",
-    )
-    resolve_parser.add_argument(
-        "--all", "-a",
-        action="store_true",
-        help="Resolve all packages from config",
-    )
-    resolve_parser.add_argument(
-        "--config", "-c",
-        type=str,
-        help="Path to config file",
-    )
-
     # doctor command
     doctor_parser = subparsers.add_parser(
         "doctor",
@@ -148,18 +119,6 @@ def main(args: Optional[List[str]] = None) -> int:
         help="Path to config file",
     )
 
-    # list-packages command
-    list_parser = subparsers.add_parser(
-        "list-packages",
-        help="Show all packages in the built-in registry",
-        description="List CUDA packages that comfy-env knows how to install",
-    )
-    list_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as JSON",
-    )
-
     parsed = parser.parse_args(args)
 
     if parsed.command is None:
@@ -175,12 +134,8 @@ def main(args: Optional[List[str]] = None) -> int:
             return cmd_install(parsed)
         elif parsed.command == "info":
             return cmd_info(parsed)
-        elif parsed.command == "resolve":
-            return cmd_resolve(parsed)
         elif parsed.command == "doctor":
             return cmd_doctor(parsed)
-        elif parsed.command == "list-packages":
-            return cmd_list_packages(parsed)
         else:
             parser.print_help()
             return 1
@@ -206,7 +161,7 @@ cuda_version = "auto"
 pytorch_version = "auto"
 
 [environment.cuda]
-# CUDA packages from comfy-env registry
+# CUDA packages from https://pozzettiandrea.github.io/cuda-wheels/
 # Example: nvdiffrast = "0.4.0"
 
 [environment.packages]
@@ -332,95 +287,6 @@ def cmd_info(args) -> int:
     return 0
 
 
-def cmd_resolve(args) -> int:
-    """Handle resolve command."""
-    from .pixi import RuntimeEnv, parse_wheel_requirement
-    from .pixi import PACKAGE_REGISTRY
-    from .pixi.registry import get_cuda_short2
-    from .config.parser import discover_env_config, load_env_from_file
-
-    env = RuntimeEnv.detect()
-    packages = []
-
-    # Get packages from args or config
-    if args.all or (not args.packages and args.config):
-        if args.config:
-            config = load_env_from_file(Path(args.config))
-        else:
-            config = discover_env_config(Path.cwd())
-
-        if config and config.no_deps_requirements:
-            packages = config.no_deps_requirements
-        else:
-            print("No CUDA packages found in config", file=sys.stderr)
-            return 1
-    elif args.packages:
-        packages = args.packages
-    else:
-        print("Specify packages or use --all with a config file", file=sys.stderr)
-        return 1
-
-    print(f"Resolving wheels for: {env}")
-    print("=" * 60)
-
-    # Build template variables
-    vars_dict = env.as_dict()
-    if env.cuda_version:
-        vars_dict["cuda_short2"] = get_cuda_short2(env.cuda_version)
-
-    all_ok = True
-    for pkg_spec in packages:
-        package, version = parse_wheel_requirement(pkg_spec)
-        pkg_lower = package.lower()
-
-        try:
-            if pkg_lower in PACKAGE_REGISTRY:
-                config = PACKAGE_REGISTRY[pkg_lower]
-
-                if "wheel_template" in config:
-                    # Direct wheel URL template
-                    effective_version = version or config.get("default_version")
-                    if not effective_version:
-                        print(f"  {package}: No version specified (no default in registry)")
-                        all_ok = False
-                        continue
-
-                    vars_dict["version"] = effective_version
-                    url = _substitute_template(config["wheel_template"], vars_dict)
-                    print(f"  {package}=={effective_version}: resolved")
-                    print(f"    {url}")
-
-                elif "package_name" in config:
-                    # PyPI variant (e.g., spconv-cu124)
-                    pkg_name = _substitute_template(config["package_name"], vars_dict)
-                    pkg_spec = f"{pkg_name}=={version}" if version else pkg_name
-                    print(f"  {package}: installs as {pkg_spec} from PyPI")
-
-                else:
-                    print(f"  {package}: no wheel_template or package_name in registry")
-                    all_ok = False
-            else:
-                print(f"  {package}: NOT in registry")
-                print(f"    Add to [wheel_sources] in comfy-env.toml:")
-                print(f'    {package} = "https://example.com/{package}-{{version}}+cu{{cuda_short}}-{{py_tag}}-{{platform}}.whl"')
-                all_ok = False
-
-        except Exception as e:
-            print(f"  {package}: FAILED - {e}")
-            all_ok = False
-
-    return 0 if all_ok else 1
-
-
-def _substitute_template(template: str, vars_dict: dict) -> str:
-    """Substitute {var} placeholders in template."""
-    result = template
-    for key, value in vars_dict.items():
-        if value is not None:
-            result = result.replace(f"{{{key}}}", str(value))
-    return result
-
-
 def cmd_doctor(args) -> int:
     """Handle doctor command."""
     from .install import verify_installation
@@ -464,73 +330,6 @@ def cmd_doctor(args) -> int:
     else:
         print("  No packages to verify (no config found)")
         return 0
-
-
-def cmd_list_packages(args) -> int:
-    """Handle list-packages command."""
-    from .pixi import PACKAGE_REGISTRY
-
-    if args.json:
-        import json
-        result = {}
-        for name, config in PACKAGE_REGISTRY.items():
-            result[name] = {
-                "description": config.get("description", ""),
-            }
-            if "wheel_template" in config:
-                result[name]["wheel_template"] = config["wheel_template"]
-            if "package_name" in config:
-                result[name]["package_name"] = config["package_name"]
-            if "default_version" in config:
-                result[name]["default_version"] = config["default_version"]
-        print(json.dumps(result, indent=2))
-        return 0
-
-    print("Built-in CUDA Package Registry")
-    print("=" * 60)
-    print()
-    print("These packages can be installed by adding them to comfy-env.toml:")
-    print()
-    print("  [cuda]")
-    print('  nvdiffrast = "0.4.0"')
-    print('  torch-scatter = "2.1.2"')
-    print()
-    print("Or override with custom wheel source:")
-    print()
-    print("  [wheel_sources]")
-    print('  nvdiffrast = "https://my-mirror.com/nvdiffrast-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"')
-    print()
-    print("-" * 60)
-
-    # Group by type
-    wheel_template_packages = []
-    package_name_packages = []
-
-    for name, config in PACKAGE_REGISTRY.items():
-        desc = config.get("description", "")
-        default = config.get("default_version", "")
-        if "wheel_template" in config:
-            wheel_template_packages.append((name, desc, default))
-        elif "package_name" in config:
-            package_name_packages.append((name, desc, config["package_name"]))
-
-    if wheel_template_packages:
-        print("\nDirect wheel URL packages:")
-        for name, desc, default in sorted(wheel_template_packages):
-            version_info = f" (default: {default})" if default else ""
-            print(f"  {name:20} - {desc}{version_info}")
-
-    if package_name_packages:
-        print("\nPyPI variant packages:")
-        for name, desc, pkg_template in sorted(package_name_packages):
-            print(f"  {name:20} - {desc}")
-            print(f"                       installs as: {pkg_template}")
-
-    print()
-    print("Template variables: {version}, {cuda_short}, {torch_mm}, {py_tag}, {platform}")
-    print("See README for full documentation on writing wheel templates.")
-    print()
-    return 0
 
 
 if __name__ == "__main__":

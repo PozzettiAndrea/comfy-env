@@ -13,7 +13,6 @@ from .core import (
     clean_pixi_artifacts,
     CUDA_WHEELS_INDEX,
 )
-from .registry import PACKAGE_REGISTRY
 from .cuda_detection import (
     detect_cuda_version,
     detect_cuda_environment,
@@ -24,6 +23,7 @@ from .cuda_detection import (
     GPUInfo,
     CUDAEnvironment,
 )
+from .resolver import RuntimeEnv
 
 __all__ = [
     # Core pixi functions
@@ -34,8 +34,6 @@ __all__ = [
     "pixi_install",
     "clean_pixi_artifacts",
     "CUDA_WHEELS_INDEX",
-    # Registry
-    "PACKAGE_REGISTRY",
     # CUDA detection
     "detect_cuda_version",
     "detect_cuda_environment",
@@ -45,4 +43,6 @@ __all__ = [
     "get_recommended_cuda_version",
     "GPUInfo",
     "CUDAEnvironment",
+    # Resolver
+    "RuntimeEnv",
 ]

@@ -32,7 +32,6 @@ from .pixi import (
     pixi_run,
     pixi_install,
     CUDA_WHEELS_INDEX,
-    PACKAGE_REGISTRY,
     detect_cuda_version,
     detect_cuda_environment,
     get_recommended_cuda_version,
@@ -88,7 +87,6 @@ __all__ = [
     "pixi_run",
     "pixi_install",
     "CUDA_WHEELS_INDEX",
-    "PACKAGE_REGISTRY",
     # CUDA detection
     "detect_cuda_version",
     "detect_cuda_environment",

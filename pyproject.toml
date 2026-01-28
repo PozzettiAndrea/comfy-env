@@ -22,7 +22,6 @@ dependencies = [
     "tomli>=2.0.0; python_version < '3.11'",  # TOML parsing (built-in tomllib for 3.11+)
     "tomli-w>=1.0.0",  # TOML writing (no stdlib equivalent)
     "uv>=0.4.0",  # Fast Python package installer and venv creator
-    "pyyaml>=6.0",  # YAML parsing for wheel_sources.yml
 ]
 
 [project.optional-dependencies]
@@ -42,9 +41,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/comfy_env"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/comfy_env/pixi/wheel_sources.yml" = "comfy_env/pixi/wheel_sources.yml"
 
 [tool.ruff]
 line-length = 100
