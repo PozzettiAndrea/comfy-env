@@ -67,6 +67,7 @@ def _get_worker(
     working_dir: Path,
     sys_path: list[str],
     lib_path: Optional[str] = None,
+    env_vars: Optional[dict] = None,
 ):
     """Get or create a persistent worker for the isolated environment."""
     cache_key = str(env_dir)
@@ -106,11 +107,14 @@ def _get_worker(
 
             print(f"[comfy-env] Starting isolated worker (MPWorker)")
             print(f"[comfy-env]   Env: {env_dir}")
+            if env_vars:
+                print(f"[comfy-env]   env_vars: {', '.join(f'{k}={v}' for k, v in env_vars.items())}")
 
             worker = MPWorker(
                 name=working_dir.name,
                 sys_path=sys_path,
                 lib_path=lib_path,
+                env_vars=env_vars,
             )
 
         _workers[cache_key] = worker
@@ -187,6 +191,7 @@ def _wrap_node_class(
     working_dir: Path,
     sys_path: list[str],
     lib_path: Optional[str] = None,
+    env_vars: Optional[dict] = None,
 ) -> type:
     """
     Wrap a node class so its FUNCTION method runs in the isolated environment.
@@ -232,7 +237,7 @@ def _wrap_node_class(
             print(f"[comfy-env] PROXY CALLED: {cls.__name__}.{func_name}", flush=True)
             print(f"[comfy-env]   kwargs keys: {list(kwargs.keys())}", flush=True)
 
-        worker = _get_worker(env_dir, working_dir, sys_path, lib_path)
+        worker = _get_worker(env_dir, working_dir, sys_path, lib_path, env_vars)
         if _DEBUG:
             print(f"[comfy-env]   worker alive: {worker.is_alive()}", flush=True)
 
@@ -322,6 +327,20 @@ def wrap_isolated_nodes(
         print(f"[comfy-env] Warning: No comfy-env.toml in {nodes_dir}")
         return node_class_mappings
 
+    # Read env_vars from comfy-env.toml
+    env_vars = {}
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
+        with open(config_file, "rb") as f:
+            config = tomllib.load(f)
+        env_vars_data = config.get("env_vars", {})
+        env_vars = {str(k): str(v) for k, v in env_vars_data.items()}
+    except Exception:
+        pass  # Ignore errors reading config
+
     # Find environment directory and paths
     env_dir = _find_env_dir(nodes_dir)
     site_packages, lib_dir = _find_env_paths(nodes_dir)
@@ -342,10 +361,12 @@ def wrap_isolated_nodes(
     print(f"[comfy-env]   site-packages: {site_packages}")
     if lib_path:
         print(f"[comfy-env]   lib: {lib_path}")
+    if env_vars:
+        print(f"[comfy-env]   env_vars: {', '.join(f'{k}={v}' for k, v in env_vars.items())}")
 
     # Wrap all node classes
     for node_name, node_cls in node_class_mappings.items():
         if hasattr(node_cls, "FUNCTION"):
-            _wrap_node_class(node_cls, env_dir, nodes_dir, sys_path, lib_path)
+            _wrap_node_class(node_cls, env_dir, nodes_dir, sys_path, lib_path, env_vars)
 
     return node_class_mappings

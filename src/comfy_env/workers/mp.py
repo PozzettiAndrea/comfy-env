@@ -40,7 +40,7 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
-def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None):
+def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, env_vars=None):
     """
     Worker process main loop.
 
@@ -56,10 +56,15 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None):
         queue_out: Output queue for sending results
         sys_path_additions: Paths to add to sys.path
         lib_path: Path to add to LD_LIBRARY_PATH (for conda libraries)
+        env_vars: Environment variables to set (from comfy-env.toml)
     """
     import os
     import sys
     from pathlib import Path
+
+    # Apply env_vars FIRST (before any library imports that might check them)
+    if env_vars:
+        os.environ.update(env_vars)
 
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
@@ -424,7 +429,7 @@ class MPWorker(Worker):
     interpreter without inherited state from the parent.
     """
 
-    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None, lib_path: Optional[str] = None):
+    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None, lib_path: Optional[str] = None, env_vars: Optional[dict] = None):
         """
         Initialize the worker.
 
@@ -432,10 +437,12 @@ class MPWorker(Worker):
             name: Optional name for logging/debugging.
             sys_path: Optional list of paths to add to sys.path in worker process.
             lib_path: Optional path to add to LD_LIBRARY_PATH (for conda libraries).
+            env_vars: Optional environment variables to set in worker process.
         """
         self.name = name or "MPWorker"
         self._sys_path = sys_path or []
         self._lib_path = lib_path
+        self._env_vars = env_vars or {}
         self._process = None
         self._queue_in = None
         self._queue_out = None
@@ -504,7 +511,7 @@ class MPWorker(Worker):
             self._queue_out = ctx.Queue()
             self._process = ctx.Process(
                 target=_worker_loop,
-                args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path),
+                args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path, self._env_vars),
                 daemon=True,
             )
             self._process.start()
