@@ -55,7 +55,11 @@ def install(
             "Create comfy-env.toml to define dependencies."
         )
 
-    # Install node dependencies first
+    # Install apt packages first (Linux only)
+    if cfg.apt_packages:
+        _install_apt_packages(cfg.apt_packages, log, dry_run)
+
+    # Install node dependencies
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
 
@@ -67,6 +71,66 @@ def install(
 
     log("\nInstallation complete!")
     return True
+
+
+def _install_apt_packages(
+    packages: List[str],
+    log: Callable[[str], None],
+    dry_run: bool,
+) -> None:
+    """Install apt packages (Linux only)."""
+    import os
+    import platform
+    import shutil
+    import subprocess
+
+    if platform.system() != "Linux":
+        log(f"[apt] Skipping apt packages (not Linux)")
+        return
+
+    log(f"\n[apt] Installing {len(packages)} system package(s):")
+    for pkg in packages:
+        log(f"  - {pkg}")
+
+    if dry_run:
+        log("  (dry run - no changes made)")
+        return
+
+    # Determine if we need sudo
+    is_root = os.geteuid() == 0
+    has_sudo = shutil.which("sudo") is not None
+    use_sudo = not is_root and has_sudo
+    prefix = ["sudo"] if use_sudo else []
+
+    if not is_root and not has_sudo:
+        log(f"[apt] Warning: No root access. Install manually:")
+        log(f"  sudo apt-get update && sudo apt-get install -y {' '.join(packages)}")
+        return
+
+    # Run apt-get update (suppress output, just show errors)
+    log("[apt] Updating package lists...")
+    result = subprocess.run(
+        prefix + ["apt-get", "update"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        log(f"[apt] Warning: apt-get update failed: {result.stderr.strip()}")
+
+    # Run apt-get install
+    log(f"[apt] Installing packages...")
+    result = subprocess.run(
+        prefix + ["apt-get", "install", "-y"] + packages,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode == 0:
+        log("[apt] System packages installed successfully!")
+    else:
+        log(f"[apt] Warning: Installation failed: {result.stderr.strip()}")
+        log(f"[apt] You may need to install manually:")
+        log(f"  sudo apt-get install -y {' '.join(packages)}")
 
 
 def _install_node_dependencies(
