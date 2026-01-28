@@ -9,10 +9,12 @@ See: https://pixi.sh/
 
 import copy
 import platform
+import re
 import shutil
 import stat
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -28,14 +30,8 @@ PIXI_URLS = {
     ("Windows", "AMD64"): "https://github.com/prefix-dev/pixi/releases/latest/download/pixi-x86_64-pc-windows-msvc.exe",
 }
 
-# CUDA wheels index
+# CUDA wheels index (includes flash-attn, PyG packages, and custom wheels)
 CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
-
-# Flash attention pre-built wheels (mjun0812)
-FLASH_ATTN_INDEX = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.7.16"
-
-# PyTorch Geometric wheels index
-PYG_WHEELS_INDEX = "https://data.pyg.org/whl/"
 
 # CUDA version -> PyTorch version mapping
 CUDA_TORCH_MAP = {
@@ -44,19 +40,87 @@ CUDA_TORCH_MAP = {
     "12.1": "2.4",
 }
 
+def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
+    """
+    Query cuda-wheels index to find a wheel matching the CUDA/torch version.
+    Returns the full version spec (e.g., "flash-attn===2.8.3+cu128torch2.8") or None.
+    """
+    cuda_short = cuda_version.replace(".", "")[:3]  # "12.8" -> "128"
+    torch_short = torch_version.replace(".", "")[:2]  # "2.8" -> "28"
+
+    # Try different directory name variants
+    pkg_variants = [package, package.replace("-", "_"), package.replace("_", "-")]
+
+    for pkg_dir in pkg_variants:
+        url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                html = resp.read().decode("utf-8")
+        except Exception:
+            continue
+
+        # Parse wheel filenames from href attributes
+        # Pattern: package_name-version+localversion-cpXX-cpXX-platform.whl
+        wheel_pattern = re.compile(
+            r'href="[^"]*?([^"/]+\.whl)"',
+            re.IGNORECASE
+        )
+
+        # Local version patterns to match:
+        # flash-attn style: +cu128torch2.8
+        # PyG style: +pt28cu128
+        local_patterns = [
+            f"+cu{cuda_short}torch{torch_version}",  # flash-attn style
+            f"+pt{torch_short}cu{cuda_short}",       # PyG style
+        ]
+
+        best_match = None
+        best_version = None
+
+        for match in wheel_pattern.finditer(html):
+            wheel_name = match.group(1)
+            # URL decode
+            wheel_name = wheel_name.replace("%2B", "+")
+
+            # Check if wheel matches our CUDA/torch version
+            for local_pattern in local_patterns:
+                if local_pattern in wheel_name:
+                    # Extract version from wheel name
+                    # Format: name-version+local-cpXX-cpXX-platform.whl
+                    parts = wheel_name.split("-")
+                    if len(parts) >= 2:
+                        version_part = parts[1]  # e.g., "2.8.3+cu128torch2.8"
+                        if best_version is None or version_part > best_version:
+                            best_version = version_part
+                            best_match = f"{package}==={version_part}"
+                    break
+
+        if best_match:
+            return best_match
+
+    return None
+
+
+def get_package_spec(package: str, torch_version: str, cuda_version: str) -> str:
+    """
+    Get package spec with local version for CUDA/torch compatibility.
+    Queries the index to find matching wheels dynamically.
+    """
+    spec = find_matching_wheel(package, torch_version, cuda_version)
+    return spec if spec else package
+
 
 def get_all_find_links(package: str, torch_version: str, cuda_version: str) -> list:
     """Get all find-links URLs for a CUDA package."""
-    cuda_short = cuda_version.replace(".", "")[:3]
-
-    return [
-        # cuda-wheels index (package-specific page)
-        f"{CUDA_WHEELS_INDEX}{package}/",
-        # flash-attn GitHub releases
-        FLASH_ATTN_INDEX,
-        # PyG index (torch version specific)
-        f"{PYG_WHEELS_INDEX}torch-{torch_version}.0+cu{cuda_short}.html",
-    ]
+    # Try both underscore and hyphen variants since directory naming is inconsistent
+    pkg_underscore = package.replace("-", "_")
+    pkg_hyphen = package.replace("_", "-")
+    urls = [f"{CUDA_WHEELS_INDEX}{package}/"]
+    if pkg_underscore != package:
+        urls.append(f"{CUDA_WHEELS_INDEX}{pkg_underscore}/")
+    if pkg_hyphen != package:
+        urls.append(f"{CUDA_WHEELS_INDEX}{pkg_hyphen}/")
+    return urls
 
 
 def get_current_platform() -> str:
@@ -340,6 +404,7 @@ def pixi_install(
         for package in cfg.cuda_packages:
             pip_cmd = [
                 str(python_path), "-m", "pip", "install",
+                "--no-index",  # Only use --find-links, don't query PyPI
                 "--no-deps",
                 "--no-cache-dir",
             ]
@@ -348,8 +413,10 @@ def pixi_install(
             for url in get_all_find_links(package, torch_version, cuda_version):
                 pip_cmd.extend(["--find-links", url])
 
-            log(f"  Installing {package}")
-            pip_cmd.append(package)
+            # Get package spec with local version for CUDA/torch compatibility
+            pkg_spec = get_package_spec(package, torch_version, cuda_version)
+            log(f"  Installing {pkg_spec}")
+            pip_cmd.append(pkg_spec)
             result = subprocess.run(pip_cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 log(f"CUDA package install failed for {package}:\n{result.stderr}")
