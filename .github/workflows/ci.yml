@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for non-ASCII characters
+        run: |
+          # Find non-ASCII characters in Python files (breaks Windows cp1252 encoding)
+          if grep -rn '[^\x00-\x7F]' --include="*.py" .; then
+            echo "::error::Found non-ASCII characters in Python files. Use ASCII only for Windows compatibility."
+            exit 1
+          fi
+          echo "No non-ASCII characters found."

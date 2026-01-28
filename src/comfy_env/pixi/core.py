@@ -211,7 +211,7 @@ def pixi_install(
         if cuda_version:
             cuda_mm = ".".join(cuda_version.split(".")[:2])
             torch_version = CUDA_TORCH_MAP.get(cuda_mm, "2.8")
-            log(f"Detected CUDA {cuda_version} → PyTorch {torch_version}")
+            log(f"Detected CUDA {cuda_version} -> PyTorch {torch_version}")
         else:
             log("Warning: CUDA packages requested but no GPU detected")
 
