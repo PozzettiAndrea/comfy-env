@@ -64,14 +64,37 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None):
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
 
-    # Set LD_LIBRARY_PATH for conda libraries (must be done before imports)
-    if lib_path:
-        if sys.platform == "win32":
-            # Windows: add to PATH for DLL loading
-            os.environ["PATH"] = lib_path + ";" + os.environ.get("PATH", "")
-        else:
-            # Linux/Mac: LD_LIBRARY_PATH
-            os.environ["LD_LIBRARY_PATH"] = lib_path + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+    # DLL/library isolation - match SubprocessWorker's isolation level
+    # Filter out conflicting paths from conda/mamba/etc and use proper DLL registration
+    path_sep = ";" if sys.platform == "win32" else ":"
+
+    if sys.platform == "win32":
+        # Use os.add_dll_directory() for explicit DLL registration (Python 3.8+)
+        if lib_path and hasattr(os, "add_dll_directory"):
+            try:
+                os.add_dll_directory(lib_path)
+            except Exception:
+                pass
+
+        # Filter conflicting paths from PATH (matches subprocess.py:1203-1212)
+        current_path = os.environ.get("PATH", "")
+        clean_parts = [
+            p for p in current_path.split(path_sep)
+            if not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda", "mingw"))
+        ]
+        if lib_path:
+            clean_parts.insert(0, lib_path)
+        os.environ["PATH"] = path_sep.join(clean_parts)
+    else:
+        # Linux/Mac: Filter LD_LIBRARY_PATH with same patterns
+        current = os.environ.get("LD_LIBRARY_PATH", "")
+        clean_parts = [
+            p for p in current.split(path_sep) if p
+            and not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+        ]
+        if lib_path:
+            clean_parts.insert(0, lib_path)
+        os.environ["LD_LIBRARY_PATH"] = path_sep.join(clean_parts)
 
     # Find ComfyUI base and add to sys.path for real folder_paths/comfy modules
     # This works because comfy.options.args_parsing=False by default, so folder_paths
