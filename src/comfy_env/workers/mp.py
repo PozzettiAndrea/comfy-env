@@ -40,7 +40,44 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
-def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, env_vars=None):
+def _dump_worker_env(worker_name: str = "unknown"):
+    """Dump worker environment to .comfy-env/logs/ for debugging."""
+    import json
+    import os
+    import platform
+    import sys
+    from datetime import datetime
+    from pathlib import Path
+
+    log_dir = Path.cwd() / ".comfy-env" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    debug_info = {
+        "timestamp": datetime.now().isoformat(),
+        "worker_name": worker_name,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version,
+            "prefix": sys.prefix,
+        },
+        "platform": {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "release": platform.release(),
+        },
+        "env_vars": dict(os.environ),
+        "sys_path": sys.path,
+        "modules_loaded": sorted(sys.modules.keys()),
+    }
+
+    log_file = log_dir / f"worker_{worker_name}_{os.getpid()}.json"
+    log_file.write_text(json.dumps(debug_info, indent=2, default=str))
+    print(f"[comfy-env] Worker env dumped to: {log_file}")
+
+
+def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, env_vars=None, worker_name=None):
     """
     Worker process main loop.
 
@@ -57,6 +94,7 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
         sys_path_additions: Paths to add to sys.path
         lib_path: Path to add to LD_LIBRARY_PATH (for conda libraries)
         env_vars: Environment variables to set (from comfy-env.toml)
+        worker_name: Name of the worker (for logging)
     """
     import os
     import sys
@@ -68,6 +106,10 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
 
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
+
+    # Debug logging if enabled
+    if os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes"):
+        _dump_worker_env(worker_name or "unknown")
 
     # DLL/library isolation - match SubprocessWorker's isolation level
     # Filter out conflicting paths from conda/mamba/etc and use proper DLL registration
@@ -511,7 +553,7 @@ class MPWorker(Worker):
             self._queue_out = ctx.Queue()
             self._process = ctx.Process(
                 target=_worker_loop,
-                args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path, self._env_vars),
+                args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path, self._env_vars, self.name),
                 daemon=True,
             )
             self._process.start()
