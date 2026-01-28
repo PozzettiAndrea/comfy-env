@@ -31,12 +31,32 @@ PIXI_URLS = {
 # CUDA wheels index
 CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
 
+# Flash attention pre-built wheels (mjun0812)
+FLASH_ATTN_INDEX = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.7.16"
+
+# PyTorch Geometric wheels index
+PYG_WHEELS_INDEX = "https://data.pyg.org/whl/"
+
 # CUDA version -> PyTorch version mapping
 CUDA_TORCH_MAP = {
     "12.8": "2.8",
     "12.4": "2.4",
     "12.1": "2.4",
 }
+
+
+def get_all_find_links(package: str, torch_version: str, cuda_version: str) -> list:
+    """Get all find-links URLs for a CUDA package."""
+    cuda_short = cuda_version.replace(".", "")[:3]
+
+    return [
+        # cuda-wheels index (package-specific page)
+        f"{CUDA_WHEELS_INDEX}{package}/",
+        # flash-attn GitHub releases
+        FLASH_ATTN_INDEX,
+        # PyG index (torch version specific)
+        f"{PYG_WHEELS_INDEX}torch-{torch_version}.0+cu{cuda_short}.html",
+    ]
 
 
 def get_current_platform() -> str:
@@ -310,7 +330,7 @@ def pixi_install(
         log(f"pixi install failed:\n{result.stderr}")
         raise RuntimeError(f"pixi install failed: {result.stderr}")
 
-    # Install CUDA packages with --no-index --find-links (bypasses PyPI completely)
+    # Install CUDA packages with --find-links (searches all known sources)
     if cfg.cuda_packages and cuda_version:
         log(f"Installing CUDA packages: {cfg.cuda_packages}")
         python_path = get_pixi_python(node_dir)
@@ -318,18 +338,18 @@ def pixi_install(
             raise RuntimeError("Could not find Python in pixi environment")
 
         for package in cfg.cuda_packages:
-            # Each package has its own find-links page at CUDA_WHEELS_INDEX/<package>/
-            find_links_url = f"{CUDA_WHEELS_INDEX}{package}/"
-            log(f"  Installing {package} from {find_links_url}")
-
             pip_cmd = [
                 str(python_path), "-m", "pip", "install",
-                "--no-index",
                 "--no-deps",
                 "--no-cache-dir",
-                "--find-links", find_links_url,
-                package,
             ]
+
+            # Add all find-links sources
+            for url in get_all_find_links(package, torch_version, cuda_version):
+                pip_cmd.extend(["--find-links", url])
+
+            log(f"  Installing {package}")
+            pip_cmd.append(package)
             result = subprocess.run(pip_cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 log(f"CUDA package install failed for {package}:\n{result.stderr}")
