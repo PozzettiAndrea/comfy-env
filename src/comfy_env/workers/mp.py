@@ -430,20 +430,68 @@ class MPWorker(Worker):
             return
 
         # Import torch here to avoid import at module level
+        import os
+        import sys
+
+        # Clear conda/pixi environment variables FIRST, before importing multiprocessing
+        # These can cause the child process to pick up the wrong Python interpreter
+        # or stdlib, leading to sys.version mismatch errors in platform module
+        conda_env_vars = [
+            'CONDA_PREFIX',
+            'CONDA_DEFAULT_ENV',
+            'CONDA_PYTHON_EXE',
+            'CONDA_EXE',
+            'CONDA_SHLVL',
+            'PYTHONHOME',
+            'PYTHONPATH',  # Also clear PYTHONPATH to prevent pixi paths
+            '_CE_CONDA',
+            '_CE_M',
+        ]
+        saved_env = {}
+        for var in conda_env_vars:
+            if var in os.environ:
+                saved_env[var] = os.environ.pop(var)
+
+        # Also remove pixi paths from LD_LIBRARY_PATH
+        ld_lib = os.environ.get('LD_LIBRARY_PATH', '')
+        if '.pixi' in ld_lib:
+            saved_env['LD_LIBRARY_PATH'] = ld_lib
+            # Filter out pixi paths
+            new_ld_lib = ':'.join(p for p in ld_lib.split(':') if '.pixi' not in p)
+            if new_ld_lib:
+                os.environ['LD_LIBRARY_PATH'] = new_ld_lib
+            else:
+                os.environ.pop('LD_LIBRARY_PATH', None)
+
         import torch.multiprocessing as mp
 
-        # Use spawn to get clean subprocess (no inherited CUDA context)
-        ctx = mp.get_context('spawn')
+        try:
+            # Use spawn to get clean subprocess (no inherited CUDA context)
+            ctx = mp.get_context('spawn')
 
-        self._queue_in = ctx.Queue()
-        self._queue_out = ctx.Queue()
-        self._process = ctx.Process(
-            target=_worker_loop,
-            args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path),
-            daemon=True,
-        )
-        self._process.start()
-        self._started = True
+            # Explicitly set the spawn executable to the current Python
+            # This prevents pixi/conda from hijacking the spawn process
+            import multiprocessing.spawn as mp_spawn
+            original_exe = mp_spawn.get_executable()
+            if original_exe != sys.executable.encode() and original_exe != sys.executable:
+                print(f"[comfy-env] Warning: spawn executable was {original_exe}, forcing to {sys.executable}")
+            mp_spawn.set_executable(sys.executable)
+
+            self._queue_in = ctx.Queue()
+            self._queue_out = ctx.Queue()
+            self._process = ctx.Process(
+                target=_worker_loop,
+                args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path),
+                daemon=True,
+            )
+            self._process.start()
+            self._started = True
+
+            # Restore original executable setting
+            mp_spawn.set_executable(original_exe)
+        finally:
+            # Restore env vars in parent process
+            os.environ.update(saved_env)
 
     def call(
         self,

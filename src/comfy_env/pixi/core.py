@@ -252,24 +252,10 @@ def pixi_install(
     dependencies.setdefault("pip", "*")  # Always include pip
     pixi_data["dependencies"] = dependencies
 
-    # Add pypi-options for CUDA wheels
+    # Add pypi-options for PyTorch index (CUDA packages installed separately via pip)
     if cfg.has_cuda and cuda_version:
         pypi_options = pixi_data.get("pypi-options", {})
-        # Merge find-links (pixi expects [{url: "..."}, ...] format)
-        find_links = pypi_options.get("find-links", [])
-        existing_urls = {
-            entry.get("url") if isinstance(entry, dict) else entry
-            for entry in find_links
-        }
-        if CUDA_WHEELS_INDEX not in existing_urls:
-            find_links.append({"url": CUDA_WHEELS_INDEX})
-        # Normalize any plain strings to {url: ...} format
-        find_links = [
-            {"url": entry} if isinstance(entry, str) else entry
-            for entry in find_links
-        ]
-        pypi_options["find-links"] = find_links
-        # Merge extra-index-urls
+        # Add PyTorch CUDA index for torch installation
         cuda_short = cuda_version.replace(".", "")[:3]
         pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_short}"
         extra_urls = pypi_options.get("extra-index-urls", [])
@@ -311,23 +297,31 @@ def pixi_install(
         log(f"pixi install failed:\n{result.stderr}")
         raise RuntimeError(f"pixi install failed: {result.stderr}")
 
-    # Install CUDA packages with --no-deps (avoids PyPI version conflicts)
+    # Install CUDA packages with --no-index --find-links (bypasses PyPI completely)
     if cfg.cuda_packages and cuda_version:
-        log(f"Installing CUDA packages with --no-deps: {cfg.cuda_packages}")
+        log(f"Installing CUDA packages: {cfg.cuda_packages}")
         python_path = get_pixi_python(node_dir)
         if not python_path:
             raise RuntimeError("Could not find Python in pixi environment")
 
-        pip_cmd = [
-            str(python_path), "-m", "pip", "install",
-            "--no-deps",
-            "--index-url", CUDA_WHEELS_INDEX,
-        ] + cfg.cuda_packages
+        for package in cfg.cuda_packages:
+            # Each package has its own find-links page at CUDA_WHEELS_INDEX/<package>/
+            find_links_url = f"{CUDA_WHEELS_INDEX}{package}/"
+            log(f"  Installing {package} from {find_links_url}")
 
-        result = subprocess.run(pip_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            log(f"CUDA package install failed:\n{result.stderr}")
-            raise RuntimeError(f"CUDA package install failed: {result.stderr}")
+            pip_cmd = [
+                str(python_path), "-m", "pip", "install",
+                "--no-index",
+                "--no-deps",
+                "--no-cache-dir",
+                "--find-links", find_links_url,
+                package,
+            ]
+            result = subprocess.run(pip_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                log(f"CUDA package install failed for {package}:\n{result.stderr}")
+                raise RuntimeError(f"CUDA package install failed: {result.stderr}")
+
         log("CUDA packages installed")
 
     # Create symlink/junction to _env_<name> for discovery (only for isolated subdirs)
