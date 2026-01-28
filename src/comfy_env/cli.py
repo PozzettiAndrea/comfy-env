@@ -119,6 +119,23 @@ def main(args: Optional[List[str]] = None) -> int:
         help="Path to config file",
     )
 
+    # apt-install command
+    apt_parser = subparsers.add_parser(
+        "apt-install",
+        help="Install system packages from [apt] section (Linux only)",
+        description="Read [apt] packages from comfy-env.toml and install via apt-get",
+    )
+    apt_parser.add_argument(
+        "--config", "-c",
+        type=str,
+        help="Path to comfy-env.toml (default: auto-discover)",
+    )
+    apt_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be installed without installing",
+    )
+
     parsed = parser.parse_args(args)
 
     if parsed.command is None:
@@ -136,6 +153,8 @@ def main(args: Optional[List[str]] = None) -> int:
             return cmd_info(parsed)
         elif parsed.command == "doctor":
             return cmd_doctor(parsed)
+        elif parsed.command == "apt-install":
+            return cmd_apt_install(parsed)
         else:
             parser.print_help()
             return 1
@@ -330,6 +349,83 @@ def cmd_doctor(args) -> int:
     else:
         print("  No packages to verify (no config found)")
         return 0
+
+
+def cmd_apt_install(args) -> int:
+    """Handle apt-install command - install system packages from [apt] section."""
+    import os
+    import shutil
+    import subprocess
+    import platform
+
+    if platform.system() != "Linux":
+        print("apt-install is only supported on Linux", file=sys.stderr)
+        return 1
+
+    # Find config
+    if args.config:
+        config_path = Path(args.config).resolve()
+    else:
+        config_path = Path.cwd() / "comfy-env.toml"
+
+    if not config_path.exists():
+        print(f"Config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    # Parse config to get apt packages
+    from .config.parser import load_config
+    config = load_config(config_path)
+
+    if not config.apt_packages:
+        print("No [apt] packages specified in config")
+        return 0
+
+    packages = config.apt_packages
+    print(f"Found {len(packages)} apt package(s) to install:")
+    for pkg in packages:
+        print(f"  - {pkg}")
+
+    # Determine if we need sudo
+    is_root = os.geteuid() == 0
+    has_sudo = shutil.which("sudo") is not None
+    use_sudo = not is_root and has_sudo
+
+    prefix = ["sudo"] if use_sudo else []
+
+    if args.dry_run:
+        print("\n[Dry run] Would run:")
+        prefix_str = "sudo " if use_sudo else ""
+        print(f"  {prefix_str}apt-get update && {prefix_str}apt-get install -y {' '.join(packages)}")
+        return 0
+
+    if not is_root and not has_sudo:
+        print("\nError: Need root privileges to install apt packages.", file=sys.stderr)
+        print("Run manually with:", file=sys.stderr)
+        print(f"  sudo apt-get update && sudo apt-get install -y {' '.join(packages)}", file=sys.stderr)
+        return 1
+
+    # Run apt-get update
+    print("\nUpdating package lists...")
+    result = subprocess.run(
+        prefix + ["apt-get", "update"],
+        capture_output=False,
+    )
+    if result.returncode != 0:
+        print("Warning: apt-get update failed, continuing anyway...")
+
+    # Run apt-get install
+    print(f"\nInstalling: {' '.join(packages)}")
+    result = subprocess.run(
+        prefix + ["apt-get", "install", "-y"] + packages,
+        capture_output=False,
+    )
+
+    if result.returncode == 0:
+        print("\nSystem packages installed successfully!")
+        return 0
+    else:
+        print("\nFailed to install some packages", file=sys.stderr)
+        return result.returncode
 
 
 if __name__ == "__main__":

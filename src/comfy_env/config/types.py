@@ -56,6 +56,9 @@ class ComfyEnvConfig:
     # [apt] - System packages to install via apt (Linux only)
     apt_packages: List[str] = field(default_factory=list)
 
+    # [env_vars] - Environment variables to set early (in prestartup)
+    env_vars: Dict[str, str] = field(default_factory=dict)
+
     # [node_reqs] - other ComfyUI nodes to clone
     node_reqs: List[NodeReq] = field(default_factory=list)
 

@@ -3,7 +3,7 @@
 # =============================================================================
 #
 # comfy-env.toml is a SUPERSET of pixi.toml. All pixi.toml syntax works here.
-# We add custom sections: [cuda], [node_reqs], and top-level `python = "x.x"`.
+# We add custom sections: [cuda], [node_reqs], [env_vars], and top-level `python = "x.x"`.
 #
 # GPU is auto-detected to select the right CUDA version.
 #
@@ -20,6 +20,21 @@
 # Omit this to use the host Python version.
 
 # python = "3.11"
+
+
+# =============================================================================
+# ENVIRONMENT VARIABLES (custom section)
+# =============================================================================
+# Environment variables applied early via setup_env() in prestartup_script.py.
+# Useful for OpenMP settings, library configs, etc. that must be set before imports.
+#
+# Requires prestartup_script.py in your node directory:
+#   from comfy_env import setup_env
+#   setup_env()
+
+[env_vars]
+# KMP_DUPLICATE_LIB_OK = "TRUE"    # Allow duplicate OpenMP libraries (macOS fix)
+# OMP_NUM_THREADS = "4"            # Limit OpenMP threads
 
 
 # =============================================================================
