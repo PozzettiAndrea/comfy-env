@@ -40,8 +40,8 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
-def _dump_worker_env(worker_name: str = "unknown"):
-    """Dump worker environment to .comfy-env/logs/ for debugging."""
+def _dump_worker_env(worker_name: str = "unknown", print_to_terminal: bool = False):
+    """Dump worker environment to .comfy-env/logs/ (always) and optionally print."""
     import json
     import os
     import platform
@@ -74,7 +74,18 @@ def _dump_worker_env(worker_name: str = "unknown"):
 
     log_file = log_dir / f"worker_{worker_name}_{os.getpid()}.json"
     log_file.write_text(json.dumps(debug_info, indent=2, default=str))
-    print(f"[comfy-env] Worker env dumped to: {log_file}")
+
+    if print_to_terminal:
+        print(f"[comfy-env] === WORKER ENV DEBUG: {worker_name} ===")
+        print(f"[comfy-env] Python: {sys.executable}")
+        print(f"[comfy-env] Version: {sys.version.split()[0]}")
+        print(f"[comfy-env] PID: {os.getpid()}, CWD: {os.getcwd()}")
+        for var in ['PATH', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'OMP_NUM_THREADS', 'KMP_DUPLICATE_LIB_OK']:
+            val = os.environ.get(var, '<unset>')
+            if len(val) > 100:
+                val = val[:100] + '...'
+            print(f"[comfy-env] {var}={val}")
+        print(f"[comfy-env] Env dumped to: {log_file}")
 
 
 def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, env_vars=None, worker_name=None):
@@ -107,9 +118,9 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
 
-    # Debug logging if enabled
-    if os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes"):
-        _dump_worker_env(worker_name or "unknown")
+    # Always dump env to file, print to terminal if debug enabled
+    print_debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+    _dump_worker_env(worker_name or "unknown", print_to_terminal=print_debug)
 
     # DLL/library isolation - match SubprocessWorker's isolation level
     # Filter out conflicting paths from conda/mamba/etc and use proper DLL registration
