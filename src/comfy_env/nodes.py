@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Set
 
 if TYPE_CHECKING:
-    from .env.config import NodeReq
+    from .config.types import NodeReq
 
 
 def normalize_repo_url(repo: str) -> str:
@@ -111,7 +111,7 @@ def install_node_deps(
         log: Logging callback
         visited: Set of already-processed node names (for cycle detection)
     """
-    from .env.config_file import discover_config
+    from .config.parser import discover_config
 
     for req in node_reqs:
         # Skip if already visited (cycle detection)

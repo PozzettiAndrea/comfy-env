@@ -16,7 +16,7 @@ class Worker(ABC):
 
     Workers should be used as context managers when possible:
 
-        with TorchMPWorker() as worker:
+        with MPWorker() as worker:
             result = worker.call(my_func, arg1, arg2)
     """
 

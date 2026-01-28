@@ -1,82 +1,85 @@
 # =============================================================================
 # comfy-env.toml - Environment configuration for ComfyUI custom nodes
-# Documentation: https://github.com/PozzettiAndrea/comfy-env
 # =============================================================================
 #
-# This file configures dependencies for your ComfyUI custom node.
-# comfy-env handles two main challenges:
-#   1. Installing CUDA packages that require compilation (nvdiffrast, pytorch3d, etc.)
-#   2. Running nodes in isolated environments with their own dependencies
+# comfy-env.toml is a SUPERSET of pixi.toml. All pixi.toml syntax works here.
+# We add custom sections: [cuda], [node_reqs], and top-level `python = "x.x"`.
+#
+# GPU is auto-detected to select the right CUDA version.
 #
 # Quick start:
 #   pip install comfy-env
 #   comfy-env init          # Creates this template
 #   comfy-env install       # Installs dependencies
-#   comfy-env doctor        # Verifies installation
 
 
 # =============================================================================
-# SYSTEM PACKAGES (optional)
+# PYTHON VERSION (optional)
 # =============================================================================
-# System-level packages installed via apt (Linux) before Python packages.
-# Useful for packages that need system libraries to compile or run.
+# Specify Python version for isolated environments (e.g., bpy needs Python 3.11)
+# Omit this to use the host Python version.
 
-[system]
-linux = []
-# Examples:
-# linux = ["libgl1", "libopengl0"]     # For OpenGL rendering (nvdiffrast)
-# linux = ["python3-dev"]               # For packages that compile C extensions
-# linux = ["ffmpeg"]                    # For video processing nodes
+# python = "3.11"
 
 
 # =============================================================================
-# CUDA PACKAGES
+# CUDA PACKAGES (custom section)
 # =============================================================================
-# CUDA packages from the built-in registry. These are pre-compiled wheels
-# that install without needing a compiler. Run `comfy-env list-packages`
-# to see all available packages.
+# Pre-compiled CUDA wheels from the cuda-wheels index.
+# Pixi auto-selects the right wheel based on your GPU.
+# Supports CUDA 12.8 → PyTorch 2.8 or CUDA 12.4 → PyTorch 2.4
 
 [cuda]
-# Use exact package names from `comfy-env list-packages` (hyphens vs underscores matter!)
-# nvdiffrast = "0.4.0"       # NVIDIA differentiable rasterizer
-# pytorch3d = "0.7.9"        # PyTorch3D - 3D deep learning
-# gsplat = "1.5.3"           # Gaussian splatting rasterization
-# torch-scatter = "2.1.2"    # PyG scatter operations
-# torch-cluster = "1.6.3"    # PyG clustering algorithms
-# flash-attn = "2.7.4"       # Flash Attention (Linux x86_64 only)
-# spconv = "2.3.8"           # Sparse convolution library
-# sageattention = "2.2.0"    # SageAttention - faster than FlashAttention
-# dpvo_cuda = "0.0.0"        # DPVO CUDA extensions
-
-
-# =============================================================================
-# REGULAR PACKAGES
-# =============================================================================
-# Standard pip packages (no special CUDA handling needed).
-
-[packages]
-requirements = []
+packages = []
 # Examples:
-# requirements = [
-#     "transformers>=4.56",
-#     "pillow",
-#     "opencv-python-headless",
-#     "trimesh",
+# packages = [
+#     "nvdiffrast",        # NVIDIA differentiable rasterizer
+#     "pytorch3d",         # PyTorch3D - 3D deep learning
+#     "gsplat",            # Gaussian splatting
+#     "cumesh",            # GPU mesh processing
+#     "flash-attn",        # Flash Attention (Linux only)
 # ]
 
 
 # =============================================================================
-# CUSTOM WHEEL SOURCES (optional)
+# CONDA PACKAGES (pixi-native)
 # =============================================================================
-# Override built-in wheel URLs or add packages not in the registry.
-# Template variables: {version}, {cuda_short}, {torch_mm}, {py_tag}, {platform}
+# Conda packages from conda-forge (includes system libraries).
+# Use this instead of apt/brew - works cross-platform.
 
-[wheel_sources]
-# my-custom-package = "https://my-server.com/my-package-{version}+cu{cuda_short}-{py_tag}-{platform}.whl"
+[dependencies]
+# mesalib = "*"           # OpenGL (replaces libgl1)
+# libglu = "*"            # GLU library
+# ffmpeg = "*"            # Video processing
+# cgal = "*"              # Computational geometry
 
 
 # =============================================================================
-# NODE DEPENDENCIES (optional)
+# PIP PACKAGES (pixi-native)
+# =============================================================================
+# Regular pip packages.
+
+[pypi-dependencies]
+# numpy = ">=1.21.0,<2"
+# trimesh = { version = ">=4.0.0", extras = ["easy"] }
+# pillow = "*"
+
+
+# =============================================================================
+# PLATFORM-SPECIFIC PACKAGES (pixi-native)
+# =============================================================================
+# Use pixi's target syntax for platform-specific packages.
+
+# [target.linux-64.pypi-dependencies]
+# embreex = "*"
+
+# [target.win-64.pypi-dependencies]
+# msvc-runtime = "*"
+# embreex = "*"
+
+
+# =============================================================================
+# NODE DEPENDENCIES (custom section)
 # =============================================================================
 # Other ComfyUI custom nodes this node depends on.
 
@@ -85,93 +88,31 @@ requirements = []
 # ComfyUI-Impact-Pack = "ltdrdata/ComfyUI-Impact-Pack"
 
 
-# #############################################################################
-#
-#                       PROCESS ISOLATION (ADVANCED)
-#
-# #############################################################################
-#
-# For nodes that need completely isolated dependencies (different Python
-# version, conda packages, conflicting native libraries), define an isolated
-# environment with `isolated = true`.
-#
-# RECOMMENDED: Pack-wide isolation (all nodes in one environment)
-# ----------------------------------------------------------------
-# This is the simplest approach - all your nodes run in the same isolated env.
-#
-# Step 1: Define environment in comfy-env.toml (this file)
-# Step 2: In __init__.py:
-#
-#     from comfy_env import setup_isolated_imports, enable_isolation
-#
-#     # Setup import stubs BEFORE importing nodes
-#     setup_isolated_imports(__file__)
-#
-#     from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-#
-#     # Enable isolation for all nodes
-#     enable_isolation(NODE_CLASS_MAPPINGS)
-#
 # =============================================================================
-
-
-# -----------------------------------------------------------------------------
-# Example: Full pack isolation with conda packages (RECOMMENDED)
-# -----------------------------------------------------------------------------
-# Uses pixi to create an isolated environment with conda + pip packages.
-
-# [mypack]
-# python = "3.11"
-# isolated = true           # Required for enable_isolation()
+# PROCESS ISOLATION
+# =============================================================================
 #
-# [mypack.conda]
-# channels = ["conda-forge"]
-# packages = ["cgal", "openmesh"]
+# For nodes needing isolated environments, put comfy-env.toml in a subdirectory:
 #
-# [mypack.packages]
-# requirements = ["trimesh[easy]>=4.0", "numpy", "scipy"]
-
-
-# -----------------------------------------------------------------------------
-# Example: Multiple isolated environments (per-node control)
-# -----------------------------------------------------------------------------
-# Use @isolated(env="envname") decorator when different nodes need different envs.
+#   ComfyUI-MyPack/
+#   ├── comfy-env.toml       # Root: installs to main env
+#   ├── __init__.py
+#   └── nodes/
+#       └── isolated/
+#           ├── comfy-env.toml   # Subdirectory: isolated env
+#           └── *.py
 #
-#     from comfy_env import isolated
+# In your nodes/__init__.py:
 #
-#     @isolated(env="env-preprocessing")
-#     class PreprocessNode: ...
+#   from pathlib import Path
+#   from comfy_env import wrap_isolated_nodes
 #
-#     @isolated(env="env-inference")
-#     class InferenceNode: ...
-
-# [env-preprocessing]
-# python = "3.11"
+#   NODE_CLASS_MAPPINGS = {}
 #
-# [env-preprocessing.packages]
-# requirements = ["opencv-python-headless", "pillow"]
-
-# [env-inference]
-# python = "3.10"
+#   from .main import NODE_CLASS_MAPPINGS as main_nodes
+#   NODE_CLASS_MAPPINGS.update(main_nodes)
 #
-# [env-inference.cuda]
-# torch-scatter = "2.1.2"
-
-
-# -----------------------------------------------------------------------------
-# Example: Platform-specific packages
-# -----------------------------------------------------------------------------
-# Different packages for Windows vs Linux.
-
-# [crossplatform]
-# python = "3.11"
-# isolated = true
-#
-# [crossplatform.packages]
-# requirements = ["numpy", "pillow"]
-#
-# [crossplatform.packages.windows]
-# requirements = ["pywin32"]
-#
-# [crossplatform.packages.linux]
-# requirements = ["python-xlib"]
+#   from .isolated import NODE_CLASS_MAPPINGS as isolated_nodes
+#   NODE_CLASS_MAPPINGS.update(
+#       wrap_isolated_nodes(isolated_nodes, Path(__file__).parent / "isolated")
+#   )

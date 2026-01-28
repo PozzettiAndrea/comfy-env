@@ -1,11 +1,11 @@
 """
-VenvWorker - Cross-venv isolation using subprocess + shared memory.
+SubprocessWorker - Cross-venv isolation using persistent subprocess + socket IPC.
 
 This worker supports calling functions in a different Python environment:
-- Uses subprocess.Popen to run in different venv
-- Transfers tensors via torch.save/load through /dev/shm (RAM-backed)
-- One memcpy per tensor per direction
-- ~100-500ms overhead per call (subprocess spawn + tensor I/O)
+- Uses a persistent subprocess to avoid spawn overhead
+- Socket-based IPC for commands/responses
+- Transfers tensors via torch.save/load over socket
+- ~50-100ms overhead per call
 
 Use this when you need:
 - Different PyTorch version
@@ -13,16 +13,17 @@ Use this when you need:
 - Different Python version
 
 Example:
-    worker = VenvWorker(
+    worker = SubprocessWorker(
         python="/path/to/other/venv/bin/python",
         working_dir="/path/to/code",
     )
 
-    # Call a function by module path
-    result = worker.call_module(
-        module="my_module",
-        func="my_function",
-        image=my_tensor,
+    # Call a method by module path
+    result = worker.call_method(
+        module_name="my_module",
+        class_name="MyClass",
+        method_name="process",
+        kwargs={"image": my_tensor},
     )
 """
 
@@ -185,7 +186,142 @@ class SocketTransport:
 
 
 # =============================================================================
-# Serialization helpers
+# Shared Memory Serialization
+# =============================================================================
+
+from multiprocessing import shared_memory as shm
+import numpy as np
+
+
+def _to_shm(obj, registry, visited=None):
+    """
+    Serialize object to shared memory. Returns JSON-safe metadata.
+
+    Args:
+        obj: Object to serialize
+        registry: List to track SharedMemory objects for cleanup
+        visited: Dict tracking already-serialized objects (cycle detection)
+    """
+    if visited is None:
+        visited = {}
+
+    obj_id = id(obj)
+    if obj_id in visited:
+        return visited[obj_id]
+
+    t = type(obj).__name__
+
+    # numpy array → direct shared memory
+    if t == 'ndarray':
+        arr = np.ascontiguousarray(obj)
+        block = shm.SharedMemory(create=True, size=arr.nbytes)
+        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+        registry.append(block)
+        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+        visited[obj_id] = result
+        return result
+
+    # torch.Tensor → convert to numpy → shared memory
+    if t == 'Tensor':
+        arr = obj.detach().cpu().numpy()
+        return _to_shm(arr, registry, visited)
+
+    # trimesh.Trimesh → vertices + faces arrays → shared memory
+    if t == 'Trimesh':
+        verts = np.ascontiguousarray(obj.vertices, dtype=np.float64)
+        faces = np.ascontiguousarray(obj.faces, dtype=np.int64)
+
+        v_block = shm.SharedMemory(create=True, size=verts.nbytes)
+        np.ndarray(verts.shape, verts.dtype, buffer=v_block.buf)[:] = verts
+        registry.append(v_block)
+
+        f_block = shm.SharedMemory(create=True, size=faces.nbytes)
+        np.ndarray(faces.shape, faces.dtype, buffer=f_block.buf)[:] = faces
+        registry.append(f_block)
+
+        result = {
+            "__shm_trimesh__": True,
+            "v_name": v_block.name, "v_shape": list(verts.shape),
+            "f_name": f_block.name, "f_shape": list(faces.shape),
+        }
+        visited[obj_id] = result
+        return result
+
+    # Path → string
+    from pathlib import PurePath
+    if isinstance(obj, PurePath):
+        return str(obj)
+
+    # dict
+    if isinstance(obj, dict):
+        result = {k: _to_shm(v, registry, visited) for k, v in obj.items()}
+        visited[obj_id] = result
+        return result
+
+    # list/tuple
+    if isinstance(obj, list):
+        result = [_to_shm(v, registry, visited) for v in obj]
+        visited[obj_id] = result
+        return result
+    if isinstance(obj, tuple):
+        result = [_to_shm(v, registry, visited) for v in obj]  # JSON doesn't have tuples
+        visited[obj_id] = result
+        return result
+
+    # primitives pass through
+    return obj
+
+
+def _from_shm(obj, unlink=True):
+    """Reconstruct object from shared memory metadata."""
+    if not isinstance(obj, dict):
+        if isinstance(obj, list):
+            return [_from_shm(v, unlink) for v in obj]
+        return obj
+
+    # numpy array
+    if "__shm_np__" in obj:
+        block = shm.SharedMemory(name=obj["__shm_np__"])
+        arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
+        block.close()
+        if unlink:
+            block.unlink()
+        return arr
+
+    # trimesh
+    if "__shm_trimesh__" in obj:
+        import trimesh
+        v_block = shm.SharedMemory(name=obj["v_name"])
+        verts = np.ndarray(tuple(obj["v_shape"]), dtype=np.float64, buffer=v_block.buf).copy()
+        v_block.close()
+        if unlink:
+            v_block.unlink()
+
+        f_block = shm.SharedMemory(name=obj["f_name"])
+        faces = np.ndarray(tuple(obj["f_shape"]), dtype=np.int64, buffer=f_block.buf).copy()
+        f_block.close()
+        if unlink:
+            f_block.unlink()
+
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    # regular dict - recurse
+    return {k: _from_shm(v, unlink) for k, v in obj.items()}
+
+
+def _cleanup_shm(registry):
+    """Unlink all shared memory blocks in registry."""
+    for block in registry:
+        try:
+            block.close()
+            block.unlink()
+        except Exception:
+            pass
+    registry.clear()
+
+
+# =============================================================================
+# Legacy Serialization helpers (for isolated objects)
 # =============================================================================
 
 
@@ -257,104 +393,6 @@ def _serialize_for_ipc(obj, visited=None):
     return obj
 
 
-# Worker script template - minimal, runs in target venv
-_WORKER_SCRIPT = '''
-import sys
-import os
-import json
-import traceback
-from types import SimpleNamespace
-
-# On Windows, add DLL directories for proper library loading
-if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-    _host_python_dir = os.environ.get("COMFYUI_HOST_PYTHON_DIR")
-    if _host_python_dir:
-        try:
-            os.add_dll_directory(_host_python_dir)
-            _dlls_dir = os.path.join(_host_python_dir, "DLLs")
-            if os.path.isdir(_dlls_dir):
-                os.add_dll_directory(_dlls_dir)
-        except Exception:
-            pass
-    _pixi_library_bin = os.environ.get("COMFYUI_PIXI_LIBRARY_BIN")
-    if _pixi_library_bin:
-        try:
-            os.add_dll_directory(_pixi_library_bin)
-        except Exception:
-            pass
-
-def _deserialize_isolated_objects(obj):
-    """Reconstruct objects serialized with __isolated_object__ marker."""
-    if isinstance(obj, dict):
-        if obj.get("__isolated_object__"):
-            # Reconstruct as SimpleNamespace (supports .attr access)
-            attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
-            ns = SimpleNamespace(**attrs)
-            ns.__class_name__ = obj.get("__class_name__", "Unknown")
-            return ns
-        return {k: _deserialize_isolated_objects(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_deserialize_isolated_objects(v) for v in obj]
-    elif isinstance(obj, tuple):
-        return tuple(_deserialize_isolated_objects(v) for v in obj)
-    return obj
-
-def main():
-    # Read request from file
-    request_path = sys.argv[1]
-    response_path = sys.argv[2]
-
-    with open(request_path, 'r') as f:
-        request = json.load(f)
-
-    try:
-        # Setup paths
-        for p in request.get("sys_path", []):
-            if p not in sys.path:
-                sys.path.insert(0, p)
-
-        # Import torch for tensor I/O
-        import torch
-
-        # Load inputs
-        inputs_path = request.get("inputs_path")
-        if inputs_path:
-            inputs = torch.load(inputs_path, weights_only=False)
-            inputs = _deserialize_isolated_objects(inputs)
-        else:
-            inputs = {}
-
-        # Import and call function
-        module_name = request["module"]
-        func_name = request["func"]
-
-        module = __import__(module_name, fromlist=[func_name])
-        func = getattr(module, func_name)
-
-        result = func(**inputs)
-
-        # Save outputs
-        outputs_path = request.get("outputs_path")
-        if outputs_path:
-            torch.save(result, outputs_path)
-
-        response = {"status": "ok"}
-
-    except Exception as e:
-        response = {
-            "status": "error",
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-        }
-
-    with open(response_path, 'w') as f:
-        json.dump(response, f)
-
-if __name__ == "__main__":
-    main()
-'''
-
-
 def _get_shm_dir() -> Path:
     """Get shared memory directory for efficient tensor transfer."""
     # Linux: /dev/shm is RAM-backed tmpfs
@@ -362,249 +400,6 @@ def _get_shm_dir() -> Path:
         return Path('/dev/shm')
     # Fallback to regular temp
     return Path(tempfile.gettempdir())
-
-
-class VenvWorker(Worker):
-    """
-    Worker using subprocess for cross-venv isolation.
-
-    This worker spawns a new Python process for each call, using
-    a different Python interpreter (from another venv). Tensors are
-    transferred via torch.save/load through shared memory.
-
-    For long-running workloads, consider using persistent mode which
-    keeps the subprocess alive between calls.
-    """
-
-    def __init__(
-        self,
-        python: Union[str, Path],
-        working_dir: Optional[Union[str, Path]] = None,
-        sys_path: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-        name: Optional[str] = None,
-        persistent: bool = True,
-    ):
-        """
-        Initialize the worker.
-
-        Args:
-            python: Path to Python executable in target venv.
-            working_dir: Working directory for subprocess.
-            sys_path: Additional paths to add to sys.path in subprocess.
-            env: Additional environment variables.
-            name: Optional name for logging.
-            persistent: If True, keep subprocess alive between calls (faster).
-        """
-        self.python = Path(python)
-        self.working_dir = Path(working_dir) if working_dir else Path.cwd()
-        self.sys_path = sys_path or []
-        self.extra_env = env or {}
-        self.name = name or f"VenvWorker({self.python.parent.parent.name})"
-        self.persistent = persistent
-
-        # Verify Python exists
-        if not self.python.exists():
-            raise FileNotFoundError(f"Python not found: {self.python}")
-
-        # Create temp directory for IPC files
-        self._temp_dir = Path(tempfile.mkdtemp(prefix='comfyui_venv_'))
-        self._shm_dir = _get_shm_dir()
-
-        # Persistent process state
-        self._process: Optional[subprocess.Popen] = None
-        self._shutdown = False
-
-        # Write worker script
-        self._worker_script = self._temp_dir / "worker.py"
-        self._worker_script.write_text(_WORKER_SCRIPT)
-
-    def call(
-        self,
-        func: Callable,
-        *args,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Any:
-        """
-        Execute a function - NOT SUPPORTED for VenvWorker.
-
-        VenvWorker cannot pickle arbitrary functions across venv boundaries.
-        Use call_module() instead to call functions by module path.
-
-        Raises:
-            NotImplementedError: Always.
-        """
-        raise NotImplementedError(
-            f"{self.name}: VenvWorker cannot call arbitrary functions. "
-            f"Use call_module(module='...', func='...', **kwargs) instead."
-        )
-
-    def call_module(
-        self,
-        module: str,
-        func: str,
-        timeout: Optional[float] = None,
-        **kwargs
-    ) -> Any:
-        """
-        Call a function by module path in the isolated venv.
-
-        Args:
-            module: Module name (e.g., "my_package.my_module").
-            func: Function name within the module.
-            timeout: Timeout in seconds (None = 600s default).
-            **kwargs: Keyword arguments passed to the function.
-                     Must be torch.save-compatible (tensors, dicts, etc.).
-
-        Returns:
-            Return value of module.func(**kwargs).
-
-        Raises:
-            WorkerError: If function raises an exception.
-            TimeoutError: If execution exceeds timeout.
-        """
-        if self._shutdown:
-            raise RuntimeError(f"{self.name}: Worker has been shut down")
-
-        timeout = timeout or 600.0  # 10 minute default
-
-        # Create unique ID for this call
-        call_id = str(uuid.uuid4())[:8]
-
-        # Paths for IPC (use shm for tensors, temp for json)
-        inputs_path = self._shm_dir / f"comfyui_venv_{call_id}_in.pt"
-        outputs_path = self._shm_dir / f"comfyui_venv_{call_id}_out.pt"
-        request_path = self._temp_dir / f"request_{call_id}.json"
-        response_path = self._temp_dir / f"response_{call_id}.json"
-
-        try:
-            # Save inputs via torch.save (handles tensors natively)
-            # Serialize custom objects with broken __module__ paths first
-            import torch
-            if kwargs:
-                serialized_kwargs = _serialize_for_ipc(kwargs)
-                torch.save(serialized_kwargs, str(inputs_path))
-
-            # Build request
-            request = {
-                "module": module,
-                "func": func,
-                "sys_path": [str(self.working_dir)] + self.sys_path,
-                "inputs_path": str(inputs_path) if kwargs else None,
-                "outputs_path": str(outputs_path),
-            }
-
-            request_path.write_text(json.dumps(request))
-
-            # Build environment
-            env = os.environ.copy()
-            env.update(self.extra_env)
-            env["COMFYUI_ISOLATION_WORKER"] = "1"
-
-            # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH (Linux)
-            lib_dir = self.python.parent.parent / "lib"
-            if lib_dir.is_dir():
-                existing = env.get("LD_LIBRARY_PATH", "")
-                env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
-
-            # On Windows, pass host Python directory and pixi Library/bin for DLL loading
-            if sys.platform == "win32":
-                env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
-
-                # For pixi environments with MKL, add Library/bin to PATH for DLL loading
-                # Pixi has python.exe directly in env dir, not in Scripts/
-                env_dir = self.python.parent
-                library_bin = env_dir / "Library" / "bin"
-                if library_bin.is_dir():
-                    existing_path = env.get("PATH", "")
-                    env["PATH"] = f"{env_dir};{library_bin};{existing_path}"
-                    env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin)
-                    # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
-                    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-                    # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
-                    env["PYTHONIOENCODING"] = "utf-8"
-
-            # Run subprocess
-            cmd = [
-                str(self.python),
-                str(self._worker_script),
-                str(request_path),
-                str(response_path),
-            ]
-
-            process = subprocess.Popen(
-                cmd,
-                cwd=str(self.working_dir),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                raise TimeoutError(f"{self.name}: Call timed out after {timeout}s")
-
-            # Check for process error
-            if process.returncode != 0:
-                raise WorkerError(
-                    f"Subprocess failed with code {process.returncode}",
-                    traceback=stderr.decode('utf-8', errors='replace'),
-                )
-
-            # Read response
-            if not response_path.exists():
-                raise WorkerError(
-                    f"No response file",
-                    traceback=stderr.decode('utf-8', errors='replace'),
-                )
-
-            response = json.loads(response_path.read_text())
-
-            if response["status"] == "error":
-                raise WorkerError(
-                    response.get("error", "Unknown error"),
-                    traceback=response.get("traceback"),
-                )
-
-            # Load result
-            if outputs_path.exists():
-                result = torch.load(str(outputs_path), weights_only=False)
-                return result
-            else:
-                return None
-
-        finally:
-            # Cleanup IPC files
-            for path in [inputs_path, outputs_path, request_path, response_path]:
-                try:
-                    if path.exists():
-                        path.unlink()
-                except:
-                    pass
-
-    def shutdown(self) -> None:
-        """Shut down the worker and clean up resources."""
-        if self._shutdown:
-            return
-
-        self._shutdown = True
-
-        # Clean up temp directory
-        try:
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
-        except:
-            pass
-
-    def is_alive(self) -> bool:
-        """VenvWorker spawns fresh process per call, so always 'alive' if not shutdown."""
-        return not self._shutdown
-
-    def __repr__(self):
-        return f"<VenvWorker name={self.name!r} python={self.python}>"
 
 
 # Persistent worker script - runs as __main__ in the venv Python subprocess
@@ -723,6 +518,99 @@ if sys.platform == "win32":
             wlog(f"[worker] Failed to add pixi Library/bin: {e}")
 
 # =============================================================================
+# Shared Memory Serialization
+# =============================================================================
+
+from multiprocessing import shared_memory as shm
+import numpy as np
+
+def _to_shm(obj, registry, visited=None):
+    """Serialize to shared memory. Returns JSON-safe metadata."""
+    if visited is None:
+        visited = {}
+    obj_id = id(obj)
+    if obj_id in visited:
+        return visited[obj_id]
+    t = type(obj).__name__
+
+    if t == 'ndarray':
+        arr = np.ascontiguousarray(obj)
+        block = shm.SharedMemory(create=True, size=arr.nbytes)
+        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+        registry.append(block)
+        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+        visited[obj_id] = result
+        return result
+
+    if t == 'Tensor':
+        arr = obj.detach().cpu().numpy()
+        return _to_shm(arr, registry, visited)
+
+    if t == 'Trimesh':
+        verts = np.ascontiguousarray(obj.vertices, dtype=np.float64)
+        faces = np.ascontiguousarray(obj.faces, dtype=np.int64)
+
+        v_block = shm.SharedMemory(create=True, size=verts.nbytes)
+        np.ndarray(verts.shape, verts.dtype, buffer=v_block.buf)[:] = verts
+        registry.append(v_block)
+
+        f_block = shm.SharedMemory(create=True, size=faces.nbytes)
+        np.ndarray(faces.shape, faces.dtype, buffer=f_block.buf)[:] = faces
+        registry.append(f_block)
+
+        result = {
+            "__shm_trimesh__": True,
+            "v_name": v_block.name, "v_shape": list(verts.shape),
+            "f_name": f_block.name, "f_shape": list(faces.shape),
+        }
+        visited[obj_id] = result
+        return result
+
+    if isinstance(obj, dict):
+        result = {k: _to_shm(v, registry, visited) for k, v in obj.items()}
+        visited[obj_id] = result
+        return result
+    if isinstance(obj, (list, tuple)):
+        result = [_to_shm(v, registry, visited) for v in obj]
+        visited[obj_id] = result
+        return result
+
+    return obj
+
+def _from_shm(obj):
+    """Reconstruct from shared memory metadata. Does NOT unlink - caller handles that."""
+    if not isinstance(obj, dict):
+        if isinstance(obj, list):
+            return [_from_shm(v) for v in obj]
+        return obj
+    if "__shm_np__" in obj:
+        block = shm.SharedMemory(name=obj["__shm_np__"])
+        arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
+        block.close()
+        return arr
+    if "__shm_trimesh__" in obj:
+        import trimesh
+        v_block = shm.SharedMemory(name=obj["v_name"])
+        verts = np.ndarray(tuple(obj["v_shape"]), dtype=np.float64, buffer=v_block.buf).copy()
+        v_block.close()
+
+        f_block = shm.SharedMemory(name=obj["f_name"])
+        faces = np.ndarray(tuple(obj["f_shape"]), dtype=np.int64, buffer=f_block.buf).copy()
+        f_block.close()
+
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    return {k: _from_shm(v) for k, v in obj.items()}
+
+def _cleanup_shm(registry):
+    for block in registry:
+        try:
+            block.close()
+            block.unlink()
+        except Exception:
+            pass
+    registry.clear()
+
+# =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
 # =============================================================================
 
@@ -767,11 +655,37 @@ def _should_use_reference(obj):
     # Dicts, lists, tuples - recurse into contents (don't ref the container)
     if isinstance(obj, (dict, list, tuple)):
         return False
-    # Trimesh - pass by value (pickle handles it well across Python versions)
+    # Trimesh - pass by value but needs special handling (see _prepare_trimesh_for_pickle)
     if obj_type == 'Trimesh':
         return False
     # Everything else (custom classes) - pass by reference
     return True
+
+def _prepare_trimesh_for_pickle(mesh):
+    """
+    Prepare a trimesh object for cross-Python-version pickling.
+
+    Trimesh attaches helper objects (ray tracer, proximity query) that may use
+    native extensions like embreex. These cause import errors when unpickling
+    on a system without those extensions. We strip them - they'll be recreated
+    lazily when needed.
+
+    Note: Do NOT strip _cache - trimesh needs it to function properly.
+    """
+    # Make a copy to avoid modifying the original
+    mesh = mesh.copy()
+
+    # Remove helper objects that may have unpickleable native code references
+    # These are lazily recreated on first access anyway
+    # Do NOT remove _cache - it's needed for trimesh to work
+    for attr in ('ray', '_ray', 'permutate', 'nearest'):
+        try:
+            delattr(mesh, attr)
+        except AttributeError:
+            pass
+
+    return mesh
+
 
 def _serialize_result(obj, visited=None):
     """Convert result for IPC - complex objects become references."""
@@ -791,6 +705,11 @@ def _serialize_result(obj, visited=None):
 
     visited.add(obj_id)
 
+    # Handle trimesh objects specially - strip unpickleable native extensions
+    obj_type = type(obj).__name__
+    if obj_type == 'Trimesh':
+        return _prepare_trimesh_for_pickle(obj)
+
     if isinstance(obj, dict):
         return {k: _serialize_result(v, visited) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -799,7 +718,6 @@ def _serialize_result(obj, visited=None):
         return tuple(_serialize_result(v, visited) for v in obj)
 
     # Convert numpy scalars to Python primitives for JSON serialization
-    obj_type = type(obj).__name__
     if obj_type in ('float16', 'float32', 'float64'):
         return float(obj)
     if obj_type in ('int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'):
@@ -918,10 +836,52 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    # Import torch after path setup
-    wlog("[worker] Importing torch...")
-    import torch
-    wlog(f"[worker] Torch imported: {torch.__version__}")
+    # Try to import torch (optional - not all isolated envs need it)
+    _HAS_TORCH = False
+    try:
+        import torch
+        _HAS_TORCH = True
+        wlog(f"[worker] Torch imported: {torch.__version__}")
+    except ImportError:
+        wlog("[worker] Torch not available, using pickle for serialization")
+
+    # Setup log forwarding to host
+    # This makes print() and logging statements in node code visible to the user
+    import builtins
+    import logging
+    _original_print = builtins.print
+
+    def _forwarded_print(*args, **kwargs):
+        """Forward print() calls to host via socket."""
+        # Build message from args
+        sep = kwargs.get('sep', ' ')
+        message = sep.join(str(a) for a in args)
+        # Send to host
+        try:
+            transport.send({"type": "log", "message": message})
+        except Exception:
+            pass  # Don't fail if transport is closed
+        # Also log locally for debugging
+        wlog(f"[print] {message}")
+
+    builtins.print = _forwarded_print
+
+    # Also forward logging module output
+    class SocketLogHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                transport.send({"type": "log", "message": msg})
+                wlog(f"[log] {msg}")
+            except Exception:
+                pass
+
+    # Add our handler to the root logger
+    _socket_handler = SocketLogHandler()
+    _socket_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    logging.root.addHandler(_socket_handler)
+
+    wlog("[worker] Print and logging forwarding enabled")
 
     # Signal ready
     transport.send({"status": "ready"})
@@ -950,23 +910,20 @@ def main():
             transport.send({"status": "pong"})
             continue
 
+        shm_registry = []
         try:
             request_type = request.get("type", "call_module")
             module_name = request["module"]
-            inputs_path = request.get("inputs_path")
-            outputs_path = request.get("outputs_path")
             wlog(f"[worker] Request: {request_type} {module_name}")
 
-            # Load inputs
-            if inputs_path:
-                wlog(f"[worker] Loading inputs from {inputs_path}...")
-                inputs = torch.load(inputs_path, weights_only=False)
-                wlog(f"[worker] Deserializing isolated objects...")
+            # Load inputs from shared memory
+            kwargs_meta = request.get("kwargs")
+            if kwargs_meta:
+                wlog(f"[worker] Reconstructing inputs from shm...")
+                inputs = _from_shm(kwargs_meta)
                 inputs = _deserialize_isolated_objects(inputs)
-                # Resolve any object references from previous node calls
-                wlog(f"[worker] Resolving object references...")
                 inputs = _deserialize_input(inputs)
-                wlog(f"[worker] Inputs ready: {list(inputs.keys())}")
+                wlog(f"[worker] Inputs ready: {list(inputs.keys()) if isinstance(inputs, dict) else type(inputs)}")
             else:
                 inputs = {}
 
@@ -995,14 +952,17 @@ def main():
                 func = getattr(module, func_name)
                 result = func(**inputs)
 
-            # Save result - convert complex objects to references
-            if outputs_path:
-                serialized_result = _serialize_result(result)
-                torch.save(serialized_result, outputs_path)
+            # Serialize result to shared memory
+            wlog(f"[worker] Serializing result to shm...")
+            result_meta = _to_shm(result, shm_registry)
+            wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
-            transport.send({"status": "ok"})
+            transport.send({"status": "ok", "result": result_meta})
+            # Note: don't cleanup shm_registry here - host needs to read it
 
         except Exception as e:
+            # Cleanup shm on error since host won't read it
+            _cleanup_shm(shm_registry)
             transport.send({
                 "status": "error",
                 "error": str(e),
@@ -1016,9 +976,9 @@ if __name__ == "__main__":
 '''
 
 
-class PersistentVenvWorker(Worker):
+class SubprocessWorker(Worker):
     """
-    Persistent version of VenvWorker that keeps subprocess alive.
+    Cross-venv worker using persistent subprocess + socket IPC.
 
     Uses Unix domain sockets (or TCP localhost on older Windows) for IPC.
     This completely separates IPC from stdout/stderr, so C libraries
@@ -1027,11 +987,11 @@ class PersistentVenvWorker(Worker):
     Benefits:
     - Works on Windows with different venv Python (full isolation)
     - Compiled CUDA extensions load correctly in the venv
-    - ~50-100ms per call (vs ~300-500ms for VenvWorker per-call spawn)
+    - ~50-100ms per call (persistent subprocess avoids spawn overhead)
     - Tensor transfer via shared memory files
     - Immune to stdout pollution from C libraries
 
-    Use this for high-frequency calls to isolated venvs.
+    Use this for calls to isolated venvs with different Python/dependencies.
     """
 
     def __init__(
@@ -1058,7 +1018,7 @@ class PersistentVenvWorker(Worker):
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.sys_path = sys_path or []
         self.extra_env = env or {}
-        self.name = name or f"PersistentVenvWorker({self.python.parent.parent.name})"
+        self.name = name or f"SubprocessWorker({self.python.parent.parent.name})"
 
         if not self.python.exists():
             raise FileNotFoundError(f"Python not found: {self.python}")
@@ -1204,21 +1164,26 @@ class PersistentVenvWorker(Worker):
             # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
             env["PYTHONIOENCODING"] = "utf-8"
 
-        # Find ComfyUI base and set env var for folder_paths stub
+        # Find ComfyUI base and add to sys_path for real folder_paths/comfy modules
+        # This works because comfy.options.args_parsing=False by default, so folder_paths
+        # auto-detects its base directory from __file__ location
         comfyui_base = self._find_comfyui_base()
         if comfyui_base:
-            env["COMFYUI_BASE"] = str(comfyui_base)
+            env["COMFYUI_BASE"] = str(comfyui_base)  # Keep for fallback/debugging
 
-        # Add stubs directory to sys_path for folder_paths etc.
-        stubs_dir = Path(__file__).parent.parent / "stubs"
-        all_sys_path = [str(stubs_dir), str(self.working_dir)] + self.sys_path
+        # Build sys_path: ComfyUI first (for real modules), then working_dir, then extras
+        all_sys_path = []
+        if comfyui_base:
+            all_sys_path.append(str(comfyui_base))
+        all_sys_path.append(str(self.working_dir))
+        all_sys_path.extend(self.sys_path)
 
         # Launch subprocess with the venv Python, passing socket address
         # For pixi environments, use "pixi run python" to get proper environment activation
         # (CONDA_PREFIX, Library paths, etc.) which fixes DLL loading issues with bpy
         is_pixi = '.pixi' in str(self.python)
         if _DEBUG:
-            print(f"[PersistentVenvWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
+            print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
             # Find pixi project root (parent of .pixi directory)
             pixi_project = self.python
@@ -1227,7 +1192,7 @@ class PersistentVenvWorker(Worker):
             pixi_project = pixi_project.parent  # Go up from .pixi to project root
             pixi_toml = pixi_project / "pixi.toml"
             if _DEBUG:
-                print(f"[PersistentVenvWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
+                print(f"[SubprocessWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
 
             if pixi_toml.exists():
                 pixi_exe = get_pixi_path()
@@ -1254,15 +1219,15 @@ class PersistentVenvWorker(Worker):
             launch_env = env
 
         if _DEBUG:
-            print(f"[PersistentVenvWorker] launching cmd={cmd[:3]}...", flush=True)
+            print(f"[SubprocessWorker] launching cmd={cmd[:3]}...", flush=True)
             if launch_env:
                 path_sep = ";" if sys.platform == "win32" else ":"
                 path_parts = launch_env.get("PATH", "").split(path_sep)
-                print(f"[PersistentVenvWorker] PATH has {len(path_parts)} entries:", flush=True)
+                print(f"[SubprocessWorker] PATH has {len(path_parts)} entries:", flush=True)
                 for i, p in enumerate(path_parts[:10]):  # Show first 10
-                    print(f"[PersistentVenvWorker]   [{i}] {p}", flush=True)
+                    print(f"[SubprocessWorker]   [{i}] {p}", flush=True)
                 if len(path_parts) > 10:
-                    print(f"[PersistentVenvWorker]   ... and {len(path_parts) - 10} more", flush=True)
+                    print(f"[SubprocessWorker]   ... and {len(path_parts) - 10} more", flush=True)
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
@@ -1349,9 +1314,21 @@ class PersistentVenvWorker(Worker):
         # Send request
         self._transport.send(request)
 
-        # Read response with timeout
+        # Read response with timeout, handling log messages along the way
         try:
-            response = self._transport.recv(timeout=timeout)
+            while True:
+                response = self._transport.recv(timeout=timeout)
+                if response is None:
+                    break  # Timeout
+
+                # Handle log messages from worker
+                if response.get("type") == "log":
+                    msg = response.get("message", "")
+                    print(f"[worker:{self.name}] {msg}", file=sys.stderr, flush=True)
+                    continue  # Keep waiting for actual response
+
+                # Got a real response
+                break
         except ConnectionError as e:
             # Socket closed - check if worker process died
             self._shutdown = True
@@ -1414,51 +1391,43 @@ class PersistentVenvWorker(Worker):
         """
         import sys
         if _DEBUG:
-            print(f"[PersistentVenvWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
+            print(f"[SubprocessWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
 
         with self._lock:
             if _DEBUG:
-                print(f"[PersistentVenvWorker] acquired lock, ensuring started...", file=sys.stderr, flush=True)
+                print(f"[SubprocessWorker] acquired lock, ensuring started...", file=sys.stderr, flush=True)
             self._ensure_started()
             if _DEBUG:
-                print(f"[PersistentVenvWorker] worker started/confirmed", file=sys.stderr, flush=True)
+                print(f"[SubprocessWorker] worker started/confirmed", file=sys.stderr, flush=True)
 
             timeout = timeout or 600.0
-            call_id = str(uuid.uuid4())[:8]
-
-            import torch
-            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
-            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
+            shm_registry = []
 
             try:
-                # Serialize kwargs
+                # Serialize kwargs to shared memory
                 if kwargs:
                     if _DEBUG:
-                        print(f"[PersistentVenvWorker] serializing kwargs...", file=sys.stderr, flush=True)
-                    serialized_kwargs = _serialize_for_ipc(kwargs)
+                        print(f"[SubprocessWorker] serializing kwargs to shm...", file=sys.stderr, flush=True)
+                    kwargs_meta = _to_shm(kwargs, shm_registry)
                     if _DEBUG:
-                        print(f"[PersistentVenvWorker] saving to {inputs_path}...", file=sys.stderr, flush=True)
-                    torch.save(serialized_kwargs, str(inputs_path))
-                    if _DEBUG:
-                        print(f"[PersistentVenvWorker] saved inputs", file=sys.stderr, flush=True)
+                        print(f"[SubprocessWorker] created {len(shm_registry)} shm blocks", file=sys.stderr, flush=True)
+                else:
+                    kwargs_meta = None
 
-                # Send request with class info
-                # Serialize self_state to handle Path objects and other non-JSON types
-                serialized_self_state = _serialize_for_ipc(self_state) if self_state else None
+                # Send request with shared memory metadata
                 request = {
                     "type": "call_method",
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
-                    "self_state": serialized_self_state,
-                    "inputs_path": str(inputs_path) if kwargs else None,
-                    "outputs_path": str(outputs_path),
+                    "self_state": _serialize_for_ipc(self_state) if self_state else None,
+                    "kwargs": kwargs_meta,
                 }
                 if _DEBUG:
-                    print(f"[PersistentVenvWorker] sending request via socket...", file=sys.stderr, flush=True)
+                    print(f"[SubprocessWorker] sending request via socket...", file=sys.stderr, flush=True)
                 response = self._send_request(request, timeout)
                 if _DEBUG:
-                    print(f"[PersistentVenvWorker] got response: {response.get('status')}", file=sys.stderr, flush=True)
+                    print(f"[SubprocessWorker] got response: {response.get('status')}", file=sys.stderr, flush=True)
 
                 if response.get("status") == "error":
                     raise WorkerError(
@@ -1466,16 +1435,14 @@ class PersistentVenvWorker(Worker):
                         traceback=response.get("traceback"),
                     )
 
-                if outputs_path.exists():
-                    return torch.load(str(outputs_path), weights_only=False)
+                # Reconstruct result from shared memory
+                result_meta = response.get("result")
+                if result_meta is not None:
+                    return _from_shm(result_meta)
                 return None
 
             finally:
-                for p in [inputs_path, outputs_path]:
-                    try:
-                        p.unlink()
-                    except:
-                        pass
+                _cleanup_shm(shm_registry)
 
     def call_module(
         self,
@@ -1489,25 +1456,16 @@ class PersistentVenvWorker(Worker):
             self._ensure_started()
 
             timeout = timeout or 600.0
-            call_id = str(uuid.uuid4())[:8]
-
-            # Save inputs
-            import torch
-            inputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_in.pt"
-            outputs_path = self._shm_dir / f"comfyui_pvenv_{call_id}_out.pt"
+            shm_registry = []
 
             try:
-                if kwargs:
-                    serialized_kwargs = _serialize_for_ipc(kwargs)
-                    torch.save(serialized_kwargs, str(inputs_path))
+                kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
 
-                # Send request
                 request = {
                     "type": "call_module",
                     "module": module,
                     "func": func,
-                    "inputs_path": str(inputs_path) if kwargs else None,
-                    "outputs_path": str(outputs_path),
+                    "kwargs": kwargs_meta,
                 }
                 response = self._send_request(request, timeout)
 
@@ -1517,17 +1475,13 @@ class PersistentVenvWorker(Worker):
                         traceback=response.get("traceback"),
                     )
 
-                # Load result
-                if outputs_path.exists():
-                    return torch.load(str(outputs_path), weights_only=False)
+                result_meta = response.get("result")
+                if result_meta is not None:
+                    return _from_shm(result_meta)
                 return None
 
             finally:
-                for p in [inputs_path, outputs_path]:
-                    try:
-                        p.unlink()
-                    except:
-                        pass
+                _cleanup_shm(shm_registry)
 
     def shutdown(self) -> None:
         """Shut down the persistent worker."""
@@ -1579,4 +1533,4 @@ class PersistentVenvWorker(Worker):
 
     def __repr__(self):
         status = "alive" if self.is_alive() else "stopped"
-        return f"<PersistentVenvWorker name={self.name!r} status={status}>"
+        return f"<SubprocessWorker name={self.name!r} status={status}>"

@@ -1,49 +1,38 @@
 """
-Workers - Simple, explicit process isolation for ComfyUI nodes.
+Workers - Process isolation for ComfyUI nodes.
 
-This module provides three isolation tiers:
+This module provides two isolation tiers:
 
-Tier 1: TorchMPWorker (same Python, fresh CUDA context)
-    - Uses torch.multiprocessing.Queue
-    - Zero-copy tensor transfer via CUDA IPC
+Tier 1: MPWorker (same Python, fresh CUDA context)
+    - Uses multiprocessing.Queue
+    - Zero-copy tensor transfer via shared memory
     - ~30ms overhead per call
     - Use for: Memory isolation, fresh CUDA context
 
-Tier 2: VenvWorker (different Python/venv)
-    - Uses subprocess + torch.save/load via /dev/shm
-    - One memcpy per tensor direction
-    - ~100-500ms overhead per call
+Tier 2: SubprocessWorker (different Python/venv)
+    - Persistent subprocess + socket IPC
+    - ~50-100ms overhead per call
     - Use for: Different PyTorch versions, incompatible deps
 
-Tier 3: ContainerWorker (full isolation) [future]
-    - Docker with GPU passthrough
-    - Use for: Different CUDA versions, hermetic environments
-
 Usage:
-    from comfy_env.workers import get_worker, TorchMPWorker
+    from comfy_env.workers import MPWorker, SubprocessWorker
 
-    # Get a named worker from the pool
-    worker = get_worker("sam3d")
-    result = worker.call(my_function, image=tensor)
-
-    # Or create directly
-    worker = TorchMPWorker()
+    # Create worker directly
+    worker = MPWorker()
     result = worker.call(my_function, arg1, arg2)
+
+    # Or use SubprocessWorker for isolated Python
+    worker = SubprocessWorker(python="/path/to/venv/bin/python")
+    result = worker.call(my_function, image=tensor)
 """
 
-from .base import Worker
-from .torch_mp import TorchMPWorker
-from .venv import VenvWorker, PersistentVenvWorker
-from .pool import WorkerPool, get_worker, register_worker, shutdown_workers, list_workers
+from .base import Worker, WorkerError
+from .mp import MPWorker
+from .subprocess import SubprocessWorker
 
 __all__ = [
     "Worker",
-    "TorchMPWorker",
-    "VenvWorker",
-    "PersistentVenvWorker",
-    "WorkerPool",
-    "get_worker",
-    "register_worker",
-    "shutdown_workers",
-    "list_workers",
+    "WorkerError",
+    "MPWorker",
+    "SubprocessWorker",
 ]

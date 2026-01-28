@@ -1,22 +1,9 @@
-"""
-Runtime environment detection for wheel resolution.
-
-This module provides RuntimeEnv for detecting the current system environment
-(CUDA version, PyTorch version, Python version, platform).
-
-Example:
-    from comfy_env.resolver import RuntimeEnv
-
-    env = RuntimeEnv.detect()
-    print(f"CUDA: {env.cuda_version}, PyTorch: {env.torch_version}")
-"""
-
 import platform
 import sys
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from .env.cuda_gpu_detection import detect_cuda_version, detect_gpu_info
+from .cuda_detection import detect_cuda_version, detect_gpu_info
 
 
 @dataclass

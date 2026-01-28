@@ -1,9 +1,9 @@
 """
-TorchMPWorker - Same-venv isolation using torch.multiprocessing.
+MPWorker - Same-venv isolation using multiprocessing.
 
 This is the simplest and fastest worker type:
-- Uses torch.multiprocessing.Queue for IPC
-- Zero-copy tensor transfer via CUDA IPC (automatic)
+- Uses multiprocessing.Queue for IPC
+- Zero-copy tensor transfer via shared memory (automatic)
 - Fresh CUDA context in subprocess
 - ~30ms overhead per call
 
@@ -13,7 +13,7 @@ Use this when you need:
 - Same Python environment as host
 
 Example:
-    worker = TorchMPWorker()
+    worker = MPWorker()
 
     def gpu_work(image):
         import torch
@@ -40,7 +40,7 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
-def _worker_loop(queue_in, queue_out, sys_path_additions=None):
+def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None):
     """
     Worker process main loop.
 
@@ -55,6 +55,7 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None):
         queue_in: Input queue for receiving work items
         queue_out: Output queue for sending results
         sys_path_additions: Paths to add to sys.path
+        lib_path: Path to add to LD_LIBRARY_PATH (for conda libraries)
     """
     import os
     import sys
@@ -63,10 +64,40 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None):
     # Set worker mode env var
     os.environ["COMFYUI_ISOLATION_WORKER"] = "1"
 
-    # Add stubs directory for folder_paths etc. (same as PersistentVenvWorker)
-    stubs_dir = Path(__file__).parent.parent / "stubs"
-    if str(stubs_dir) not in sys.path:
-        sys.path.insert(0, str(stubs_dir))
+    # Set LD_LIBRARY_PATH for conda libraries (must be done before imports)
+    if lib_path:
+        if sys.platform == "win32":
+            # Windows: add to PATH for DLL loading
+            os.environ["PATH"] = lib_path + ";" + os.environ.get("PATH", "")
+        else:
+            # Linux/Mac: LD_LIBRARY_PATH
+            os.environ["LD_LIBRARY_PATH"] = lib_path + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+
+    # Find ComfyUI base and add to sys.path for real folder_paths/comfy modules
+    # This works because comfy.options.args_parsing=False by default, so folder_paths
+    # auto-detects its base directory from __file__ location
+    def _find_comfyui_base():
+        cwd = Path.cwd().resolve()
+        # Check common child directories (for test environments)
+        for base in [cwd, cwd.parent]:
+            for child in [".comfy-test-env/ComfyUI", "ComfyUI"]:
+                candidate = base / child
+                if (candidate / "main.py").exists() and (candidate / "comfy").exists():
+                    return candidate
+        # Walk up from cwd looking for ComfyUI
+        current = cwd
+        for _ in range(10):
+            if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            current = current.parent
+        # Check COMFYUI_BASE env var as fallback
+        if os.environ.get("COMFYUI_BASE"):
+            return Path(os.environ["COMFYUI_BASE"])
+        return None
+
+    comfyui_base = _find_comfyui_base()
+    if comfyui_base and str(comfyui_base) not in sys.path:
+        sys.path.insert(0, str(comfyui_base))
 
     # Add custom paths to sys.path for module discovery
     if sys_path_additions:
@@ -356,7 +387,7 @@ def _execute_method_call(module_name: str, class_name: str, method_name: str,
     return original_method(instance, **kwargs)
 
 
-class TorchMPWorker(Worker):
+class MPWorker(Worker):
     """
     Worker using torch.multiprocessing for same-venv isolation.
 
@@ -370,16 +401,18 @@ class TorchMPWorker(Worker):
     interpreter without inherited state from the parent.
     """
 
-    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None):
+    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None, lib_path: Optional[str] = None):
         """
         Initialize the worker.
 
         Args:
             name: Optional name for logging/debugging.
             sys_path: Optional list of paths to add to sys.path in worker process.
+            lib_path: Optional path to add to LD_LIBRARY_PATH (for conda libraries).
         """
-        self.name = name or "TorchMPWorker"
+        self.name = name or "MPWorker"
         self._sys_path = sys_path or []
+        self._lib_path = lib_path
         self._process = None
         self._queue_in = None
         self._queue_out = None
@@ -406,7 +439,7 @@ class TorchMPWorker(Worker):
         self._queue_out = ctx.Queue()
         self._process = ctx.Process(
             target=_worker_loop,
-            args=(self._queue_in, self._queue_out, self._sys_path),
+            args=(self._queue_in, self._queue_out, self._sys_path, self._lib_path),
             daemon=True,
         )
         self._process.start()
@@ -593,4 +626,4 @@ class TorchMPWorker(Worker):
 
     def __repr__(self):
         status = "alive" if self.is_alive() else "stopped"
-        return f"<TorchMPWorker name={self.name!r} status={status}>"
+        return f"<MPWorker name={self.name!r} status={status}>"

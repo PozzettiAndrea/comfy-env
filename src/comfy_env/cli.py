@@ -2,6 +2,8 @@
 CLI for comfy-env.
 
 Provides the `comfy-env` command with subcommands:
+- init: Create a default comfy-env.toml
+- generate: Generate pixi.toml from comfy-env.toml
 - install: Install dependencies from config
 - info: Show runtime environment information
 - resolve: Show resolved wheel URLs
@@ -9,7 +11,9 @@ Provides the `comfy-env` command with subcommands:
 - list-packages: Show all packages in the built-in registry
 
 Usage:
-    comfy-env install
+    comfy-env init ---> creates template comfy-env.toml
+    comfy-env generate nodes/cgal/comfy-env.toml ---> nodes/cgal/pixi.toml
+    comfy-env install ---> installs from comfy
     comfy-env install --dry-run
 
     comfy-env info
@@ -52,6 +56,23 @@ def main(args: Optional[List[str]] = None) -> int:
         "--force", "-f",
         action="store_true",
         help="Overwrite existing config file",
+    )
+
+    # generate command
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="Generate pixi.toml from comfy-env.toml",
+        description="Parse comfy-env.toml and generate a pixi.toml in the same directory",
+    )
+    generate_parser.add_argument(
+        "config",
+        type=str,
+        help="Path to comfy-env.toml",
+    )
+    generate_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Overwrite existing pixi.toml",
     )
 
     # install command
@@ -148,6 +169,8 @@ def main(args: Optional[List[str]] = None) -> int:
     try:
         if parsed.command == "init":
             return cmd_init(parsed)
+        elif parsed.command == "generate":
+            return cmd_generate(parsed)
         elif parsed.command == "install":
             return cmd_install(parsed)
         elif parsed.command == "info":
@@ -205,6 +228,53 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_generate(args) -> int:
+    """Handle generate command - create pixi.toml from comfy-env.toml."""
+    from .config.parser import load_config
+    from .pixi import create_pixi_toml
+
+    config_path = Path(args.config).resolve()
+
+    if not config_path.exists():
+        print(f"Config file not found: {config_path}", file=sys.stderr)
+        return 1
+
+    if config_path.name != "comfy-env.toml":
+        print(f"Warning: Expected comfy-env.toml, got {config_path.name}", file=sys.stderr)
+
+    node_dir = config_path.parent
+    pixi_path = node_dir / "pixi.toml"
+
+    if pixi_path.exists() and not args.force:
+        print(f"pixi.toml already exists: {pixi_path}", file=sys.stderr)
+        print("Use --force to overwrite", file=sys.stderr)
+        return 1
+
+    # Load the config
+    config = load_config(config_path)
+    if not config or not config.envs:
+        print(f"No environments found in {config_path}", file=sys.stderr)
+        return 1
+
+    # Use the first environment
+    env_name = next(iter(config.envs.keys()))
+    env_config = config.envs[env_name]
+
+    print(f"Generating pixi.toml from {config_path}")
+    print(f"  Environment: {env_name}")
+    print(f"  Python: {env_config.python}")
+
+    # Generate pixi.toml
+    result_path = create_pixi_toml(env_config, node_dir)
+
+    print(f"Created {result_path}")
+    print()
+    print("Next steps:")
+    print(f"  cd {node_dir}")
+    print("  pixi install")
+    return 0
+
+
 def cmd_install(args) -> int:
     """Handle install command."""
     from .install import install
@@ -228,7 +298,7 @@ def cmd_install(args) -> int:
 
 def cmd_info(args) -> int:
     """Handle info command."""
-    from .resolver import RuntimeEnv
+    from .pixi import RuntimeEnv
 
     env = RuntimeEnv.detect()
 
@@ -264,9 +334,10 @@ def cmd_info(args) -> int:
 
 def cmd_resolve(args) -> int:
     """Handle resolve command."""
-    from .resolver import RuntimeEnv, parse_wheel_requirement
-    from .registry import PACKAGE_REGISTRY, get_cuda_short2
-    from .env.config_file import discover_env_config, load_env_from_file
+    from .pixi import RuntimeEnv, parse_wheel_requirement
+    from .pixi import PACKAGE_REGISTRY
+    from .pixi.registry import get_cuda_short2
+    from .config.parser import discover_env_config, load_env_from_file
 
     env = RuntimeEnv.detect()
     packages = []
@@ -353,7 +424,7 @@ def _substitute_template(template: str, vars_dict: dict) -> str:
 def cmd_doctor(args) -> int:
     """Handle doctor command."""
     from .install import verify_installation
-    from .env.config_file import discover_env_config, load_env_from_file
+    from .config.parser import discover_env_config, load_env_from_file
 
     print("Running diagnostics...")
     print("=" * 40)
@@ -397,7 +468,7 @@ def cmd_doctor(args) -> int:
 
 def cmd_list_packages(args) -> int:
     """Handle list-packages command."""
-    from .registry import PACKAGE_REGISTRY
+    from .pixi import PACKAGE_REGISTRY
 
     if args.json:
         import json

@@ -1,103 +1,46 @@
 comfy-env Setup Instructions
 ============================
 
-comfy-env handles CUDA wheel installation and process isolation for ComfyUI
-custom nodes.
+All dependencies go through pixi (conda + pip unified).
+GPU is auto-detected to select the right CUDA version.
 
 QUICK START
 -----------
-1. Install comfy-env:
-   pip install comfy-env
+1. pip install comfy-env
+2. comfy-env init
+3. Edit comfy-env.toml
+4. comfy-env install
 
-2. Initialize config in your node directory:
-   comfy-env init
+CONFIG FORMAT
+-------------
+[cuda]
+packages = ["nvdiffrast", "pytorch3d"]
 
-3. Edit comfy-env.toml to add your dependencies
+[conda]
+channels = ["conda-forge"]
+packages = ["mesalib", "ffmpeg"]
 
-4. Add to your __init__.py (at the top, before other imports):
-   from comfy_env import install
-   install()
+[packages]
+requirements = ["numpy", "trimesh"]
 
-5. Test locally:
-   comfy-env install --dry-run  # Preview what will be installed
-   comfy-env install            # Actually install
-   comfy-env doctor             # Verify all packages work
+[node_reqs]
+SomeNode = "owner/repo"
 
+USAGE IN __init__.py
+--------------------
+from comfy_env import install
+install()  # That's it!
 
-COMMON USE CASES
-----------------
-
-Case 1: Just need CUDA packages (nvdiffrast, pytorch3d, etc.)
-  - Add packages to [cuda] section
-  - Call install() in your __init__.py
-
-Case 2: Need process isolation (conflicting dependencies, conda packages)
-  - Define an isolated environment with `isolated = true`
-  - Use enable_isolation(NODE_CLASS_MAPPINGS) in your __init__.py
-  - See PROCESS ISOLATION section below
-
-Case 3: Need system packages (apt)
-  - Add to [system] linux = ["package1", "package2"]
-
+For isolated nodes:
+from comfy_env import wrap_isolated_nodes
+NODE_CLASS_MAPPINGS.update(
+    wrap_isolated_nodes(isolated_nodes, Path(__file__).parent / "nodes/isolated")
+)
 
 CLI COMMANDS
 ------------
-  comfy-env init           Create comfy-env.toml template
-  comfy-env install        Install dependencies from config
-  comfy-env install --dry-run  Preview without installing
-  comfy-env info           Show detected environment (Python, CUDA, PyTorch)
-  comfy-env resolve PKG    Show resolved wheel URL for a package
-  comfy-env doctor         Verify installation
-  comfy-env list-packages  Show all packages in built-in registry
+comfy-env init           Create comfy-env.toml template
+comfy-env install        Install all dependencies
+comfy-env info           Show detected GPU and CUDA version
 
-
-PROCESS ISOLATION
------------------
-For nodes that need isolated dependencies:
-
-RECOMMENDED: Pack-wide isolation (all nodes in same isolated env)
-
-  from comfy_env import setup_isolated_imports, enable_isolation
-
-  # Setup import stubs BEFORE importing nodes
-  setup_isolated_imports(__file__)
-
-  from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-
-  # Enable isolation for all nodes
-  enable_isolation(NODE_CLASS_MAPPINGS)
-
-Requires `isolated = true` in comfy-env.toml:
-
-  [mypack]
-  python = "3.11"
-  isolated = true
-
-  [mypack.packages]
-  requirements = ["trimesh", "scipy"]
-
-ALTERNATIVE: Per-node isolation (for multiple isolated envs)
-
-  from comfy_env import isolated
-
-  @isolated(env="myenv")
-  class MyNode:
-      FUNCTION = "process"
-      def process(self, image):
-          import conflicting_lib
-          return (result,)
-
-How it works:
-  - Runs FUNCTION methods in a separate Python process
-  - Tensors/numpy arrays passed by value (efficient)
-  - Complex objects (meshes, etc.) passed by reference
-
-
-TROUBLESHOOTING
----------------
-- "Package X not found in registry": Add custom wheel URL to [wheel_sources]
-- "CUDA not detected": Ensure PyTorch with CUDA is installed in ComfyUI
-- "Worker failed to connect": Check the isolated env was set up correctly
-- Import errors: Run `comfy-env doctor` to verify packages
-
-For more help: https://github.com/PozzettiAndrea/comfy-env
+For more: https://github.com/PozzettiAndrea/comfy-env
