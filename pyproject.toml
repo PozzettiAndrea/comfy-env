@@ -1,6 +1,6 @@
 [project]
 name = "comfy-env"
-version = "0.1.7"
+version = "0.1.8"
 description = "Environment management for ComfyUI custom nodes - CUDA wheel resolution and process isolation"
 readme = "README.md"
 license = {text = "MIT"}
