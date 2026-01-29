@@ -144,15 +144,11 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
             clean_parts.insert(0, lib_path)
         os.environ["PATH"] = path_sep.join(clean_parts)
     elif sys.platform == "darwin":
-        # macOS: Use DYLD_LIBRARY_PATH
-        current = os.environ.get("DYLD_LIBRARY_PATH", "")
-        clean_parts = [
-            p for p in current.split(path_sep) if p
-            and not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
-        ]
+        # macOS: ONLY use the isolated lib_path, don't inherit
         if lib_path:
-            clean_parts.insert(0, lib_path)
-        os.environ["DYLD_LIBRARY_PATH"] = path_sep.join(clean_parts)
+            os.environ["DYLD_LIBRARY_PATH"] = lib_path
+        else:
+            os.environ.pop("DYLD_LIBRARY_PATH", None)
     else:
         # Linux: Use LD_LIBRARY_PATH
         current = os.environ.get("LD_LIBRARY_PATH", "")
