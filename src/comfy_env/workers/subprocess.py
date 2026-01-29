@@ -221,10 +221,12 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # torch.Tensor → convert to numpy → shared memory
+    # torch.Tensor → convert to numpy → shared memory (with marker to restore type)
     if t == 'Tensor':
         arr = obj.detach().cpu().numpy()
-        return _to_shm(arr, registry, visited)
+        result = _to_shm(arr, registry, visited)
+        result["__was_tensor__"] = True
+        return result
 
     # trimesh.Trimesh → vertices + faces arrays → shared memory
     if t == 'Trimesh':
@@ -279,13 +281,17 @@ def _from_shm(obj, unlink=True):
             return [_from_shm(v, unlink) for v in obj]
         return obj
 
-    # numpy array
+    # numpy array (or tensor that was converted to numpy)
     if "__shm_np__" in obj:
         block = shm.SharedMemory(name=obj["__shm_np__"])
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
         block.close()
         if unlink:
             block.unlink()
+        # Convert back to tensor if it was originally a tensor
+        if obj.get("__was_tensor__"):
+            import torch
+            return torch.from_numpy(arr)
         return arr
 
     # trimesh
@@ -544,7 +550,9 @@ def _to_shm(obj, registry, visited=None):
 
     if t == 'Tensor':
         arr = obj.detach().cpu().numpy()
-        return _to_shm(arr, registry, visited)
+        result = _to_shm(arr, registry, visited)
+        result["__was_tensor__"] = True
+        return result
 
     if t == 'Trimesh':
         verts = np.ascontiguousarray(obj.vertices, dtype=np.float64)
@@ -587,6 +595,10 @@ def _from_shm(obj):
         block = shm.SharedMemory(name=obj["__shm_np__"])
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
         block.close()
+        # Convert back to tensor if it was originally a tensor
+        if obj.get("__was_tensor__"):
+            import torch
+            return torch.from_numpy(arr)
         return arr
     if "__shm_trimesh__" in obj:
         import trimesh

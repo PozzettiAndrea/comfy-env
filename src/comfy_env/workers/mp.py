@@ -40,6 +40,53 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
+# ---------------------------------------------------------------------------
+# Tensor file transfer - avoids CUDA IPC issues with cudaMallocAsync
+# ---------------------------------------------------------------------------
+
+def _save_tensors_to_files(obj, file_registry=None):
+    """Recursively save torch tensors to temp files for IPC."""
+    if file_registry is None:
+        file_registry = []
+
+    try:
+        import torch
+        if isinstance(obj, torch.Tensor):
+            import tempfile
+            f = tempfile.NamedTemporaryFile(suffix='.pt', delete=False)
+            torch.save(obj.cpu(), f.name)  # Always save as CPU tensor
+            f.close()
+            file_registry.append(f.name)
+            return {"__tensor_file__": f.name, "dtype": str(obj.dtype), "device": str(obj.device)}
+    except ImportError:
+        pass
+
+    if isinstance(obj, dict):
+        return {k: _save_tensors_to_files(v, file_registry) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_save_tensors_to_files(v, file_registry) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_save_tensors_to_files(v, file_registry) for v in obj)
+    return obj
+
+
+def _load_tensors_from_files(obj):
+    """Recursively load torch tensors from temp files."""
+    if isinstance(obj, dict):
+        if "__tensor_file__" in obj:
+            import os
+            import torch
+            tensor = torch.load(obj["__tensor_file__"], weights_only=True)
+            os.unlink(obj["__tensor_file__"])  # Cleanup temp file
+            return tensor
+        return {k: _load_tensors_from_files(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_load_tensors_from_files(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_load_tensors_from_files(v) for v in obj)
+    return obj
+
+
 def _dump_worker_env(worker_name: str = "unknown", print_to_terminal: bool = False):
     """Dump worker environment to .comfy-env/logs/ (always) and optionally print."""
     import json
@@ -205,14 +252,20 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
                 # Handle method call protocol
                 if isinstance(item, tuple) and len(item) == 6 and item[0] == _CALL_METHOD:
                     _, module_name, class_name, method_name, self_state, kwargs = item
+                    # Load tensors from files (saved by host to avoid cudaMallocAsync IPC issues)
+                    kwargs = _load_tensors_from_files(kwargs)
                     result = _execute_method_call(
                         module_name, class_name, method_name, self_state, kwargs
                     )
+                    # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
+                    result = _save_tensors_to_files(result)
                     queue_out.put(("ok", result))
                 else:
                     # Direct function call (legacy)
                     func, args, kwargs = item
                     result = func(*args, **kwargs)
+                    # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
+                    result = _save_tensors_to_files(result)
                     queue_out.put(("ok", result))
 
             except Exception as e:
@@ -646,6 +699,9 @@ class MPWorker(Worker):
         """
         self._ensure_started()
 
+        # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
+        kwargs = _save_tensors_to_files(kwargs)
+
         # Send method call request using protocol
         self._queue_in.put((
             _CALL_METHOD,
@@ -672,6 +728,8 @@ class MPWorker(Worker):
 
         # Handle response
         if status == "ok":
+            # Load tensors from temp files
+            result = _load_tensors_from_files(result)
             return result
         elif status == "error":
             msg, tb = result

@@ -34,6 +34,12 @@ from typing import Any, Dict, Optional
 # Debug logging (set COMFY_ENV_DEBUG=1 to enable)
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
+
+def get_env_name(dir_name: str) -> str:
+    """Convert directory name to env name: ComfyUI-UniRig → _env_unirig"""
+    name = dir_name.lower().replace("-", "_").lstrip("comfyui_")
+    return f"_env_{name}"
+
 # Global worker cache (one per isolated environment)
 _workers: Dict[str, Any] = {}
 _workers_lock = threading.Lock()
@@ -144,13 +150,27 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     """
     import glob
 
-    # Check pixi environment first
+    # Check _env_<name> directory first (new pattern)
+    env_name = get_env_name(node_dir.name)
+    env_dir = node_dir / env_name
+    if env_dir.exists():
+        if sys.platform == "win32":
+            site_packages = env_dir / "Lib" / "site-packages"
+            lib_dir = env_dir / "Library" / "bin"
+        else:
+            pattern = str(env_dir / "lib" / "python*" / "site-packages")
+            matches = glob.glob(pattern)
+            site_packages = Path(matches[0]) if matches else None
+            lib_dir = env_dir / "lib"
+        if site_packages and site_packages.exists():
+            return site_packages, lib_dir if lib_dir.exists() else None
+
+    # Fallback: Check old .pixi/envs/default (for backward compat)
     pixi_env = node_dir / ".pixi" / "envs" / "default"
     if pixi_env.exists():
-        # Find site-packages (pythonX.Y varies)
         if sys.platform == "win32":
             site_packages = pixi_env / "Lib" / "site-packages"
-            lib_dir = pixi_env / "Library" / "bin"  # Windows DLLs
+            lib_dir = pixi_env / "Library" / "bin"
         else:
             pattern = str(pixi_env / "lib" / "python*" / "site-packages")
             matches = glob.glob(pattern)
@@ -176,6 +196,12 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
 
 def _find_env_dir(node_dir: Path) -> Optional[Path]:
     """Find the environment directory (for cache key)."""
+    # Check _env_<name> first
+    env_name = get_env_name(node_dir.name)
+    env_dir = node_dir / env_name
+    if env_dir.exists():
+        return env_dir
+    # Fallback to old paths
     pixi_env = node_dir / ".pixi" / "envs" / "default"
     if pixi_env.exists():
         return pixi_env

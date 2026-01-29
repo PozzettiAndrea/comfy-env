@@ -281,6 +281,12 @@ def ensure_pixi(
     return pixi_path
 
 
+def get_env_name(dir_name: str) -> str:
+    """Convert directory name to env name: ComfyUI-UniRig → _env_unirig"""
+    name = dir_name.lower().replace("-", "_").lstrip("comfyui_")
+    return f"_env_{name}"
+
+
 def clean_pixi_artifacts(node_dir: Path, log: Callable[[str], None] = print) -> None:
     """Remove previous pixi installation artifacts."""
     for path in [node_dir / "pixi.toml", node_dir / "pixi.lock"]:
@@ -289,11 +295,21 @@ def clean_pixi_artifacts(node_dir: Path, log: Callable[[str], None] = print) -> 
     pixi_dir = node_dir / ".pixi"
     if pixi_dir.exists():
         shutil.rmtree(pixi_dir)
+    # Also clean old _env_* directories
+    env_name = get_env_name(node_dir.name)
+    env_dir = node_dir / env_name
+    if env_dir.exists():
+        shutil.rmtree(env_dir)
 
 
 def get_pixi_python(node_dir: Path) -> Optional[Path]:
     """Get path to Python in the pixi environment."""
-    env_dir = node_dir / ".pixi" / "envs" / "default"
+    # Check new _env_<name> location first
+    env_name = get_env_name(node_dir.name)
+    env_dir = node_dir / env_name
+    if not env_dir.exists():
+        # Fallback to old .pixi path
+        env_dir = node_dir / ".pixi" / "envs" / "default"
     if sys.platform == "win32":
         python_path = env_dir / "python.exe"
     else:
@@ -506,6 +522,21 @@ def pixi_install(
                 raise RuntimeError(f"CUDA package install failed: {result.stderr}")
 
         log("CUDA packages installed")
+
+    # Move environment from .pixi/envs/default to _env_<name>
+    old_env = node_dir / ".pixi" / "envs" / "default"
+    env_name = get_env_name(node_dir.name)
+    new_env = node_dir / env_name
+
+    if old_env.exists():
+        if new_env.exists():
+            shutil.rmtree(new_env)  # Clean old env
+        shutil.move(str(old_env), str(new_env))
+        # Clean up .pixi directory (keep pixi.toml and pixi.lock)
+        pixi_dir = node_dir / ".pixi"
+        if pixi_dir.exists():
+            shutil.rmtree(pixi_dir)
+        log(f"Moved environment to {new_env}")
 
     log("Installation complete!")
     return True

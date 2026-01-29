@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Optional, Dict
 
 
+def get_env_name(dir_name: str) -> str:
+    """Convert directory name to env name: ComfyUI-UniRig → _env_unirig"""
+    name = dir_name.lower().replace("-", "_").lstrip("comfyui_")
+    return f"_env_{name}"
+
+
 def _load_env_vars(config_path: str) -> Dict[str, str]:
     """
     Load [env_vars] section from comfy-env.toml.
@@ -121,10 +127,15 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     for key, value in env_vars.items():
         os.environ[key] = value
 
-    pixi_env = os.path.join(node_dir, ".pixi", "envs", "default")
+    # Check _env_<name> first, then fallback to old .pixi path
+    env_name = get_env_name(os.path.basename(node_dir))
+    pixi_env = os.path.join(node_dir, env_name)
 
     if not os.path.exists(pixi_env):
-        return  # No pixi environment
+        # Fallback to old .pixi path
+        pixi_env = os.path.join(node_dir, ".pixi", "envs", "default")
+        if not os.path.exists(pixi_env):
+            return  # No environment found
 
     if sys.platform == "win32":
         # Windows: add to PATH for DLL loading
