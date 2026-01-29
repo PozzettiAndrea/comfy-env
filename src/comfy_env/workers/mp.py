@@ -80,7 +80,7 @@ def _dump_worker_env(worker_name: str = "unknown", print_to_terminal: bool = Fal
         print(f"[comfy-env] Python: {sys.executable}")
         print(f"[comfy-env] Version: {sys.version.split()[0]}")
         print(f"[comfy-env] PID: {os.getpid()}, CWD: {os.getcwd()}")
-        for var in ['PATH', 'LD_LIBRARY_PATH', 'PYTHONPATH', 'OMP_NUM_THREADS', 'KMP_DUPLICATE_LIB_OK']:
+        for var in ['PATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'PYTHONPATH', 'OMP_NUM_THREADS', 'KMP_DUPLICATE_LIB_OK']:
             val = os.environ.get(var, '<unset>')
             if len(val) > 100:
                 val = val[:100] + '...'
@@ -143,8 +143,18 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
         if lib_path:
             clean_parts.insert(0, lib_path)
         os.environ["PATH"] = path_sep.join(clean_parts)
+    elif sys.platform == "darwin":
+        # macOS: Use DYLD_LIBRARY_PATH
+        current = os.environ.get("DYLD_LIBRARY_PATH", "")
+        clean_parts = [
+            p for p in current.split(path_sep) if p
+            and not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+        ]
+        if lib_path:
+            clean_parts.insert(0, lib_path)
+        os.environ["DYLD_LIBRARY_PATH"] = path_sep.join(clean_parts)
     else:
-        # Linux/Mac: Filter LD_LIBRARY_PATH with same patterns
+        # Linux: Use LD_LIBRARY_PATH
         current = os.environ.get("LD_LIBRARY_PATH", "")
         clean_parts = [
             p for p in current.split(path_sep) if p
