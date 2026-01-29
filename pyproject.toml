@@ -22,6 +22,7 @@ dependencies = [
     "tomli>=2.0.0; python_version < '3.11'",  # TOML parsing (built-in tomllib for 3.11+)
     "tomli-w>=1.0.0",  # TOML writing (no stdlib equivalent)
     "uv>=0.4.0",  # Fast Python package installer and venv creator
+    "pip>=21.0",  # Fallback package installer
 ]
 
 [project.optional-dependencies]

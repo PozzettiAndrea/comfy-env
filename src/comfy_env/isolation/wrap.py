@@ -319,6 +319,13 @@ def wrap_isolated_nodes(
     if os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
         return node_class_mappings
 
+    # Get ComfyUI base path from folder_paths (canonical source)
+    try:
+        import folder_paths
+        comfyui_base = folder_paths.base_path
+    except ImportError:
+        comfyui_base = None
+
     nodes_dir = Path(nodes_dir).resolve()
 
     # Check for comfy-env.toml
@@ -340,6 +347,10 @@ def wrap_isolated_nodes(
         env_vars = {str(k): str(v) for k, v in env_vars_data.items()}
     except Exception:
         pass  # Ignore errors reading config
+
+    # Set COMFYUI_BASE for worker to find ComfyUI modules
+    if comfyui_base:
+        env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
     # Find environment directory and paths
     env_dir = _find_env_dir(nodes_dir)

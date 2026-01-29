@@ -1044,15 +1044,21 @@ class SubprocessWorker(Worker):
 
     def _find_comfyui_base(self) -> Optional[Path]:
         """Find ComfyUI base directory."""
-        # Check common child directories (for test environments)
-        # Also check parent's children (isolated venv is sibling to .comfy-test-env)
+        # Use folder_paths.base_path (canonical source) if available
+        try:
+            import folder_paths
+            return Path(folder_paths.base_path)
+        except ImportError:
+            pass
+
+        # Fallback: Check common child directories (for test environments)
         for base in [self.working_dir, self.working_dir.parent]:
             for child in [".comfy-test-env/ComfyUI", "ComfyUI"]:
                 candidate = base / child
                 if (candidate / "main.py").exists() and (candidate / "comfy").exists():
                     return candidate
 
-        # Walk up from working_dir (standard ComfyUI custom_nodes layout)
+        # Fallback: Walk up from working_dir (standard ComfyUI custom_nodes layout)
         current = self.working_dir.resolve()
         for _ in range(10):
             if (current / "main.py").exists() and (current / "comfy").exists():

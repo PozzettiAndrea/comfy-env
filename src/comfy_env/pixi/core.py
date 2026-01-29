@@ -40,10 +40,87 @@ CUDA_TORCH_MAP = {
     "12.1": "2.4",
 }
 
+def find_wheel_url(
+    package: str,
+    torch_version: str,
+    cuda_version: str,
+    python_version: str,
+) -> Optional[str]:
+    """
+    Query cuda-wheels index and return the direct URL for the matching wheel.
+
+    This bypasses pip's version validation by providing a direct URL,
+    which is necessary for wheels where the filename has a local version
+    but the internal METADATA doesn't (e.g., flash-attn from mjun0812).
+
+    Args:
+        package: Package name (e.g., "flash-attn")
+        torch_version: PyTorch version (e.g., "2.8")
+        cuda_version: CUDA version (e.g., "12.8")
+        python_version: Python version (e.g., "3.10")
+
+    Returns:
+        Direct URL to the wheel file, or None if no match found.
+    """
+    cuda_short = cuda_version.replace(".", "")[:3]  # "12.8" -> "128"
+    torch_short = torch_version.replace(".", "")[:2]  # "2.8" -> "28"
+    py_tag = f"cp{python_version.replace('.', '')}"  # "3.10" -> "cp310"
+
+    # Platform tag for current system
+    if sys.platform == "linux":
+        platform_tag = "linux_x86_64"
+    elif sys.platform == "win32":
+        platform_tag = "win_amd64"
+    else:
+        platform_tag = None  # macOS doesn't typically have CUDA wheels
+
+    # Local version patterns to match:
+    # cuda-wheels style: +cu128torch28
+    # PyG style: +pt28cu128
+    local_patterns = [
+        f"+cu{cuda_short}torch{torch_short}",  # cuda-wheels style
+        f"+pt{torch_short}cu{cuda_short}",     # PyG style
+    ]
+
+    pkg_variants = [package, package.replace("-", "_"), package.replace("_", "-")]
+
+    for pkg_dir in pkg_variants:
+        index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
+        try:
+            with urllib.request.urlopen(index_url, timeout=10) as resp:
+                html = resp.read().decode("utf-8")
+        except Exception:
+            continue
+
+        # Parse href and display name from HTML: <a href="URL">DISPLAY_NAME</a>
+        link_pattern = re.compile(r'href="([^"]+\.whl)"[^>]*>([^<]+)</a>', re.IGNORECASE)
+
+        for match in link_pattern.finditer(html):
+            wheel_url = match.group(1)
+            display_name = match.group(2)
+
+            # Match on display name (has normalized torch28 format)
+            matches_cuda_torch = any(p in display_name for p in local_patterns)
+            matches_python = py_tag in display_name
+            matches_platform = platform_tag is None or platform_tag in display_name
+
+            if matches_cuda_torch and matches_python and matches_platform:
+                # Return absolute URL
+                if wheel_url.startswith("http"):
+                    return wheel_url
+                # Relative URL - construct absolute
+                return f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
+
+    return None
+
+
 def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
     """
     Query cuda-wheels index to find a wheel matching the CUDA/torch version.
     Returns the full version spec (e.g., "flash-attn===2.8.3+cu128torch2.8") or None.
+
+    Note: This is used as a fallback for packages with correct wheel metadata.
+    For packages with mismatched metadata (like flash-attn), use find_wheel_url() instead.
     """
     cuda_short = cuda_version.replace(".", "")[:3]  # "12.8" -> "128"
     torch_short = torch_version.replace(".", "")[:2]  # "2.8" -> "28"
@@ -67,11 +144,11 @@ def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> 
         )
 
         # Local version patterns to match:
-        # flash-attn style: +cu128torch2.8
+        # cuda-wheels style: +cu128torch28
         # PyG style: +pt28cu128
         local_patterns = [
-            f"+cu{cuda_short}torch{torch_version}",  # flash-attn style
-            f"+pt{torch_short}cu{cuda_short}",       # PyG style
+            f"+cu{cuda_short}torch{torch_short}",  # cuda-wheels style
+            f"+pt{torch_short}cu{cuda_short}",     # PyG style
         ]
 
         best_match = None
@@ -394,29 +471,35 @@ def pixi_install(
         log(f"pixi install failed:\n{result.stderr}")
         raise RuntimeError(f"pixi install failed: {result.stderr}")
 
-    # Install CUDA packages with --find-links (searches all known sources)
+    # Install CUDA packages via direct URL or find-links fallback
     if cfg.cuda_packages and cuda_version:
         log(f"Installing CUDA packages: {cfg.cuda_packages}")
         python_path = get_pixi_python(node_dir)
         if not python_path:
             raise RuntimeError("Could not find Python in pixi environment")
 
+        # Get Python version from the pixi environment
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
         for package in cfg.cuda_packages:
+            # Find direct wheel URL (bypasses metadata validation)
+            wheel_url = find_wheel_url(package, torch_version, cuda_version, py_version)
+
+            if not wheel_url:
+                raise RuntimeError(
+                    f"No wheel found for {package} with CUDA {cuda_version}, "
+                    f"torch {torch_version}, Python {py_version}. "
+                    f"Check cuda-wheels index."
+                )
+
+            log(f"  Installing {package} from {wheel_url}")
             pip_cmd = [
                 str(python_path), "-m", "pip", "install",
-                "--no-index",  # Only use --find-links, don't query PyPI
                 "--no-deps",
                 "--no-cache-dir",
+                wheel_url,
             ]
 
-            # Add all find-links sources
-            for url in get_all_find_links(package, torch_version, cuda_version):
-                pip_cmd.extend(["--find-links", url])
-
-            # Get package spec with local version for CUDA/torch compatibility
-            pkg_spec = get_package_spec(package, torch_version, cuda_version)
-            log(f"  Installing {pkg_spec}")
-            pip_cmd.append(pkg_spec)
             result = subprocess.run(pip_cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 log(f"CUDA package install failed for {package}:\n{result.stderr}")

@@ -71,6 +71,31 @@ def clone_node(
     return node_path
 
 
+def install_requirements(
+    node_dir: Path,
+    log: Callable[[str], None],
+) -> None:
+    """
+    Install requirements.txt in a node directory if it exists.
+
+    Args:
+        node_dir: Path to the node directory
+        log: Logging callback
+    """
+    requirements_file = node_dir / "requirements.txt"
+
+    if requirements_file.exists():
+        log(f"  Installing requirements for {node_dir.name}...")
+        result = subprocess.run(
+            ["uv", "pip", "install", "-r", str(requirements_file), "--python", sys.executable],
+            cwd=node_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            log(f"  Warning: requirements.txt install failed for {node_dir.name}: {result.stderr.strip()[:200]}")
+
+
 def run_install_script(
     node_dir: Path,
     log: Callable[[str], None],
@@ -131,6 +156,9 @@ def install_node_deps(
         try:
             # Clone the repository
             clone_node(req.repo, req.name, custom_nodes_dir, log)
+
+            # Install requirements.txt if present
+            install_requirements(node_path, log)
 
             # Run install.py if present
             run_install_script(node_path, log)
