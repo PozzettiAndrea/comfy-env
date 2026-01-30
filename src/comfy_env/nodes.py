@@ -10,6 +10,7 @@ Example configuration:
     ComfyUI-DepthAnythingV2 = "kijai/ComfyUI-DepthAnythingV2"
 """
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -84,16 +85,20 @@ def install_requirements(
     """
     requirements_file = node_dir / "requirements.txt"
 
-    if requirements_file.exists():
-        log(f"  Installing requirements for {node_dir.name}...")
-        result = subprocess.run(
-            ["uv", "pip", "install", "-r", str(requirements_file), "--python", sys.executable],
-            cwd=node_dir,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            log(f"  Warning: requirements.txt install failed for {node_dir.name}: {result.stderr.strip()[:200]}")
+    if not requirements_file.exists():
+        return
+
+    log(f"  Installing requirements for {node_dir.name}...")
+
+    # Try uv first, fall back to pip if uv not in PATH
+    if shutil.which("uv"):
+        cmd = ["uv", "pip", "install", "-r", str(requirements_file), "--python", sys.executable]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "-r", str(requirements_file)]
+
+    result = subprocess.run(cmd, cwd=node_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"  Warning: requirements.txt install failed for {node_dir.name}: {result.stderr.strip()[:200]}")
 
 
 def run_install_script(
