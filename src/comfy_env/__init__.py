@@ -56,6 +56,15 @@ from .install import install, verify_installation
 # Prestartup helpers
 from .prestartup import setup_env
 
+# Cache management
+from .cache import (
+    get_cache_dir,
+    cleanup_orphaned_envs,
+    resolve_env_path,
+    CACHE_DIR,
+    MARKER_FILE,
+)
+
 # Errors
 from .errors import (
     EnvManagerError,
@@ -105,4 +114,20 @@ __all__ = [
     "DependencyError",
     "CUDANotFoundError",
     "InstallError",
+    # Cache
+    "get_cache_dir",
+    "cleanup_orphaned_envs",
+    "resolve_env_path",
+    "CACHE_DIR",
+    "MARKER_FILE",
 ]
+
+# Run orphan cleanup once on module load (silently)
+def _run_startup_cleanup():
+    """Clean orphaned envs on startup. Runs silently, never fails startup."""
+    try:
+        cleanup_orphaned_envs(log=lambda x: None)  # Silent
+    except Exception:
+        pass  # Never fail startup due to cleanup
+
+_run_startup_cleanup()

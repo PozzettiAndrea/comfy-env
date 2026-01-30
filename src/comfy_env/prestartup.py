@@ -127,15 +127,43 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     for key, value in env_vars.items():
         os.environ[key] = value
 
-    # Check _env_<name> first, then fallback to old .pixi path
-    env_name = get_env_name(os.path.basename(node_dir))
-    pixi_env = os.path.join(node_dir, env_name)
+    # Resolve environment path with fallback chain:
+    # 1. Marker file -> central cache
+    # 2. _env_<name> (current local)
+    # 3. .pixi/envs/default (old pixi)
+    pixi_env = None
 
-    if not os.path.exists(pixi_env):
-        # Fallback to old .pixi path
-        pixi_env = os.path.join(node_dir, ".pixi", "envs", "default")
-        if not os.path.exists(pixi_env):
-            return  # No environment found
+    # 1. Check marker file -> central cache
+    marker_path = os.path.join(node_dir, ".comfy-env-marker.toml")
+    if os.path.exists(marker_path):
+        try:
+            if sys.version_info >= (3, 11):
+                import tomllib
+            else:
+                import tomli as tomllib
+            with open(marker_path, "rb") as f:
+                marker = tomllib.load(f)
+            env_path = marker.get("env", {}).get("path")
+            if env_path and os.path.exists(env_path):
+                pixi_env = env_path
+        except Exception:
+            pass  # Fall through to other options
+
+    # 2. Check _env_<name> (local)
+    if not pixi_env:
+        env_name = get_env_name(os.path.basename(node_dir))
+        local_env = os.path.join(node_dir, env_name)
+        if os.path.exists(local_env):
+            pixi_env = local_env
+
+    # 3. Fallback to old .pixi path
+    if not pixi_env:
+        old_pixi = os.path.join(node_dir, ".pixi", "envs", "default")
+        if os.path.exists(old_pixi):
+            pixi_env = old_pixi
+
+    if not pixi_env:
+        return  # No environment found
 
     if sys.platform == "win32":
         # Windows: add to PATH for DLL loading

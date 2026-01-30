@@ -145,15 +145,19 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     """
     Find site-packages and lib directories for the isolated environment.
 
+    Fallback order:
+        1. Marker file -> central cache
+        2. _env_<name> (local)
+        3. .pixi/envs/default (old pixi)
+        4. .venv
+
     Returns:
         (site_packages, lib_dir) - lib_dir is for LD_LIBRARY_PATH
     """
     import glob
 
-    # Check _env_<name> directory first (new pattern)
-    env_name = get_env_name(node_dir.name)
-    env_dir = node_dir / env_name
-    if env_dir.exists():
+    def _get_paths_from_env(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
+        """Extract site-packages and lib_dir from an env directory."""
         if sys.platform == "win32":
             site_packages = env_dir / "Lib" / "site-packages"
             lib_dir = env_dir / "Library" / "bin"
@@ -163,23 +167,45 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
             site_packages = Path(matches[0]) if matches else None
             lib_dir = env_dir / "lib"
         if site_packages and site_packages.exists():
-            return site_packages, lib_dir if lib_dir.exists() else None
+            return site_packages, lib_dir if lib_dir and lib_dir.exists() else None
+        return None, None
 
-    # Fallback: Check old .pixi/envs/default (for backward compat)
+    # 1. Check marker file -> central cache
+    marker_path = node_dir / ".comfy-env-marker.toml"
+    if marker_path.exists():
+        try:
+            if sys.version_info >= (3, 11):
+                import tomllib
+            else:
+                import tomli as tomllib
+            with open(marker_path, "rb") as f:
+                marker = tomllib.load(f)
+            env_path = marker.get("env", {}).get("path")
+            if env_path:
+                env_dir = Path(env_path)
+                if env_dir.exists():
+                    result = _get_paths_from_env(env_dir)
+                    if result[0]:
+                        return result
+        except Exception:
+            pass  # Fall through to other options
+
+    # 2. Check _env_<name> directory (local)
+    env_name = get_env_name(node_dir.name)
+    env_dir = node_dir / env_name
+    if env_dir.exists():
+        result = _get_paths_from_env(env_dir)
+        if result[0]:
+            return result
+
+    # 3. Fallback: Check old .pixi/envs/default (for backward compat)
     pixi_env = node_dir / ".pixi" / "envs" / "default"
     if pixi_env.exists():
-        if sys.platform == "win32":
-            site_packages = pixi_env / "Lib" / "site-packages"
-            lib_dir = pixi_env / "Library" / "bin"
-        else:
-            pattern = str(pixi_env / "lib" / "python*" / "site-packages")
-            matches = glob.glob(pattern)
-            site_packages = Path(matches[0]) if matches else None
-            lib_dir = pixi_env / "lib"
-        if site_packages and site_packages.exists():
-            return site_packages, lib_dir if lib_dir.exists() else None
+        result = _get_paths_from_env(pixi_env)
+        if result[0]:
+            return result
 
-    # Check .venv directory
+    # 4. Check .venv directory
     venv_dir = node_dir / ".venv"
     if venv_dir.exists():
         if sys.platform == "win32":
@@ -195,19 +221,49 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
 
 
 def _find_env_dir(node_dir: Path) -> Optional[Path]:
-    """Find the environment directory (for cache key)."""
-    # Check _env_<name> first
+    """
+    Find the environment directory (for cache key).
+
+    Fallback order:
+        1. Marker file -> central cache
+        2. _env_<name> (local)
+        3. .pixi/envs/default (old pixi)
+        4. .venv
+    """
+    # 1. Check marker file -> central cache
+    marker_path = node_dir / ".comfy-env-marker.toml"
+    if marker_path.exists():
+        try:
+            if sys.version_info >= (3, 11):
+                import tomllib
+            else:
+                import tomli as tomllib
+            with open(marker_path, "rb") as f:
+                marker = tomllib.load(f)
+            env_path = marker.get("env", {}).get("path")
+            if env_path:
+                env_dir = Path(env_path)
+                if env_dir.exists():
+                    return env_dir
+        except Exception:
+            pass
+
+    # 2. Check _env_<name> first
     env_name = get_env_name(node_dir.name)
     env_dir = node_dir / env_name
     if env_dir.exists():
         return env_dir
-    # Fallback to old paths
+
+    # 3. Fallback to old .pixi path
     pixi_env = node_dir / ".pixi" / "envs" / "default"
     if pixi_env.exists():
         return pixi_env
+
+    # 4. Check .venv
     venv_dir = node_dir / ".venv"
     if venv_dir.exists():
         return venv_dir
+
     return None
 
 

@@ -534,20 +534,55 @@ def pixi_install(
 
         log("CUDA packages installed")
 
-    # Move environment from .pixi/envs/default to _env_<name>
+    # Move environment from .pixi/envs/default to central cache
+    from ..cache import (
+        get_central_env_path, write_marker, write_env_metadata,
+        MARKER_FILE, get_cache_dir
+    )
+
     old_env = node_dir / ".pixi" / "envs" / "default"
-    env_name = get_env_name(node_dir.name)
-    new_env = node_dir / env_name
+    config_path = node_dir / "comfy-env.toml"
+
+    # Determine the main node directory (for naming)
+    # If node_dir is custom_nodes/NodeName/subdir, main_node_dir is custom_nodes/NodeName
+    # If node_dir is custom_nodes/NodeName, main_node_dir is custom_nodes/NodeName
+    if node_dir.parent.name == "custom_nodes":
+        main_node_dir = node_dir
+    else:
+        # Walk up to find custom_nodes parent
+        main_node_dir = node_dir
+        for parent in node_dir.parents:
+            if parent.parent.name == "custom_nodes":
+                main_node_dir = parent
+                break
+
+    # Get central env path
+    central_env = get_central_env_path(main_node_dir, config_path)
 
     if old_env.exists():
-        if new_env.exists():
-            shutil.rmtree(new_env)  # Clean old env
-        shutil.move(str(old_env), str(new_env))
-        # Clean up .pixi directory (keep pixi.toml and pixi.lock)
+        # Ensure cache directory exists
+        get_cache_dir()
+
+        # Remove old central env if exists
+        if central_env.exists():
+            shutil.rmtree(central_env)
+
+        # Move to central cache
+        shutil.move(str(old_env), str(central_env))
+
+        # Write marker file in node directory
+        write_marker(config_path, central_env)
+
+        # Write metadata in env for orphan detection
+        marker_path = config_path.parent / MARKER_FILE
+        write_env_metadata(central_env, marker_path)
+
+        # Clean up .pixi directory
         pixi_dir = node_dir / ".pixi"
         if pixi_dir.exists():
             shutil.rmtree(pixi_dir)
-        log(f"Moved environment to {new_env}")
+
+        log(f"Environment created at: {central_env}")
 
     log("Installation complete!")
     return True
