@@ -228,23 +228,19 @@ def _to_shm(obj, registry, visited=None):
         result["__was_tensor__"] = True
         return result
 
-    # trimesh.Trimesh → vertices + faces arrays → shared memory
+    # trimesh.Trimesh → pickle → shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
-        verts = np.ascontiguousarray(obj.vertices, dtype=np.float64)
-        faces = np.ascontiguousarray(obj.faces, dtype=np.int64)
+        import pickle
+        mesh_bytes = pickle.dumps(obj)
 
-        v_block = shm.SharedMemory(create=True, size=verts.nbytes)
-        np.ndarray(verts.shape, verts.dtype, buffer=v_block.buf)[:] = verts
-        registry.append(v_block)
-
-        f_block = shm.SharedMemory(create=True, size=faces.nbytes)
-        np.ndarray(faces.shape, faces.dtype, buffer=f_block.buf)[:] = faces
-        registry.append(f_block)
+        block = shm.SharedMemory(create=True, size=len(mesh_bytes))
+        block.buf[:len(mesh_bytes)] = mesh_bytes
+        registry.append(block)
 
         result = {
             "__shm_trimesh__": True,
-            "v_name": v_block.name, "v_shape": list(verts.shape),
-            "f_name": f_block.name, "f_shape": list(faces.shape),
+            "name": block.name,
+            "size": len(mesh_bytes),
         }
         visited[obj_id] = result
         return result
@@ -294,22 +290,15 @@ def _from_shm(obj, unlink=True):
             return torch.from_numpy(arr)
         return arr
 
-    # trimesh
+    # trimesh (pickled to preserve visual, metadata, normals)
     if "__shm_trimesh__" in obj:
-        import trimesh
-        v_block = shm.SharedMemory(name=obj["v_name"])
-        verts = np.ndarray(tuple(obj["v_shape"]), dtype=np.float64, buffer=v_block.buf).copy()
-        v_block.close()
+        import pickle
+        block = shm.SharedMemory(name=obj["name"])
+        mesh_bytes = bytes(block.buf[:obj["size"]])
+        block.close()
         if unlink:
-            v_block.unlink()
-
-        f_block = shm.SharedMemory(name=obj["f_name"])
-        faces = np.ndarray(tuple(obj["f_shape"]), dtype=np.int64, buffer=f_block.buf).copy()
-        f_block.close()
-        if unlink:
-            f_block.unlink()
-
-        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            block.unlink()
+        return pickle.loads(mesh_bytes)
 
     # regular dict - recurse
     return {k: _from_shm(v, unlink) for k, v in obj.items()}
@@ -426,42 +415,29 @@ faulthandler.enable(file=sys.stderr, all_threads=True)
 # Debug logging (set COMFY_ENV_DEBUG=1 to enable)
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
-# Pre-import bpy FIRST to avoid DLL conflicts with numpy/torch/MKL
-# bpy's DLLs must be loaded before other packages load conflicting versions
-try:
-    import bpy
-    if _DEBUG:
-        print("[worker] Pre-imported bpy successfully", file=sys.stderr, flush=True)
-except ImportError as e:
-    # bpy not available in this environment - that's fine
-    pass
-except Exception as e:
-    if _DEBUG:
-        print(f"[worker] bpy pre-import warning: {e}", file=sys.stderr, flush=True)
-
 # Watchdog: dump all thread stacks every 60 seconds to catch hangs
 import threading
 import tempfile as _tempfile
 _watchdog_log = os.path.join(_tempfile.gettempdir(), "comfy_worker_watchdog.log")
 def _watchdog():
     import time
-    import io
     tick = 0
     while True:
         time.sleep(60)
         tick += 1
-        # Capture stack dump to string
-        buf = io.StringIO()
-        faulthandler.dump_traceback(file=buf, all_threads=True)
-        dump = buf.getvalue()
+        # Dump to temp file first (faulthandler needs real file descriptor)
+        tmp_path = _watchdog_log + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as tmp:
+            faulthandler.dump_traceback(file=tmp, all_threads=True)
+        with open(tmp_path, "r", encoding="utf-8") as tmp:
+            dump = tmp.read()
 
-        # Write to file
+        # Write to persistent log
         with open(_watchdog_log, "a", encoding="utf-8") as f:
             f.write(f"\\n=== WATCHDOG TICK {tick} ({time.strftime('%H:%M:%S')}) ===\\n")
             f.write(dump)
             f.write("=== END ===\\n")
             f.flush()
-            os.fsync(f.fileno())
 
         # Also print
         print(f"\\n=== WATCHDOG TICK {tick} ===", flush=True)
@@ -554,22 +530,19 @@ def _to_shm(obj, registry, visited=None):
         result["__was_tensor__"] = True
         return result
 
+    # trimesh.Trimesh → pickle → shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
-        verts = np.ascontiguousarray(obj.vertices, dtype=np.float64)
-        faces = np.ascontiguousarray(obj.faces, dtype=np.int64)
+        import pickle
+        mesh_bytes = pickle.dumps(obj)
 
-        v_block = shm.SharedMemory(create=True, size=verts.nbytes)
-        np.ndarray(verts.shape, verts.dtype, buffer=v_block.buf)[:] = verts
-        registry.append(v_block)
-
-        f_block = shm.SharedMemory(create=True, size=faces.nbytes)
-        np.ndarray(faces.shape, faces.dtype, buffer=f_block.buf)[:] = faces
-        registry.append(f_block)
+        block = shm.SharedMemory(create=True, size=len(mesh_bytes))
+        block.buf[:len(mesh_bytes)] = mesh_bytes
+        registry.append(block)
 
         result = {
             "__shm_trimesh__": True,
-            "v_name": v_block.name, "v_shape": list(verts.shape),
-            "f_name": f_block.name, "f_shape": list(faces.shape),
+            "name": block.name,
+            "size": len(mesh_bytes),
         }
         visited[obj_id] = result
         return result
@@ -600,17 +573,13 @@ def _from_shm(obj):
             import torch
             return torch.from_numpy(arr)
         return arr
+    # trimesh (pickled to preserve visual, metadata, normals)
     if "__shm_trimesh__" in obj:
-        import trimesh
-        v_block = shm.SharedMemory(name=obj["v_name"])
-        verts = np.ndarray(tuple(obj["v_shape"]), dtype=np.float64, buffer=v_block.buf).copy()
-        v_block.close()
-
-        f_block = shm.SharedMemory(name=obj["f_name"])
-        faces = np.ndarray(tuple(obj["f_shape"]), dtype=np.int64, buffer=f_block.buf).copy()
-        f_block.close()
-
-        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        import pickle
+        block = shm.SharedMemory(name=obj["name"])
+        mesh_bytes = bytes(block.buf[:obj["size"]])
+        block.close()
+        return pickle.loads(mesh_bytes)
     return {k: _from_shm(v) for k, v in obj.items()}
 
 def _cleanup_shm(registry):

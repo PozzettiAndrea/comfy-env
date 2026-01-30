@@ -457,11 +457,14 @@ def pixi_install(
     # Build pypi-dependencies section (CUDA packages excluded - installed separately)
     pypi_deps = pixi_data.get("pypi-dependencies", {})
 
-    # Add torch if we have CUDA packages
+    # Enforce torch version if we have CUDA packages (must match cuda_packages wheels)
     if cfg.has_cuda and torch_version:
         torch_major = torch_version.split(".")[0]
         torch_minor = int(torch_version.split(".")[1])
-        pypi_deps.setdefault("torch", f">={torch_version},<{torch_major}.{torch_minor + 1}")
+        required_torch = f">={torch_version},<{torch_major}.{torch_minor + 1}"
+        if "torch" in pypi_deps and pypi_deps["torch"] != required_torch:
+            log(f"Overriding torch={pypi_deps['torch']} with {required_torch} (required for cuda_packages)")
+        pypi_deps["torch"] = required_torch
 
     # NOTE: CUDA packages are NOT added here - they're installed with --no-deps after pixi
 
@@ -494,8 +497,16 @@ def pixi_install(
         if not python_path:
             raise RuntimeError("Could not find Python in pixi environment")
 
-        # Get Python version from the pixi environment
-        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        # Get Python version from the pixi environment (not host Python)
+        result = subprocess.run(
+            [str(python_path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            py_version = result.stdout.strip()
+        else:
+            py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            log(f"Warning: Could not detect pixi Python version, using host: {py_version}")
 
         for package in cfg.cuda_packages:
             # Find direct wheel URL (bypasses metadata validation)

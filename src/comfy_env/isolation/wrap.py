@@ -211,6 +211,34 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     return None
 
 
+def _find_custom_node_root(nodes_dir: Path) -> Optional[Path]:
+    """
+    Find the custom node root (direct child of custom_nodes/).
+
+    Uses folder_paths to find custom_nodes directories, then finds
+    which one is an ancestor of nodes_dir.
+
+    Example: /path/custom_nodes/ComfyUI-UniRig/nodes/nodes_gpu
+             -> returns /path/custom_nodes/ComfyUI-UniRig
+    """
+    try:
+        import folder_paths
+        custom_nodes_dirs = folder_paths.get_folder_paths("custom_nodes")
+    except (ImportError, KeyError):
+        return None
+
+    for cn_dir in custom_nodes_dirs:
+        cn_path = Path(cn_dir)
+        try:
+            rel = nodes_dir.relative_to(cn_path)
+            if rel.parts:
+                return cn_path / rel.parts[0]
+        except ValueError:
+            continue
+
+    return None
+
+
 def _wrap_node_class(
     cls: type,
     env_dir: Path,
@@ -388,7 +416,9 @@ def wrap_isolated_nodes(
         print(f"[comfy-env] Run 'comfy-env install' in {nodes_dir}")
         return node_class_mappings
 
-    # Build sys.path for the worker - site-packages first, then node dir
+    # Build sys.path - site-packages first, then nodes_dir
+    # Note: isolated modules should use absolute imports (their dir is in sys.path)
+    # Relative imports would require importing parent package which may have host-only deps
     sys_path = [str(site_packages), str(nodes_dir)]
 
     # lib_dir for LD_LIBRARY_PATH (conda libraries)
