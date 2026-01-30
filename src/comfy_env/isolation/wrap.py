@@ -36,7 +36,7 @@ _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
 
 def get_env_name(dir_name: str) -> str:
-    """Convert directory name to env name: ComfyUI-UniRig → _env_unirig"""
+    """Convert directory name to env name: ComfyUI-UniRig -> _env_unirig"""
     name = dir_name.lower().replace("-", "_").lstrip("comfyui_")
     return f"_env_{name}"
 

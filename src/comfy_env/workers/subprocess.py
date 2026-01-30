@@ -211,7 +211,7 @@ def _to_shm(obj, registry, visited=None):
 
     t = type(obj).__name__
 
-    # numpy array → direct shared memory
+    # numpy array -> direct shared memory
     if t == 'ndarray':
         arr = np.ascontiguousarray(obj)
         block = shm.SharedMemory(create=True, size=arr.nbytes)
@@ -221,14 +221,14 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # torch.Tensor → convert to numpy → shared memory (with marker to restore type)
+    # torch.Tensor -> convert to numpy -> shared memory (with marker to restore type)
     if t == 'Tensor':
         arr = obj.detach().cpu().numpy()
         result = _to_shm(arr, registry, visited)
         result["__was_tensor__"] = True
         return result
 
-    # trimesh.Trimesh → pickle → shared memory (preserves visual, metadata, normals)
+    # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
         import pickle
         mesh_bytes = pickle.dumps(obj)
@@ -245,7 +245,7 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # Path → string
+    # Path -> string
     from pathlib import PurePath
     if isinstance(obj, PurePath):
         return str(obj)
@@ -530,7 +530,7 @@ def _to_shm(obj, registry, visited=None):
         result["__was_tensor__"] = True
         return result
 
-    # trimesh.Trimesh → pickle → shared memory (preserves visual, metadata, normals)
+    # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
         import pickle
         mesh_bytes = pickle.dumps(obj)

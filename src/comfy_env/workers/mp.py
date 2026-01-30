@@ -29,6 +29,7 @@ from queue import Empty as QueueEmpty
 from typing import Any, Callable, Optional
 
 from .base import Worker, WorkerError
+from .tensor_utils import prepare_for_ipc_recursive, keep_tensors_recursive
 
 logger = logging.getLogger("comfy_env")
 
@@ -40,8 +41,20 @@ _SHUTDOWN = object()
 _CALL_METHOD = "call_method"
 
 
+def _can_use_cuda_ipc():
+    """
+    Check if CUDA IPC is available.
+
+    CUDA IPC works with native allocator but breaks with cudaMallocAsync.
+    If no backend is specified, CUDA IPC should work (PyTorch default is native).
+    """
+    import os
+    conf = os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
+    return 'cudaMallocAsync' not in conf
+
+
 # ---------------------------------------------------------------------------
-# Tensor file transfer - avoids CUDA IPC issues with cudaMallocAsync
+# Tensor file transfer - fallback for cudaMallocAsync (CUDA IPC doesn't work)
 # ---------------------------------------------------------------------------
 
 def _save_tensors_to_files(obj, file_registry=None):
@@ -252,20 +265,31 @@ def _worker_loop(queue_in, queue_out, sys_path_additions=None, lib_path=None, en
                 # Handle method call protocol
                 if isinstance(item, tuple) and len(item) == 6 and item[0] == _CALL_METHOD:
                     _, module_name, class_name, method_name, self_state, kwargs = item
-                    # Load tensors from files (saved by host to avoid cudaMallocAsync IPC issues)
-                    kwargs = _load_tensors_from_files(kwargs)
+                    # Load tensors from files if using file-based transfer
+                    if not _can_use_cuda_ipc():
+                        kwargs = _load_tensors_from_files(kwargs)
                     result = _execute_method_call(
                         module_name, class_name, method_name, self_state, kwargs
                     )
-                    # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
-                    result = _save_tensors_to_files(result)
+                    # Handle result based on allocator
+                    if _can_use_cuda_ipc():
+                        keep_tensors_recursive(result)
+                    else:
+                        result = _save_tensors_to_files(result)
                     queue_out.put(("ok", result))
                 else:
                     # Direct function call (legacy)
                     func, args, kwargs = item
+                    # Load tensors from files if using file-based transfer
+                    if not _can_use_cuda_ipc():
+                        args = tuple(_load_tensors_from_files(a) for a in args)
+                        kwargs = _load_tensors_from_files(kwargs)
                     result = func(*args, **kwargs)
-                    # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
-                    result = _save_tensors_to_files(result)
+                    # Handle result based on allocator
+                    if _can_use_cuda_ipc():
+                        keep_tensors_recursive(result)
+                    else:
+                        result = _save_tensors_to_files(result)
                     queue_out.put(("ok", result))
 
             except Exception as e:
@@ -661,6 +685,16 @@ class MPWorker(Worker):
         """
         self._ensure_started()
 
+        # Handle tensors based on allocator
+        if _can_use_cuda_ipc():
+            # CUDA IPC - zero copy (works with native allocator)
+            kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
+            args = tuple(prepare_for_ipc_recursive(a) for a in args)
+        else:
+            # File-based transfer (fallback for cudaMallocAsync)
+            kwargs = _save_tensors_to_files(kwargs)
+            args = tuple(_save_tensors_to_files(a) for a in args)
+
         # Send work item
         self._queue_in.put((func, args, kwargs))
 
@@ -699,8 +733,13 @@ class MPWorker(Worker):
         """
         self._ensure_started()
 
-        # Save tensors to files to avoid CUDA IPC issues with cudaMallocAsync
-        kwargs = _save_tensors_to_files(kwargs)
+        # Handle tensors based on allocator
+        if _can_use_cuda_ipc():
+            # CUDA IPC - zero copy (works with native allocator)
+            kwargs = prepare_for_ipc_recursive(kwargs)
+        else:
+            # File-based transfer (fallback for cudaMallocAsync)
+            kwargs = _save_tensors_to_files(kwargs)
 
         # Send method call request using protocol
         self._queue_in.put((
@@ -728,8 +767,9 @@ class MPWorker(Worker):
 
         # Handle response
         if status == "ok":
-            # Load tensors from temp files
-            result = _load_tensors_from_files(result)
+            # Load tensors from temp files if using file-based transfer
+            if not _can_use_cuda_ipc():
+                result = _load_tensors_from_files(result)
             return result
         elif status == "error":
             msg, tb = result
