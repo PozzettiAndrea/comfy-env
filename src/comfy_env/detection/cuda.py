@@ -1,8 +1,4 @@
-"""
-CUDA version detection with multiple fallback methods.
-
-Detection priority: PyTorch -> nvcc -> env vars
-"""
+"""CUDA version detection. Priority: env -> torch -> nvcc"""
 
 from __future__ import annotations
 
@@ -14,25 +10,8 @@ CUDA_VERSION_ENV_VAR = "COMFY_ENV_CUDA_VERSION"
 
 
 def detect_cuda_version() -> str | None:
-    """
-    Detect CUDA version from available sources.
-
-    Returns:
-        CUDA version string (e.g., "12.8") or None if not detected.
-    """
-    # Check environment override first
-    if version := get_cuda_from_env():
-        return version
-
-    # Try PyTorch
-    if version := get_cuda_from_torch():
-        return version
-
-    # Try nvcc
-    if version := get_cuda_from_nvcc():
-        return version
-
-    return None
+    """Detect CUDA version from available sources."""
+    return get_cuda_from_env() or get_cuda_from_torch() or get_cuda_from_nvcc()
 
 
 def get_cuda_from_env() -> str | None:
@@ -40,7 +19,6 @@ def get_cuda_from_env() -> str | None:
     override = os.environ.get(CUDA_VERSION_ENV_VAR, "").strip()
     if not override:
         return None
-    # Handle formats like "128" -> "12.8"
     if "." not in override and len(override) >= 2:
         return f"{override[:-1]}.{override[-1]}"
     return override
@@ -58,16 +36,13 @@ def get_cuda_from_torch() -> str | None:
 
 
 def get_cuda_from_nvml() -> str | None:
-    """Get CUDA version from NVML (driver API version)."""
+    """Get CUDA version from NVML."""
     try:
         import pynvml
         pynvml.nvmlInit()
         try:
-            # NVML reports driver CUDA version, not runtime
             cuda_version = pynvml.nvmlSystemGetCudaDriverVersion_v2()
-            major = cuda_version // 1000
-            minor = (cuda_version % 1000) // 10
-            return f"{major}.{minor}"
+            return f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
         finally:
             pynvml.nvmlShutdown()
     except Exception:
@@ -78,33 +53,9 @@ def get_cuda_from_nvml() -> str | None:
 def get_cuda_from_nvcc() -> str | None:
     """Get CUDA version from nvcc compiler."""
     try:
-        r = subprocess.run(
-            ["nvcc", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if r.returncode == 0:
-            if m := re.search(r"release (\d+\.\d+)", r.stdout):
-                return m.group(1)
-    except Exception:
-        pass
-    return None
-
-
-def get_cuda_from_nvidia_smi() -> str | None:
-    """Get CUDA version from nvidia-smi (driver-supported version)."""
-    try:
-        r = subprocess.run(
-            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if r.returncode == 0:
-            # nvidia-smi shows driver-supported CUDA, not installed runtime
-            # This is less reliable for our purposes
-            pass
+        r = subprocess.run(["nvcc", "--version"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and (m := re.search(r"release (\d+\.\d+)", r.stdout)):
+            return m.group(1)
     except Exception:
         pass
     return None

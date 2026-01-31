@@ -1,23 +1,4 @@
-"""
-CLI for comfy-env.
-
-Provides the `comfy-env` command with subcommands:
-- init: Create a default comfy-env.toml
-- generate: Generate pixi.toml from comfy-env.toml
-- install: Install dependencies from config
-- info: Show runtime environment information
-- doctor: Verify installation
-
-Usage:
-    comfy-env init ---> creates template comfy-env.toml
-    comfy-env generate nodes/cgal/comfy-env.toml ---> nodes/cgal/pixi.toml
-    comfy-env install ---> installs from comfy
-    comfy-env install --dry-run
-
-    comfy-env info
-
-    comfy-env doctor
-"""
+"""CLI for comfy-env."""
 
 import argparse
 import sys
@@ -28,136 +9,51 @@ from . import __version__
 
 
 def main(args: Optional[List[str]] = None) -> int:
-    """Main entry point for comfy-env CLI."""
-    parser = argparse.ArgumentParser(
-        prog="comfy-env",
-        description="Environment management for ComfyUI custom nodes",
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"comfy-env {__version__}"
-    )
+    parser = argparse.ArgumentParser(prog="comfy-env", description="Environment management for ComfyUI")
+    parser.add_argument("--version", action="version", version=f"comfy-env {__version__}")
+    sub = parser.add_subparsers(dest="command", help="Commands")
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    # init
+    p = sub.add_parser("init", help="Create comfy-env.toml")
+    p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
 
-    # init command
-    init_parser = subparsers.add_parser(
-        "init",
-        help="Create a default comfy-env.toml config file",
-        description="Initialize a new comfy-env.toml configuration file in the current directory",
-    )
-    init_parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Overwrite existing config file",
-    )
+    # generate
+    p = sub.add_parser("generate", help="Generate pixi.toml from comfy-env.toml")
+    p.add_argument("config", type=str, help="Path to comfy-env.toml")
+    p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
 
-    # generate command
-    generate_parser = subparsers.add_parser(
-        "generate",
-        help="Generate pixi.toml from comfy-env.toml",
-        description="Parse comfy-env.toml and generate a pixi.toml in the same directory",
-    )
-    generate_parser.add_argument(
-        "config",
-        type=str,
-        help="Path to comfy-env.toml",
-    )
-    generate_parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Overwrite existing pixi.toml",
-    )
+    # install
+    p = sub.add_parser("install", help="Install dependencies")
+    p.add_argument("--config", "-c", type=str, help="Config path")
+    p.add_argument("--dry-run", action="store_true", help="Preview only")
+    p.add_argument("--dir", "-d", type=str, help="Node directory")
 
-    # install command
-    install_parser = subparsers.add_parser(
-        "install",
-        help="Install dependencies from config",
-        description="Install CUDA wheels and dependencies from comfy-env.toml",
-    )
-    install_parser.add_argument(
-        "--config", "-c",
-        type=str,
-        help="Path to config file (default: auto-discover)",
-    )
-    install_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be installed without installing",
-    )
-    install_parser.add_argument(
-        "--dir", "-d",
-        type=str,
-        help="Directory containing the config (default: current directory)",
-    )
+    # info
+    p = sub.add_parser("info", help="Show runtime info")
+    p.add_argument("--json", action="store_true", help="JSON output")
 
-    # info command
-    info_parser = subparsers.add_parser(
-        "info",
-        help="Show runtime environment information",
-        description="Display detected Python, CUDA, PyTorch, and GPU information",
-    )
-    info_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output as JSON",
-    )
+    # doctor
+    p = sub.add_parser("doctor", help="Verify installation")
+    p.add_argument("--package", "-p", type=str, help="Check specific package")
+    p.add_argument("--config", "-c", type=str, help="Config path")
 
-    # doctor command
-    doctor_parser = subparsers.add_parser(
-        "doctor",
-        help="Verify installation and diagnose issues",
-        description="Check if packages are properly installed and importable",
-    )
-    doctor_parser.add_argument(
-        "--package", "-p",
-        type=str,
-        help="Check specific package",
-    )
-    doctor_parser.add_argument(
-        "--config", "-c",
-        type=str,
-        help="Path to config file",
-    )
-
-    # apt-install command
-    apt_parser = subparsers.add_parser(
-        "apt-install",
-        help="Install system packages from [apt] section (Linux only)",
-        description="Read [apt] packages from comfy-env.toml and install via apt-get",
-    )
-    apt_parser.add_argument(
-        "--config", "-c",
-        type=str,
-        help="Path to comfy-env.toml (default: auto-discover)",
-    )
-    apt_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be installed without installing",
-    )
+    # apt-install
+    p = sub.add_parser("apt-install", help="Install apt packages (Linux)")
+    p.add_argument("--config", "-c", type=str, help="Config path")
+    p.add_argument("--dry-run", action="store_true", help="Preview only")
 
     parsed = parser.parse_args(args)
-
-    if parsed.command is None:
+    if not parsed.command:
         parser.print_help()
         return 0
 
+    commands = {
+        "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
+        "info": cmd_info, "doctor": cmd_doctor, "apt-install": cmd_apt_install,
+    }
+
     try:
-        if parsed.command == "init":
-            return cmd_init(parsed)
-        elif parsed.command == "generate":
-            return cmd_generate(parsed)
-        elif parsed.command == "install":
-            return cmd_install(parsed)
-        elif parsed.command == "info":
-            return cmd_info(parsed)
-        elif parsed.command == "doctor":
-            return cmd_doctor(parsed)
-        elif parsed.command == "apt-install":
-            return cmd_apt_install(parsed)
-        else:
-            parser.print_help()
-            return 1
+        return commands.get(parsed.command, lambda _: 1)(parsed)
     except KeyboardInterrupt:
         print("\nInterrupted")
         return 130
@@ -167,111 +63,64 @@ def main(args: Optional[List[str]] = None) -> int:
 
 
 DEFAULT_CONFIG = """\
-# comfy-env.toml - Environment configuration for ComfyUI custom nodes
-# Documentation: https://github.com/PozzettiAndrea/comfy-env
+# comfy-env.toml
+[cuda]
+packages = []
 
-[system]
-# System packages required (apt on Linux, brew on macOS)
-linux = []
-
-[environment]
-python = "3.11"
-cuda_version = "auto"
-pytorch_version = "auto"
-
-[environment.cuda]
-# CUDA packages from https://pozzettiandrea.github.io/cuda-wheels/
-# Example: nvdiffrast = "0.4.0"
-
-[environment.packages]
-requirements = []
+[pypi-dependencies]
+# example = "*"
 """
 
 
 def cmd_init(args) -> int:
-    """Handle init command."""
     config_path = Path.cwd() / "comfy-env.toml"
-
     if config_path.exists() and not args.force:
-        print(f"Config file already exists: {config_path}", file=sys.stderr)
-        print("Use --force to overwrite", file=sys.stderr)
+        print(f"Already exists: {config_path}\nUse --force to overwrite", file=sys.stderr)
         return 1
-
     config_path.write_text(DEFAULT_CONFIG)
     print(f"Created {config_path}")
     return 0
 
 
 def cmd_generate(args) -> int:
-    """Handle generate command - create pixi.toml from comfy-env.toml."""
     from .config import load_config
     from .packages.toml_generator import write_pixi_toml
 
     config_path = Path(args.config).resolve()
-
     if not config_path.exists():
-        print(f"Config file not found: {config_path}", file=sys.stderr)
+        print(f"Not found: {config_path}", file=sys.stderr)
         return 1
-
-    if config_path.name != "comfy-env.toml":
-        print(f"Warning: Expected comfy-env.toml, got {config_path.name}", file=sys.stderr)
 
     node_dir = config_path.parent
     pixi_path = node_dir / "pixi.toml"
-
     if pixi_path.exists() and not args.force:
-        print(f"pixi.toml already exists: {pixi_path}", file=sys.stderr)
-        print("Use --force to overwrite", file=sys.stderr)
+        print(f"Already exists: {pixi_path}\nUse --force to overwrite", file=sys.stderr)
         return 1
 
-    # Load the config
     config = load_config(config_path)
     if not config:
-        print(f"Failed to load config from {config_path}", file=sys.stderr)
+        print(f"Failed to load: {config_path}", file=sys.stderr)
         return 1
 
     print(f"Generating pixi.toml from {config_path}")
-    if config.python:
-        print(f"  Python: {config.python}")
-    if config.cuda_packages:
-        print(f"  CUDA packages: {', '.join(config.cuda_packages)}")
-
-    # Generate pixi.toml
-    result_path = write_pixi_toml(config, node_dir)
-
-    print(f"Created {result_path}")
-    print()
-    print("Next steps:")
-    print(f"  cd {node_dir}")
-    print("  pixi install")
+    write_pixi_toml(config, node_dir)
+    print(f"Created {pixi_path}\nNext: cd {node_dir} && pixi install")
     return 0
 
 
 def cmd_install(args) -> int:
-    """Handle install command."""
     from .install import install
-
     node_dir = Path(args.dir) if args.dir else Path.cwd()
-
     try:
-        install(
-            config=args.config,
-            node_dir=node_dir,
-            dry_run=args.dry_run,
-        )
+        install(config=args.config, node_dir=node_dir, dry_run=args.dry_run)
         return 0
-    except FileNotFoundError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
     except Exception as e:
-        print(f"Installation failed: {e}", file=sys.stderr)
+        print(f"Failed: {e}", file=sys.stderr)
         return 1
 
 
 def cmd_info(args) -> int:
-    """Handle info command."""
     from .detection import RuntimeEnv
-
     env = RuntimeEnv.detect()
 
     if args.json:
@@ -279,149 +128,74 @@ def cmd_info(args) -> int:
         print(json.dumps(env.as_dict(), indent=2))
         return 0
 
-    print("Runtime Environment")
-    print("=" * 40)
-    print(f"  OS:           {env.os_name}")
-    print(f"  Platform:     {env.platform_tag}")
-    print(f"  Python:       {env.python_version}")
-
-    if env.cuda_version:
-        print(f"  CUDA:         {env.cuda_version}")
-    else:
-        print("  CUDA:         Not detected")
-
-    if env.torch_version:
-        print(f"  PyTorch:      {env.torch_version}")
-    else:
-        print("  PyTorch:      Not installed")
-
+    print("Runtime Environment\n" + "=" * 40)
+    print(f"  OS:       {env.os_name}")
+    print(f"  Platform: {env.platform_tag}")
+    print(f"  Python:   {env.python_version}")
+    print(f"  CUDA:     {env.cuda_version or 'Not detected'}")
+    print(f"  PyTorch:  {env.torch_version or 'Not installed'}")
     if env.gpu_name:
-        print(f"  GPU:          {env.gpu_name}")
-        if env.gpu_compute:
-            print(f"  Compute:      {env.gpu_compute}")
-
+        print(f"  GPU:      {env.gpu_name}")
+        if env.gpu_compute: print(f"  Compute:  {env.gpu_compute}")
     print()
     return 0
 
 
 def cmd_doctor(args) -> int:
-    """Handle doctor command."""
     from .install import verify_installation
     from .config import load_config, discover_config
 
-    print("Running diagnostics...")
-    print("=" * 40)
-
-    # Check environment
+    print("Diagnostics\n" + "=" * 40)
     print("\n1. Environment")
     cmd_info(argparse.Namespace(json=False))
 
-    # Check packages
-    print("2. Package Verification")
-
+    print("2. Packages")
     packages = []
     if args.package:
         packages = [args.package]
-    elif args.config:
-        config = load_config(Path(args.config))
-        if config:
-            # Get packages from pypi-dependencies
-            pypi_deps = config.pixi_passthrough.get("pypi-dependencies", {})
-            packages = list(pypi_deps.keys()) + config.cuda_packages
     else:
-        config = discover_config(Path.cwd())
-        if config:
-            pypi_deps = config.pixi_passthrough.get("pypi-dependencies", {})
-            packages = list(pypi_deps.keys()) + config.cuda_packages
+        cfg = load_config(Path(args.config)) if args.config else discover_config(Path.cwd())
+        if cfg:
+            packages = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys()) + cfg.cuda_packages
 
     if packages:
-        all_ok = verify_installation(packages)
-        if all_ok:
-            print("\nAll packages verified!")
-            return 0
-        else:
-            print("\nSome packages failed verification.")
-            return 1
-    else:
-        print("  No packages to verify (no config found)")
-        return 0
+        return 0 if verify_installation(packages) else 1
+    print("  No packages to verify")
+    return 0
 
 
 def cmd_apt_install(args) -> int:
-    """Handle apt-install command - install system packages from [apt] section."""
-    import os
-    import shutil
-    import subprocess
-    import platform
-
+    import os, shutil, subprocess, platform
     if platform.system() != "Linux":
-        print("apt-install is only supported on Linux", file=sys.stderr)
+        print("apt-install: Linux only", file=sys.stderr)
         return 1
 
-    # Find config
-    if args.config:
-        config_path = Path(args.config).resolve()
-    else:
-        config_path = Path.cwd() / "comfy-env.toml"
-
+    config_path = Path(args.config).resolve() if args.config else Path.cwd() / "comfy-env.toml"
     if not config_path.exists():
-        print(f"Config file not found: {config_path}", file=sys.stderr)
+        print(f"Not found: {config_path}", file=sys.stderr)
         return 1
 
-    # Parse config to get apt packages
     from .config.parser import load_config
-    config = load_config(config_path)
-
-    if not config.apt_packages:
-        print("No [apt] packages specified in config")
+    packages = load_config(config_path).apt_packages
+    if not packages:
+        print("No apt packages in config")
         return 0
 
-    packages = config.apt_packages
-    print(f"Found {len(packages)} apt package(s) to install:")
-    for pkg in packages:
-        print(f"  - {pkg}")
-
-    # Determine if we need sudo
-    is_root = os.geteuid() == 0
-    has_sudo = shutil.which("sudo") is not None
-    use_sudo = not is_root and has_sudo
-
+    print(f"Packages: {', '.join(packages)}")
+    use_sudo = os.geteuid() != 0 and shutil.which("sudo")
     prefix = ["sudo"] if use_sudo else []
 
     if args.dry_run:
-        print("\n[Dry run] Would run:")
-        prefix_str = "sudo " if use_sudo else ""
-        print(f"  {prefix_str}apt-get update && {prefix_str}apt-get install -y {' '.join(packages)}")
+        print(f"Would run: {'sudo ' if use_sudo else ''}apt-get install -y {' '.join(packages)}")
         return 0
 
-    if not is_root and not has_sudo:
-        print("\nError: Need root privileges to install apt packages.", file=sys.stderr)
-        print("Run manually with:", file=sys.stderr)
-        print(f"  sudo apt-get update && sudo apt-get install -y {' '.join(packages)}", file=sys.stderr)
+    if os.geteuid() != 0 and not shutil.which("sudo"):
+        print("Need root. Run: sudo apt-get install -y " + " ".join(packages), file=sys.stderr)
         return 1
 
-    # Run apt-get update
-    print("\nUpdating package lists...")
-    result = subprocess.run(
-        prefix + ["apt-get", "update"],
-        capture_output=False,
-    )
-    if result.returncode != 0:
-        print("Warning: apt-get update failed, continuing anyway...")
-
-    # Run apt-get install
-    print(f"\nInstalling: {' '.join(packages)}")
-    result = subprocess.run(
-        prefix + ["apt-get", "install", "-y"] + packages,
-        capture_output=False,
-    )
-
-    if result.returncode == 0:
-        print("\nSystem packages installed successfully!")
-        return 0
-    else:
-        print("\nFailed to install some packages", file=sys.stderr)
-        return result.returncode
+    subprocess.run(prefix + ["apt-get", "update"], capture_output=False)
+    result = subprocess.run(prefix + ["apt-get", "install", "-y"] + packages, capture_output=False)
+    return result.returncode
 
 
 if __name__ == "__main__":
