@@ -5,7 +5,6 @@ Handles pixi, CUDA wheels, apt packages, and node dependencies.
 """
 
 from .pixi import (
-    PIXI_VERSION,
     ensure_pixi,
     get_pixi_path,
     get_pixi_python,
@@ -35,7 +34,6 @@ from .node_dependencies import (
 
 __all__ = [
     # Pixi package manager
-    "PIXI_VERSION",
     "ensure_pixi",
     "get_pixi_path",
     "get_pixi_python",

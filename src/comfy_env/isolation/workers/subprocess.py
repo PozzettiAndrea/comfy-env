@@ -193,6 +193,32 @@ from multiprocessing import shared_memory as shm
 import numpy as np
 
 
+def _prepare_trimesh_for_pickle(mesh):
+    """
+    Prepare a trimesh object for cross-Python-version pickling.
+
+    Trimesh attaches helper objects (ray tracer, proximity query) that may use
+    native extensions like embreex. These cause import errors when unpickling
+    on a system without those extensions. We strip them - they'll be recreated
+    lazily when needed.
+
+    Note: Do NOT strip _cache - trimesh needs it to function properly.
+    """
+    # Make a copy to avoid modifying the original
+    mesh = mesh.copy()
+
+    # Remove helper objects that may have unpickleable native code references
+    # These are lazily recreated on first access anyway
+    # Do NOT remove _cache - it's needed for trimesh to work
+    for attr in ('ray', '_ray', 'permutate', 'nearest'):
+        try:
+            delattr(mesh, attr)
+        except AttributeError:
+            pass
+
+    return mesh
+
+
 def _to_shm(obj, registry, visited=None):
     """
     Serialize object to shared memory. Returns JSON-safe metadata.
@@ -231,6 +257,7 @@ def _to_shm(obj, registry, visited=None):
     # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
         import pickle
+        obj = _prepare_trimesh_for_pickle(obj)
         mesh_bytes = pickle.dumps(obj)
 
         block = shm.SharedMemory(create=True, size=len(mesh_bytes))
@@ -533,6 +560,7 @@ def _to_shm(obj, registry, visited=None):
     # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
     if t == 'Trimesh':
         import pickle
+        obj = _prepare_trimesh_for_pickle(obj)
         mesh_bytes = pickle.dumps(obj)
 
         block = shm.SharedMemory(create=True, size=len(mesh_bytes))
@@ -641,31 +669,6 @@ def _should_use_reference(obj):
         return False
     # Everything else (custom classes) - pass by reference
     return True
-
-def _prepare_trimesh_for_pickle(mesh):
-    """
-    Prepare a trimesh object for cross-Python-version pickling.
-
-    Trimesh attaches helper objects (ray tracer, proximity query) that may use
-    native extensions like embreex. These cause import errors when unpickling
-    on a system without those extensions. We strip them - they'll be recreated
-    lazily when needed.
-
-    Note: Do NOT strip _cache - trimesh needs it to function properly.
-    """
-    # Make a copy to avoid modifying the original
-    mesh = mesh.copy()
-
-    # Remove helper objects that may have unpickleable native code references
-    # These are lazily recreated on first access anyway
-    # Do NOT remove _cache - it's needed for trimesh to work
-    for attr in ('ray', '_ray', 'permutate', 'nearest'):
-        try:
-            delattr(mesh, attr)
-        except AttributeError:
-            pass
-
-    return mesh
 
 
 def _serialize_result(obj, visited=None):
