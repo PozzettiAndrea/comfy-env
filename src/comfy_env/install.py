@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Callable, List, Optional, Set, Union
 
-from .config import ComfyEnvConfig, NodeDependency, load_config, discover_config, CONFIG_FILE_NAME
+from .config import ComfyEnvConfig, NodeDependency, load_config, discover_config, CONFIG_FILE_NAME, ROOT_CONFIG_FILE_NAME
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
@@ -20,7 +20,7 @@ def install(
     log_callback: Optional[Callable[[str], None]] = None,
     dry_run: bool = False,
 ) -> bool:
-    """Install dependencies from comfy-env.toml."""
+    """Install dependencies from comfy-env-root.toml or comfy-env.toml."""
     if node_dir is None:
         node_dir = Path(inspect.stack()[1].filename).parent.resolve()
 
@@ -32,10 +32,10 @@ def install(
             config_path = node_dir / config_path
         cfg = load_config(config_path)
     else:
-        cfg = discover_config(node_dir)
+        cfg = discover_config(node_dir, root=True)
 
     if cfg is None:
-        raise FileNotFoundError(f"No comfy-env.toml found in {node_dir}")
+        raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
     if cfg.apt_packages: _install_apt_packages(cfg.apt_packages, log, dry_run)
     if cfg.env_vars: _set_persistent_env_vars(cfg.env_vars, log, dry_run)
@@ -168,8 +168,12 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             if result.returncode != 0:
                 raise RuntimeError(f"Failed: {result.stderr}")
 
+    # Find config file for marker
+    config_path = node_dir / CONFIG_FILE_NAME
+    if not config_path.exists():
+        config_path = node_dir / ROOT_CONFIG_FILE_NAME
+
     old_env = node_dir / ".pixi" / "envs" / "default"
-    config_path = node_dir / "comfy-env.toml"
     main_node_dir = node_dir
     for parent in node_dir.parents:
         if parent.parent.name == "custom_nodes":
@@ -229,8 +233,9 @@ def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[
 
 
 def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
+    """Find and install comfy-env.toml in subdirectories (isolated folders only)."""
     for config_file in node_dir.rglob(CONFIG_FILE_NAME):
-        if config_file.parent == node_dir: continue
+        if config_file.parent == node_dir: continue  # Skip root
         log(f"\n[isolated] {config_file.parent.relative_to(node_dir)}")
         if not dry_run:
             _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)

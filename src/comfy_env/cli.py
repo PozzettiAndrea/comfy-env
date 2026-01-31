@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
+from .config import ROOT_CONFIG_FILE_NAME, CONFIG_FILE_NAME
 
 
 def main(args: Optional[List[str]] = None) -> int:
@@ -14,12 +15,13 @@ def main(args: Optional[List[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", help="Commands")
 
     # init
-    p = sub.add_parser("init", help="Create comfy-env.toml")
+    p = sub.add_parser("init", help=f"Create {ROOT_CONFIG_FILE_NAME}")
     p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
+    p.add_argument("--isolated", action="store_true", help=f"Create {CONFIG_FILE_NAME} instead (for isolated folders)")
 
     # generate
-    p = sub.add_parser("generate", help="Generate pixi.toml from comfy-env.toml")
-    p.add_argument("config", type=str, help="Path to comfy-env.toml")
+    p = sub.add_parser("generate", help="Generate pixi.toml from config")
+    p.add_argument("config", type=str, help="Path to config file")
     p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
 
     # install
@@ -62,22 +64,53 @@ def main(args: Optional[List[str]] = None) -> int:
         return 1
 
 
-DEFAULT_CONFIG = """\
-# comfy-env.toml
+ROOT_DEFAULT_CONFIG = """\
+# comfy-env-root.toml - Main node config
+# PyPI deps go in requirements.txt
+
 [cuda]
 packages = []
 
+[apt]
+packages = []
+
+[dependencies]
+# cgal = "*"
+
+[env_vars]
+# KMP_DUPLICATE_LIB_OK = "TRUE"
+
+[node_reqs]
+# ComfyUI_essentials = "cubiq/ComfyUI_essentials"
+"""
+
+ISOLATED_DEFAULT_CONFIG = """\
+# comfy-env.toml - Isolated folder config
+python = "3.11"
+
+[dependencies]
+# cgal = "*"
+
 [pypi-dependencies]
-# example = "*"
+# trimesh = { version = "*", extras = ["easy"] }
+
+[env_vars]
+# SOME_VAR = "value"
 """
 
 
 def cmd_init(args) -> int:
-    config_path = Path.cwd() / "comfy-env.toml"
+    if getattr(args, 'isolated', False):
+        config_path = Path.cwd() / CONFIG_FILE_NAME
+        content = ISOLATED_DEFAULT_CONFIG
+    else:
+        config_path = Path.cwd() / ROOT_CONFIG_FILE_NAME
+        content = ROOT_DEFAULT_CONFIG
+
     if config_path.exists() and not args.force:
         print(f"Already exists: {config_path}\nUse --force to overwrite", file=sys.stderr)
         return 1
-    config_path.write_text(DEFAULT_CONFIG)
+    config_path.write_text(content)
     print(f"Created {config_path}")
     return 0
 
@@ -170,7 +203,13 @@ def cmd_apt_install(args) -> int:
         print("apt-install: Linux only", file=sys.stderr)
         return 1
 
-    config_path = Path(args.config).resolve() if args.config else Path.cwd() / "comfy-env.toml"
+    # Check root config first, then regular
+    if args.config:
+        config_path = Path(args.config).resolve()
+    else:
+        root_path = Path.cwd() / ROOT_CONFIG_FILE_NAME
+        config_path = root_path if root_path.exists() else Path.cwd() / CONFIG_FILE_NAME
+
     if not config_path.exists():
         print(f"Not found: {config_path}", file=sys.stderr)
         return 1

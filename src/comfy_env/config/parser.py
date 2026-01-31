@@ -8,11 +8,12 @@ import tomli
 
 from .types import ComfyEnvConfig, NodeDependency
 
-CONFIG_FILE_NAME = "comfy-env.toml"
+ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"  # Main node config
+CONFIG_FILE_NAME = "comfy-env.toml"  # Isolated folder config
 
 
 def load_config(path: Path) -> ComfyEnvConfig:
-    """Load and parse comfy-env.toml."""
+    """Load and parse config file."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -20,9 +21,14 @@ def load_config(path: Path) -> ComfyEnvConfig:
         return parse_config(tomli.load(f))
 
 
-def discover_config(node_dir: Path) -> Optional[ComfyEnvConfig]:
-    """Find and load comfy-env.toml from directory."""
-    config_path = Path(node_dir) / CONFIG_FILE_NAME
+def discover_config(node_dir: Path, root: bool = True) -> Optional[ComfyEnvConfig]:
+    """Find and load config from directory. Checks root config first if root=True."""
+    node_dir = Path(node_dir)
+    if root:
+        root_path = node_dir / ROOT_CONFIG_FILE_NAME
+        if root_path.exists():
+            return load_config(root_path)
+    config_path = node_dir / CONFIG_FILE_NAME
     return load_config(config_path) if config_path.exists() else None
 
 
@@ -49,7 +55,6 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
 
 
 def _parse_node_reqs(data: Dict[str, Any]) -> List[NodeDependency]:
-    """Parse [node_reqs] section."""
     return [
         NodeDependency(name=name, repo=value if isinstance(value, str) else value.get("repo", ""))
         for name, value in data.items()

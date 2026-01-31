@@ -10,6 +10,7 @@ from .cache import MARKER_FILE, sanitize_name
 from .libomp import dedupe_libomp
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
+ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"
 
 
 def is_comfy_env_enabled() -> bool:
@@ -50,8 +51,10 @@ def setup_env(node_dir: Optional[str] = None) -> None:
         import inspect
         node_dir = str(Path(inspect.stack()[1].filename).parent)
 
-    # Apply env vars
-    for k, v in load_env_vars(os.path.join(node_dir, "comfy-env.toml")).items():
+    # Apply env vars (check root config first, then regular)
+    root_config = os.path.join(node_dir, ROOT_CONFIG_FILE_NAME)
+    config = root_config if os.path.exists(root_config) else os.path.join(node_dir, "comfy-env.toml")
+    for k, v in load_env_vars(config).items():
         os.environ[k] = v
 
     # Find env: marker -> _env_<name> -> .pixi

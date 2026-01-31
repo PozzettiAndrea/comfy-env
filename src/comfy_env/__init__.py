@@ -37,10 +37,11 @@ from .isolation import wrap_isolated_nodes, wrap_nodes
 from .config import (
     ComfyEnvConfig,
     NodeDependency,
-    NodeReq,  # Backwards compatibility alias
+    NodeReq,
     load_config,
     discover_config,
     CONFIG_FILE_NAME,
+    ROOT_CONFIG_FILE_NAME,
 )
 
 
@@ -136,6 +137,7 @@ __all__ = [
     "load_config",
     "discover_config",
     "CONFIG_FILE_NAME",
+    "ROOT_CONFIG_FILE_NAME",
     # Detection
     "detect_cuda_version",
     "detect_cuda_environment",

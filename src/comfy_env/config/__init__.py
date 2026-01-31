@@ -1,15 +1,12 @@
-"""
-Config layer - Configuration parsing and types.
-
-Pure parsing, no side effects.
-"""
+"""Config layer - Configuration parsing and types."""
 
 from .types import (
     ComfyEnvConfig,
     NodeDependency,
-    NodeReq,  # Backwards compatibility alias
+    NodeReq,
 )
 from .parser import (
+    ROOT_CONFIG_FILE_NAME,
     CONFIG_FILE_NAME,
     load_config,
     discover_config,
@@ -17,11 +14,10 @@ from .parser import (
 )
 
 __all__ = [
-    # Types
     "ComfyEnvConfig",
     "NodeDependency",
-    "NodeReq",  # Backwards compatibility
-    # Parsing
+    "NodeReq",
+    "ROOT_CONFIG_FILE_NAME",
     "CONFIG_FILE_NAME",
     "load_config",
     "discover_config",
