@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Callable, List, Optional, Set, Union
 
-from .config.parser import ComfyEnvConfig, NodeReq, load_config, discover_config
+from .config import ComfyEnvConfig, NodeDependency, load_config, discover_config, CONFIG_FILE_NAME
 
 
 # Environment variable to disable comfy-env isolation
@@ -82,10 +82,9 @@ def _install_apt_packages(
     dry_run: bool,
 ) -> None:
     """Install apt packages (Linux only)."""
-    import os
+    from .packages.apt import apt_install
+
     import platform
-    import shutil
-    import subprocess
 
     if platform.system() != "Linux":
         log(f"[apt] Skipping apt packages (not Linux)")
@@ -99,48 +98,7 @@ def _install_apt_packages(
         log("  (dry run - no changes made)")
         return
 
-    # Determine if we need sudo
-    is_root = os.geteuid() == 0
-    has_sudo = shutil.which("sudo") is not None
-    use_sudo = not is_root and has_sudo
-    prefix = ["sudo"] if use_sudo else []
-
-    if not is_root and not has_sudo:
-        log(f"[apt] Warning: No root access. Install manually:")
-        log(f"  sudo apt-get update && sudo apt-get install -y {' '.join(packages)}")
-        return
-
-    # Run apt-get update (suppress output, just show errors)
-    log("[apt] Updating package lists...")
-    result = subprocess.run(
-        prefix + ["apt-get", "update"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log(f"[apt] Warning: apt-get update failed: {result.stderr.strip()}")
-
-    # Install each package individually (some may not exist on all distros)
-    log("[apt] Installing packages...")
-    installed = []
-    skipped = []
-    for pkg in packages:
-        result = subprocess.run(
-            prefix + ["apt-get", "install", "-y", pkg],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            installed.append(pkg)
-            log(f"  [apt] Installed {pkg}")
-        else:
-            skipped.append(pkg)
-            log(f"  [apt] Skipped {pkg} (not available)")
-
-    if installed:
-        log(f"[apt] Installed {len(installed)} package(s)")
-    if skipped:
-        log(f"[apt] Skipped {len(skipped)} unavailable package(s)")
+    apt_install(packages, log)
 
 
 def _set_persistent_env_vars(
@@ -233,13 +191,13 @@ def _add_to_shell_profile(
 
 
 def _install_node_dependencies(
-    node_reqs: List[NodeReq],
+    node_reqs: List[NodeDependency],
     node_dir: Path,
     log: Callable[[str], None],
     dry_run: bool,
 ) -> None:
     """Install node dependencies (other ComfyUI custom nodes)."""
-    from .nodes import install_node_deps
+    from .packages.node_dependencies import install_node_dependencies
 
     custom_nodes_dir = node_dir.parent
     log(f"\nInstalling {len(node_reqs)} node dependencies...")
@@ -252,7 +210,7 @@ def _install_node_dependencies(
         return
 
     visited: Set[str] = {node_dir.name}
-    install_node_deps(node_reqs, custom_nodes_dir, log, visited)
+    install_node_dependencies(node_reqs, custom_nodes_dir, log, visited)
 
 
 def _install_via_pixi(
@@ -262,7 +220,17 @@ def _install_via_pixi(
     dry_run: bool,
 ) -> None:
     """Install all packages via pixi."""
-    from .pixi import pixi_install
+    from .packages.pixi import ensure_pixi, get_pixi_python, pixi_clean
+    from .packages.toml_generator import write_pixi_toml
+    from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
+    from .detection import get_recommended_cuda_version
+    from .environment.cache import (
+        get_central_env_path, write_marker, write_env_metadata,
+        MARKER_FILE, get_cache_dir
+    )
+    import shutil
+    import subprocess
+    import sys
 
     # Count what we're installing
     cuda_count = len(cfg.cuda_packages)
@@ -287,7 +255,110 @@ def _install_via_pixi(
         log("\n(dry run - no changes made)")
         return
 
-    pixi_install(cfg, node_dir, log)
+    # Clean previous artifacts
+    pixi_clean(node_dir, log)
+
+    # Create .pixi/config.toml to ensure inline environments
+    pixi_config_dir = node_dir / ".pixi"
+    pixi_config_dir.mkdir(parents=True, exist_ok=True)
+    pixi_config_file = pixi_config_dir / "config.toml"
+    pixi_config_file.write_text("detached-environments = false\n")
+
+    # Ensure pixi is installed
+    pixi_path = ensure_pixi(log=log)
+
+    # Detect CUDA version if needed
+    cuda_version = None
+    torch_version = None
+    if cfg.has_cuda and sys.platform != "darwin":
+        cuda_version = get_recommended_cuda_version()
+        if cuda_version:
+            cuda_mm = ".".join(cuda_version.split(".")[:2])
+            torch_version = CUDA_TORCH_MAP.get(cuda_mm, "2.8")
+
+    # Generate pixi.toml
+    write_pixi_toml(cfg, node_dir, log)
+
+    # Run pixi install
+    log("Running pixi install...")
+    result = subprocess.run(
+        [str(pixi_path), "install"],
+        cwd=node_dir,
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        log(f"pixi install failed:\n{result.stderr}")
+        raise RuntimeError(f"pixi install failed: {result.stderr}")
+
+    # Install CUDA packages via direct URL
+    if cfg.cuda_packages and cuda_version:
+        log(f"Installing CUDA packages: {cfg.cuda_packages}")
+        python_path = get_pixi_python(node_dir)
+        if not python_path:
+            raise RuntimeError("Could not find Python in pixi environment")
+
+        # Get Python version from the pixi environment
+        result = subprocess.run(
+            [str(python_path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            py_version = result.stdout.strip()
+        else:
+            py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+        for package in cfg.cuda_packages:
+            wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
+            if not wheel_url:
+                raise RuntimeError(
+                    f"No wheel found for {package} with CUDA {cuda_version}, "
+                    f"torch {torch_version}, Python {py_version}."
+                )
+
+            log(f"  Installing {package} from {wheel_url}")
+            pip_cmd = [
+                str(python_path), "-m", "pip", "install",
+                "--no-deps", "--no-cache-dir", wheel_url,
+            ]
+            result = subprocess.run(pip_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(f"CUDA package install failed: {result.stderr}")
+
+        log("CUDA packages installed")
+
+    # Move environment from .pixi/envs/default to central cache
+    old_env = node_dir / ".pixi" / "envs" / "default"
+    config_path = node_dir / "comfy-env.toml"
+
+    # Determine the main node directory
+    if node_dir.parent.name == "custom_nodes":
+        main_node_dir = node_dir
+    else:
+        main_node_dir = node_dir
+        for parent in node_dir.parents:
+            if parent.parent.name == "custom_nodes":
+                main_node_dir = parent
+                break
+
+    # Get central env path
+    central_env = get_central_env_path(main_node_dir, config_path)
+
+    if old_env.exists():
+        get_cache_dir()
+        if central_env.exists():
+            shutil.rmtree(central_env)
+        shutil.move(str(old_env), str(central_env))
+        write_marker(config_path, central_env)
+        marker_path = config_path.parent / MARKER_FILE
+        write_env_metadata(central_env, marker_path)
+        pixi_dir = node_dir / ".pixi"
+        if pixi_dir.exists():
+            shutil.rmtree(pixi_dir)
+        log(f"Environment created at: {central_env}")
+
+    log("Installation complete!")
 
 
 def _install_to_host_python(
@@ -301,15 +372,14 @@ def _install_to_host_python(
     import subprocess
     import sys
 
-    from .pixi import CUDA_WHEELS_INDEX, find_wheel_url
-    from .pixi.cuda_detection import get_recommended_cuda_version
+    from .packages.cuda_wheels import CUDA_WHEELS_INDEX, get_wheel_url, CUDA_TORCH_MAP
+    from .detection import get_recommended_cuda_version
 
     # Collect packages to install
     pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})
     conda_deps = cfg.pixi_passthrough.get("dependencies", {})
 
-    # Warn about conda dependencies (can't install without pixi)
-    # Filter out 'python' and 'pip' which are meta-dependencies
+    # Warn about conda dependencies
     real_conda_deps = {k: v for k, v in conda_deps.items() if k not in ("python", "pip")}
     if real_conda_deps:
         log(f"\n[warning] Cannot install conda packages without isolation:")
@@ -317,7 +387,6 @@ def _install_to_host_python(
             log(f"  - {pkg}")
         log("  Set USE_COMFY_ENV=1 to enable isolated environments")
 
-    # Nothing to install?
     if not pypi_deps and not cfg.cuda_packages:
         log("No packages to install")
         return
@@ -325,7 +394,6 @@ def _install_to_host_python(
     # Build pip install command
     pip_packages = []
 
-    # Add pypi dependencies
     for pkg, spec in pypi_deps.items():
         if isinstance(spec, str):
             if spec == "*":
@@ -356,10 +424,8 @@ def _install_to_host_python(
         log("\n(dry run - no changes made)")
         return
 
-    # Use uv if available, otherwise pip
     use_uv = shutil.which("uv") is not None
 
-    # Install regular PyPI packages
     if pip_packages:
         if use_uv:
             cmd = ["uv", "pip", "install", "--python", sys.executable] + pip_packages
@@ -373,23 +439,19 @@ def _install_to_host_python(
         else:
             log(f"  Installed {len(pip_packages)} package(s)")
 
-    # Install CUDA packages from cuda-wheels
     if cfg.cuda_packages:
         cuda_version = get_recommended_cuda_version()
         if not cuda_version:
             log("  [warning] No CUDA detected, skipping CUDA packages")
             return
 
-        # Get torch version for wheel matching
         cuda_mm = ".".join(cuda_version.split(".")[:2])
-        from .pixi.core import CUDA_TORCH_MAP
         torch_version = CUDA_TORCH_MAP.get(cuda_mm, "2.8")
-
         py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
         log(f"  CUDA {cuda_version}, PyTorch {torch_version}, Python {py_version}")
 
         for package in cfg.cuda_packages:
-            wheel_url = find_wheel_url(package, torch_version, cuda_version, py_version)
+            wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
             if not wheel_url:
                 log(f"  [error] No wheel found for {package}")
                 continue
@@ -413,9 +475,6 @@ def _install_isolated_subdirs(
     dry_run: bool,
 ) -> None:
     """Find and install comfy-env.toml in subdirectories."""
-    from .pixi import pixi_install
-    from .config.parser import CONFIG_FILE_NAME
-
     # Find all comfy-env.toml files in subdirectories (not root)
     for config_file in node_dir.rglob(CONFIG_FILE_NAME):
         if config_file.parent == node_dir:
@@ -431,7 +490,7 @@ def _install_isolated_subdirs(
             log(f"  (dry run)")
             continue
 
-        pixi_install(sub_cfg, sub_dir, log)
+        _install_via_pixi(sub_cfg, sub_dir, log, dry_run)
 
 
 def verify_installation(

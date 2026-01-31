@@ -204,8 +204,8 @@ def cmd_init(args) -> int:
 
 def cmd_generate(args) -> int:
     """Handle generate command - create pixi.toml from comfy-env.toml."""
-    from .config.parser import load_config
-    from .pixi import create_pixi_toml
+    from .config import load_config
+    from .packages.toml_generator import write_pixi_toml
 
     config_path = Path(args.config).resolve()
 
@@ -226,20 +226,18 @@ def cmd_generate(args) -> int:
 
     # Load the config
     config = load_config(config_path)
-    if not config or not config.envs:
-        print(f"No environments found in {config_path}", file=sys.stderr)
+    if not config:
+        print(f"Failed to load config from {config_path}", file=sys.stderr)
         return 1
 
-    # Use the first environment
-    env_name = next(iter(config.envs.keys()))
-    env_config = config.envs[env_name]
-
     print(f"Generating pixi.toml from {config_path}")
-    print(f"  Environment: {env_name}")
-    print(f"  Python: {env_config.python}")
+    if config.python:
+        print(f"  Python: {config.python}")
+    if config.cuda_packages:
+        print(f"  CUDA packages: {', '.join(config.cuda_packages)}")
 
     # Generate pixi.toml
-    result_path = create_pixi_toml(env_config, node_dir)
+    result_path = write_pixi_toml(config, node_dir)
 
     print(f"Created {result_path}")
     print()
@@ -272,7 +270,7 @@ def cmd_install(args) -> int:
 
 def cmd_info(args) -> int:
     """Handle info command."""
-    from .pixi import RuntimeEnv
+    from .detection import RuntimeEnv
 
     env = RuntimeEnv.detect()
 
@@ -309,7 +307,7 @@ def cmd_info(args) -> int:
 def cmd_doctor(args) -> int:
     """Handle doctor command."""
     from .install import verify_installation
-    from .config.parser import load_config, discover_config
+    from .config import load_config, discover_config
 
     print("Running diagnostics...")
     print("=" * 40)

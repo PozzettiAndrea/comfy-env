@@ -91,7 +91,7 @@ def _get_worker(
 
         if isolated_version and isolated_version != host_version:
             # Different Python version - must use SubprocessWorker
-            from ..workers.subprocess import SubprocessWorker
+            from .workers.subprocess import SubprocessWorker
 
             if sys.platform == "win32":
                 python_path = env_dir / "python.exe"
@@ -109,7 +109,7 @@ def _get_worker(
             )
         else:
             # Same Python version - use MPWorker (faster)
-            from ..workers.mp import MPWorker
+            from .workers.mp import MPWorker
 
             print(f"[comfy-env] Starting isolated worker (MPWorker)")
             print(f"[comfy-env]   Env: {env_dir}")
@@ -347,7 +347,7 @@ def _wrap_node_class(
 
         # Clone tensors for IPC if needed
         try:
-            from ..workers.tensor_utils import prepare_for_ipc_recursive
+            from .tensor_utils import prepare_for_ipc_recursive
 
             kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
         except ImportError:
@@ -368,7 +368,7 @@ def _wrap_node_class(
 
         # Clone result tensors
         try:
-            from ..workers.tensor_utils import prepare_for_ipc_recursive
+            from .tensor_utils import prepare_for_ipc_recursive
 
             result = prepare_for_ipc_recursive(result)
         except ImportError:

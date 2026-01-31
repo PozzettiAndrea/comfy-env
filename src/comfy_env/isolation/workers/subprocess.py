@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .base import Worker, WorkerError
-from ..pixi import get_pixi_path
+from ...packages.pixi import get_pixi_path
 
 # Debug logging (set COMFY_ENV_DEBUG=1 to enable)
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")

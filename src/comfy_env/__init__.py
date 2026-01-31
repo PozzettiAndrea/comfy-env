@@ -1,4 +1,11 @@
-"""Environment management for ComfyUI custom nodes."""
+"""
+comfy-env - Environment management for ComfyUI custom nodes.
+
+Features:
+- CUDA wheel resolution (pre-built wheels without compilation)
+- Process isolation (run nodes in separate Python environments)
+- Central environment cache (~/.comfy-env/envs/)
+"""
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -7,55 +14,109 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
-# Config types and parsing
-from .config import (
-    ComfyEnvConfig,
-    NodeReq,
-    load_config,
-    discover_config,
-    CONFIG_FILE_NAME,
-)
 
-# Pixi integration
-from .pixi import (
-    ensure_pixi,
-    get_pixi_path,
-    get_pixi_python,
-    pixi_run,
-    pixi_install,
-    CUDA_WHEELS_INDEX,
-    detect_cuda_version,
-    detect_cuda_environment,
-    get_recommended_cuda_version,
-    GPUInfo,
-    CUDAEnvironment,
-)
-
-# Workers
-from .workers import (
-    Worker,
-    WorkerError,
-    MPWorker,
-    SubprocessWorker,
-)
-
-# Isolation
-from .isolation import wrap_isolated_nodes, wrap_nodes
+# =============================================================================
+# Primary API (what most users need)
+# =============================================================================
 
 # Install API
 from .install import install, verify_installation, USE_COMFY_ENV_VAR
 
 # Prestartup helpers
-from .prestartup import setup_env, copy_files
+from .environment.setup import setup_env
+from .environment.paths import copy_files
 
-# Cache management
-from .cache import (
+# Isolation
+from .isolation import wrap_isolated_nodes, wrap_nodes
+
+
+# =============================================================================
+# Config Layer
+# =============================================================================
+
+from .config import (
+    ComfyEnvConfig,
+    NodeDependency,
+    NodeReq,  # Backwards compatibility alias
+    load_config,
+    discover_config,
+    CONFIG_FILE_NAME,
+)
+
+
+# =============================================================================
+# Detection Layer
+# =============================================================================
+
+from .detection import (
+    # CUDA detection
+    detect_cuda_version,
+    detect_cuda_environment,
+    get_recommended_cuda_version,
+    # GPU detection
+    GPUInfo,
+    CUDAEnvironment,
+    detect_gpu,
+    get_gpu_summary,
+    # Platform detection
+    detect_platform,
+    get_platform_tag,
+    # Runtime detection
+    RuntimeEnv,
+    detect_runtime,
+)
+
+
+# =============================================================================
+# Packages Layer
+# =============================================================================
+
+from .packages import (
+    # Pixi
+    ensure_pixi,
+    get_pixi_path,
+    get_pixi_python,
+    pixi_run,
+    pixi_clean,
+    # CUDA wheels
+    CUDA_WHEELS_INDEX,
+    get_wheel_url,
+    get_cuda_torch_mapping,
+)
+
+
+# =============================================================================
+# Environment Layer
+# =============================================================================
+
+from .environment import (
+    # Cache management
     get_cache_dir,
     cleanup_orphaned_envs,
     resolve_env_path,
     CACHE_DIR,
     MARKER_FILE,
 )
+
+
+# =============================================================================
+# Isolation Layer
+# =============================================================================
+
+from .isolation import (
+    # Workers
+    Worker,
+    WorkerError,
+    MPWorker,
+    SubprocessWorker,
+    # Tensor utilities
+    TensorKeeper,
+)
+
+
+# =============================================================================
+# Exports
+# =============================================================================
 
 __all__ = [
     # Install API
@@ -70,37 +131,51 @@ __all__ = [
     "wrap_nodes",
     # Config
     "ComfyEnvConfig",
+    "NodeDependency",
     "NodeReq",
     "load_config",
     "discover_config",
     "CONFIG_FILE_NAME",
-    # Pixi
-    "ensure_pixi",
-    "get_pixi_path",
-    "get_pixi_python",
-    "pixi_run",
-    "pixi_install",
-    "CUDA_WHEELS_INDEX",
-    # CUDA detection
+    # Detection
     "detect_cuda_version",
     "detect_cuda_environment",
     "get_recommended_cuda_version",
     "GPUInfo",
     "CUDAEnvironment",
-    # Workers
-    "Worker",
-    "WorkerError",
-    "MPWorker",
-    "SubprocessWorker",
-    # Cache
+    "detect_gpu",
+    "get_gpu_summary",
+    "detect_platform",
+    "get_platform_tag",
+    "RuntimeEnv",
+    "detect_runtime",
+    # Packages
+    "ensure_pixi",
+    "get_pixi_path",
+    "get_pixi_python",
+    "pixi_run",
+    "pixi_clean",
+    "CUDA_WHEELS_INDEX",
+    "get_wheel_url",
+    "get_cuda_torch_mapping",
+    # Environment
     "get_cache_dir",
     "cleanup_orphaned_envs",
     "resolve_env_path",
     "CACHE_DIR",
     "MARKER_FILE",
+    # Workers
+    "Worker",
+    "WorkerError",
+    "MPWorker",
+    "SubprocessWorker",
+    "TensorKeeper",
 ]
 
-# Run orphan cleanup once on module load (silently)
+
+# =============================================================================
+# Startup cleanup
+# =============================================================================
+
 def _run_startup_cleanup():
     """Clean orphaned envs on startup."""
     try:

@@ -29,7 +29,7 @@ from queue import Empty as QueueEmpty
 from typing import Any, Callable, Optional
 
 from .base import Worker, WorkerError
-from .tensor_utils import prepare_for_ipc_recursive, keep_tensors_recursive
+from ..tensor_utils import prepare_for_ipc_recursive, keep_tensors_recursive
 
 logger = logging.getLogger("comfy_env")
 

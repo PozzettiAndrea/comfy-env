@@ -1,21 +1,24 @@
-"""Central environment cache management."""
+"""
+Central environment cache management.
+
+Environments are stored in ~/.comfy-env/envs/ with marker files
+linking node directories to their cached environments.
+"""
 
 import hashlib
-import os
 import shutil
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Callable
-
-# Import version
-try:
-    from . import __version__
-except ImportError:
-    __version__ = "0.0.0-dev"
+from typing import Callable, Optional, Tuple
 
 import tomli
 import tomli_w
+
+# Import version
+try:
+    from .. import __version__
+except ImportError:
+    __version__ = "0.0.0-dev"
 
 
 # Constants
@@ -38,7 +41,6 @@ def compute_config_hash(config_path: Path) -> str:
 
 def sanitize_name(name: str) -> str:
     """Sanitize a name for use in filesystem paths."""
-    # Lowercase and replace problematic chars
     name = name.lower()
     for prefix in ("comfyui-", "comfyui_"):
         if name.startswith(prefix):
@@ -47,7 +49,16 @@ def sanitize_name(name: str) -> str:
 
 
 def get_env_name(node_dir: Path, config_path: Path) -> str:
-    """Generate env name: <nodename>_<subfolder>_<hash>."""
+    """
+    Generate env name: <nodename>_<subfolder>_<hash>.
+
+    Args:
+        node_dir: Main node directory.
+        config_path: Path to comfy-env.toml.
+
+    Returns:
+        Environment name for central cache.
+    """
     # Get node name
     node_name = sanitize_name(node_dir.name)
 
@@ -60,7 +71,6 @@ def get_env_name(node_dir: Path, config_path: Path) -> str:
             rel_path = config_parent.relative_to(node_dir)
             subfolder = rel_path.as_posix().replace("/", "_")
         except ValueError:
-            # config_path not under node_dir - use parent folder name
             subfolder = sanitize_name(config_parent.name)
 
     # Compute hash
@@ -69,13 +79,17 @@ def get_env_name(node_dir: Path, config_path: Path) -> str:
     return f"{node_name}_{subfolder}_{config_hash}"
 
 
-def get_central_env_path(node_dir: Path, config_path: Path) -> Path:
+def get_env_path(node_dir: Path, config_path: Path) -> Path:
     """Get path to central environment for this config."""
     env_name = get_env_name(node_dir, config_path)
     return get_cache_dir() / env_name
 
 
-def write_marker(config_path: Path, env_path: Path) -> None:
+# Alias for backwards compatibility
+get_central_env_path = get_env_path
+
+
+def write_marker_file(config_path: Path, env_path: Path) -> None:
     """Write marker file linking node to central env."""
     marker_path = config_path.parent / MARKER_FILE
     marker_data = {
@@ -90,8 +104,12 @@ def write_marker(config_path: Path, env_path: Path) -> None:
     marker_path.write_text(tomli_w.dumps(marker_data))
 
 
+# Alias for backwards compatibility
+write_marker = write_marker_file
+
+
 def write_env_metadata(env_path: Path, marker_path: Path) -> None:
-    """Write metadata file for orphan detection."""
+    """Write metadata file in env for orphan detection."""
     metadata_path = env_path / METADATA_FILE
     metadata = {
         "marker_path": str(marker_path),
@@ -100,7 +118,7 @@ def write_env_metadata(env_path: Path, marker_path: Path) -> None:
     metadata_path.write_text(tomli_w.dumps(metadata))
 
 
-def read_marker(marker_path: Path) -> Optional[dict]:
+def read_marker_file(marker_path: Path) -> Optional[dict]:
     """Read marker file, return None if invalid/missing."""
     if not marker_path.exists():
         return None
@@ -109,6 +127,10 @@ def read_marker(marker_path: Path) -> Optional[dict]:
             return tomli.load(f)
     except Exception:
         return None
+
+
+# Alias for backwards compatibility
+read_marker = read_marker_file
 
 
 def read_env_metadata(env_path: Path) -> Optional[dict]:
@@ -124,10 +146,27 @@ def read_env_metadata(env_path: Path) -> Optional[dict]:
 
 
 def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
-    """Resolve environment path. Returns (env_path, site_packages, lib_dir)."""
+    """
+    Resolve environment path with fallback chain.
+
+    Checks:
+    1. Marker file -> central cache
+    2. _env_<name> (local)
+    3. .pixi/envs/default (legacy)
+    4. .venv
+
+    Args:
+        node_dir: Node directory to check.
+
+    Returns:
+        Tuple of (env_path, site_packages, lib_dir). All None if not found.
+    """
+    import glob
+    import sys
+
     # 1. Check marker file -> central cache
     marker_path = node_dir / MARKER_FILE
-    marker = read_marker(marker_path)
+    marker = read_marker_file(marker_path)
     if marker and "env" in marker:
         env_path = Path(marker["env"]["path"])
         if env_path.exists():
@@ -156,6 +195,7 @@ def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Op
 def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]]:
     """Get site-packages and lib paths from an environment."""
     import glob
+    import sys
 
     if sys.platform == "win32":
         site_packages = env_path / "Lib" / "site-packages"
@@ -170,7 +210,18 @@ def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]
 
 
 def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
-    """Remove orphaned environments. Returns count cleaned."""
+    """
+    Remove orphaned environments.
+
+    An environment is orphaned if its marker file no longer exists
+    (i.e., the node was deleted).
+
+    Args:
+        log: Logging callback.
+
+    Returns:
+        Count of environments cleaned.
+    """
     cache_dir = get_cache_dir()
     if not cache_dir.exists():
         return 0
@@ -180,7 +231,7 @@ def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
         if not env_dir.is_dir():
             continue
 
-        # Skip if no metadata (might be manually created or old format)
+        # Skip if no metadata
         metadata = read_env_metadata(env_dir)
         if not metadata:
             continue

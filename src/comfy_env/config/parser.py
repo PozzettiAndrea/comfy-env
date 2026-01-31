@@ -5,58 +5,63 @@ Loads comfy-env.toml (a superset of pixi.toml) and provides typed config objects
 """
 
 import copy
-import sys
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional
+
 import tomli
 
-# --- Types&Constants ---
+from .types import ComfyEnvConfig, NodeDependency
+
 CONFIG_FILE_NAME = "comfy-env.toml"
-
-@dataclass
-class NodeReq:
-    """A node dependency (another ComfyUI custom node)."""
-    name: str
-    repo: str  # GitHub repo, e.g., "owner/repo"
-
-@dataclass
-class ComfyEnvConfig:
-    """Configuration from comfy-env.toml."""
-    python: Optional[str] = None
-    cuda_packages: List[str] = field(default_factory=list)
-    apt_packages: List[str] = field(default_factory=list)
-    env_vars: Dict[str, str] = field(default_factory=dict)
-    node_reqs: List[NodeReq] = field(default_factory=list)
-    pixi_passthrough: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def has_cuda(self) -> bool:
-        return bool(self.cuda_packages)
-# --- Types&Constants ---
 
 
 def load_config(path: Path) -> ComfyEnvConfig:
-    """Load config from a TOML file."""
+    """
+    Load config from a TOML file.
+
+    Args:
+        path: Path to comfy-env.toml file.
+
+    Returns:
+        Parsed ComfyEnvConfig.
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist.
+    """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
     with open(path, "rb") as f:
         data = tomli.load(f)
-    return _parse_config(data)
+    return parse_config(data)
 
 
 def discover_config(node_dir: Path) -> Optional[ComfyEnvConfig]:
-    """Find and load comfy-env.toml from a directory."""
+    """
+    Find and load comfy-env.toml from a directory.
+
+    Args:
+        node_dir: Directory to search for config file.
+
+    Returns:
+        ComfyEnvConfig if found, None otherwise.
+    """
     config_path = Path(node_dir) / CONFIG_FILE_NAME
     if config_path.exists():
         return load_config(config_path)
-
     return None
 
 
-def _parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
-    """Parse TOML data into ComfyEnvConfig."""
+def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
+    """
+    Parse TOML data into ComfyEnvConfig.
+
+    Args:
+        data: Parsed TOML dictionary.
+
+    Returns:
+        ComfyEnvConfig with extracted sections.
+    """
     # Make a copy so we can pop our custom sections
     data = copy.deepcopy(data)
 
@@ -94,14 +99,14 @@ def _parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
     )
 
 
-def _parse_node_reqs(data: Dict[str, Any]) -> List[NodeReq]:
-    """Parse [node_reqs] section."""
+def _parse_node_reqs(data: Dict[str, Any]) -> List[NodeDependency]:
+    """Parse [node_reqs] section into NodeDependency list."""
     node_reqs = []
     for name, value in data.items():
         if isinstance(value, str):
-            node_reqs.append(NodeReq(name=name, repo=value))
+            node_reqs.append(NodeDependency(name=name, repo=value))
         elif isinstance(value, dict):
-            node_reqs.append(NodeReq(name=name, repo=value.get("repo", "")))
+            node_reqs.append(NodeDependency(name=name, repo=value.get("repo", "")))
     return node_reqs
 
 
