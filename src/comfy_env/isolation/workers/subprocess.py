@@ -533,6 +533,21 @@ if sys.platform == "win32":
 from multiprocessing import shared_memory as shm
 import numpy as np
 
+
+def _prepare_trimesh_for_pickle(mesh):
+    """
+    Prepare a trimesh object for cross-Python-version pickling.
+    Strips native extension helpers that cause import errors.
+    """
+    mesh = mesh.copy()
+    for attr in ('ray', '_ray', 'permutate', 'nearest'):
+        try:
+            delattr(mesh, attr)
+        except AttributeError:
+            pass
+    return mesh
+
+
 def _to_shm(obj, registry, visited=None):
     """Serialize to shared memory. Returns JSON-safe metadata."""
     if visited is None:
