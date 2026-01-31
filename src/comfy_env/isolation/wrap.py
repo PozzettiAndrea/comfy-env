@@ -174,12 +174,9 @@ def _find_env_paths(node_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     marker_path = node_dir / ".comfy-env-marker.toml"
     if marker_path.exists():
         try:
-            if sys.version_info >= (3, 11):
-                import tomllib
-            else:
-                import tomli as tomllib
+            import tomli
             with open(marker_path, "rb") as f:
-                marker = tomllib.load(f)
+                marker = tomli.load(f)
             env_path = marker.get("env", {}).get("path")
             if env_path:
                 env_dir = Path(env_path)
@@ -234,12 +231,9 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     marker_path = node_dir / ".comfy-env-marker.toml"
     if marker_path.exists():
         try:
-            if sys.version_info >= (3, 11):
-                import tomllib
-            else:
-                import tomli as tomllib
+            import tomli
             with open(marker_path, "rb") as f:
-                marker = tomllib.load(f)
+                marker = tomli.load(f)
             env_path = marker.get("env", {}).get("path")
             if env_path:
                 env_dir = Path(env_path)
@@ -391,6 +385,131 @@ def _wrap_node_class(
     return cls
 
 
+def _is_comfy_env_enabled() -> bool:
+    """Check if comfy-env isolation is enabled (default: True)."""
+    val = os.environ.get("USE_COMFY_ENV", "1").lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def wrap_nodes() -> None:
+    """
+    Auto-wrap nodes for isolation. Call from your __init__.py after defining NODE_CLASS_MAPPINGS.
+
+    Usage:
+        from comfy_env import wrap_nodes
+        wrap_nodes()
+    """
+    # Skip if isolation is disabled
+    if not _is_comfy_env_enabled():
+        print(f"[comfy-env] Isolation disabled, nodes running in main process")
+        return
+
+    # Skip if running inside worker subprocess
+    if os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
+        return
+
+    # Get caller's frame and module
+    frame = inspect.stack()[1]
+    caller_module = inspect.getmodule(frame.frame)
+    if caller_module is None:
+        print("[comfy-env] Warning: Could not determine caller module")
+        return
+
+    # Get NODE_CLASS_MAPPINGS from caller's module
+    node_class_mappings = getattr(caller_module, "NODE_CLASS_MAPPINGS", None)
+    if not node_class_mappings:
+        print("[comfy-env] Warning: No NODE_CLASS_MAPPINGS found in caller module")
+        return
+
+    # Get package root directory
+    caller_file = Path(frame.filename).resolve()
+    package_dir = caller_file.parent
+
+    # Find all comfy-env.toml files
+    config_files = list(package_dir.rglob("comfy-env.toml"))
+    if not config_files:
+        return  # No configs, nothing to wrap
+
+    # Get ComfyUI base path
+    try:
+        import folder_paths
+        comfyui_base = folder_paths.base_path
+    except ImportError:
+        comfyui_base = None
+
+    # Build a map of config_dir -> env info
+    config_envs = []
+    for config_file in config_files:
+        config_dir = config_file.parent
+        env_dir = _find_env_dir(config_dir)
+        site_packages, lib_dir = _find_env_paths(config_dir)
+
+        if not env_dir or not site_packages:
+            continue
+
+        # Read env_vars from config
+        env_vars = {}
+        try:
+            import tomli
+            with open(config_file, "rb") as f:
+                config = tomli.load(f)
+            env_vars_data = config.get("env_vars", {})
+            env_vars = {str(k): str(v) for k, v in env_vars_data.items()}
+        except Exception:
+            pass
+
+        if comfyui_base:
+            env_vars["COMFYUI_BASE"] = str(comfyui_base)
+
+        config_envs.append({
+            "config_dir": config_dir,
+            "env_dir": env_dir,
+            "site_packages": site_packages,
+            "lib_dir": lib_dir,
+            "env_vars": env_vars,
+        })
+
+    if not config_envs:
+        return
+
+    # Match nodes to configs by checking source file location
+    wrapped_count = 0
+    for node_name, node_cls in node_class_mappings.items():
+        if not hasattr(node_cls, "FUNCTION"):
+            continue
+
+        # Get node's source file
+        try:
+            source_file = Path(inspect.getfile(node_cls)).resolve()
+        except (TypeError, OSError):
+            continue
+
+        # Find which config this node belongs to
+        for env_info in config_envs:
+            config_dir = env_info["config_dir"]
+            try:
+                source_file.relative_to(config_dir)
+                # Node is under this config dir - wrap it
+                sys_path = [str(env_info["site_packages"]), str(config_dir)]
+                lib_path = str(env_info["lib_dir"]) if env_info["lib_dir"] else None
+
+                _wrap_node_class(
+                    node_cls,
+                    env_info["env_dir"],
+                    config_dir,
+                    sys_path,
+                    lib_path,
+                    env_info["env_vars"],
+                )
+                wrapped_count += 1
+                break
+            except ValueError:
+                continue  # Node not under this config dir
+
+    if wrapped_count > 0:
+        print(f"[comfy-env] Wrapped {wrapped_count} nodes for isolation")
+
+
 def wrap_isolated_nodes(
     node_class_mappings: Dict[str, type],
     nodes_dir: Path,
@@ -425,6 +544,11 @@ def wrap_isolated_nodes(
             wrap_isolated_nodes(cgal_nodes, Path(__file__).parent / "nodes/cgal")
         )
     """
+    # Skip if isolation is disabled
+    if not _is_comfy_env_enabled():
+        print(f"[comfy-env] Isolation disabled, nodes running in main process")
+        return node_class_mappings
+
     # Skip if running inside worker subprocess
     if os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
         return node_class_mappings
@@ -447,12 +571,9 @@ def wrap_isolated_nodes(
     # Read env_vars from comfy-env.toml
     env_vars = {}
     try:
-        if sys.version_info >= (3, 11):
-            import tomllib
-        else:
-            import tomli as tomllib
+        import tomli
         with open(config_file, "rb") as f:
-            config = tomllib.load(f)
+            config = tomli.load(f)
         env_vars_data = config.get("env_vars", {})
         env_vars = {str(k): str(v) for k, v in env_vars_data.items()}
     except Exception:

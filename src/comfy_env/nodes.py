@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Set
 
 if TYPE_CHECKING:
-    from .config.types import NodeReq
+    from .config.parser import NodeReq
 
 
 def normalize_repo_url(repo: str) -> str:

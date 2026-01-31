@@ -20,24 +20,16 @@ def get_env_name(dir_name: str) -> str:
 def _load_env_vars(config_path: str) -> Dict[str, str]:
     """
     Load [env_vars] section from comfy-env.toml.
-
-    Uses tomllib (Python 3.11+) or tomli fallback.
     Returns empty dict if file not found or parsing fails.
     """
     if not os.path.exists(config_path):
         return {}
 
     try:
-        if sys.version_info >= (3, 11):
-            import tomllib
-        else:
-            try:
-                import tomli as tomllib
-            except ImportError:
-                return {}
+        import tomli
 
         with open(config_path, "rb") as f:
-            data = tomllib.load(f)
+            data = tomli.load(f)
 
         env_vars_data = data.get("env_vars", {})
         return {str(k): str(v) for k, v in env_vars_data.items()}
@@ -95,6 +87,12 @@ def _dedupe_libomp_macos():
                 pass  # Permission denied, etc.
 
 
+def _is_comfy_env_enabled() -> bool:
+    """Check if comfy-env isolation is enabled (default: True)."""
+    val = os.environ.get("USE_COMFY_ENV", "1").lower()
+    return val not in ("0", "false", "no", "off")
+
+
 def setup_env(node_dir: Optional[str] = None) -> None:
     """
     Set up environment for pixi conda libraries.
@@ -112,6 +110,10 @@ def setup_env(node_dir: Optional[str] = None) -> None:
         from comfy_env import setup_env
         setup_env()
     """
+    # Skip if isolation is disabled
+    if not _is_comfy_env_enabled():
+        return
+
     # macOS: Dedupe libomp to prevent OpenMP conflicts (torch vs pymeshlab, etc.)
     _dedupe_libomp_macos()
 
@@ -137,12 +139,9 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     marker_path = os.path.join(node_dir, ".comfy-env-marker.toml")
     if os.path.exists(marker_path):
         try:
-            if sys.version_info >= (3, 11):
-                import tomllib
-            else:
-                import tomli as tomllib
+            import tomli
             with open(marker_path, "rb") as f:
-                marker = tomllib.load(f)
+                marker = tomli.load(f)
             env_path = marker.get("env", {}).get("path")
             if env_path and os.path.exists(env_path):
                 pixi_env = env_path
@@ -190,3 +189,20 @@ def setup_env(node_dir: Optional[str] = None) -> None:
 
     if site_packages and os.path.exists(site_packages) and site_packages not in sys.path:
         sys.path.insert(0, site_packages)
+
+
+def copy_files(src, dst, pattern: str = "*") -> None:
+    """Copy files matching pattern from src to dst (skip existing)."""
+    import shutil
+
+    src, dst = Path(src), Path(dst)
+    if not src.exists():
+        return
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in src.glob(pattern):
+        if f.is_file():
+            target = dst / f.relative_to(src)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy2(f, target)

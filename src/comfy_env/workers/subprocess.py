@@ -440,7 +440,7 @@ def _watchdog():
             f.flush()
 
         # Also print
-        print(f"\\n=== WATCHDOG TICK {tick} ===", flush=True)
+        print(f"\\n=== WATCHDOG TICK {tick} (debug only, don't worry) ===", flush=True)
         print(dump, flush=True)
         print("=== END ===\\n", flush=True)
 

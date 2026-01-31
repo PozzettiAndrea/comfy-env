@@ -1,12 +1,4 @@
-"""
-comfy-env: Environment management for ComfyUI custom nodes.
-
-All dependencies go through pixi for unified management.
-
-Main APIs:
-- install(): Install dependencies from comfy-env.toml
-- wrap_isolated_nodes(): Wrap nodes for subprocess isolation
-"""
+"""Environment management for ComfyUI custom nodes."""
 
 from importlib.metadata import version, PackageNotFoundError
 
@@ -48,13 +40,13 @@ from .workers import (
 )
 
 # Isolation
-from .isolation import wrap_isolated_nodes
+from .isolation import wrap_isolated_nodes, wrap_nodes
 
 # Install API
-from .install import install, verify_installation
+from .install import install, verify_installation, USE_COMFY_ENV_VAR
 
 # Prestartup helpers
-from .prestartup import setup_env
+from .prestartup import setup_env, copy_files
 
 # Cache management
 from .cache import (
@@ -65,24 +57,17 @@ from .cache import (
     MARKER_FILE,
 )
 
-# Errors
-from .errors import (
-    EnvManagerError,
-    ConfigError,
-    WheelNotFoundError,
-    DependencyError,
-    CUDANotFoundError,
-    InstallError,
-)
-
 __all__ = [
     # Install API
     "install",
     "verify_installation",
+    "USE_COMFY_ENV_VAR",
     # Prestartup
     "setup_env",
+    "copy_files",
     # Isolation
     "wrap_isolated_nodes",
+    "wrap_nodes",
     # Config
     "ComfyEnvConfig",
     "NodeReq",
@@ -107,13 +92,6 @@ __all__ = [
     "WorkerError",
     "MPWorker",
     "SubprocessWorker",
-    # Errors
-    "EnvManagerError",
-    "ConfigError",
-    "WheelNotFoundError",
-    "DependencyError",
-    "CUDANotFoundError",
-    "InstallError",
     # Cache
     "get_cache_dir",
     "cleanup_orphaned_envs",
@@ -124,7 +102,7 @@ __all__ = [
 
 # Run orphan cleanup once on module load (silently)
 def _run_startup_cleanup():
-    """Clean orphaned envs on startup. Runs silently, never fails startup."""
+    """Clean orphaned envs on startup."""
     try:
         cleanup_orphaned_envs(log=lambda x: None)  # Silent
     except Exception:

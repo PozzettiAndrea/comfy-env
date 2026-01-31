@@ -1,100 +1,53 @@
-"""Load configuration from comfy-env.toml.
+"""
+Configuration parsing for comfy-env.
 
-comfy-env.toml is a superset of pixi.toml. Custom sections we handle:
-- python = "3.11" - Python version for isolated envs
-- [cuda] packages = [...] - CUDA packages (triggers find-links + PyTorch detection)
-- [node_reqs] - Other ComfyUI nodes to clone
-
-Everything else passes through to pixi.toml directly.
-
-Example config:
-
-    python = "3.11"
-
-    [cuda]
-    packages = ["cumesh"]
-
-    [dependencies]
-    mesalib = "*"
-    cgal = "*"
-
-    [pypi-dependencies]
-    numpy = ">=1.21.0,<2"
-    trimesh = { version = ">=4.0.0", extras = ["easy"] }
-
-    [target.linux-64.pypi-dependencies]
-    embreex = "*"
-
-    [node_reqs]
-    SomeNode = "owner/repo"
+Loads comfy-env.toml (a superset of pixi.toml) and provides typed config objects.
 """
 
 import copy
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+import tomli
 
-# Use built-in tomllib (Python 3.11+) or tomli fallback
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None  # type: ignore
-
-from .types import ComfyEnvConfig, NodeReq
-
-
+# --- Types&Constants ---
 CONFIG_FILE_NAME = "comfy-env.toml"
 
-# Sections we handle specially (not passed through to pixi.toml)
-CUSTOM_SECTIONS = {"python", "cuda", "node_reqs", "apt", "env_vars"}
+@dataclass
+class NodeReq:
+    """A node dependency (another ComfyUI custom node)."""
+    name: str
+    repo: str  # GitHub repo, e.g., "owner/repo"
+
+@dataclass
+class ComfyEnvConfig:
+    """Configuration from comfy-env.toml."""
+    python: Optional[str] = None
+    cuda_packages: List[str] = field(default_factory=list)
+    apt_packages: List[str] = field(default_factory=list)
+    env_vars: Dict[str, str] = field(default_factory=dict)
+    node_reqs: List[NodeReq] = field(default_factory=list)
+    pixi_passthrough: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_cuda(self) -> bool:
+        return bool(self.cuda_packages)
+# --- Types&Constants ---
 
 
 def load_config(path: Path) -> ComfyEnvConfig:
-    """
-    Load configuration from a TOML file.
-
-    Args:
-        path: Path to comfy-env.toml
-
-    Returns:
-        ComfyEnvConfig instance
-
-    Raises:
-        FileNotFoundError: If config file doesn't exist
-        ImportError: If tomli not installed (Python < 3.11)
-    """
-    if tomllib is None:
-        raise ImportError(
-            "TOML parsing requires tomli for Python < 3.11. "
-            "Install with: pip install tomli"
-        )
-
+    """Load config from a TOML file."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
-
     with open(path, "rb") as f:
-        data = tomllib.load(f)
-
+        data = tomli.load(f)
     return _parse_config(data)
 
 
 def discover_config(node_dir: Path) -> Optional[ComfyEnvConfig]:
-    """
-    Find and load comfy-env.toml from a directory.
-
-    Args:
-        node_dir: Directory to search
-
-    Returns:
-        ComfyEnvConfig if found, None otherwise
-    """
-    if tomllib is None:
-        return None
-
+    """Find and load comfy-env.toml from a directory."""
     config_path = Path(node_dir) / CONFIG_FILE_NAME
     if config_path.exists():
         return load_config(config_path)

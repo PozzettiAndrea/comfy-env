@@ -18,7 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from ..config.types import ComfyEnvConfig
+from ..config.parser import ComfyEnvConfig
 
 
 # Pixi download URLs by platform
@@ -37,7 +37,6 @@ CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
 CUDA_TORCH_MAP = {
     "12.8": "2.8",
     "12.4": "2.4",
-    "12.1": "2.4",
 }
 
 def find_wheel_url(

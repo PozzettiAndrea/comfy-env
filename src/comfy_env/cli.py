@@ -309,7 +309,7 @@ def cmd_info(args) -> int:
 def cmd_doctor(args) -> int:
     """Handle doctor command."""
     from .install import verify_installation
-    from .config.parser import discover_env_config, load_env_from_file
+    from .config.parser import load_config, discover_config
 
     print("Running diagnostics...")
     print("=" * 40)
@@ -325,21 +325,19 @@ def cmd_doctor(args) -> int:
     if args.package:
         packages = [args.package]
     elif args.config:
-        config = load_env_from_file(Path(args.config))
+        config = load_config(Path(args.config))
         if config:
-            packages = (config.requirements or []) + (config.no_deps_requirements or [])
+            # Get packages from pypi-dependencies
+            pypi_deps = config.pixi_passthrough.get("pypi-dependencies", {})
+            packages = list(pypi_deps.keys()) + config.cuda_packages
     else:
-        config = discover_env_config(Path.cwd())
+        config = discover_config(Path.cwd())
         if config:
-            packages = (config.requirements or []) + (config.no_deps_requirements or [])
+            pypi_deps = config.pixi_passthrough.get("pypi-dependencies", {})
+            packages = list(pypi_deps.keys()) + config.cuda_packages
 
     if packages:
-        pkg_names = []
-        for pkg in packages:
-            name = pkg.split("==")[0].split(">=")[0].split("[")[0]
-            pkg_names.append(name)
-
-        all_ok = verify_installation(pkg_names)
+        all_ok = verify_installation(packages)
         if all_ok:
             print("\nAll packages verified!")
             return 0

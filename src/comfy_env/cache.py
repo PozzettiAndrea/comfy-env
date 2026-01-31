@@ -1,11 +1,4 @@
-"""
-Central environment cache management for comfy-env.
-
-Stores environments in ~/.comfy-env/envs/<nodename>_<subfolder>_<hash>/
-to avoid Windows MAX_PATH (260 char) issues.
-
-Marker files in node folders link to central envs and enable orphan cleanup.
-"""
+"""Central environment cache management."""
 
 import hashlib
 import os
@@ -21,24 +14,8 @@ try:
 except ImportError:
     __version__ = "0.0.0-dev"
 
-# Lazy import tomli/tomllib
-def _get_tomli():
-    if sys.version_info >= (3, 11):
-        import tomllib
-        return tomllib
-    else:
-        try:
-            import tomli
-            return tomli
-        except ImportError:
-            return None
-
-def _get_tomli_w():
-    try:
-        import tomli_w
-        return tomli_w
-    except ImportError:
-        return None
+import tomli
+import tomli_w
 
 
 # Constants
@@ -70,17 +47,7 @@ def sanitize_name(name: str) -> str:
 
 
 def get_env_name(node_dir: Path, config_path: Path) -> str:
-    """
-    Generate env name: <nodename>_<subfolder>_<hash>
-
-    Args:
-        node_dir: The custom node directory (e.g., custom_nodes/ComfyUI-UniRig)
-        config_path: Path to comfy-env.toml
-
-    Examples:
-        - ComfyUI-UniRig/nodes/comfy-env.toml -> unirig_nodes_a1b2c3d4
-        - ComfyUI-Pack/comfy-env.toml -> pack__f5e6d7c8 (double underscore = no subfolder)
-    """
+    """Generate env name: <nodename>_<subfolder>_<hash>."""
     # Get node name
     node_name = sanitize_name(node_dir.name)
 
@@ -109,27 +76,7 @@ def get_central_env_path(node_dir: Path, config_path: Path) -> Path:
 
 
 def write_marker(config_path: Path, env_path: Path) -> None:
-    """
-    Write marker file linking node to central env.
-
-    Args:
-        config_path: Path to comfy-env.toml
-        env_path: Path to central environment
-    """
-    tomli_w = _get_tomli_w()
-    if not tomli_w:
-        # Fallback to manual TOML writing
-        marker_path = config_path.parent / MARKER_FILE
-        content = f'''[env]
-name = "{env_path.name}"
-path = "{env_path}"
-config_hash = "{compute_config_hash(config_path)}"
-created = "{datetime.now().isoformat()}"
-comfy_env_version = "{__version__}"
-'''
-        marker_path.write_text(content)
-        return
-
+    """Write marker file linking node to central env."""
     marker_path = config_path.parent / MARKER_FILE
     marker_data = {
         "env": {
@@ -144,24 +91,8 @@ comfy_env_version = "{__version__}"
 
 
 def write_env_metadata(env_path: Path, marker_path: Path) -> None:
-    """
-    Write metadata file in env for orphan detection.
-
-    Args:
-        env_path: Path to central environment
-        marker_path: Path to marker file in node folder
-    """
-    tomli_w = _get_tomli_w()
+    """Write metadata file for orphan detection."""
     metadata_path = env_path / METADATA_FILE
-
-    if not tomli_w:
-        # Fallback to manual TOML writing
-        content = f'''marker_path = "{marker_path}"
-created = "{datetime.now().isoformat()}"
-'''
-        metadata_path.write_text(content)
-        return
-
     metadata = {
         "marker_path": str(marker_path),
         "created": datetime.now().isoformat(),
@@ -170,22 +101,9 @@ created = "{datetime.now().isoformat()}"
 
 
 def read_marker(marker_path: Path) -> Optional[dict]:
-    """
-    Read marker file, return None if invalid/missing.
-
-    Args:
-        marker_path: Path to .comfy-env-marker.toml
-
-    Returns:
-        Parsed marker data or None
-    """
+    """Read marker file, return None if invalid/missing."""
     if not marker_path.exists():
         return None
-
-    tomli = _get_tomli()
-    if not tomli:
-        return None
-
     try:
         with open(marker_path, "rb") as f:
             return tomli.load(f)
@@ -194,23 +112,10 @@ def read_marker(marker_path: Path) -> Optional[dict]:
 
 
 def read_env_metadata(env_path: Path) -> Optional[dict]:
-    """
-    Read metadata file from env, return None if invalid/missing.
-
-    Args:
-        env_path: Path to central environment
-
-    Returns:
-        Parsed metadata or None
-    """
+    """Read metadata file from env, return None if invalid/missing."""
     metadata_path = env_path / METADATA_FILE
     if not metadata_path.exists():
         return None
-
-    tomli = _get_tomli()
-    if not tomli:
-        return None
-
     try:
         with open(metadata_path, "rb") as f:
             return tomli.load(f)
@@ -219,21 +124,7 @@ def read_env_metadata(env_path: Path) -> Optional[dict]:
 
 
 def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
-    """
-    Resolve environment path with fallback chain.
-
-    Args:
-        node_dir: Directory containing comfy-env.toml or marker file
-
-    Returns:
-        (env_path, site_packages, lib_dir) or (None, None, None)
-
-    Fallback order:
-        1. Marker file -> central cache
-        2. _env_<name> (current location)
-        3. .pixi/envs/default (old pixi)
-        4. .venv (venv support)
-    """
+    """Resolve environment path. Returns (env_path, site_packages, lib_dir)."""
     # 1. Check marker file -> central cache
     marker_path = node_dir / MARKER_FILE
     marker = read_marker(marker_path)
@@ -263,15 +154,7 @@ def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Op
 
 
 def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]]:
-    """
-    Get site-packages and lib paths from an environment.
-
-    Args:
-        env_path: Path to environment root
-
-    Returns:
-        (env_path, site_packages, lib_dir)
-    """
+    """Get site-packages and lib paths from an environment."""
     import glob
 
     if sys.platform == "win32":
@@ -287,18 +170,7 @@ def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]
 
 
 def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
-    """
-    Scan central cache and remove orphaned environments.
-
-    An env is orphaned if its marker file no longer exists
-    (meaning the node was deleted).
-
-    Args:
-        log: Logging function
-
-    Returns:
-        Number of envs cleaned up
-    """
+    """Remove orphaned environments. Returns count cleaned."""
     cache_dir = get_cache_dir()
     if not cache_dir.exists():
         return 0

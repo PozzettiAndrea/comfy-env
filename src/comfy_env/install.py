@@ -1,17 +1,21 @@
-"""
-Installation API for comfy-env.
-
-Example:
-    from comfy_env import install
-    install()  # Auto-discovers comfy-env.toml and installs
-"""
+"""Installation API for comfy-env."""
 
 import inspect
+import os
 from pathlib import Path
 from typing import Callable, List, Optional, Set, Union
 
-from .config.types import ComfyEnvConfig, NodeReq
-from .config.parser import load_config, discover_config
+from .config.parser import ComfyEnvConfig, NodeReq, load_config, discover_config
+
+
+# Environment variable to disable comfy-env isolation
+USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
+
+
+def _is_comfy_env_enabled() -> bool:
+    """Check if isolation is enabled."""
+    val = os.environ.get(USE_COMFY_ENV_VAR, "1").lower()
+    return val not in ("0", "false", "no", "off")
 
 
 def install(
@@ -20,18 +24,7 @@ def install(
     log_callback: Optional[Callable[[str], None]] = None,
     dry_run: bool = False,
 ) -> bool:
-    """
-    Install dependencies from comfy-env.toml.
-
-    Args:
-        config: Optional path to comfy-env.toml. Auto-discovered if not provided.
-        node_dir: Optional node directory. Auto-discovered from caller if not provided.
-        log_callback: Optional callback for logging. Defaults to print.
-        dry_run: If True, show what would be installed without installing.
-
-    Returns:
-        True if installation succeeded.
-    """
+    """Install dependencies from comfy-env.toml."""
     # Auto-discover caller's directory if not provided
     if node_dir is None:
         frame = inspect.stack()[1]
@@ -67,11 +60,17 @@ def install(
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
 
-    # Install everything via pixi
-    _install_via_pixi(cfg, node_dir, log, dry_run)
+    # Check if isolation is enabled
+    if _is_comfy_env_enabled():
+        # Install everything via pixi (isolated environment)
+        _install_via_pixi(cfg, node_dir, log, dry_run)
 
-    # Auto-discover and install isolated subdirectory environments
-    _install_isolated_subdirs(node_dir, log, dry_run)
+        # Auto-discover and install isolated subdirectory environments
+        _install_isolated_subdirs(node_dir, log, dry_run)
+    else:
+        # Install directly to host Python (no isolation)
+        log("\n[comfy-env] Isolation disabled (USE_COMFY_ENV=0)")
+        _install_to_host_python(cfg, node_dir, log, dry_run)
 
     log("\nInstallation complete!")
     return True
@@ -289,6 +288,123 @@ def _install_via_pixi(
         return
 
     pixi_install(cfg, node_dir, log)
+
+
+def _install_to_host_python(
+    cfg: ComfyEnvConfig,
+    node_dir: Path,
+    log: Callable[[str], None],
+    dry_run: bool,
+) -> None:
+    """Install packages directly to host Python (no isolation)."""
+    import shutil
+    import subprocess
+    import sys
+
+    from .pixi import CUDA_WHEELS_INDEX, find_wheel_url
+    from .pixi.cuda_detection import get_recommended_cuda_version
+
+    # Collect packages to install
+    pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})
+    conda_deps = cfg.pixi_passthrough.get("dependencies", {})
+
+    # Warn about conda dependencies (can't install without pixi)
+    # Filter out 'python' and 'pip' which are meta-dependencies
+    real_conda_deps = {k: v for k, v in conda_deps.items() if k not in ("python", "pip")}
+    if real_conda_deps:
+        log(f"\n[warning] Cannot install conda packages without isolation:")
+        for pkg in real_conda_deps:
+            log(f"  - {pkg}")
+        log("  Set USE_COMFY_ENV=1 to enable isolated environments")
+
+    # Nothing to install?
+    if not pypi_deps and not cfg.cuda_packages:
+        log("No packages to install")
+        return
+
+    # Build pip install command
+    pip_packages = []
+
+    # Add pypi dependencies
+    for pkg, spec in pypi_deps.items():
+        if isinstance(spec, str):
+            if spec == "*":
+                pip_packages.append(pkg)
+            else:
+                pip_packages.append(f"{pkg}{spec}")
+        elif isinstance(spec, dict):
+            version = spec.get("version", "*")
+            extras = spec.get("extras", [])
+            if extras:
+                pkg_with_extras = f"{pkg}[{','.join(extras)}]"
+            else:
+                pkg_with_extras = pkg
+            if version == "*":
+                pip_packages.append(pkg_with_extras)
+            else:
+                pip_packages.append(f"{pkg_with_extras}{version}")
+
+    log(f"\nInstalling to host Python ({sys.executable}):")
+    if pip_packages:
+        log(f"  PyPI packages: {len(pip_packages)}")
+    if cfg.cuda_packages:
+        log(f"  CUDA packages: {', '.join(cfg.cuda_packages)}")
+
+    if dry_run:
+        if pip_packages:
+            log(f"  Would install: {', '.join(pip_packages)}")
+        log("\n(dry run - no changes made)")
+        return
+
+    # Use uv if available, otherwise pip
+    use_uv = shutil.which("uv") is not None
+
+    # Install regular PyPI packages
+    if pip_packages:
+        if use_uv:
+            cmd = ["uv", "pip", "install", "--python", sys.executable] + pip_packages
+        else:
+            cmd = [sys.executable, "-m", "pip", "install"] + pip_packages
+
+        log(f"  Running: {' '.join(cmd[:4])}...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  [error] pip install failed: {result.stderr.strip()[:200]}")
+        else:
+            log(f"  Installed {len(pip_packages)} package(s)")
+
+    # Install CUDA packages from cuda-wheels
+    if cfg.cuda_packages:
+        cuda_version = get_recommended_cuda_version()
+        if not cuda_version:
+            log("  [warning] No CUDA detected, skipping CUDA packages")
+            return
+
+        # Get torch version for wheel matching
+        cuda_mm = ".".join(cuda_version.split(".")[:2])
+        from .pixi.core import CUDA_TORCH_MAP
+        torch_version = CUDA_TORCH_MAP.get(cuda_mm, "2.8")
+
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        log(f"  CUDA {cuda_version}, PyTorch {torch_version}, Python {py_version}")
+
+        for package in cfg.cuda_packages:
+            wheel_url = find_wheel_url(package, torch_version, cuda_version, py_version)
+            if not wheel_url:
+                log(f"  [error] No wheel found for {package}")
+                continue
+
+            log(f"  Installing {package}...")
+            if use_uv:
+                cmd = ["uv", "pip", "install", "--python", sys.executable, "--no-deps", wheel_url]
+            else:
+                cmd = [sys.executable, "-m", "pip", "install", "--no-deps", wheel_url]
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                log(f"  [error] Failed to install {package}: {result.stderr.strip()[:200]}")
+            else:
+                log(f"  Installed {package}")
 
 
 def _install_isolated_subdirs(
