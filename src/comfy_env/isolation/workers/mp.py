@@ -565,7 +565,9 @@ class MPWorker(Worker):
     interpreter without inherited state from the parent.
     """
 
-    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None, lib_path: Optional[str] = None, env_vars: Optional[dict] = None):
+    def __init__(self, name: Optional[str] = None, sys_path: Optional[list] = None,
+                 lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                 python: Optional[str] = None):
         """
         Initialize the worker.
 
@@ -574,11 +576,15 @@ class MPWorker(Worker):
             sys_path: Optional list of paths to add to sys.path in worker process.
             lib_path: Optional path to add to LD_LIBRARY_PATH (for conda libraries).
             env_vars: Optional environment variables to set in worker process.
+            python: Optional path to venv Python executable for true process isolation.
+                   When provided, spawn uses this Python instead of sys.executable,
+                   avoiding Windows issues where spawn re-imports main.py.
         """
         self.name = name or "MPWorker"
         self._sys_path = sys_path or []
         self._lib_path = lib_path
         self._env_vars = env_vars or {}
+        self._python = python  # Venv Python for true isolation (like pyisolate)
         self._process = None
         self._queue_in = None
         self._queue_out = None
@@ -635,13 +641,18 @@ class MPWorker(Worker):
             # Use spawn to get clean subprocess (no inherited CUDA context)
             ctx = mp.get_context('spawn')
 
-            # Explicitly set the spawn executable to the current Python
-            # This prevents pixi/conda from hijacking the spawn process
+            # Set the spawn executable for true process isolation (like pyisolate)
+            # When venv python is provided, use it to avoid Windows spawn importing main.py
             import multiprocessing.spawn as mp_spawn
             original_exe = mp_spawn.get_executable()
-            if original_exe != sys.executable.encode() and original_exe != sys.executable:
-                print(f"[comfy-env] Warning: spawn executable was {original_exe}, forcing to {sys.executable}")
-            mp_spawn.set_executable(sys.executable)
+            if self._python:
+                # True isolation: use venv Python (fixes Windows spawn __main__ issue)
+                mp_spawn.set_executable(self._python)
+            else:
+                # Fallback: use current Python (may fail on Windows with ComfyUI)
+                if original_exe != sys.executable.encode() and original_exe != sys.executable:
+                    print(f"[comfy-env] Warning: spawn executable was {original_exe}, forcing to {sys.executable}")
+                mp_spawn.set_executable(sys.executable)
 
             self._queue_in = ctx.Queue()
             self._queue_out = ctx.Queue()

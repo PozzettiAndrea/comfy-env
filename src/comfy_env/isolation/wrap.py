@@ -74,16 +74,20 @@ def _get_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 
         host_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
         iso_ver = _get_python_version(env_dir)
+        python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
 
         if iso_ver and iso_ver != host_ver:
+            # Different Python version - must use SubprocessWorker
             from .workers.subprocess import SubprocessWorker
-            python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
             print(f"[comfy-env] SubprocessWorker: {python} ({iso_ver} vs {host_ver})")
             worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name)
         else:
+            # Same version - use MPWorker with venv Python for true isolation (like pyisolate)
+            # This fixes Windows where spawn would otherwise re-import main.py
             from .workers.mp import MPWorker
-            print(f"[comfy-env] MPWorker: {env_dir}")
-            worker = MPWorker(name=working_dir.name, sys_path=sys_path, lib_path=lib_path, env_vars=env_vars)
+            print(f"[comfy-env] MPWorker: {python}")
+            worker = MPWorker(name=working_dir.name, sys_path=sys_path, lib_path=lib_path,
+                            env_vars=env_vars, python=str(python))
 
         _workers[cache_key] = worker
         return worker
