@@ -16,7 +16,7 @@ class Worker(ABC):
 
     Workers should be used as context managers when possible:
 
-        with MPWorker() as worker:
+        with SubprocessWorker(python="/path/to/venv/bin/python") as worker:
             result = worker.call(my_func, arg1, arg2)
     """
 

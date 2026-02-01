@@ -11,7 +11,6 @@ from .wrap import (
 from .workers import (
     Worker,
     WorkerError,
-    MPWorker,
     SubprocessWorker,
 )
 from .tensor_utils import (
@@ -29,7 +28,6 @@ __all__ = [
     # Workers
     "Worker",
     "WorkerError",
-    "MPWorker",
     "SubprocessWorker",
     # Tensor utilities
     "TensorKeeper",

@@ -108,7 +108,6 @@ from .isolation import (
     # Workers
     Worker,
     WorkerError,
-    MPWorker,
     SubprocessWorker,
     # Tensor utilities
     TensorKeeper,
@@ -168,7 +167,6 @@ __all__ = [
     # Workers
     "Worker",
     "WorkerError",
-    "MPWorker",
     "SubprocessWorker",
     "TensorKeeper",
 ]
