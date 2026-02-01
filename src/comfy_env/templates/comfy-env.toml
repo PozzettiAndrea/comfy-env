@@ -1,0 +1,133 @@
+# =============================================================================
+# comfy-env.toml - Environment configuration for ComfyUI custom nodes
+# =============================================================================
+#
+# comfy-env.toml is a SUPERSET of pixi.toml. All pixi.toml syntax works here.
+# We add custom sections: [cuda], [node_reqs], [env_vars], and top-level `python = "x.x"`.
+#
+# GPU is auto-detected to select the right CUDA version.
+#
+# Quick start:
+#   pip install comfy-env
+#   comfy-env init          # Creates this template
+#   comfy-env install       # Installs dependencies
+
+
+# =============================================================================
+# PYTHON VERSION (optional)
+# =============================================================================
+# Specify Python version for isolated environments (e.g., bpy needs Python 3.11)
+# Omit this to use the host Python version.
+
+# python = "3.11"
+
+
+# =============================================================================
+# ENVIRONMENT VARIABLES (custom section)
+# =============================================================================
+# Environment variables applied early via setup_env() in prestartup_script.py.
+# Useful for OpenMP settings, library configs, etc. that must be set before imports.
+#
+# Requires prestartup_script.py in your node directory:
+#   from comfy_env import setup_env
+#   setup_env()
+
+[env_vars]
+# KMP_DUPLICATE_LIB_OK = "TRUE"    # Allow duplicate OpenMP libraries (macOS fix)
+# OMP_NUM_THREADS = "4"            # Limit OpenMP threads
+
+
+# =============================================================================
+# CUDA PACKAGES (custom section)
+# =============================================================================
+# Pre-compiled CUDA wheels from the cuda-wheels index.
+# Pixi auto-selects the right wheel based on your GPU.
+# Supports CUDA 12.8 -> PyTorch 2.8 or CUDA 12.4 -> PyTorch 2.4
+
+[cuda]
+packages = []
+# Examples:
+# packages = [
+#     "nvdiffrast",        # NVIDIA differentiable rasterizer
+#     "pytorch3d",         # PyTorch3D - 3D deep learning
+#     "gsplat",            # Gaussian splatting
+#     "cumesh",            # GPU mesh processing
+#     "flash-attn",        # Flash Attention (Linux only)
+# ]
+
+
+# =============================================================================
+# CONDA PACKAGES (pixi-native)
+# =============================================================================
+# Conda packages from conda-forge (includes system libraries).
+# Use this instead of apt/brew - works cross-platform.
+
+[dependencies]
+# mesalib = "*"           # OpenGL (replaces libgl1)
+# libglu = "*"            # GLU library
+# ffmpeg = "*"            # Video processing
+# cgal = "*"              # Computational geometry
+
+
+# =============================================================================
+# PIP PACKAGES (pixi-native)
+# =============================================================================
+# Regular pip packages.
+
+[pypi-dependencies]
+# numpy = ">=1.21.0,<2"
+# trimesh = { version = ">=4.0.0", extras = ["easy"] }
+# pillow = "*"
+
+
+# =============================================================================
+# PLATFORM-SPECIFIC PACKAGES (pixi-native)
+# =============================================================================
+# Use pixi's target syntax for platform-specific packages.
+
+# [target.linux-64.pypi-dependencies]
+# embreex = "*"
+
+# [target.win-64.pypi-dependencies]
+# msvc-runtime = "*"
+# embreex = "*"
+
+
+# =============================================================================
+# NODE DEPENDENCIES (custom section)
+# =============================================================================
+# Other ComfyUI custom nodes this node depends on.
+
+[node_reqs]
+# VideoHelperSuite = "Kosinkadink/ComfyUI-VideoHelperSuite"
+# ComfyUI-Impact-Pack = "ltdrdata/ComfyUI-Impact-Pack"
+
+
+# =============================================================================
+# PROCESS ISOLATION
+# =============================================================================
+#
+# For nodes needing isolated environments, put comfy-env.toml in a subdirectory:
+#
+#   ComfyUI-MyPack/
+#   |-- comfy-env.toml       # Root: installs to main env
+#   |-- __init__.py
+#   \-- nodes/
+#       \-- isolated/
+#           |-- comfy-env.toml   # Subdirectory: isolated env
+#           \-- *.py
+#
+# In your nodes/__init__.py:
+#
+#   from pathlib import Path
+#   from comfy_env import wrap_isolated_nodes
+#
+#   NODE_CLASS_MAPPINGS = {}
+#
+#   from .main import NODE_CLASS_MAPPINGS as main_nodes
+#   NODE_CLASS_MAPPINGS.update(main_nodes)
+#
+#   from .isolated import NODE_CLASS_MAPPINGS as isolated_nodes
+#   NODE_CLASS_MAPPINGS.update(
+#       wrap_isolated_nodes(isolated_nodes, Path(__file__).parent / "isolated")
+#   )
