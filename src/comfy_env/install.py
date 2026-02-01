@@ -116,8 +116,11 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
     from .detection import get_recommended_cuda_version
-    from .environment.cache import get_central_env_path, write_marker, write_env_metadata, MARKER_FILE, get_cache_dir
+    from .environment.cache import get_central_env_path, write_marker, write_env_metadata, MARKER_FILE, get_cache_dir, cleanup_orphaned_envs
     import shutil, subprocess, sys
+
+    # Clean up orphaned environments before installing
+    cleanup_orphaned_envs(log)
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
     pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})

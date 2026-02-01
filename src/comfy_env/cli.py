@@ -44,6 +44,9 @@ def main(args: Optional[List[str]] = None) -> int:
     p.add_argument("--config", "-c", type=str, help="Config path")
     p.add_argument("--dry-run", action="store_true", help="Preview only")
 
+    # cleanup
+    sub.add_parser("cleanup", help="Remove orphaned environments")
+
     parsed = parser.parse_args(args)
     if not parsed.command:
         parser.print_help()
@@ -52,6 +55,7 @@ def main(args: Optional[List[str]] = None) -> int:
     commands = {
         "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
         "info": cmd_info, "doctor": cmd_doctor, "apt-install": cmd_apt_install,
+        "cleanup": cmd_cleanup,
     }
 
     try:
@@ -235,6 +239,17 @@ def cmd_apt_install(args) -> int:
     subprocess.run(prefix + ["apt-get", "update"], capture_output=False)
     result = subprocess.run(prefix + ["apt-get", "install", "-y"] + packages, capture_output=False)
     return result.returncode
+
+
+def cmd_cleanup(args) -> int:
+    from .environment.cache import cleanup_orphaned_envs
+    print("Cleaning orphaned environments...")
+    cleaned = cleanup_orphaned_envs()
+    if cleaned:
+        print(f"Removed {cleaned} orphaned environment(s)")
+    else:
+        print("No orphaned environments found")
+    return 0
 
 
 if __name__ == "__main__":

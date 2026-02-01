@@ -297,6 +297,45 @@ def _to_shm(obj, registry, visited=None):
     return obj
 
 
+def _deserialize_tensor_ref(data):
+    """Deserialize tensor from PyTorch shared memory (TensorRef format)."""
+    import torch
+    import torch.multiprocessing.reductions as reductions
+
+    dtype_str = data["dtype"]
+    dtype = getattr(torch, dtype_str.split(".")[-1])
+
+    manager_path = data["manager_path"]
+    storage_key = data["storage_key"]
+    storage_size = data["storage_size"]
+
+    # Encode to bytes if needed
+    if isinstance(manager_path, str):
+        manager_path = manager_path.encode("utf-8")
+    if isinstance(storage_key, str):
+        storage_key = storage_key.encode("utf-8")
+
+    # Rebuild storage from shared memory file
+    rebuilt_storage = reductions.rebuild_storage_filename(
+        torch.UntypedStorage, manager_path, storage_key, storage_size
+    )
+
+    # Wrap in TypedStorage
+    typed_storage = torch.storage.TypedStorage(
+        wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
+    )
+
+    # Rebuild tensor
+    metadata = (
+        data["tensor_offset"],
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["requires_grad"],
+    )
+    tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
+    return tensor
+
+
 def _from_shm(obj, unlink=True):
     """Reconstruct object from shared memory metadata."""
     if not isinstance(obj, dict):
@@ -304,7 +343,15 @@ def _from_shm(obj, unlink=True):
             return [_from_shm(v, unlink) for v in obj]
         return obj
 
-    # numpy array (or tensor that was converted to numpy)
+    # TensorRef -> use PyTorch's native deserialization (new format)
+    if obj.get("__type__") == "TensorRef":
+        tensor = _deserialize_tensor_ref(obj)
+        # Convert back to numpy if it was originally numpy
+        if obj.get("__was_numpy__"):
+            return tensor.numpy()
+        return tensor
+
+    # numpy array (or tensor that was converted to numpy) - legacy format
     if "__shm_np__" in obj:
         block = shm.SharedMemory(name=obj["__shm_np__"])
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
@@ -362,10 +409,10 @@ def _serialize_for_ipc(obj, visited=None):
     if obj_id in visited:
         return visited[obj_id]  # Return cached serialized result
 
-    # Handle Path objects - convert to string for JSON serialization
+    # Handle Path objects - mark for reconstruction
     from pathlib import PurePath
     if isinstance(obj, PurePath):
-        return str(obj)
+        return {"__path__": str(obj)}
 
     # Check if this is a custom object with broken module path
     if (hasattr(obj, '__dict__') and
@@ -434,6 +481,8 @@ import socket
 import struct
 import traceback
 import faulthandler
+import collections
+import time
 from types import SimpleNamespace
 
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
@@ -533,6 +582,34 @@ if sys.platform == "win32":
 from multiprocessing import shared_memory as shm
 import numpy as np
 
+# Set PyTorch to use file_system sharing (uses /dev/shm, no resource_tracker)
+try:
+    import torch
+    import torch.multiprocessing as mp
+    mp.set_sharing_strategy("file_system")
+    wlog("[worker] PyTorch sharing strategy set to file_system")
+except ImportError:
+    wlog("[worker] PyTorch not available")
+
+
+# Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
+class TensorKeeper:
+    """Keep tensors alive for a retention period to prevent shared memory deletion."""
+    def __init__(self, retention_seconds=30.0):
+        self.retention_seconds = retention_seconds
+        self._keeper = collections.deque()
+        self._lock = threading.Lock()
+
+    def keep(self, t):
+        now = time.time()
+        with self._lock:
+            self._keeper.append((now, t))
+            # Cleanup old entries
+            while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
+                self._keeper.popleft()
+
+_tensor_keeper = TensorKeeper()
+
 
 def _prepare_trimesh_for_pickle(mesh):
     """
@@ -548,6 +625,43 @@ def _prepare_trimesh_for_pickle(mesh):
     return mesh
 
 
+def _serialize_tensor_native(t, registry):
+    """Serialize tensor using PyTorch's native shared memory (no resource_tracker)."""
+    import torch
+    import torch.multiprocessing.reductions as reductions
+
+    # Keep tensor alive until parent reads it
+    _tensor_keeper.keep(t)
+
+    # Put tensor in shared memory via PyTorch's manager
+    if not t.is_shared():
+        t.share_memory_()
+
+    storage = t.untyped_storage()
+    sfunc, sargs = reductions.reduce_storage(storage)
+
+    if sfunc.__name__ == "rebuild_storage_filename":
+        # sargs: (cls, manager_path, storage_key, size)
+        return {
+            "__type__": "TensorRef",
+            "strategy": "file_system",
+            "manager_path": sargs[1].decode("utf-8") if isinstance(sargs[1], bytes) else sargs[1],
+            "storage_key": sargs[2].decode("utf-8") if isinstance(sargs[2], bytes) else sargs[2],
+            "storage_size": sargs[3],
+            "dtype": str(t.dtype),
+            "tensor_size": list(t.size()),
+            "tensor_stride": list(t.stride()),
+            "tensor_offset": t.storage_offset(),
+            "requires_grad": t.requires_grad,
+        }
+    else:
+        # Fallback: force file_system strategy
+        import torch.multiprocessing as mp
+        mp.set_sharing_strategy("file_system")
+        t.share_memory_()
+        return _serialize_tensor_native(t, registry)
+
+
 def _to_shm(obj, registry, visited=None):
     """Serialize to shared memory. Returns JSON-safe metadata."""
     if visited is None:
@@ -557,22 +671,26 @@ def _to_shm(obj, registry, visited=None):
         return visited[obj_id]
     t = type(obj).__name__
 
-    if t == 'ndarray':
-        arr = np.ascontiguousarray(obj)
-        block = shm.SharedMemory(create=True, size=arr.nbytes)
-        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-        registry.append(block)
-        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+    # Tensor -> use PyTorch's native shared memory (bypasses resource_tracker)
+    if t == 'Tensor':
+        import torch
+        tensor = obj.detach().cpu().contiguous()
+        result = _serialize_tensor_native(tensor, registry)
         visited[obj_id] = result
         return result
 
-    if t == 'Tensor':
-        arr = obj.detach().cpu().numpy()
-        result = _to_shm(arr, registry, visited)
-        result["__was_tensor__"] = True
+    # ndarray -> convert to tensor, use PyTorch's native shared memory
+    if t == 'ndarray':
+        import torch
+        arr = np.ascontiguousarray(obj)
+        tensor = torch.from_numpy(arr)
+        result = _serialize_tensor_native(tensor, registry)
+        result["__was_numpy__"] = True
+        result["numpy_dtype"] = str(arr.dtype)
+        visited[obj_id] = result
         return result
 
-    # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
+    # trimesh.Trimesh -> pickle -> shared memory
     if t == 'Trimesh':
         import pickle
         obj = _prepare_trimesh_for_pickle(obj)
@@ -601,12 +719,62 @@ def _to_shm(obj, registry, visited=None):
 
     return obj
 
+
+def _deserialize_tensor_native(data):
+    """Deserialize tensor from PyTorch shared memory."""
+    import torch
+    import torch.multiprocessing.reductions as reductions
+
+    dtype_str = data["dtype"]
+    dtype = getattr(torch, dtype_str.split(".")[-1])
+
+    manager_path = data["manager_path"]
+    storage_key = data["storage_key"]
+    storage_size = data["storage_size"]
+
+    # Encode to bytes if needed
+    if isinstance(manager_path, str):
+        manager_path = manager_path.encode("utf-8")
+    if isinstance(storage_key, str):
+        storage_key = storage_key.encode("utf-8")
+
+    # Rebuild storage from shared memory file
+    rebuilt_storage = reductions.rebuild_storage_filename(
+        torch.UntypedStorage, manager_path, storage_key, storage_size
+    )
+
+    # Wrap in TypedStorage
+    typed_storage = torch.storage.TypedStorage(
+        wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
+    )
+
+    # Rebuild tensor
+    metadata = (
+        data["tensor_offset"],
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["requires_grad"],
+    )
+    tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
+    return tensor
+
+
 def _from_shm(obj):
     """Reconstruct from shared memory metadata. Does NOT unlink - caller handles that."""
     if not isinstance(obj, dict):
         if isinstance(obj, list):
             return [_from_shm(v) for v in obj]
         return obj
+
+    # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
+    if obj.get("__type__") == "TensorRef":
+        tensor = _deserialize_tensor_native(obj)
+        # Convert back to numpy if it was originally numpy
+        if obj.get("__was_numpy__"):
+            return tensor.numpy()
+        return tensor
+
+    # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
     if "__shm_np__" in obj:
         block = shm.SharedMemory(name=obj["__shm_np__"])
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
@@ -616,13 +784,16 @@ def _from_shm(obj):
             import torch
             return torch.from_numpy(arr)
         return arr
-    # trimesh (pickled to preserve visual, metadata, normals)
+
+    # trimesh (pickled)
     if "__shm_trimesh__" in obj:
         import pickle
         block = shm.SharedMemory(name=obj["name"])
         mesh_bytes = bytes(block.buf[:obj["size"]])
         block.close()
+        block.unlink()
         return pickle.loads(mesh_bytes)
+
     return {k: _from_shm(v) for k, v in obj.items()}
 
 def _cleanup_shm(registry):
@@ -633,6 +804,25 @@ def _cleanup_shm(registry):
         except Exception:
             pass
     registry.clear()
+
+# Shared memory keeper - holds references to prevent premature GC
+class ShmKeeper:
+    """Keep shm blocks alive for a retention period to prevent race conditions."""
+    def __init__(self, retention_seconds=30.0):
+        self.retention_seconds = retention_seconds
+        self._keeper = collections.deque()
+        self._lock = threading.Lock()
+
+    def keep(self, blocks):
+        now = time.time()
+        with self._lock:
+            self._keeper.append((now, list(blocks)))  # Copy the list
+            # Cleanup old entries
+            while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
+                old_time, old_blocks = self._keeper.popleft()
+                _cleanup_shm(old_blocks)
+
+_shm_keeper = ShmKeeper()
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -796,6 +986,9 @@ def _connect(addr):
 def _deserialize_isolated_objects(obj):
     """Reconstruct objects serialized with __isolated_object__ marker."""
     if isinstance(obj, dict):
+        if obj.get("__path__"):
+            from pathlib import Path
+            return Path(obj["__path__"])
         if obj.get("__isolated_object__"):
             attrs = {k: _deserialize_isolated_objects(v) for k, v in obj.get("__attrs__", {}).items()}
             ns = SimpleNamespace(**attrs)
@@ -941,6 +1134,7 @@ def main():
                 wlog(f"[worker] Creating instance...")
                 instance = object.__new__(cls)
                 if self_state:
+                    self_state = _deserialize_isolated_objects(self_state)
                     instance.__dict__.update(self_state)
                 wlog(f"[worker] Calling {method_name}...")
                 method = getattr(instance, method_name)
@@ -957,7 +1151,7 @@ def main():
             wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
             transport.send({"status": "ok", "result": result_meta})
-            # Note: don't cleanup shm_registry here - host needs to read it
+            _shm_keeper.keep(shm_registry)  # Keep alive for 30s until host reads
 
         except Exception as e:
             # Cleanup shm on error since host won't read it
@@ -1134,7 +1328,9 @@ class SubprocessWorker(Worker):
         lib_dir = self.python.parent.parent / "lib"
         if lib_dir.is_dir():
             existing = env.get("LD_LIBRARY_PATH", "")
-            env["LD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+            # Also include system library paths so apt-installed libs (OpenGL, etc.) are found
+            system_libs = "/usr/lib/x86_64-linux-gnu:/usr/lib:/lib/x86_64-linux-gnu"
+            env["LD_LIBRARY_PATH"] = f"{lib_dir}:{system_libs}:{existing}" if existing else f"{lib_dir}:{system_libs}"
 
         # On Windows, pass host Python directory so worker can add it via os.add_dll_directory()
         # This fixes "DLL load failed" errors for packages like opencv-python-headless
