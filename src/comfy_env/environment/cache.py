@@ -2,6 +2,7 @@
 
 import glob
 import hashlib
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -16,14 +17,16 @@ try:
 except ImportError:
     __version__ = "0.0.0-dev"
 
-CACHE_DIR = Path.home() / ".comfy-env" / "envs"
+CACHE_DIR = Path.home() / ".comfy-env" / "envs"  # Default, use get_cache_dir() for dynamic lookup
 MARKER_FILE = ".comfy-env-marker.toml"
 METADATA_FILE = ".comfy-env-metadata.toml"
 
 
 def get_cache_dir() -> Path:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return CACHE_DIR
+    """Get cache dir, checking COMFY_ENV_CACHE_DIR env var each time."""
+    cache_dir = Path(os.environ.get("COMFY_ENV_CACHE_DIR", Path.home() / ".comfy-env" / "envs"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
 
 
 def compute_config_hash(config_path: Path) -> str:

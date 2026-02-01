@@ -668,7 +668,10 @@ def _to_shm(obj, registry, visited=None):
         visited = {}
     obj_id = id(obj)
     if obj_id in visited:
-        return visited[obj_id]
+        cached = visited[obj_id]
+        if isinstance(cached, dict) and cached.get("__type__") == "TensorRef":
+            print(f"[SHM DEBUG] _to_shm CACHE HIT: id={obj_id} -> storage_key=...{cached.get('storage_key','?')[-20:]}, tensor_size={cached.get('tensor_size')}", file=sys.stderr)
+        return cached
     t = type(obj).__name__
 
     # Tensor -> use PyTorch's native shared memory (bypasses resource_tracker)
@@ -676,6 +679,7 @@ def _to_shm(obj, registry, visited=None):
         import torch
         tensor = obj.detach().cpu().contiguous()
         result = _serialize_tensor_native(tensor, registry)
+        print(f"[SHM DEBUG] _to_shm Tensor: id={obj_id}, orig_shape={list(obj.shape)}, new_shape={list(tensor.shape)} -> storage_key=...{result.get('storage_key','?')[-20:]}, tensor_size={result.get('tensor_size')}", file=sys.stderr)
         visited[obj_id] = result
         return result
 
@@ -769,6 +773,7 @@ def _from_shm(obj):
     # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
     if obj.get("__type__") == "TensorRef":
         tensor = _deserialize_tensor_native(obj)
+        print(f"[SHM DEBUG] _from_shm TensorRef: storage_key=...{obj.get('storage_key','?')[-20:]}, expected_size={obj.get('tensor_size')} -> actual_shape={list(tensor.shape)}", file=sys.stderr)
         # Convert back to numpy if it was originally numpy
         if obj.get("__was_numpy__"):
             return tensor.numpy()
