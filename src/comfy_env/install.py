@@ -59,7 +59,9 @@ def _install_apt_packages(packages: List[str], log: Callable[[str], None], dry_r
         return
     log(f"\n[apt] Installing: {', '.join(packages)}")
     if not dry_run:
-        apt_install(packages, log)
+        success = apt_install(packages, log)
+        if not success:
+            log("[apt] WARNING: Some apt packages failed to install. This may cause issues.")
 
 
 def _set_persistent_env_vars(env_vars: dict, log: Callable[[str], None], dry_run: bool) -> None:

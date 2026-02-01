@@ -10,18 +10,50 @@ def apt_install(packages: List[str], log: Callable[[str], None] = print) -> bool
     if not packages or sys.platform != "linux":
         return True
 
-    log(f"Installing apt packages: {packages}")
+    log(f"[apt] Requested packages: {packages}")
 
-    subprocess.run(["sudo", "apt-get", "update"], capture_output=True, text=True)
+    # Check which packages are missing
+    missing = check_apt_packages(packages)
+    if not missing:
+        log("[apt] All packages already installed")
+        return True
 
-    result = subprocess.run(
-        ["sudo", "apt-get", "install", "-y"] + packages,
+    log(f"[apt] Missing packages: {missing}")
+
+    # Run apt-get update with full output
+    log("[apt] Running: sudo apt-get update")
+    update_result = subprocess.run(
+        ["sudo", "apt-get", "update"],
         capture_output=True, text=True
     )
+    if update_result.returncode != 0:
+        log(f"[apt] WARNING: apt-get update failed (exit {update_result.returncode})")
+        log(f"[apt] stderr: {update_result.stderr}")
+    else:
+        log("[apt] apt-get update succeeded")
+
+    # Install missing packages
+    log(f"[apt] Running: sudo apt-get install -y {' '.join(missing)}")
+    result = subprocess.run(
+        ["sudo", "apt-get", "install", "-y"] + missing,
+        capture_output=True, text=True
+    )
+
     if result.returncode != 0:
-        log(f"Warning: apt-get install failed: {result.stderr[:200]}")
+        log(f"[apt] ERROR: apt-get install failed (exit {result.returncode})")
+        log(f"[apt] stdout: {result.stdout}")
+        log(f"[apt] stderr: {result.stderr}")
         return False
 
+    log("[apt] Installation succeeded")
+
+    # Verify installation
+    still_missing = check_apt_packages(missing)
+    if still_missing:
+        log(f"[apt] WARNING: These packages still not found: {still_missing}")
+        return False
+
+    log("[apt] All packages verified installed")
     return True
 
 
