@@ -79,7 +79,9 @@ def _get_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         # SubprocessWorker uses a clean entry script that avoids this issue.
         from .workers.subprocess import SubprocessWorker
         print(f"[comfy-env] SubprocessWorker: {python}")
-        worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name)
+        if env_vars:
+            print(f"[comfy-env] env_vars: {env_vars}")
+        worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name, env=env_vars)
 
         _workers[cache_key] = worker
         return worker
