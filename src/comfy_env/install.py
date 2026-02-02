@@ -151,7 +151,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     log("Running pixi install...")
     result = subprocess.run([str(pixi_path), "install"], cwd=node_dir, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"pixi install failed: {result.stderr}")
+        raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
     if cfg.cuda_packages and cuda_version:
         log(f"Installing CUDA packages...")
@@ -171,7 +171,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url],
                                    capture_output=True, text=True)
             if result.returncode != 0:
-                raise RuntimeError(f"Failed: {result.stderr}")
+                raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
     # Find config file for marker
     config_path = node_dir / CONFIG_FILE_NAME
