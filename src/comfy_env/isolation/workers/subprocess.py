@@ -1200,6 +1200,7 @@ class SubprocessWorker(Worker):
         env: Optional[Dict[str, str]] = None,
         name: Optional[str] = None,
         share_torch: bool = True,  # Kept for API compatibility
+        health_check_timeout: float = 2.0,
     ):
         """
         Initialize persistent worker.
@@ -1211,12 +1212,14 @@ class SubprocessWorker(Worker):
             env: Additional environment variables.
             name: Optional name for logging.
             share_torch: Ignored (kept for API compatibility).
+            health_check_timeout: Timeout in seconds for worker health checks.
         """
         self.python = Path(python)
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.sys_path = sys_path or []
         self.extra_env = env or {}
         self.name = name or f"SubprocessWorker({self.python.parent.parent.name})"
+        self.health_check_timeout = health_check_timeout
 
         if not self.python.exists():
             raise FileNotFoundError(f"Python not found: {self.python}")
@@ -1267,14 +1270,18 @@ class SubprocessWorker(Worker):
     def _check_socket_health(self) -> bool:
         """Check if socket connection is healthy using a quick ping."""
         if not self._transport:
+            print(f"[{self.name}] Health check: no transport", file=sys.stderr, flush=True)
             return False
         try:
-            # Send a ping request with short timeout
+            # Send a ping request with configurable timeout
+            print(f"[{self.name}] Health check: ping (timeout={self.health_check_timeout}s)...", file=sys.stderr, flush=True)
             self._transport.send({"method": "ping"})
-            response = self._transport.recv(timeout=2.0)
-            return response is not None and response.get("status") == "pong"
+            response = self._transport.recv(timeout=self.health_check_timeout)
+            ok = response is not None and response.get("status") == "pong"
+            print(f"[{self.name}] Health check: {'ok' if ok else 'failed'}", file=sys.stderr, flush=True)
+            return ok
         except Exception as e:
-            print(f"[{self.name}] Socket health check failed: {e}", file=sys.stderr, flush=True)
+            print(f"[{self.name}] Socket health check exception: {e}", file=sys.stderr, flush=True)
             return False
 
     def _kill_worker(self) -> None:

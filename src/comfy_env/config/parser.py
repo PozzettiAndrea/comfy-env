@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import tomli
 
-from .types import ComfyEnvConfig, NodeDependency
+from .types import ComfyEnvConfig, ComfyEnvOptions, NodeDependency
 
 ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"  # Main node config
 CONFIG_FILE_NAME = "comfy-env.toml"  # Isolated folder config
@@ -43,6 +43,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
     apt_packages = _ensure_list(data.pop("apt", {}).get("packages", []))
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
     node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
+    options = _parse_options(data.pop("options", {}))
 
     return ComfyEnvConfig(
         python=python_version,
@@ -50,7 +51,15 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
         apt_packages=apt_packages,
         env_vars=env_vars,
         node_reqs=node_reqs,
+        options=options,
         pixi_passthrough=data,
+    )
+
+
+def _parse_options(data: Dict[str, Any]) -> ComfyEnvOptions:
+    """Parse [options] section into ComfyEnvOptions."""
+    return ComfyEnvOptions(
+        health_check_timeout=float(data.get("health_check_timeout", 2.0)),
     )
 
 

@@ -66,7 +66,8 @@ def _get_python_version(env_dir: Path) -> Optional[str]:
 
 
 def _get_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
-                lib_path: Optional[str] = None, env_vars: Optional[dict] = None):
+                lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                health_check_timeout: float = 2.0):
     cache_key = str(env_dir)
     with _workers_lock:
         if cache_key in _workers and _workers[cache_key].is_alive():
@@ -81,7 +82,9 @@ def _get_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         print(f"[comfy-env] SubprocessWorker: {python}")
         if env_vars:
             print(f"[comfy-env] env_vars: {env_vars}")
-        worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name, env=env_vars)
+        if health_check_timeout != 2.0:
+            print(f"[comfy-env] health_check_timeout: {health_check_timeout}s")
+        worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name, env=env_vars, health_check_timeout=health_check_timeout)
 
         _workers[cache_key] = worker
         return worker
@@ -97,7 +100,8 @@ def _shutdown_workers():
 
 
 def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
-                     lib_path: Optional[str] = None, env_vars: Optional[dict] = None) -> type:
+                     lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                     health_check_timeout: float = 2.0) -> type:
     func_name = getattr(cls, "FUNCTION", None)
     if not func_name: return cls
     original = getattr(cls, func_name, None)
@@ -111,7 +115,7 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
     @wraps(original)
     def proxy(self, **kwargs):
-        worker = _get_worker(env_dir, working_dir, sys_path, lib_path, env_vars)
+        worker = _get_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
         try:
             from .tensor_utils import prepare_for_ipc_recursive
             kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
@@ -163,14 +167,19 @@ def wrap_nodes() -> None:
         if not env_dir or not sp: continue
 
         env_vars = {}
+        health_check_timeout = 2.0
         try:
             import tomli
             with open(cf, "rb") as f:
-                env_vars = {str(k): str(v) for k, v in tomli.load(f).get("env_vars", {}).items()}
-        except Exception: pass
+                toml_data = tomli.load(f)
+                env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
+                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", 2.0))
+                print(f"[comfy-env] Parsed {cf}: health_check_timeout={health_check_timeout}")
+        except Exception as e:
+            print(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base: env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
-        envs.append({"dir": cf.parent, "env_dir": env_dir, "sp": sp, "lib": lib, "env_vars": env_vars})
+        envs.append({"dir": cf.parent, "env_dir": env_dir, "sp": sp, "lib": lib, "env_vars": env_vars, "health_check_timeout": health_check_timeout})
 
     wrapped = 0
     for name, cls in mappings.items():
@@ -183,7 +192,7 @@ def wrap_nodes() -> None:
             try:
                 src.relative_to(e["dir"])
                 _wrap_node_class(cls, e["env_dir"], e["dir"], [str(e["sp"]), str(e["dir"])],
-                               str(e["lib"]) if e["lib"] else None, e["env_vars"])
+                               str(e["lib"]) if e["lib"] else None, e["env_vars"], e.get("health_check_timeout", 2.0))
                 wrapped += 1
                 break
             except ValueError: continue
@@ -209,11 +218,16 @@ def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -
         return node_class_mappings
 
     env_vars = {}
+    health_check_timeout = 2.0
     try:
         import tomli
         with open(config, "rb") as f:
-            env_vars = {str(k): str(v) for k, v in tomli.load(f).get("env_vars", {}).items()}
-    except Exception: pass
+            toml_data = tomli.load(f)
+            env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
+            health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", 2.0))
+            print(f"[comfy-env] Parsed {config}: health_check_timeout={health_check_timeout}")
+    except Exception as e:
+        print(f"[comfy-env] Failed to parse {config}: {e}")
     if comfyui_base: env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
     env_dir = _find_env_dir(nodes_dir)
@@ -228,6 +242,6 @@ def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -
     print(f"[comfy-env] Wrapping {len(node_class_mappings)} nodes from {nodes_dir.name}")
     for cls in node_class_mappings.values():
         if hasattr(cls, "FUNCTION"):
-            _wrap_node_class(cls, env_dir, nodes_dir, sys_path, lib_path, env_vars)
+            _wrap_node_class(cls, env_dir, nodes_dir, sys_path, lib_path, env_vars, health_check_timeout)
 
     return node_class_mappings

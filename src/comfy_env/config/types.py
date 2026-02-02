@@ -15,6 +15,12 @@ NodeReq = NodeDependency  # Backwards compat
 
 
 @dataclass
+class ComfyEnvOptions:
+    """Runtime options for comfy-env."""
+    health_check_timeout: float = 2.0  # Timeout for worker health checks (seconds)
+
+
+@dataclass
 class ComfyEnvConfig:
     """Parsed comfy-env.toml configuration."""
     python: Optional[str] = None
@@ -22,6 +28,7 @@ class ComfyEnvConfig:
     apt_packages: List[str] = field(default_factory=list)
     env_vars: Dict[str, str] = field(default_factory=dict)
     node_reqs: List[NodeDependency] = field(default_factory=list)
+    options: ComfyEnvOptions = field(default_factory=ComfyEnvOptions)
     pixi_passthrough: Dict[str, Any] = field(default_factory=dict)
 
     @property
