@@ -19,13 +19,32 @@ PIXI_URLS = {
 
 
 def get_pixi_path() -> Optional[Path]:
-    """Find pixi in PATH or common locations."""
-    if cmd := shutil.which("pixi"): return Path(cmd)
+    """Find pixi in PATH, venv, or common user locations."""
+    # 1. PATH
+    if cmd := shutil.which("pixi"):
+        return Path(cmd)
+
+    # 2. Active venv (pip-installed pixi)
+    prefix = Path(sys.prefix)
+    candidates = []
+    if sys.platform == "win32":
+        candidates.append(prefix / "Scripts" / "pixi.exe")
+    else:
+        candidates.append(prefix / "bin" / "pixi")
+
+    # 3. User locations
     home = Path.home()
-    for p in [home / ".pixi/bin/pixi", home / ".local/bin/pixi"]:
-        candidate = p.with_suffix(".exe") if sys.platform == "win32" else p
-        if candidate.exists(): return candidate
+    candidates.extend([
+        home / ".pixi" / "bin" / ("pixi.exe" if sys.platform == "win32" else "pixi"),
+        home / ".local" / "bin" / ("pixi.exe" if sys.platform == "win32" else "pixi"),
+    ])
+
+    for c in candidates:
+        if c.exists():
+            return c
+
     return None
+
 
 
 def ensure_pixi(install_dir: Optional[Path] = None, log: Callable[[str], None] = print) -> Path:
