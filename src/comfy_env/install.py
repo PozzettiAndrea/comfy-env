@@ -146,17 +146,26 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     if pypi_deps: log(f"  PyPI: {len(pypi_deps)}")
     if dry_run: return
 
+    log("[DEBUG] pixi_clean...")
     pixi_clean(node_dir, log)
+    log("[DEBUG] mkdir .pixi...")
     (node_dir / ".pixi").mkdir(parents=True, exist_ok=True)
     (node_dir / ".pixi" / "config.toml").write_text("detached-environments = false\n")
 
+    log("[DEBUG] ensure_pixi...")
     pixi_path = ensure_pixi(log=log)
+    log(f"[DEBUG] pixi_path={pixi_path}")
+
     cuda_version = torch_version = None
     if cfg.has_cuda and sys.platform != "darwin":
+        log("[DEBUG] get_recommended_cuda_version...")
         cuda_version = get_recommended_cuda_version()
+        log(f"[DEBUG] cuda_version={cuda_version}")
         if cuda_version:
             torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+            log(f"[DEBUG] torch_version={torch_version}")
 
+    log("[DEBUG] write_pixi_toml...")
     write_pixi_toml(cfg, node_dir, log)
     log("Running pixi install...")
     result = subprocess.run([str(pixi_path), "install"], cwd=node_dir, capture_output=True, text=True)
