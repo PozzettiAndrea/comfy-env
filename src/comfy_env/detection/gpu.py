@@ -95,7 +95,15 @@ def detect_cuda_environment(force_refresh: bool = False) -> CUDAEnvironment:
         return _cache[1]
 
     gpus, method = None, "none"
-    for name, fn in [("nvml", _detect_nvml), ("torch", _detect_torch), ("smi", _detect_smi), ("sysfs", _detect_sysfs)]:
+    # On Windows, try nvidia-smi first (subprocess, crash-safe) before torch/nvml
+    # which can cause hard crashes from DLL load failures
+    import sys
+    if sys.platform == "win32":
+        detection_order = [("smi", _detect_smi), ("nvml", _detect_nvml), ("torch", _detect_torch)]
+    else:
+        detection_order = [("nvml", _detect_nvml), ("torch", _detect_torch), ("smi", _detect_smi), ("sysfs", _detect_sysfs)]
+
+    for name, fn in detection_order:
         if result := fn():
             gpus, method = result, name
             break
