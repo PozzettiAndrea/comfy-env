@@ -113,7 +113,15 @@ def _install_node_dependencies(node_reqs: List[NodeDependency], node_dir: Path, 
     install_node_dependencies(node_reqs, custom_nodes_dir, log, {node_dir.name})
 
 
-def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
+def _has_isolated_subdirs(node_dir: Path) -> bool:
+    """Check if there are any comfy-env.toml files in subdirectories."""
+    for config_file in node_dir.rglob(CONFIG_FILE_NAME):
+        if config_file.parent != node_dir:
+            return True
+    return False
+
+
+def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool, is_root: bool = True) -> None:
     from .packages.pixi import ensure_pixi, get_pixi_python, pixi_clean
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
@@ -127,7 +135,9 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     deps = cfg.pixi_passthrough.get("dependencies", {})
     pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})
     if not cfg.cuda_packages and not deps and not pypi_deps:
-        log("No packages to install")
+        # Only log "no packages" if this is root AND there are no isolated subdirs
+        if not is_root or not _has_isolated_subdirs(node_dir):
+            log("No packages to install")
         return
 
     log(f"\nInstalling via pixi:")
@@ -243,7 +253,7 @@ def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_ru
         if config_file.parent == node_dir: continue  # Skip root
         log(f"\n[isolated] {config_file.parent.relative_to(node_dir)}")
         if not dry_run:
-            _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
+            _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run, is_root=False)
 
 
 def verify_installation(packages: List[str], log: Callable[[str], None] = print) -> bool:
