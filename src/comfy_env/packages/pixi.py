@@ -98,7 +98,10 @@ def pixi_run(command: List[str], node_dir: Path, log: Callable[[str], None] = pr
 
 
 def pixi_clean(node_dir: Path, log: Callable[[str], None] = print) -> None:
-    """Remove pixi artifacts (pixi.toml, pixi.lock, .pixi/)."""
+    """Remove pixi artifacts (pixi.toml, pixi.lock, .pixi/) and global cache."""
     for path in [node_dir / "pixi.toml", node_dir / "pixi.lock"]:
         if path.exists(): path.unlink()
     if (node_dir / ".pixi").exists(): shutil.rmtree(node_dir / ".pixi")
+    # Also nuke global pixi cache to avoid migration issues
+    global_pixi = Path.home() / ".pixi"
+    if global_pixi.exists(): shutil.rmtree(global_pixi, ignore_errors=True)
