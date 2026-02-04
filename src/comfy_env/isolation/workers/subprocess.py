@@ -248,10 +248,15 @@ def _to_shm(obj, registry, visited=None):
         return result
 
     # torch.Tensor -> convert to numpy -> shared memory (with marker to restore type)
+    # IMPORTANT: Inline serialization to avoid caching ephemeral numpy array by id().
+    # The temp array can be GC'd and its address reused, causing cache collisions.
     if t == 'Tensor':
-        arr = obj.detach().cpu().numpy()
-        result = _to_shm(arr, registry, visited)
-        result["__was_tensor__"] = True
+        arr = np.ascontiguousarray(obj.detach().cpu().numpy())
+        block = shm.SharedMemory(create=True, size=arr.nbytes)
+        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+        registry.append(block)
+        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype), "__was_tensor__": True}
+        visited[obj_id] = result  # Cache by tensor id, not temp array id
         return result
 
     # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
@@ -516,13 +521,16 @@ def _watchdog():
             f.write("=== END ===\\n")
             f.flush()
 
-        # Also print
-        print(f"\\n=== WATCHDOG TICK {tick} (debug only, don't worry) ===", flush=True)
-        print(dump, flush=True)
-        print("=== END ===\\n", flush=True)
+        # Also print (only if debug enabled)
+        if _DEBUG:
+            print(f"\\n=== WATCHDOG TICK {tick} ===", flush=True)
+            print(dump, flush=True)
+            print("=== END ===\\n", flush=True)
 
-_watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
-_watchdog_thread.start()
+# Only start watchdog when debugging (still logs to file if needed)
+if _DEBUG:
+    _watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    _watchdog_thread.start()
 if _DEBUG:
     print(f"[worker] Watchdog started, logging to: {_watchdog_log}", flush=True)
 
@@ -766,6 +774,8 @@ def _deserialize_tensor_native(data):
 
 def _from_shm(obj):
     """Reconstruct from shared memory metadata. Does NOT unlink - caller handles that."""
+    if _DEBUG and isinstance(obj, dict) and any(k in obj for k in ("__type__", "__shm_np__", "tensor_size")):
+        print(f"[comfy-env] _from_shm got dict with keys: {list(obj.keys())[:5]}", file=sys.stderr, flush=True)
     if not isinstance(obj, dict):
         if isinstance(obj, list):
             return [_from_shm(v) for v in obj]
@@ -773,7 +783,11 @@ def _from_shm(obj):
 
     # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
     if obj.get("__type__") == "TensorRef":
+        if _DEBUG:
+            print(f"[comfy-env] DESERIALIZE TensorRef: tensor_size={obj.get('tensor_size')}", file=sys.stderr, flush=True)
         tensor = _deserialize_tensor_native(obj)
+        if _DEBUG:
+            print(f"[comfy-env] DESERIALIZED tensor shape: {tensor.shape}", file=sys.stderr, flush=True)
         # Convert back to numpy if it was originally numpy
         if obj.get("__was_numpy__"):
             return tensor.numpy()
@@ -781,6 +795,8 @@ def _from_shm(obj):
 
     # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
     if "__shm_np__" in obj:
+        if _DEBUG:
+            print(f"[comfy-env] DESERIALIZE __shm_np__: shape={obj.get('shape')}, was_tensor={obj.get('__was_tensor__')}", file=sys.stderr, flush=True)
         block = shm.SharedMemory(name=obj["__shm_np__"])
         # Unregister from resource_tracker - parent owns these blocks and will clean them up
         try:
@@ -790,6 +806,8 @@ def _from_shm(obj):
             pass
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
         block.close()
+        if _DEBUG:
+            print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
         # Convert back to tensor if it was originally a tensor
         if obj.get("__was_tensor__"):
             import torch
@@ -1636,10 +1654,10 @@ class SubprocessWorker(Worker):
             try:
                 # Serialize kwargs to shared memory
                 if kwargs:
-                    # Debug: log tensor shapes before serialization (always)
-                    for k, v in kwargs.items():
-                        if hasattr(v, 'shape'):
-                            print(f"[comfy-env] PRE-SERIALIZE '{k}' shape: {v.shape}", file=sys.stderr, flush=True)
+                    if _DEBUG:
+                        for k, v in kwargs.items():
+                            if hasattr(v, 'shape'):
+                                print(f"[comfy-env] PRE-SERIALIZE '{k}' shape: {v.shape}", file=sys.stderr, flush=True)
                     if _DEBUG:
                         print(f"[SubprocessWorker] serializing kwargs to shm...", file=sys.stderr, flush=True)
                     kwargs_meta = _to_shm(kwargs, shm_registry)
