@@ -184,15 +184,24 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         # PyTorch packages install from official PyTorch index
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
+        # torchvision has different versioning scheme
+        torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
         cuda_short = cuda_version.replace(".", "")[:3]
         pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_short}"
 
         for package in cfg.cuda_packages:
             if package in pytorch_packages:
-                # Install from PyTorch CUDA index
-                log(f"  {package} (from PyTorch index)")
+                # Install from PyTorch CUDA index with version pinning
+                if package == "torch":
+                    pin_version = torch_version
+                elif package == "torchvision":
+                    pin_version = torchvision_map.get(torch_version, "0.23")
+                else:  # torchaudio follows torch versioning
+                    pin_version = torch_version
+                pkg_spec = f"{package}=={pin_version}.*"
+                log(f"  {package} (from PyTorch index, pinned to {pin_version}.*)")
                 result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-cache-dir",
-                                        "--extra-index-url", pytorch_index, package],
+                                        "--extra-index-url", pytorch_index, pkg_spec],
                                        capture_output=True, text=True)
             else:
                 # Install from cuda-wheels

@@ -184,3 +184,36 @@ def _run_startup_cleanup():
         pass  # Never fail startup due to cleanup
 
 _run_startup_cleanup()
+
+
+# =============================================================================
+# CUDA package mocking for testing (comfy-test integration)
+# =============================================================================
+
+def _mock_cuda_packages():
+    """Mock CUDA packages when running under comfy-test.
+
+    When COMFY_TEST_MOCK_PACKAGES is set, creates empty mock modules
+    so imports don't fail on CPU-only test machines.
+    """
+    import os
+    import sys
+    import types
+    import importlib.machinery
+
+    mock_packages = os.environ.get("COMFY_TEST_MOCK_PACKAGES", "")
+    if not mock_packages:
+        return
+
+    for pkg in mock_packages.split(","):
+        pkg = pkg.strip()
+        if not pkg or pkg in sys.modules:
+            continue
+
+        mock_module = types.ModuleType(pkg)
+        mock_module.__spec__ = importlib.machinery.ModuleSpec(pkg, None)
+        mock_module.__path__ = []  # Mark as package
+        mock_module.__file__ = "<mocked by comfy-env for testing>"
+        sys.modules[pkg] = mock_module
+
+_mock_cuda_packages()
