@@ -1,67 +1,87 @@
-name: Bump Version & Publish
+name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  bump-and-publish:
+  check-and-publish:
     runs-on: ubuntu-latest
-    environment: pypi
+    environment: \${{ github.event_name == 'push' && 'pypi' || '' }}
     permissions:
       contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: \${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for non-ASCII characters
+        run: |
+          # Check for non-ASCII (bytes > 127) which break Windows cp1252 encoding
+          if LC_ALL=C grep -rPn '[\x80-\xFF]' --include="*.py" . 2>/dev/null | grep -v '^\.\/\.'; then
+            echo "::error::Found non-ASCII characters in Python files. Use ASCII only for Windows cp1252 compatibility."
+            exit 1
+          fi
+          echo "No problematic characters found."
 
       - name: Setup Python
+        if: github.event_name == 'push'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Get current version
-        id: get_version
+      - name: Check and bump version if needed
+        if: github.event_name == 'push'
+        id: version
         run: |
-          current=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' | tr -d '\r')
-          echo "current=$current" >> $GITHUB_OUTPUT
+          local_version=\$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' | tr -d '\r')
+          echo "Local version: \$local_version"
 
-      - name: Bump patch version
-        id: bump_version
+          pypi_version=\$(pip index versions comfy-env 2>/dev/null | head -1 | grep -oP '\(\K[^)]+' || echo "0.0.0")
+          echo "PyPI version: \$pypi_version"
+
+          higher=\$(printf '%s\n%s' "\$local_version" "\$pypi_version" | sort -V | tail -1)
+
+          if [ "\$local_version" = "\$pypi_version" ] || [ "\$higher" = "\$pypi_version" ]; then
+            echo "Bumping: \$local_version <= \$pypi_version"
+            IFS='.' read -r major minor patch <<< "\$pypi_version"
+            new_version="\${major}.\${minor}.\$((patch + 1))"
+            sed -i "s/^version = \".*\"/version = \"\${new_version}\"/" pyproject.toml
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add pyproject.toml
+            git commit -m "Bump version to \${new_version} [skip ci]"
+            git push
+            echo "version=\$new_version" >> \$GITHUB_OUTPUT
+          else
+            echo "No bump needed: \$local_version > \$pypi_version"
+            echo "version=\$local_version" >> \$GITHUB_OUTPUT
+          fi
+
+      - name: Create tag
+        if: github.event_name == 'push'
         run: |
-          current="${{ steps.get_version.outputs.current }}"
-          IFS='.' read -r major minor patch <<< "$current"
-          new_patch=$((patch + 1))
-          new_version="${major}.${minor}.${new_patch}"
-          sed -i "s/^version = \".*\"/version = \"${new_version}\"/" pyproject.toml
-          echo "new_version=$new_version" >> $GITHUB_OUTPUT
-          echo "Bumped version: $current -> $new_version"
-
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml
-          git commit -m "Bump version to ${{ steps.bump_version.outputs.new_version }} [skip ci]"
-          git tag "v${{ steps.bump_version.outputs.new_version }}"
-          git push origin main --tags
-
-      - name: Install build tools
-        run: pip install build
+          version="\${{ steps.version.outputs.version }}"
+          git rev-parse "v\$version" >/dev/null 2>&1 || { git tag "v\$version" && git push origin "v\$version"; }
 
       - name: Build package
-        run: python -m build
+        if: github.event_name == 'push'
+        run: pip install build && python -m build
 
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.bump_version.outputs.new_version }}
-          name: v${{ steps.bump_version.outputs.new_version }}
+          tag_name: v\${{ steps.version.outputs.version }}
+          name: v\${{ steps.version.outputs.version }}
           generate_release_notes: true
           files: dist/*
 
       - name: Publish to PyPI
+        if: github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@release/v1
