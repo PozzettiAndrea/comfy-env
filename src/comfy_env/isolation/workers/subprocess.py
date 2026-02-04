@@ -483,6 +483,7 @@ import traceback
 import faulthandler
 import collections
 import time
+import importlib
 from types import SimpleNamespace
 
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
@@ -668,10 +669,7 @@ def _to_shm(obj, registry, visited=None):
         visited = {}
     obj_id = id(obj)
     if obj_id in visited:
-        cached = visited[obj_id]
-        if isinstance(cached, dict) and cached.get("__type__") == "TensorRef":
-            print(f"[SHM DEBUG] _to_shm CACHE HIT: id={obj_id} -> storage_key=...{cached.get('storage_key','?')[-20:]}, tensor_size={cached.get('tensor_size')}", file=sys.stderr)
-        return cached
+        return visited[obj_id]
     t = type(obj).__name__
 
     # Tensor -> use PyTorch's native shared memory (bypasses resource_tracker)
@@ -679,7 +677,6 @@ def _to_shm(obj, registry, visited=None):
         import torch
         tensor = obj.detach().cpu().contiguous()
         result = _serialize_tensor_native(tensor, registry)
-        print(f"[SHM DEBUG] _to_shm Tensor: id={obj_id}, orig_shape={list(obj.shape)}, new_shape={list(tensor.shape)} -> storage_key=...{result.get('storage_key','?')[-20:]}, tensor_size={result.get('tensor_size')}", file=sys.stderr)
         visited[obj_id] = result
         return result
 
@@ -720,6 +717,10 @@ def _to_shm(obj, registry, visited=None):
         result = [_to_shm(v, registry, visited) for v in obj]
         visited[obj_id] = result
         return result
+
+    # Convert numpy scalars to Python primitives for JSON serialization
+    if isinstance(obj, (np.floating, np.integer, np.bool_)):
+        return obj.item()
 
     return obj
 
@@ -773,7 +774,6 @@ def _from_shm(obj):
     # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
     if obj.get("__type__") == "TensorRef":
         tensor = _deserialize_tensor_native(obj)
-        print(f"[SHM DEBUG] _from_shm TensorRef: storage_key=...{obj.get('storage_key','?')[-20:]}, expected_size={obj.get('tensor_size')} -> actual_shape={list(tensor.shape)}", file=sys.stderr)
         # Convert back to numpy if it was originally numpy
         if obj.get("__was_numpy__"):
             return tensor.numpy()
@@ -782,6 +782,12 @@ def _from_shm(obj):
     # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
     if "__shm_np__" in obj:
         block = shm.SharedMemory(name=obj["__shm_np__"])
+        # Unregister from resource_tracker - parent owns these blocks and will clean them up
+        try:
+            from multiprocessing.resource_tracker import unregister
+            unregister(block._name, "shared_memory")
+        except Exception:
+            pass
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
         block.close()
         # Convert back to tensor if it was originally a tensor
@@ -794,9 +800,15 @@ def _from_shm(obj):
     if "__shm_trimesh__" in obj:
         import pickle
         block = shm.SharedMemory(name=obj["name"])
+        # Unregister from resource_tracker - parent owns these blocks
+        try:
+            from multiprocessing.resource_tracker import unregister
+            unregister(block._name, "shared_memory")
+        except Exception:
+            pass
         mesh_bytes = bytes(block.buf[:obj["size"]])
         block.close()
-        block.unlink()
+        # Don't unlink - parent will clean up
         return pickle.loads(mesh_bytes)
 
     return {k: _from_shm(v) for k, v in obj.items()}
@@ -1126,7 +1138,7 @@ def main():
 
             # Import module
             wlog(f"[worker] Importing module {module_name}...")
-            module = __import__(module_name, fromlist=[""])
+            module = importlib.import_module(module_name)
             wlog(f"[worker] Module imported")
 
             if request_type == "call_method":

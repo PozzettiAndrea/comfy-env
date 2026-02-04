@@ -1,18 +1,112 @@
 """Process isolation for ComfyUI nodes - wraps FUNCTION methods to run in isolated env."""
 
-import atexit
 import glob
 import inspect
 import os
+import shutil
+import signal
 import sys
-import threading
+import tempfile
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
-_workers: Dict[str, Any] = {}
-_workers_lock = threading.Lock()
+_CLEANUP_DONE = False
+
+
+def _cleanup_stale_workers():
+    """Kill orphaned worker processes and remove stale temp directories on startup.
+
+    Only kills workers whose parent process no longer exists - safe for multiple
+    ComfyUI instances running on the same machine.
+    """
+    global _CLEANUP_DONE
+    if _CLEANUP_DONE:
+        return
+    _CLEANUP_DONE = True
+
+    temp_dir = tempfile.gettempdir()
+
+    # Find stale socket files
+    socket_patterns = [
+        "/dev/shm/comfy_worker_*.sock",  # Linux shared memory
+        os.path.join(temp_dir, "comfy_worker_*.sock"),  # Fallback
+    ]
+
+    for pattern in socket_patterns:
+        for sock_file in glob.glob(pattern):
+            try:
+                os.unlink(sock_file)
+                print(f"[comfy-env] Removed stale socket: {sock_file}")
+            except Exception:
+                pass
+
+    # Kill only ORPHANED worker processes (parent PID no longer exists)
+    # This is safe for multiple ComfyUI instances on same machine
+    try:
+        import psutil
+        for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline') or []
+                if any('persistent_worker.py' in arg for arg in cmdline):
+                    parent_pid = proc.info.get('ppid')
+                    # Check if parent process still exists
+                    if parent_pid and not psutil.pid_exists(parent_pid):
+                        print(f"[comfy-env] Killing orphaned worker (parent {parent_pid} dead): {proc.pid}")
+                        proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except ImportError:
+        # psutil not available - use /proc on Linux
+        if sys.platform == 'linux':
+            for pid_dir in glob.glob('/proc/[0-9]*'):
+                try:
+                    pid = int(os.path.basename(pid_dir))
+                    with open(f'{pid_dir}/cmdline', 'rb') as f:
+                        cmdline = f.read().decode('utf-8', errors='ignore')
+                    if 'persistent_worker.py' in cmdline:
+                        with open(f'{pid_dir}/stat', 'r') as f:
+                            stat = f.read().split()
+                            ppid = int(stat[3])
+                        # Check if parent exists
+                        if not os.path.exists(f'/proc/{ppid}'):
+                            print(f"[comfy-env] Killing orphaned worker (parent {ppid} dead): {pid}")
+                            os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+    # Find and remove stale temp directories
+    stale_dirs = glob.glob(os.path.join(temp_dir, "comfyui_pvenv_*"))
+    for stale_dir in stale_dirs:
+        try:
+            # Check if any process is using this directory
+            dir_in_use = False
+            try:
+                import psutil
+                for proc in psutil.process_iter(['pid', 'cmdline', 'cwd']):
+                    try:
+                        cwd = proc.info.get('cwd') or ''
+                        cmdline = ' '.join(proc.info.get('cmdline') or [])
+                        if stale_dir in cwd or stale_dir in cmdline:
+                            dir_in_use = True
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except ImportError:
+                # No psutil - check if worker script exists and is recent (< 1 hour)
+                worker_script = os.path.join(stale_dir, 'persistent_worker.py')
+                if os.path.exists(worker_script):
+                    age_hours = (time.time() - os.path.getmtime(worker_script)) / 3600
+                    if age_hours < 1:
+                        dir_in_use = True  # Assume in use if recent
+
+            if not dir_in_use:
+                shutil.rmtree(stale_dir)
+                print(f"[comfy-env] Removed stale temp dir: {stale_dir}")
+        except Exception:
+            pass
 
 
 def _is_enabled() -> bool:
@@ -54,6 +148,18 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     return None
 
 
+def _find_package_root(start_dir: Path) -> Path:
+    """Find package root for import resolution.
+
+    If start_dir contains __init__.py (is a package), return its parent
+    so the package itself is importable. Otherwise return start_dir.
+    """
+    start_dir = start_dir.resolve()
+    if (start_dir / "__init__.py").exists():
+        return start_dir.parent
+    return start_dir
+
+
 def _get_python_version(env_dir: Path) -> Optional[str]:
     python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
     if not python.exists(): return None
@@ -65,38 +171,20 @@ def _get_python_version(env_dir: Path) -> Optional[str]:
     except Exception: return None
 
 
-def _get_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
-                lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
-                health_check_timeout: float = 2.0):
-    cache_key = str(env_dir)
-    with _workers_lock:
-        if cache_key in _workers and _workers[cache_key].is_alive():
-            return _workers[cache_key]
-
-        python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
-
-        # Always use SubprocessWorker - MPWorker's spawn mechanism tries to re-import
-        # the parent's __main__ (ComfyUI's main.py), which fails with import errors.
-        # SubprocessWorker uses a clean entry script that avoids this issue.
-        from .workers.subprocess import SubprocessWorker
+def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
+                   lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                   health_check_timeout: float = 2.0):
+    """Create a fresh subprocess worker. Never reused - caller must shutdown after use."""
+    python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
+    from .workers.subprocess import SubprocessWorker
+    if _DEBUG:
         print(f"[comfy-env] SubprocessWorker: {python}")
         if env_vars:
             print(f"[comfy-env] env_vars: {env_vars}")
-        if health_check_timeout != 2.0:
-            print(f"[comfy-env] health_check_timeout: {health_check_timeout}s")
-        worker = SubprocessWorker(python=str(python), working_dir=working_dir, sys_path=sys_path, name=working_dir.name, env=env_vars, health_check_timeout=health_check_timeout)
-
-        _workers[cache_key] = worker
-        return worker
-
-
-@atexit.register
-def _shutdown_workers():
-    with _workers_lock:
-        for w in _workers.values():
-            try: w.shutdown()
-            except Exception: pass
-        _workers.clear()
+    return SubprocessWorker(
+        python=str(python), working_dir=working_dir, sys_path=sys_path,
+        name=working_dir.name, env=env_vars, health_check_timeout=health_check_timeout
+    )
 
 
 def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
@@ -115,23 +203,29 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
     @wraps(original)
     def proxy(self, **kwargs):
-        worker = _get_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        # Create fresh worker for each call - never reuse to avoid stale state
+        worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
         try:
-            from .tensor_utils import prepare_for_ipc_recursive
-            kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
-        except ImportError: pass
+            # Prepare tensors for IPC
+            try:
+                from .tensor_utils import prepare_for_ipc_recursive
+                kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
+            except ImportError: pass
 
-        result = worker.call_method(
-            module_name=module_name, class_name=cls.__name__, method_name=func_name,
-            self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
-            kwargs=kwargs, timeout=600.0,
-        )
+            result = worker.call_method(
+                module_name=module_name, class_name=cls.__name__, method_name=func_name,
+                self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
+                kwargs=kwargs, timeout=600.0,
+            )
 
-        try:
-            from .tensor_utils import prepare_for_ipc_recursive
-            result = prepare_for_ipc_recursive(result)
-        except ImportError: pass
-        return result
+            try:
+                from .tensor_utils import prepare_for_ipc_recursive
+                result = prepare_for_ipc_recursive(result)
+            except ImportError: pass
+            return result
+        finally:
+            # Always shutdown worker after use
+            worker.shutdown()
 
     setattr(cls, func_name, proxy)
     cls._comfy_env_isolated = True
@@ -140,6 +234,8 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
 def wrap_nodes() -> None:
     """Auto-wrap nodes for isolation. Call from __init__.py after NODE_CLASS_MAPPINGS."""
+    _cleanup_stale_workers()
+
     if not _is_enabled() or os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
         return
 
@@ -191,7 +287,9 @@ def wrap_nodes() -> None:
         for e in envs:
             try:
                 src.relative_to(e["dir"])
-                _wrap_node_class(cls, e["env_dir"], e["dir"], [str(e["sp"]), str(e["dir"])],
+                # Find package root by walking up until no __init__.py
+                package_root = _find_package_root(e["dir"])
+                _wrap_node_class(cls, e["env_dir"], package_root, [str(e["sp"]), str(package_root)],
                                str(e["lib"]) if e["lib"] else None, e["env_vars"], e.get("health_check_timeout", 2.0))
                 wrapped += 1
                 break
@@ -202,6 +300,8 @@ def wrap_nodes() -> None:
 
 def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -> Dict[str, type]:
     """Wrap nodes from a directory with comfy-env.toml for isolation."""
+    _cleanup_stale_workers()
+
     if not _is_enabled() or os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
         return node_class_mappings
 
