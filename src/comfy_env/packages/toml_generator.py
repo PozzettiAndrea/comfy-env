@@ -69,12 +69,6 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
         extra_urls = pypi_options.setdefault("extra-index-urls", [])
         if pytorch_index not in extra_urls: extra_urls.append(pytorch_index)
 
-    # Enforce torch version
-    if cfg.has_cuda and torch_version:
-        pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
-        torch_minor = int(torch_version.split(".")[1])
-        pypi_deps["torch"] = f">={torch_version},<{torch_version.split('.')[0]}.{torch_minor + 1}"
-
     return pixi_data
 
 

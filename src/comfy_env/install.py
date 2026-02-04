@@ -182,13 +182,26 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                                capture_output=True, text=True)
         py_version = result.stdout.strip() if result.returncode == 0 else f"{sys.version_info.major}.{sys.version_info.minor}"
 
+        # PyTorch packages install from official PyTorch index
+        pytorch_packages = {"torch", "torchvision", "torchaudio"}
+        cuda_short = cuda_version.replace(".", "")[:3]
+        pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_short}"
+
         for package in cfg.cuda_packages:
-            wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
-            if not wheel_url:
-                raise RuntimeError(f"No wheel for {package}")
-            log(f"  {package}")
-            result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url],
-                                   capture_output=True, text=True)
+            if package in pytorch_packages:
+                # Install from PyTorch CUDA index
+                log(f"  {package} (from PyTorch index)")
+                result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-cache-dir",
+                                        "--extra-index-url", pytorch_index, package],
+                                       capture_output=True, text=True)
+            else:
+                # Install from cuda-wheels
+                wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
+                if not wheel_url:
+                    raise RuntimeError(f"No wheel for {package}")
+                log(f"  {package}")
+                result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url],
+                                       capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
