@@ -1133,6 +1133,11 @@ def main():
                 inputs = _deserialize_isolated_objects(inputs)
                 inputs = _deserialize_input(inputs)
                 wlog(f"[worker] Inputs ready: {list(inputs.keys()) if isinstance(inputs, dict) else type(inputs)}")
+                # Debug: log tensor shapes
+                if isinstance(inputs, dict):
+                    for k, v in inputs.items():
+                        if hasattr(v, 'shape'):
+                            wlog(f"[worker] Input '{k}' shape: {v.shape}")
             else:
                 inputs = {}
 
@@ -1631,6 +1636,10 @@ class SubprocessWorker(Worker):
             try:
                 # Serialize kwargs to shared memory
                 if kwargs:
+                    # Debug: log tensor shapes before serialization (always)
+                    for k, v in kwargs.items():
+                        if hasattr(v, 'shape'):
+                            print(f"[comfy-env] PRE-SERIALIZE '{k}' shape: {v.shape}", file=sys.stderr, flush=True)
                     if _DEBUG:
                         print(f"[SubprocessWorker] serializing kwargs to shm...", file=sys.stderr, flush=True)
                     kwargs_meta = _to_shm(kwargs, shm_registry)
