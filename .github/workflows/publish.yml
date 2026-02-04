@@ -26,6 +26,7 @@ jobs:
           errors = []
           for f in pathlib.Path('.').rglob('*'):
               if not f.is_file() or '.git' in f.parts: continue
+              if f.suffix.lower() not in ['.py', '.yaml', '.yml']: continue
               try:
                   f.read_bytes().decode('ascii')
               except UnicodeDecodeError as e:

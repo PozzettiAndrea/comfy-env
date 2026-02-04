@@ -42,7 +42,7 @@
 # =============================================================================
 # Pre-compiled CUDA wheels from the cuda-wheels index.
 # Pixi auto-selects the right wheel based on your GPU.
-# Supports CUDA 12.8 → PyTorch 2.8 or CUDA 12.4 → PyTorch 2.4
+# Supports CUDA 12.8 -> PyTorch 2.8 or CUDA 12.4 -> PyTorch 2.4
 
 [cuda]
 packages = []
@@ -110,12 +110,12 @@ packages = []
 # For nodes needing isolated environments, put comfy-env.toml in a subdirectory:
 #
 #   ComfyUI-MyPack/
-#   ├── comfy-env.toml       # Root: installs to main env
-#   ├── __init__.py
-#   └── nodes/
-#       └── isolated/
-#           ├── comfy-env.toml   # Subdirectory: isolated env
-#           └── *.py
+#   |-- comfy-env.toml       # Root: installs to main env
+#   |-- __init__.py
+#   \-- nodes/
+#       \-- isolated/
+#           |-- comfy-env.toml   # Subdirectory: isolated env
+#           \-- *.py
 #
 # In your nodes/__init__.py:
 #

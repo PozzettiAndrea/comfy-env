@@ -65,7 +65,7 @@ KMP_DUPLICATE_LIB_OK = "TRUE"
 ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 ```
 
-PyPI deps → `requirements.txt`
+PyPI deps -> `requirements.txt`
 
 ### comfy-env.toml (isolated folder)
 
@@ -86,13 +86,13 @@ SOME_VAR = "value"
 
 | Section | Root | Isolated |
 |---------|------|----------|
-| `[cuda]` | ✓ | ✓ |
-| `[apt]` | ✓ | ✓ |
-| `[dependencies]` | ✓ | ✓ |
-| `[env_vars]` | ✓ | ✓ |
-| `[node_reqs]` | ✓ | ✗ |
-| `python = "X.Y"` | ✗ | ✓ |
-| `[pypi-dependencies]` | ✗ | ✓ |
+| `[cuda]` | [x] | [x] |
+| `[apt]` | [x] | [x] |
+| `[dependencies]` | [x] | [x] |
+| `[env_vars]` | [x] | [x] |
+| `[node_reqs]` | [x] | [ ] |
+| `python = "X.Y"` | [ ] | [x] |
+| `[pypi-dependencies]` | [ ] | [x] |
 
 ---
 
@@ -186,8 +186,8 @@ See [ComfyUI-GeometryPack](https://github.com/PozzettiAndrea/ComfyUI-GeometryPac
 
 **How envs work:**
 - Central cache: `~/.comfy-env/envs/`
-- Marker files link nodes → cached envs
-- Config hash in name → changes create new envs
+- Marker files link nodes -> cached envs
+- Config hash in name -> changes create new envs
 
 ---
 
