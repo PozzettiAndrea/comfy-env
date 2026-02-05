@@ -17,14 +17,25 @@ try:
 except ImportError:
     __version__ = "0.0.0-dev"
 
-CACHE_DIR = Path.home() / ".comfy-env" / "envs"  # Default, use get_cache_dir() for dynamic lookup
 MARKER_FILE = ".comfy-env-marker.toml"
 METADATA_FILE = ".comfy-env-metadata.toml"
+JUNCTION_FILE = ".junction"
+
+
+def _get_default_cache_dir() -> Path:
+    """Get platform-specific default cache directory."""
+    if sys.platform == "win32":
+        return Path("C:/comfy-envs")
+    else:
+        return Path("/home/comfy-envs")
+
+
+CACHE_DIR = _get_default_cache_dir()
 
 
 def get_cache_dir() -> Path:
     """Get cache dir, checking COMFY_ENV_CACHE_DIR env var each time."""
-    cache_dir = Path(os.environ.get("COMFY_ENV_CACHE_DIR", Path.home() / ".comfy-env" / "envs"))
+    cache_dir = Path(os.environ.get("COMFY_ENV_CACHE_DIR", _get_default_cache_dir()))
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -124,23 +135,73 @@ def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]
     return env_path, Path(matches[0]) if matches else None, env_path / "lib"
 
 
+def write_junction_path(env_path: Path, junction_path: Path) -> None:
+    """Write junction path to env's .junction file."""
+    (env_path / JUNCTION_FILE).write_text(str(junction_path))
+
+
+def read_junction_path(env_path: Path) -> Optional[Path]:
+    """Read junction path from env's .junction file."""
+    junction_file = env_path / JUNCTION_FILE
+    if not junction_file.exists():
+        return None
+    try:
+        return Path(junction_file.read_text().strip())
+    except Exception:
+        return None
+
+
+def _is_valid_junction(junction_path: Path, env_path: Path) -> bool:
+    """Check if junction exists and points to the env."""
+    if not junction_path.exists():
+        return False
+    try:
+        # Check if it's a symlink/junction pointing to our env
+        if junction_path.is_symlink():
+            return junction_path.resolve() == env_path.resolve()
+        # On Windows, junctions may not show as symlinks, check if it's a dir
+        return junction_path.is_dir() and junction_path.resolve() == env_path.resolve()
+    except Exception:
+        return False
+
+
 def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
-    """Remove envs whose marker files no longer exist."""
+    """Remove envs whose junctions no longer exist or point elsewhere."""
     cache_dir = get_cache_dir()
     if not cache_dir.exists(): return 0
 
     cleaned = 0
     for env_dir in cache_dir.iterdir():
         if not env_dir.is_dir(): continue
+
+        # Skip build directories
+        if env_dir.name.endswith("_build"):
+            continue
+
+        # Try new junction-based cleanup first
+        junction_path = read_junction_path(env_dir)
+        if junction_path:
+            if not _is_valid_junction(junction_path, env_dir):
+                log(f"[comfy-env] Cleaning orphaned env: {env_dir.name}")
+                try:
+                    shutil.rmtree(env_dir)
+                    cleaned += 1
+                except Exception:
+                    pass
+            continue
+
+        # Fallback: old marker-based cleanup for legacy envs
         metadata = read_env_metadata(env_dir)
-        if not metadata: continue
-        marker_path = metadata.get("marker_path", "")
-        if marker_path and not Path(marker_path).exists():
-            log(f"[comfy-env] Cleaning: {env_dir.name}")
-            try:
-                shutil.rmtree(env_dir)
-                cleaned += 1
-            except Exception: pass
+        if metadata:
+            marker_path = metadata.get("marker_path", "")
+            if marker_path and not Path(marker_path).exists():
+                log(f"[comfy-env] Cleaning legacy env: {env_dir.name}")
+                try:
+                    shutil.rmtree(env_dir)
+                    cleaned += 1
+                except Exception:
+                    pass
+
     return cleaned
 
 

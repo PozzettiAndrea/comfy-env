@@ -139,7 +139,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
     from .detection import get_recommended_cuda_version
-    from .environment.cache import get_cache_dir, get_junction_name, create_junction, get_env_name, cleanup_orphaned_envs
+    from .environment.cache import get_cache_dir, get_junction_name, create_junction, get_env_name, cleanup_orphaned_envs, write_junction_path
     import shutil, subprocess, sys
 
     # Clean up orphaned environments before installing
@@ -271,6 +271,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             shutil.rmtree(central_env)
         shutil.move(str(pixi_env), str(central_env))
         create_junction(junction_path, central_env)
+        write_junction_path(central_env, junction_path)
         shutil.rmtree(env_work_dir, ignore_errors=True)
         # Clean up any old .pixi in node_dir
         shutil.rmtree(node_dir / ".pixi", ignore_errors=True)
