@@ -12,6 +12,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
+
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 _CLEANUP_DONE = False
 
@@ -173,7 +175,7 @@ def _get_python_version(env_dir: Path) -> Optional[str]:
 
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                    lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
-                   health_check_timeout: float = 2.0):
+                   health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
     """Create a fresh subprocess worker. Never reused - caller must shutdown after use."""
     python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
     from .workers.subprocess import SubprocessWorker
@@ -189,7 +191,7 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 
 def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
                      lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
-                     health_check_timeout: float = 2.0) -> type:
+                     health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT) -> type:
     func_name = getattr(cls, "FUNCTION", None)
     if not func_name: return cls
     original = getattr(cls, func_name, None)
@@ -263,13 +265,13 @@ def wrap_nodes() -> None:
         if not env_dir or not sp: continue
 
         env_vars = {}
-        health_check_timeout = 2.0
+        health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
         try:
             import tomli
             with open(cf, "rb") as f:
                 toml_data = tomli.load(f)
                 env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
-                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", 2.0))
+                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
                 print(f"[comfy-env] Parsed {cf}: health_check_timeout={health_check_timeout}")
         except Exception as e:
             print(f"[comfy-env] Failed to parse {cf}: {e}")
@@ -290,7 +292,7 @@ def wrap_nodes() -> None:
                 # Find package root by walking up until no __init__.py
                 package_root = _find_package_root(e["dir"])
                 _wrap_node_class(cls, e["env_dir"], package_root, [str(e["sp"]), str(package_root)],
-                               str(e["lib"]) if e["lib"] else None, e["env_vars"], e.get("health_check_timeout", 2.0))
+                               str(e["lib"]) if e["lib"] else None, e["env_vars"], e.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
                 wrapped += 1
                 break
             except ValueError: continue
@@ -318,13 +320,13 @@ def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -
         return node_class_mappings
 
     env_vars = {}
-    health_check_timeout = 2.0
+    health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
     try:
         import tomli
         with open(config, "rb") as f:
             toml_data = tomli.load(f)
             env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
-            health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", 2.0))
+            health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
             print(f"[comfy-env] Parsed {config}: health_check_timeout={health_check_timeout}")
     except Exception as e:
         print(f"[comfy-env] Failed to parse {config}: {e}")

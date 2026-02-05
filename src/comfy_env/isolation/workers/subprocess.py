@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .base import Worker, WorkerError
 from ...packages.pixi import get_pixi_path
+from ...config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 # Debug logging (set COMFY_ENV_DEBUG=1 to enable)
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
@@ -1235,7 +1236,7 @@ class SubprocessWorker(Worker):
         env: Optional[Dict[str, str]] = None,
         name: Optional[str] = None,
         share_torch: bool = True,  # Kept for API compatibility
-        health_check_timeout: float = 2.0,
+        health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
     ):
         """
         Initialize persistent worker.

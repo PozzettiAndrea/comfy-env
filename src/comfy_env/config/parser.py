@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import tomli
 
-from .types import ComfyEnvConfig, ComfyEnvOptions, NodeDependency
+from .types import ComfyEnvConfig, ComfyEnvOptions, NodeDependency, DEFAULT_HEALTH_CHECK_TIMEOUT
 
 ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"  # Main node config
 CONFIG_FILE_NAME = "comfy-env.toml"  # Isolated folder config
@@ -59,7 +59,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
 def _parse_options(data: Dict[str, Any]) -> ComfyEnvOptions:
     """Parse [options] section into ComfyEnvOptions."""
     return ComfyEnvOptions(
-        health_check_timeout=float(data.get("health_check_timeout", 2.0)),
+        health_check_timeout=float(data.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT)),
     )
 
 

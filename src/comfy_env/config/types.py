@@ -3,6 +3,9 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+# Default timeout for worker health checks (seconds)
+DEFAULT_HEALTH_CHECK_TIMEOUT = 5.0
+
 
 @dataclass
 class NodeDependency:
@@ -17,7 +20,7 @@ NodeReq = NodeDependency  # Backwards compat
 @dataclass
 class ComfyEnvOptions:
     """Runtime options for comfy-env."""
-    health_check_timeout: float = 2.0  # Timeout for worker health checks (seconds)
+    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT
 
 
 @dataclass
