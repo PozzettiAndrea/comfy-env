@@ -236,6 +236,13 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
 def wrap_nodes() -> None:
     """Auto-wrap nodes for isolation. Call from __init__.py after NODE_CLASS_MAPPINGS."""
+    # Log version for debugging
+    try:
+        from importlib.metadata import version as get_version
+        print(f"[comfy-env] Version: {get_version('comfy-env')}")
+    except Exception:
+        pass
+
     _cleanup_stale_workers()
 
     if not _is_enabled() or os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
