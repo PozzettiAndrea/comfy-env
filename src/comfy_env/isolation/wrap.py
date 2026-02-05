@@ -132,17 +132,15 @@ def _get_env_paths(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
 
 
 def _find_env_dir(node_dir: Path) -> Optional[Path]:
-    """Find env dir: marker -> _env_<name> -> .pixi -> .venv"""
-    marker = node_dir / ".comfy-env-marker.toml"
-    if marker.exists():
-        try:
-            import tomli
-            with open(marker, "rb") as f:
-                env_path = tomli.load(f).get("env", {}).get("path")
-            if env_path and Path(env_path).exists():
-                return Path(env_path)
-        except Exception: pass
+    """Find env dir: junction (_*) -> _env_<name> -> .pixi -> .venv"""
+    # Look for junction directories (start with _ and are symlinks)
+    for item in node_dir.iterdir():
+        if item.name.startswith("_") and item.is_symlink() and item.is_dir():
+            resolved = item.resolve()
+            if resolved.exists():
+                return resolved
 
+    # Fallback to old patterns
     for candidate in [node_dir / _env_name(node_dir.name),
                      node_dir / ".pixi/envs/default",
                      node_dir / ".venv"]:

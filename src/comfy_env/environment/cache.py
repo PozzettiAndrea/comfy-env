@@ -142,3 +142,19 @@ def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
                 cleaned += 1
             except Exception: pass
     return cleaned
+
+
+def create_junction(link_path: Path, target_path: Path) -> None:
+    """Create a junction/symlink from link_path to target_path."""
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.is_symlink():
+            link_path.unlink()
+        else:
+            shutil.rmtree(link_path)
+    os.symlink(target_path, link_path, target_is_directory=True)
+
+
+def get_junction_name(config_path: Path) -> str:
+    """Generate junction name: _<subfolder>_<hash>"""
+    subfolder = sanitize_name(config_path.parent.name)
+    return f"_{subfolder}_{compute_config_hash(config_path)[:6]}"
