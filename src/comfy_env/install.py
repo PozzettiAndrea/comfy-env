@@ -201,14 +201,14 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         if cuda_version:
             # GPU mode - use CUDA index
-            log(f"Installing CUDA packages...")
             pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
             pin_torch_version = torch_version
+            log(f"Installing CUDA packages from {pytorch_index}")
         else:
             # CPU mode - use CPU index
-            log(f"Installing CPU packages (no GPU detected)...")
             pytorch_index = "https://download.pytorch.org/whl/cpu"
             pin_torch_version = "2.8"  # Default torch version for CPU
+            log(f"Installing CPU packages from {pytorch_index}")
 
         for package in cfg.cuda_packages:
             if package in pytorch_packages:

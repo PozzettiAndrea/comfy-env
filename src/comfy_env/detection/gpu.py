@@ -66,6 +66,10 @@ def get_compute_capability(gpu_index: int = 0) -> tuple[int, int] | None:
 
 def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
     """Blackwell: 12.8, Pascal: 12.4, others: 12.8"""
+    # Skip GPU detection on explicit CPU test runners (avoids torch import/CUDA warning)
+    if os.environ.get("COMFY_TEST_GPU") == "0":
+        return ""
+
     if override := os.environ.get(CUDA_VERSION_ENV_VAR, "").strip():
         return f"{override[:-1]}.{override[-1]}" if "." not in override and len(override) >= 2 else override
 
