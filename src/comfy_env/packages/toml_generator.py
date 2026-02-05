@@ -1,6 +1,7 @@
 """Generate pixi.toml from ComfyEnvConfig."""
 
 import copy
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -46,7 +47,7 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     pytorch_packages = {"torch", "torchvision", "torchaudio"}
     torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
 
-    if cfg.cuda_packages:
+    if cfg.cuda_packages and sys.platform != "darwin":
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
         # Use detected torch_version for GPU, or default "2.8" for CPU
         pin_version = torch_version or "2.8"
@@ -81,8 +82,16 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     dependencies.setdefault("python", f"{py_version}.*")
     dependencies.setdefault("pip", "*")
 
-    # PyTorch index (CUDA or CPU)
-    if cfg.has_cuda:
+    # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
+    if sys.platform == "darwin":
+        pypi_deps = pixi_data.get("pypi-dependencies", {})
+        cuda_pkgs = [k for k in pypi_deps if re.search(r"-cu\d+", k)]
+        for k in cuda_pkgs:
+            del pypi_deps[k]
+            log(f"  Skipping {k} (CUDA-only, no macOS wheels)")
+
+    # PyTorch index (CUDA or CPU) - skip on macOS
+    if cfg.has_cuda and sys.platform != "darwin":
         pypi_options = pixi_data.setdefault("pypi-options", {})
         if cuda_version:
             pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"

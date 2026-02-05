@@ -207,7 +207,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     if result.returncode != 0:
         raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
-    if cfg.cuda_packages:
+    if cfg.cuda_packages and sys.platform != "darwin":
         # Get Python from the build dir
         pixi_env = env_work_dir / ".pixi" / "envs" / "default"
         python_path = pixi_env / ("python.exe" if sys.platform == "win32" else "bin/python")
