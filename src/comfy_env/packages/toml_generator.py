@@ -43,19 +43,22 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
 
     # Pin torch/torchvision versions in pypi-dependencies if they're cuda packages
     # This ensures transitive dependencies (pytorch_lightning, timm, etc.) get the correct torch version
-    if cfg.cuda_packages and torch_version:
-        pytorch_packages = {"torch", "torchvision", "torchaudio"}
-        torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
+    pytorch_packages = {"torch", "torchvision", "torchaudio"}
+    torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
+
+    if cfg.cuda_packages:
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
+        # Use detected torch_version for GPU, or default "2.8" for CPU
+        pin_version = torch_version or "2.8"
         for pkg in cfg.cuda_packages:
             if pkg in pytorch_packages:
                 if pkg == "torch":
-                    pypi_deps[pkg] = f"=={torch_version}.*"
+                    pypi_deps[pkg] = f"=={pin_version}.*"
                 elif pkg == "torchvision":
-                    tv_version = torchvision_map.get(torch_version, "0.23")
+                    tv_version = torchvision_map.get(pin_version, "0.23")
                     pypi_deps[pkg] = f"=={tv_version}.*"
                 elif pkg == "torchaudio":
-                    pypi_deps[pkg] = f"=={torch_version}.*"
+                    pypi_deps[pkg] = f"=={pin_version}.*"
 
     # Workspace
     workspace = pixi_data.setdefault("workspace", {})
@@ -78,10 +81,15 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     dependencies.setdefault("python", f"{py_version}.*")
     dependencies.setdefault("pip", "*")
 
-    # PyTorch CUDA index
-    if cfg.has_cuda and cuda_version:
+    # PyTorch index (CUDA or CPU)
+    if cfg.has_cuda:
         pypi_options = pixi_data.setdefault("pypi-options", {})
-        pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
+        if cuda_version:
+            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
+        else:
+            # No GPU detected - use CPU index
+            pytorch_index = "https://download.pytorch.org/whl/cpu"
+            log("No GPU detected - using PyTorch CPU index")
         extra_urls = pypi_options.setdefault("extra-index-urls", [])
         if pytorch_index not in extra_urls: extra_urls.append(pytorch_index)
 

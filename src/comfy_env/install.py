@@ -185,8 +185,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     if result.returncode != 0:
         raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
-    if cfg.cuda_packages and cuda_version:
-        log(f"Installing CUDA packages...")
+    if cfg.cuda_packages:
         python_path = get_pixi_python(node_dir)
         if not python_path:
             raise RuntimeError("No Python in pixi env")
@@ -199,33 +198,47 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
         # torchvision has different versioning scheme
         torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
-        cuda_short = cuda_version.replace(".", "")[:3]
-        pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_short}"
+
+        if cuda_version:
+            # GPU mode - use CUDA index
+            log(f"Installing CUDA packages...")
+            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
+            pin_torch_version = torch_version
+        else:
+            # CPU mode - use CPU index
+            log(f"Installing CPU packages (no GPU detected)...")
+            pytorch_index = "https://download.pytorch.org/whl/cpu"
+            pin_torch_version = "2.8"  # Default torch version for CPU
 
         for package in cfg.cuda_packages:
             if package in pytorch_packages:
-                # Install from PyTorch CUDA index with version pinning
+                # Install from PyTorch index with version pinning
                 if package == "torch":
-                    pin_version = torch_version
+                    pin_version = pin_torch_version
                 elif package == "torchvision":
-                    pin_version = torchvision_map.get(torch_version, "0.23")
+                    pin_version = torchvision_map.get(pin_torch_version, "0.23")
                 else:  # torchaudio follows torch versioning
-                    pin_version = torch_version
+                    pin_version = pin_torch_version
                 pkg_spec = f"{package}=={pin_version}.*"
                 log(f"  {package} (from PyTorch index, pinned to {pin_version}.*)")
                 result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-cache-dir",
                                         "--extra-index-url", pytorch_index, pkg_spec],
                                        capture_output=True, text=True)
-            else:
-                # Install from cuda-wheels
+                if result.returncode != 0:
+                    raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+            elif cuda_version:
+                # Install GPU-only packages from cuda-wheels (skip on CPU)
                 wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
                 if not wheel_url:
                     raise RuntimeError(f"No wheel for {package}")
                 log(f"  {package}")
                 result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url],
                                        capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+                if result.returncode != 0:
+                    raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+            else:
+                # CPU mode - skip GPU-only packages
+                log(f"  {package} (skipped - GPU only)")
 
     # Find config file for marker
     config_path = node_dir / CONFIG_FILE_NAME
