@@ -146,12 +146,23 @@ def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
 
 def create_junction(link_path: Path, target_path: Path) -> None:
     """Create a junction/symlink from link_path to target_path."""
+    import subprocess
     if link_path.exists() or link_path.is_symlink():
         if link_path.is_symlink():
             link_path.unlink()
         else:
             shutil.rmtree(link_path)
-    os.symlink(target_path, link_path, target_is_directory=True)
+
+    if sys.platform == "win32":
+        # Use mklink /J for junctions - doesn't require admin privileges
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise OSError(f"Failed to create junction: {result.stderr}")
+    else:
+        os.symlink(target_path, link_path, target_is_directory=True)
 
 
 def get_junction_name(config_path: Path) -> str:
