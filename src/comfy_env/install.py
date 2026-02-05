@@ -220,10 +220,10 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:  # torchaudio follows torch versioning
                     pin_version = pin_torch_version
                 pkg_spec = f"{package}=={pin_version}.*"
-                log(f"  {package} (from PyTorch index, pinned to {pin_version}.*)")
-                result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-cache-dir",
-                                        "--extra-index-url", pytorch_index, pkg_spec],
-                                       capture_output=True, text=True)
+                pip_cmd = [str(python_path), "-m", "pip", "install", "--no-cache-dir",
+                          "--extra-index-url", pytorch_index, pkg_spec]
+                log(f"  {' '.join(pip_cmd)}")
+                result = subprocess.run(pip_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
                     raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
             elif cuda_version:
@@ -231,7 +231,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
                 if not wheel_url:
                     raise RuntimeError(f"No wheel for {package}")
-                log(f"  {package}")
+                log(f"  {package} from {wheel_url}")
                 result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url],
                                        capture_output=True, text=True)
                 if result.returncode != 0:
