@@ -135,7 +135,7 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     """Find env dir: junction (_*) -> _env_<name> -> .pixi -> .venv"""
     # Look for junction directories (start with _ and are symlinks)
     for item in node_dir.iterdir():
-        if item.name.startswith("_") and item.is_symlink() and item.is_dir():
+        if item.name.startswith("_") and item.is_dir() and item.resolve() != item:
             resolved = item.resolve()
             if resolved.exists():
                 return resolved
