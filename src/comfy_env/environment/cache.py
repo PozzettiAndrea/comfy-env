@@ -27,7 +27,7 @@ def _get_default_cache_dir() -> Path:
     if sys.platform == "win32":
         return Path("C:/comfy-envs")
     else:
-        return Path("/home/comfy-envs")
+        return Path.home() / ".comfy-envs"
 
 
 CACHE_DIR = _get_default_cache_dir()
