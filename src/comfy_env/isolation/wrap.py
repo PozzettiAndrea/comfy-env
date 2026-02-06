@@ -115,10 +115,6 @@ def _is_enabled() -> bool:
     return os.environ.get("USE_COMFY_ENV", "1").lower() not in ("0", "false", "no", "off")
 
 
-def _env_name(dir_name: str) -> str:
-    return f"_env_{dir_name.lower().replace('-', '_').lstrip('comfyui_')}"
-
-
 def _get_env_paths(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     """Get (site_packages, lib_dir) from env."""
     if sys.platform == "win32":
@@ -132,19 +128,13 @@ def _get_env_paths(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
 
 
 def _find_env_dir(node_dir: Path) -> Optional[Path]:
-    """Find env dir: junction (_*) -> _env_<name> -> .pixi -> .venv"""
-    # Look for junction directories (start with _ and are symlinks)
-    for item in node_dir.iterdir():
-        if item.name.startswith("_") and item.is_dir() and item.resolve() != item:
-            resolved = item.resolve()
-            if resolved.exists():
-                return resolved
-
-    # Fallback to old patterns
-    for candidate in [node_dir / _env_name(node_dir.name),
-                     node_dir / ".pixi/envs/default",
-                     node_dir / ".venv"]:
-        if candidate.exists(): return candidate
+    """Find _env_* directory in node_dir."""
+    try:
+        for item in node_dir.iterdir():
+            if item.name.startswith("_env_") and item.is_dir():
+                return item
+    except OSError:
+        pass
     return None
 
 

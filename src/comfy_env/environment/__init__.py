@@ -6,21 +6,12 @@ Handles environment caching, path resolution, and runtime setup.
 
 from .cache import (
     CACHE_DIR,
-    MARKER_FILE,
-    JUNCTION_FILE,
     get_cache_dir,
     get_env_name,
-    get_env_path,
-    cleanup_orphaned_envs,
-    write_marker_file,
-    read_marker_file,
-    write_junction_path,
-    read_junction_path,
-    create_junction,
-    get_junction_name,
+    get_local_env_path,
+    resolve_env_path,
 )
 from .paths import (
-    resolve_env_path,
     get_site_packages_path,
     get_lib_path,
     copy_files,
@@ -37,20 +28,11 @@ from .libomp import (
 __all__ = [
     # Cache management
     "CACHE_DIR",
-    "MARKER_FILE",
-    "JUNCTION_FILE",
     "get_cache_dir",
     "get_env_name",
-    "get_env_path",
-    "cleanup_orphaned_envs",
-    "write_marker_file",
-    "read_marker_file",
-    "write_junction_path",
-    "read_junction_path",
-    "create_junction",
-    "get_junction_name",
-    # Path resolution
+    "get_local_env_path",
     "resolve_env_path",
+    # Path resolution
     "get_site_packages_path",
     "get_lib_path",
     "copy_files",

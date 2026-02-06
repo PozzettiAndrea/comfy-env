@@ -1427,6 +1427,9 @@ class SubprocessWorker(Worker):
         all_sys_path.append(str(self.working_dir))
         all_sys_path.extend(self.sys_path)
 
+        print(f"[{self.name}] python: {self.python}", flush=True)
+        print(f"[{self.name}] sys_path sent to worker: {all_sys_path}", flush=True)
+
         # Launch subprocess with the venv Python, passing socket address
         # For pixi environments, use "pixi run python" to get proper environment activation
         # (CONDA_PREFIX, Library paths, etc.) which fixes DLL loading issues with bpy

@@ -1,25 +1,11 @@
-"""Central environment cache at ~/.comfy-env/envs/"""
+"""Environment cache and path utilities for comfy-env."""
 
 import glob
 import hashlib
 import os
-import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional, Tuple
-
-import tomli
-import tomli_w
-
-try:
-    from .. import __version__
-except ImportError:
-    __version__ = "0.0.0-dev"
-
-MARKER_FILE = ".comfy-env-marker.toml"
-METADATA_FILE = ".comfy-env-metadata.toml"
-JUNCTION_FILE = ".junction"
+from typing import Optional, Tuple
 
 
 def _get_default_cache_dir() -> Path:
@@ -65,66 +51,26 @@ def get_env_name(node_dir: Path, config_path: Path) -> str:
     return f"{node_name}_{subfolder}_{compute_config_hash(config_path)}"
 
 
-def get_env_path(node_dir: Path, config_path: Path) -> Path:
-    return get_cache_dir() / get_env_name(node_dir, config_path)
-
-get_central_env_path = get_env_path
-
-
-def write_marker_file(config_path: Path, env_path: Path) -> None:
-    marker_path = config_path.parent / MARKER_FILE
-    marker_path.write_text(tomli_w.dumps({
-        "env": {"name": env_path.name, "path": str(env_path),
-                "config_hash": compute_config_hash(config_path),
-                "created": datetime.now().isoformat(), "comfy_env_version": __version__}
-    }))
-
-write_marker = write_marker_file
-
-
-def write_env_metadata(env_path: Path, marker_path: Path) -> None:
-    (env_path / METADATA_FILE).write_text(tomli_w.dumps({
-        "marker_path": str(marker_path), "created": datetime.now().isoformat()
-    }))
-
-
-def read_marker_file(marker_path: Path) -> Optional[dict]:
-    if not marker_path.exists(): return None
-    try:
-        with open(marker_path, "rb") as f: return tomli.load(f)
-    except Exception: return None
-
-read_marker = read_marker_file
-
-
-def read_env_metadata(env_path: Path) -> Optional[dict]:
-    metadata_path = env_path / METADATA_FILE
-    if not metadata_path.exists(): return None
-    try:
-        with open(metadata_path, "rb") as f: return tomli.load(f)
-    except Exception: return None
+def get_local_env_path(main_node_dir: Path, config_path: Path) -> Path:
+    """Return path for _env_* folder directly in config_path.parent."""
+    plugin = sanitize_name(main_node_dir.name)
+    subfolder = sanitize_name(config_path.parent.name)
+    h = compute_config_hash(config_path)[:6]
+    if subfolder == plugin or config_path.parent == main_node_dir:
+        name = f"_env_{plugin}_{h}"
+    else:
+        name = f"_env_{plugin}_{subfolder}_{h}"
+    return config_path.parent / name
 
 
 def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
-    """Resolve env with fallback: marker -> _env_<name> -> .pixi -> .venv"""
-    # Marker
-    marker = read_marker_file(node_dir / MARKER_FILE)
-    if marker and "env" in marker:
-        env_path = Path(marker["env"]["path"])
-        if env_path.exists(): return _get_env_paths(env_path)
-
-    # Local _env_<name>
-    local_env = node_dir / f"_env_{sanitize_name(node_dir.name)}"
-    if local_env.exists(): return _get_env_paths(local_env)
-
-    # .pixi
-    pixi_env = node_dir / ".pixi" / "envs" / "default"
-    if pixi_env.exists(): return _get_env_paths(pixi_env)
-
-    # .venv
-    venv = node_dir / ".venv"
-    if venv.exists(): return _get_env_paths(venv)
-
+    """Find _env_* dir in node_dir."""
+    try:
+        for item in node_dir.iterdir():
+            if item.name.startswith("_env_") and item.is_dir():
+                return _get_env_paths(item)
+    except OSError:
+        pass
     return None, None, None
 
 
@@ -133,100 +79,3 @@ def _get_env_paths(env_path: Path) -> Tuple[Path, Optional[Path], Optional[Path]
         return env_path, env_path / "Lib" / "site-packages", env_path / "Library" / "bin"
     matches = glob.glob(str(env_path / "lib" / "python*" / "site-packages"))
     return env_path, Path(matches[0]) if matches else None, env_path / "lib"
-
-
-def write_junction_path(env_path: Path, junction_path: Path) -> None:
-    """Write junction path to env's .junction file."""
-    (env_path / JUNCTION_FILE).write_text(str(junction_path))
-
-
-def read_junction_path(env_path: Path) -> Optional[Path]:
-    """Read junction path from env's .junction file."""
-    junction_file = env_path / JUNCTION_FILE
-    if not junction_file.exists():
-        return None
-    try:
-        return Path(junction_file.read_text().strip())
-    except Exception:
-        return None
-
-
-def _is_valid_junction(junction_path: Path, env_path: Path) -> bool:
-    """Check if junction exists and points to the env."""
-    if not junction_path.exists():
-        return False
-    try:
-        # Check if it's a symlink/junction pointing to our env
-        if junction_path.is_symlink():
-            return junction_path.resolve() == env_path.resolve()
-        # On Windows, junctions may not show as symlinks, check if it's a dir
-        return junction_path.is_dir() and junction_path.resolve() == env_path.resolve()
-    except Exception:
-        return False
-
-
-def cleanup_orphaned_envs(log: Callable[[str], None] = print) -> int:
-    """Remove envs whose junctions no longer exist or point elsewhere."""
-    cache_dir = get_cache_dir()
-    if not cache_dir.exists(): return 0
-
-    cleaned = 0
-    for env_dir in cache_dir.iterdir():
-        if not env_dir.is_dir(): continue
-
-        # Skip build directories
-        if env_dir.name.endswith("_build"):
-            continue
-
-        # Try new junction-based cleanup first
-        junction_path = read_junction_path(env_dir)
-        if junction_path:
-            if not _is_valid_junction(junction_path, env_dir):
-                log(f"[comfy-env] Cleaning orphaned env: {env_dir.name}")
-                try:
-                    shutil.rmtree(env_dir)
-                    cleaned += 1
-                except Exception:
-                    pass
-            continue
-
-        # Fallback: old marker-based cleanup for legacy envs
-        metadata = read_env_metadata(env_dir)
-        if metadata:
-            marker_path = metadata.get("marker_path", "")
-            if marker_path and not Path(marker_path).exists():
-                log(f"[comfy-env] Cleaning legacy env: {env_dir.name}")
-                try:
-                    shutil.rmtree(env_dir)
-                    cleaned += 1
-                except Exception:
-                    pass
-
-    return cleaned
-
-
-def create_junction(link_path: Path, target_path: Path) -> None:
-    """Create a junction/symlink from link_path to target_path."""
-    import subprocess
-    if link_path.exists() or link_path.is_symlink():
-        if link_path.is_symlink():
-            link_path.unlink()
-        else:
-            shutil.rmtree(link_path)
-
-    if sys.platform == "win32":
-        # Use mklink /J for junctions - doesn't require admin privileges
-        result = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path)],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise OSError(f"Failed to create junction: {result.stderr}")
-    else:
-        os.symlink(target_path, link_path, target_is_directory=True)
-
-
-def get_junction_name(config_path: Path) -> str:
-    """Generate junction name: _<subfolder>_<hash>"""
-    subfolder = sanitize_name(config_path.parent.name)
-    return f"_{subfolder}_{compute_config_hash(config_path)[:6]}"

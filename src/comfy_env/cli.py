@@ -242,13 +242,8 @@ def cmd_apt_install(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    from .environment.cache import cleanup_orphaned_envs
-    print("Cleaning orphaned environments...")
-    cleaned = cleanup_orphaned_envs()
-    if cleaned:
-        print(f"Removed {cleaned} orphaned environment(s)")
-    else:
-        print("No orphaned environments found")
+    print("Cleanup is no longer needed — envs are stored directly in node dirs.")
+    print("To remove an env, delete the _env_* folder in the node directory.")
     return 0
 
 

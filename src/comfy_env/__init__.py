@@ -4,7 +4,7 @@ comfy-env - Environment management for ComfyUI custom nodes.
 Features:
 - CUDA wheel resolution (pre-built wheels without compilation)
 - Process isolation (run nodes in separate Python environments)
-- Central environment cache (~/.comfy-env/envs/)
+- Local _env_* folders (no central cache, no junctions)
 """
 
 from importlib.metadata import version, PackageNotFoundError
@@ -91,12 +91,9 @@ from .packages import (
 # =============================================================================
 
 from .environment import (
-    # Cache management
     get_cache_dir,
-    cleanup_orphaned_envs,
     resolve_env_path,
     CACHE_DIR,
-    MARKER_FILE,
 )
 
 
@@ -160,30 +157,14 @@ __all__ = [
     "get_cuda_torch_mapping",
     # Environment
     "get_cache_dir",
-    "cleanup_orphaned_envs",
     "resolve_env_path",
     "CACHE_DIR",
-    "MARKER_FILE",
     # Workers
     "Worker",
     "WorkerError",
     "SubprocessWorker",
     "TensorKeeper",
 ]
-
-
-# =============================================================================
-# Startup cleanup
-# =============================================================================
-
-def _run_startup_cleanup():
-    """Clean orphaned envs on startup."""
-    try:
-        cleanup_orphaned_envs(log=lambda x: None)  # Silent
-    except Exception:
-        pass  # Never fail startup due to cleanup
-
-_run_startup_cleanup()
 
 
 # =============================================================================
