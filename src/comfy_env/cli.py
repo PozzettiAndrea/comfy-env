@@ -242,7 +242,7 @@ def cmd_apt_install(args) -> int:
 
 
 def cmd_cleanup(args) -> int:
-    print("Cleanup is no longer needed — envs are stored directly in node dirs.")
+    print("Cleanup is no longer needed -- envs are stored directly in node dirs.")
     print("To remove an env, delete the _env_* folder in the node directory.")
     return 0
 
