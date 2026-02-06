@@ -1772,8 +1772,11 @@ class SubprocessWorker(Worker):
             try:
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=2)
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=5)
+                except Exception:
+                    pass
 
         shutil.rmtree(self._temp_dir, ignore_errors=True)
 
