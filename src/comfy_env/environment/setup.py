@@ -103,3 +103,8 @@ def setup_env(node_dir: Optional[str] = None) -> None:
         _set_library_paths(root_env)
         if sp:
             print(f"[comfy-env]   site-packages: {sp}", file=sys.stderr)
+
+    if os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes"):
+        print("[comfy-env] Environment variables:", file=sys.stderr)
+        for k, v in sorted(os.environ.items()):
+            print(f"[comfy-env]   {k}={v}", file=sys.stderr)
