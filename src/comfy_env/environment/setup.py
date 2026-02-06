@@ -72,6 +72,9 @@ def setup_env(node_dir: Optional[str] = None) -> None:
         import inspect
         node_dir = str(Path(inspect.stack()[1].filename).parent)
 
+    import faulthandler
+    faulthandler.enable(file=sys.stderr)
+
     # Print all detected envs first
     root_env = os.path.join(node_dir, ROOT_ENV_DIR_NAME)
     has_root = os.path.isdir(root_env)
