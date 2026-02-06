@@ -10,6 +10,7 @@ from .libomp import dedupe_libomp
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"
+ROOT_ENV_DIR_NAME = "_root_env"
 
 
 def is_comfy_env_enabled() -> bool:
@@ -55,14 +56,13 @@ def _set_library_paths(env_path: str) -> None:
 
 
 def _find_env_dirs(node_dir: str) -> list:
-    """Recursively find all _env_* directories under node_dir."""
+    """Recursively find all _env_* directories under node_dir (for debug info only)."""
     envs = []
     for root, dirs, _ in os.walk(node_dir):
         for d in dirs:
             if d.startswith("_env_"):
                 envs.append(os.path.join(root, d))
-        # Don't recurse into _env_* dirs themselves
-        dirs[:] = [d for d in dirs if not d.startswith("_env_")]
+        dirs[:] = [d for d in dirs if not d.startswith(("_env_", "_root_env"))]
     return envs
 
 
@@ -81,12 +81,20 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     for k, v in load_env_vars(config).items():
         os.environ[k] = v
 
-    # Find all _env_* dirs
-    env_dirs = _find_env_dirs(node_dir)
-    print(f"[comfy-env] {os.path.basename(node_dir)}: {len(env_dirs)} env(s) found")
-    for env_path in env_dirs:
-        print(f"[comfy-env]   {os.path.basename(env_path)} -> {env_path}")
+    # Handle _root_env only -- inject site-packages + set library paths
+    root_env = os.path.join(node_dir, ROOT_ENV_DIR_NAME)
+    if os.path.isdir(root_env):
+        sp = inject_site_packages(root_env)
+        _set_library_paths(root_env)
+        print(f"[comfy-env] {os.path.basename(node_dir)}: _root_env -> {root_env}")
+        if sp:
+            print(f"[comfy-env]   site-packages: {sp}")
+    else:
+        print(f"[comfy-env] {os.path.basename(node_dir)}: no _root_env")
 
-    for env_path in env_dirs:
-        sp = inject_site_packages(env_path)
-        _set_library_paths(env_path)
+    # Print subdirectory _env_* dirs for debug (but don't touch sys.path or env vars)
+    sub_envs = _find_env_dirs(node_dir)
+    if sub_envs:
+        print(f"[comfy-env] {len(sub_envs)} isolation env(s):")
+        for env_path in sub_envs:
+            print(f"[comfy-env]   {os.path.basename(env_path)} -> {env_path}")

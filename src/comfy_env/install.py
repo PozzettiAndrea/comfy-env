@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Set, Union
 
 from .config import ComfyEnvConfig, NodeDependency, load_config, discover_config, CONFIG_FILE_NAME, ROOT_CONFIG_FILE_NAME
+from .environment.cache import get_root_env_path, get_local_env_path
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
@@ -170,7 +171,6 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
     from .detection import get_recommended_cuda_version
-    from .environment.cache import get_local_env_path
     import shutil, subprocess, tempfile
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
@@ -186,13 +186,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     if pypi_deps: log(f"  PyPI: {len(pypi_deps)}")
     if dry_run: return
 
-    # Find config file path
-    config_path = node_dir / CONFIG_FILE_NAME
-    if not config_path.exists():
-        config_path = node_dir / ROOT_CONFIG_FILE_NAME
-
-    main_node_dir = _find_main_node_dir(node_dir)
-    env_path = get_local_env_path(main_node_dir, config_path)
+    # Root config -> _root_env, subdirectory config -> _env_*
+    if is_root:
+        env_path = get_root_env_path(node_dir)
+    else:
+        config_path = node_dir / CONFIG_FILE_NAME
+        main_node_dir = _find_main_node_dir(node_dir)
+        env_path = get_local_env_path(main_node_dir, config_path)
 
     # Build in a temp dir, then move to final location
     build_dir = env_path.parent / f"{env_path.name}_build"
