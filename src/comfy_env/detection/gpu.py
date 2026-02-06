@@ -105,7 +105,7 @@ def detect_cuda_environment(force_refresh: bool = False) -> CUDAEnvironment:
     if sys.platform == "win32":
         detection_order = [("smi", _detect_smi), ("nvml", _detect_nvml), ("torch", _detect_torch)]
     else:
-        detection_order = [("nvml", _detect_nvml), ("torch", _detect_torch), ("smi", _detect_smi), ("sysfs", _detect_sysfs)]
+        detection_order = [("nvml", _detect_nvml), ("smi", _detect_smi), ("torch", _detect_torch), ("sysfs", _detect_sysfs)]
 
     for name, fn in detection_order:
         if result := fn():
@@ -244,12 +244,14 @@ def _get_driver_version() -> str:
 
 
 def _get_cuda_version() -> str:
-    # On Windows, skip torch import (can cause DLL crashes)
-    import sys
-    if sys.platform == "win32":
-        return ""
+    # Use nvidia-smi (subprocess, crash-safe) instead of torch import
+    # (torch import can cause C++ terminate() from ApproximateClock bug)
     try:
-        import torch
-        if torch.cuda.is_available() and torch.version.cuda: return torch.version.cuda
-    except Exception: pass
+        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            for line in r.stdout.split("\n"):
+                if "CUDA Version" in line:
+                    return line.split("CUDA Version:")[1].strip().split()[0]
+    except Exception:
+        pass
     return ""

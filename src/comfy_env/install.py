@@ -203,7 +203,12 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     log("[DEBUG] write_pixi_toml...")
     write_pixi_toml(cfg, env_work_dir, log)
     log("Running pixi install...")
-    result = subprocess.run([str(pixi_path), "install"], cwd=env_work_dir, capture_output=True, text=True)
+    # Prevent rattler/uv from discovering UV-managed Pythons during source builds
+    # (causes SRE module mismatch when pixi's Python != UV-managed Python)
+    pixi_env = dict(os.environ)
+    pixi_env["UV_PYTHON_INSTALL_DIR"] = str(env_work_dir / "_no_python")
+    pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
+    result = subprocess.run([str(pixi_path), "install"], cwd=env_work_dir, capture_output=True, text=True, env=pixi_env)
     if result.returncode != 0:
         raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
