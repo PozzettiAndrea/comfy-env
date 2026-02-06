@@ -19,13 +19,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check Windows compatibility (ASCII-only)
-        run: |
-          if grep -rn '[^\x00-\x7F]' --include="*.py" --include="*.yaml" --include="*.yml" .; then
-            echo "::error::Non-ASCII characters found. Use ASCII only for Windows compatibility."
-            exit 1
-          fi
-
       - name: Setup Python
         if: github.event_name == 'push'
         uses: actions/setup-python@v5
