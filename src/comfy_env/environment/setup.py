@@ -68,12 +68,25 @@ def _find_env_dirs(node_dir: str) -> list:
 
 def setup_env(node_dir: Optional[str] = None) -> None:
     """Set up env for pixi libraries. Call in prestartup_script.py before native imports."""
-    if not is_comfy_env_enabled(): return
-    dedupe_libomp()
-
     if node_dir is None:
         import inspect
         node_dir = str(Path(inspect.stack()[1].filename).parent)
+
+    # Print all detected envs first
+    root_env = os.path.join(node_dir, ROOT_ENV_DIR_NAME)
+    has_root = os.path.isdir(root_env)
+    sub_envs = _find_env_dirs(node_dir)
+    if has_root:
+        print(f"[comfy-env] {os.path.basename(node_dir)}: _root_env -> {root_env}", file=sys.stderr)
+    else:
+        print(f"[comfy-env] {os.path.basename(node_dir)}: no _root_env", file=sys.stderr)
+    if sub_envs:
+        print(f"[comfy-env] {len(sub_envs)} isolation env(s):", file=sys.stderr)
+        for env_path in sub_envs:
+            print(f"[comfy-env]   {os.path.basename(env_path)} -> {env_path}", file=sys.stderr)
+
+    if not is_comfy_env_enabled(): return
+    dedupe_libomp()
 
     # Apply env vars (check root config first, then regular)
     root_config = os.path.join(node_dir, ROOT_CONFIG_FILE_NAME)
@@ -82,19 +95,8 @@ def setup_env(node_dir: Optional[str] = None) -> None:
         os.environ[k] = v
 
     # Handle _root_env only -- inject site-packages + set library paths
-    root_env = os.path.join(node_dir, ROOT_ENV_DIR_NAME)
-    if os.path.isdir(root_env):
+    if has_root:
         sp = inject_site_packages(root_env)
         _set_library_paths(root_env)
-        print(f"[comfy-env] {os.path.basename(node_dir)}: _root_env -> {root_env}")
         if sp:
-            print(f"[comfy-env]   site-packages: {sp}")
-    else:
-        print(f"[comfy-env] {os.path.basename(node_dir)}: no _root_env")
-
-    # Print subdirectory _env_* dirs for debug (but don't touch sys.path or env vars)
-    sub_envs = _find_env_dirs(node_dir)
-    if sub_envs:
-        print(f"[comfy-env] {len(sub_envs)} isolation env(s):")
-        for env_path in sub_envs:
-            print(f"[comfy-env]   {os.path.basename(env_path)} -> {env_path}")
+            print(f"[comfy-env]   site-packages: {sp}", file=sys.stderr)

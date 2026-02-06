@@ -21,23 +21,10 @@ jobs:
 
       - name: Check Windows compatibility (ASCII-only)
         run: |
-          python3 << 'EOF'
-          import pathlib, sys
-          errors = []
-          for f in pathlib.Path('.').rglob('*'):
-              if not f.is_file() or '.git' in f.parts: continue
-              if f.suffix.lower() not in ['.py', '.yaml', '.yml']: continue
-              try:
-                  f.read_bytes().decode('ascii')
-              except UnicodeDecodeError as e:
-                  errors.append(f"{f}: non-ASCII byte {hex(e.object[e.start])} at position {e.start}")
-              except Exception:
-                  pass
-          if errors:
-              print("Files with non-ASCII characters (may break on Windows):")
-              for e in errors: print(f"  {e}")
-              sys.exit(1)
-          EOF
+          if grep -rn '[^\x00-\x7F]' --include="*.py" --include="*.yaml" --include="*.yml" .; then
+            echo "::error::Non-ASCII characters found. Use ASCII only for Windows compatibility."
+            exit 1
+          fi
 
       - name: Setup Python
         if: github.event_name == 'push'
@@ -45,34 +32,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Check and bump version if needed
+      - name: Get version
         if: github.event_name == 'push'
         id: version
         run: |
-          local_version=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' | tr -d '\r')
-          echo "Local version: $local_version"
-
-          pypi_version=$(pip index versions comfy-env 2>/dev/null | head -1 | grep -oP '\(\K[^)]+' || echo "0.0.0")
-          echo "PyPI version: $pypi_version"
-
-          higher=$(printf '%s\n%s' "$local_version" "$pypi_version" | sort -V | tail -1)
-
-          if [ "$local_version" = "$pypi_version" ] || [ "$higher" = "$pypi_version" ]; then
-            echo "Bumping: $local_version <= $pypi_version"
-            IFS='.' read -r major minor patch <<< "$pypi_version"
-            new_version="${major}.${minor}.$((patch + 1))"
-            sed -i "s/^version = \".*\"/version = \"${new_version}\"/" pyproject.toml
-
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add pyproject.toml
-            git commit -m "Bump version to ${new_version} [skip ci]"
-            git push
-            echo "version=$new_version" >> $GITHUB_OUTPUT
-          else
-            echo "No bump needed: $local_version > $pypi_version"
-            echo "version=$local_version" >> $GITHUB_OUTPUT
-          fi
+          version=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/' | tr -d '\r')
+          echo "version=$version" >> $GITHUB_OUTPUT
 
       - name: Create tag
         if: github.event_name == 'push'

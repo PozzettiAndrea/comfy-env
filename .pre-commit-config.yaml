@@ -6,3 +6,10 @@ repos:
         entry: bash -c 'if grep -rn "[^\x00-\x7F]" --include="*.py" .; then echo "Use ASCII only for Windows compatibility."; exit 1; fi'
         language: system
         pass_filenames: false
+
+      - id: auto-bump-version
+        name: Auto-bump version if behind PyPI
+        entry: bash scripts/auto-bump.sh
+        language: system
+        pass_filenames: false
+        always_run: true
