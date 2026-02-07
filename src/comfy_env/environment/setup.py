@@ -112,3 +112,5 @@ def setup_env(node_dir: Optional[str] = None) -> None:
             v = os.environ.get(k)
             if v:
                 print(f"[comfy-env]   {k}={v}", file=sys.stderr, flush=True)
+
+    print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)

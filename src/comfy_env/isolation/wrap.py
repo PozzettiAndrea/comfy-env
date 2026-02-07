@@ -140,6 +140,12 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     ]
     if library_bin.is_dir():
         minimal_path_parts.insert(1, str(library_bin))
+        if _DEBUG:
+            dll_count = len([f for f in library_bin.iterdir() if f.suffix.lower() == ".dll"])
+            _log(f"[comfy-env] {env_root.name}: Library/bin has {dll_count} DLLs")
+    else:
+        if _DEBUG:
+            _log(f"[comfy-env] {env_root.name}: Library/bin NOT FOUND at {library_bin}")
     env["PATH"] = ";".join(minimal_path_parts)
     env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
