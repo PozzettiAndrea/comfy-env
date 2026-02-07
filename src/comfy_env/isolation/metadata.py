@@ -146,7 +146,6 @@ def fetch_metadata(
     node_dir: Path,
     package_name: str,
     working_dir: Path,
-    timeout: float = 30.0,
     env_vars: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Fetch node metadata by running a subprocess in the isolation env.
@@ -156,7 +155,6 @@ def fetch_metadata(
         node_dir: Path to the node subdirectory (e.g., nodes/gpu/)
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
-        timeout: Max seconds to wait for subprocess
         env_vars: Additional environment variables from comfy-env.toml
 
     Returns:
@@ -196,7 +194,6 @@ def fetch_metadata(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=timeout,
             cwd=str(working_dir),
             env=scan_env,
         )
@@ -234,9 +231,6 @@ def fetch_metadata(
 
         return payload
 
-    except subprocess.TimeoutExpired:
-        print(f"[comfy-env] Metadata scan timed out for {package_name} ({timeout}s)")
-        return {"nodes": {}, "display": {}}
     except Exception as e:
         print(f"[comfy-env] Metadata scan error for {package_name}: {e}")
         return {"nodes": {}, "display": {}}
