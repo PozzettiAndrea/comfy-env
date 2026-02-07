@@ -78,7 +78,8 @@ def fetch_metadata(
     node_dir: Path,
     package_name: str,
     working_dir: Path,
-    timeout: float = 15.0,
+    timeout: float = 30.0,
+    env_vars: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Fetch node metadata by running a subprocess in the isolation env.
 
@@ -88,6 +89,7 @@ def fetch_metadata(
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         timeout: Max seconds to wait for subprocess
+        env_vars: Additional environment variables from comfy-env.toml
 
     Returns:
         {"nodes": {name: meta_dict, ...}, "display": {name: display_name, ...}}
@@ -97,6 +99,10 @@ def fetch_metadata(
     if not python.exists():
         print(f"[comfy-env] No Python in {env_dir}, skipping metadata scan")
         return {"nodes": {}, "display": {}}
+
+    # Build proper subprocess environment (DLL paths, library paths, etc.)
+    from .wrap import build_isolation_env
+    scan_env = build_isolation_env(python, env_vars)
 
     # Write script to temp file
     script_file = None
@@ -118,6 +124,7 @@ def fetch_metadata(
             capture_output=True,
             timeout=timeout,
             cwd=str(working_dir),
+            env=scan_env,
         )
 
         elapsed = time.perf_counter() - t0

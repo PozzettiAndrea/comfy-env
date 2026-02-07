@@ -115,6 +115,67 @@ def _is_enabled() -> bool:
     return os.environ.get("USE_COMFY_ENV", "1").lower() not in ("0", "false", "no", "off")
 
 
+# ---------------------------------------------------------------------------
+# Isolation environment setup (shared by metadata scan + SubprocessWorker)
+# ---------------------------------------------------------------------------
+
+def _build_isolation_env_win32(env: dict, python: Path) -> dict:
+    """Windows: minimal PATH with env + Library/bin + system dirs."""
+    env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
+    env_root = python.parent
+    library_bin = env_root / "Library" / "bin"
+    windir = os.environ.get("WINDIR", r"C:\Windows")
+    minimal_path_parts = [
+        str(env_root),
+        str(env_root / "Scripts"),
+        str(env_root / "Lib" / "site-packages" / "bpy"),
+        f"{windir}\\System32",
+        f"{windir}",
+        f"{windir}\\System32\\Wbem",
+    ]
+    if library_bin.is_dir():
+        minimal_path_parts.insert(1, str(library_bin))
+    env["PATH"] = ";".join(minimal_path_parts)
+    env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _build_isolation_env_darwin(env: dict, python: Path) -> dict:
+    """macOS: add env's lib dir to DYLD_LIBRARY_PATH."""
+    lib_dir = python.parent.parent / "lib"
+    if lib_dir.is_dir():
+        existing = env.get("DYLD_LIBRARY_PATH", "")
+        env["DYLD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+    return env
+
+
+def _build_isolation_env_linux(env: dict, python: Path) -> dict:
+    """Linux: add env's lib dir + system libs to LD_LIBRARY_PATH."""
+    lib_dir = python.parent.parent / "lib"
+    if lib_dir.is_dir():
+        existing = env.get("LD_LIBRARY_PATH", "")
+        system_libs = "/usr/lib/x86_64-linux-gnu:/usr/lib:/lib/x86_64-linux-gnu"
+        env["LD_LIBRARY_PATH"] = f"{lib_dir}:{system_libs}:{existing}" if existing else f"{lib_dir}:{system_libs}"
+    return env
+
+
+def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
+    """Build environment dict for isolation subprocess. Dispatches to platform-specific builder."""
+    env = os.environ.copy()
+    if env_vars:
+        env.update(env_vars)
+    env["COMFYUI_ISOLATION_WORKER"] = "1"
+
+    if sys.platform == "win32":
+        return _build_isolation_env_win32(env, python)
+    elif sys.platform == "darwin":
+        return _build_isolation_env_darwin(env, python)
+    else:
+        return _build_isolation_env_linux(env, python)
+
+
 def _get_env_paths(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     """Get (site_packages, lib_dir) from env."""
     if sys.platform == "win32":
@@ -483,6 +544,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 node_dir=subdir,
                 package_name=package_name,
                 working_dir=pkg_dir,
+                env_vars=env["env_vars"],
             )
 
         with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:

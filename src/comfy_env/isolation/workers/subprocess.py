@@ -1366,52 +1366,9 @@ class SubprocessWorker(Worker):
         # Create server socket for IPC
         self._server_socket, self._socket_addr = _create_server_socket()
 
-        # Set up environment
-        env = os.environ.copy()
-        env.update(self.extra_env)
-        env["COMFYUI_ISOLATION_WORKER"] = "1"
-
-        # For conda/pixi environments, add lib dir to LD_LIBRARY_PATH
-        # This ensures libraries like libstdc++ from the env are used
-        lib_dir = self.python.parent.parent / "lib"
-        if lib_dir.is_dir():
-            existing = env.get("LD_LIBRARY_PATH", "")
-            # Also include system library paths so apt-installed libs (OpenGL, etc.) are found
-            system_libs = "/usr/lib/x86_64-linux-gnu:/usr/lib:/lib/x86_64-linux-gnu"
-            env["LD_LIBRARY_PATH"] = f"{lib_dir}:{system_libs}:{existing}" if existing else f"{lib_dir}:{system_libs}"
-
-        # On Windows, pass host Python directory so worker can add it via os.add_dll_directory()
-        # This fixes "DLL load failed" errors for packages like opencv-python-headless
-        if sys.platform == "win32":
-            env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
-
-            # For pixi environments with MKL, add Library/bin to PATH for DLL loading
-            # MKL DLLs are in .pixi/envs/default/Library/bin/
-            # Pixi has python.exe directly in env dir, not in Scripts/
-            env_dir = self.python.parent
-            library_bin = env_dir / "Library" / "bin"
-
-            # COMPLETE DLL ISOLATION: Build minimal PATH from scratch
-            # Only include Windows system directories + pixi environment
-            # This prevents DLL conflicts from mingw, conda, etc.
-            windir = os.environ.get("WINDIR", r"C:\Windows")
-            minimal_path_parts = [
-                str(env_dir),  # Pixi env (python.exe location)
-                str(env_dir / "Scripts"),  # Pixi Scripts
-                str(env_dir / "Lib" / "site-packages" / "bpy"),  # bpy DLLs
-                f"{windir}\\System32",  # Core Windows DLLs
-                f"{windir}",  # Windows directory
-                f"{windir}\\System32\\Wbem",  # WMI tools
-            ]
-            if library_bin.is_dir():
-                minimal_path_parts.insert(1, str(library_bin))  # MKL DLLs
-
-            env["PATH"] = ";".join(minimal_path_parts)
-            env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
-            # Allow duplicate OpenMP libraries (MKL's libiomp5md.dll + PyTorch's libomp.dll)
-            env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-            # Use UTF-8 encoding for stdout/stderr to handle Unicode symbols
-            env["PYTHONIOENCODING"] = "utf-8"
+        # Set up environment (shared with metadata scan)
+        from ..wrap import build_isolation_env
+        env = build_isolation_env(self.python, self.extra_env)
 
         # Find ComfyUI base and add to sys_path for real folder_paths/comfy modules
         # This works because comfy.options.args_parsing=False by default, so folder_paths
