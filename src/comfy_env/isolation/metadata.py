@@ -96,6 +96,11 @@ package_name = sys.argv[2]
 sys.path.insert(0, working_dir)
 os.chdir(working_dir)
 
+# Add ComfyUI base to sys.path so nodes can import folder_paths etc.
+_comfyui_base = os.environ.get("COMFYUI_BASE")
+if _comfyui_base and _comfyui_base not in sys.path:
+    sys.path.insert(1, _comfyui_base)
+
 if _debug:
     print(f"[meta-scan] importing {package_name} from {working_dir}", file=sys.stderr, flush=True)
 module = importlib.import_module(package_name)
