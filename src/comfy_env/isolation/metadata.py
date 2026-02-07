@@ -115,6 +115,8 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
         "output_node": getattr(cls, "OUTPUT_NODE", False),
         "return_types": getattr(cls, "RETURN_TYPES", ()),
         "return_names": getattr(cls, "RETURN_NAMES", ()),
+        "output_is_list": getattr(cls, "OUTPUT_IS_LIST", None),
+        "input_is_list": getattr(cls, "INPUT_IS_LIST", None),
         "module_name": cls.__module__,
         "class_name": cls.__name__,
     }
@@ -281,6 +283,12 @@ def build_proxy_class(
         "_comfy_env_module": module_name,
         "_comfy_env_class": class_name,
     }
+
+    # Batch processing attributes (ComfyUI uses these for list iteration)
+    if meta.get("output_is_list") is not None:
+        attrs["OUTPUT_IS_LIST"] = tuple(meta["output_is_list"])
+    if meta.get("input_is_list") is not None:
+        attrs["INPUT_IS_LIST"] = meta["input_is_list"]
 
     # INPUT_TYPES classmethod returning cached metadata
     @classmethod
