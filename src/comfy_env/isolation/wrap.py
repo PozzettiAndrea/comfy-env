@@ -18,6 +18,11 @@ _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 _CLEANUP_DONE = False
 
 
+def _log(msg: str) -> None:
+    """Print to stderr with flush — survives process crashes."""
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _cleanup_stale_workers():
     """Kill orphaned worker processes and remove stale temp directories on startup.
 
@@ -432,7 +437,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # Log version
     try:
         from importlib.metadata import version as get_version
-        print(f"[comfy-env] Version: {get_version('comfy-env')}")
+        _log(f"[comfy-env] Version: {get_version('comfy-env')}")
     except Exception:
         pass
 
@@ -445,11 +450,11 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     caller_pkg_name = caller_module.__name__ if caller_module else None
 
     if _DEBUG:
-        print(f"[comfy-env] register_nodes: pkg_dir={pkg_dir}, caller={caller_pkg_name}")
+        _log(f"[comfy-env] register_nodes: pkg_dir={pkg_dir}, caller={caller_pkg_name}")
 
     nodes_dir = pkg_dir / nodes_package
     if not nodes_dir.is_dir():
-        print(f"[comfy-env] No '{nodes_package}/' directory in {pkg_dir}")
+        _log(f"[comfy-env] No '{nodes_package}/' directory in {pkg_dir}")
         return {}, {}
 
     # Discover isolation configs
@@ -481,7 +486,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
                 health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
         except Exception as e:
-            print(f"[comfy-env] Failed to parse {cf}: {e}")
+            _log(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
@@ -497,7 +502,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         }
 
     if _DEBUG:
-        print(f"[comfy-env] Found {len(isolation_envs)} isolation env(s)")
+        _log(f"[comfy-env] Found {len(isolation_envs)} isolation env(s)")
 
     all_mappings = {}
     all_display = {}
@@ -523,16 +528,16 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # Import main-process dirs normally
     for subdir in main_dirs:
         module_path = f".{nodes_package}.{subdir.name}"
+        _log(f"[comfy-env] Importing {subdir.name}...")
         try:
             mod = importlib.import_module(module_path, package=caller_pkg_name)
             mappings = getattr(mod, "NODE_CLASS_MAPPINGS", {})
             display = getattr(mod, "NODE_DISPLAY_NAME_MAPPINGS", {})
             all_mappings.update(mappings)
             all_display.update(display)
-            if _DEBUG:
-                print(f"[comfy-env] Imported {subdir.name}: {len(mappings)} nodes")
+            _log(f"[comfy-env] Imported {subdir.name}: {len(mappings)} nodes")
         except Exception as e:
-            print(f"[comfy-env] Failed to import {module_path}: {e}")
+            _log(f"[comfy-env] Failed to import {module_path}: {e}")
 
     # Subprocess-scan isolation dirs (in parallel)
     if enabled and isolation_dirs:
@@ -554,7 +559,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     subdir, env, metadata = future.result()
                 except Exception as e:
                     subdir = futures[future]
-                    print(f"[comfy-env] Metadata scan failed for {subdir.name}: {e}")
+                    _log(f"[comfy-env] Metadata scan failed for {subdir.name}: {e}")
                     continue
 
                 nodes_meta = metadata.get("nodes", {})
@@ -578,11 +583,11 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
                 all_display.update(display)
                 if nodes_meta:
-                    print(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
+                    _log(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
 
     elif isolation_dirs and not enabled:
         if _DEBUG:
-            print(f"[comfy-env] Isolation disabled, skipping {len(isolation_dirs)} dirs")
+            _log(f"[comfy-env] Isolation disabled, skipping {len(isolation_dirs)} dirs")
 
     # Report skipped isolation dirs (no _env_* installed)
     for cf in config_files:
@@ -591,9 +596,9 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if cf.parent.resolve() not in isolation_envs:
             env_dir = _find_env_dir(cf.parent)
             if not env_dir:
-                print(f"[comfy-env] No env for {cf.parent.name} — run 'comfy-env install'")
+                _log(f"[comfy-env] No env for {cf.parent.name} — run 'comfy-env install'")
 
-    print(f"[comfy-env] Registered {len(all_mappings)} total nodes "
-          f"({len(main_dirs)} main + {len(isolation_dirs)} isolation dirs)")
+    _log(f"[comfy-env] Registered {len(all_mappings)} total nodes "
+         f"({len(main_dirs)} main + {len(isolation_dirs)} isolation dirs)")
 
     return all_mappings, all_display

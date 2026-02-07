@@ -105,6 +105,10 @@ def setup_env(node_dir: Optional[str] = None) -> None:
             print(f"[comfy-env]   site-packages: {sp}", file=sys.stderr)
 
     if os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes"):
-        print("[comfy-env] Environment variables:", file=sys.stderr)
-        for k, v in sorted(os.environ.items()):
-            print(f"[comfy-env]   {k}={v}", file=sys.stderr)
+        _path_keys = ("PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH",
+                       "DYLD_FALLBACK_LIBRARY_PATH", "CONDA_PREFIX")
+        print("[comfy-env] Library paths (main process):", file=sys.stderr, flush=True)
+        for k in _path_keys:
+            v = os.environ.get(k)
+            if v:
+                print(f"[comfy-env]   {k}={v}", file=sys.stderr, flush=True)

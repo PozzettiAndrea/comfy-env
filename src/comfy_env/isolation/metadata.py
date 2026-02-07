@@ -33,13 +33,42 @@ import pickle
 import base64
 import importlib
 
+# Print environment diagnostics to stderr (survives crashes)
+_debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+if _debug:
+    _sep = ";" if sys.platform == "win32" else ":"
+    print(f"[meta-scan] python: {sys.executable}", file=sys.stderr, flush=True)
+    print(f"[meta-scan] PATH:", file=sys.stderr, flush=True)
+    for _i, _p in enumerate(os.environ.get("PATH", "").split(_sep)):
+        print(f"[meta-scan]   [{_i}] {_p}", file=sys.stderr, flush=True)
+    if sys.platform == "win32":
+        # List DLLs in the env's Library/bin (critical for CGAL, MKL, etc.)
+        _env_bin = os.path.join(os.path.dirname(sys.executable), "Library", "bin")
+        if os.path.isdir(_env_bin):
+            _dlls = [f for f in os.listdir(_env_bin) if f.lower().endswith(".dll")]
+            print(f"[meta-scan] Library/bin ({_env_bin}): {len(_dlls)} DLLs", file=sys.stderr, flush=True)
+            for _d in sorted(_dlls)[:30]:
+                print(f"[meta-scan]   {_d}", file=sys.stderr, flush=True)
+            if len(_dlls) > 30:
+                print(f"[meta-scan]   ... and {len(_dlls) - 30} more", file=sys.stderr, flush=True)
+        else:
+            print(f"[meta-scan] Library/bin NOT FOUND at {_env_bin}", file=sys.stderr, flush=True)
+    else:
+        _ld = os.environ.get("LD_LIBRARY_PATH") or os.environ.get("DYLD_LIBRARY_PATH")
+        if _ld:
+            print(f"[meta-scan] LD/DYLD_LIBRARY_PATH: {_ld}", file=sys.stderr, flush=True)
+
 working_dir = sys.argv[1]
 package_name = sys.argv[2]
 
 sys.path.insert(0, working_dir)
 os.chdir(working_dir)
 
+if _debug:
+    print(f"[meta-scan] importing {package_name} from {working_dir}", file=sys.stderr, flush=True)
 module = importlib.import_module(package_name)
+if _debug:
+    print(f"[meta-scan] import OK", file=sys.stderr, flush=True)
 
 nodes = {}
 for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
@@ -117,7 +146,12 @@ def fetch_metadata(
         cmd = [str(python), script_file, str(working_dir), package_name]
 
         if _DEBUG:
-            print(f"[comfy-env] Metadata scan: {' '.join(cmd)}")
+            print(f"[comfy-env] Metadata scan: {' '.join(cmd)}", file=sys.stderr, flush=True)
+            path_sep = ";" if sys.platform == "win32" else ":"
+            scan_path = scan_env.get("PATH", "")
+            print(f"[comfy-env] Scan env PATH for {package_name}:", file=sys.stderr, flush=True)
+            for i, p in enumerate(scan_path.split(path_sep)):
+                print(f"[comfy-env]   [{i}] {p}", file=sys.stderr, flush=True)
 
         result = subprocess.run(
             cmd,
@@ -129,24 +163,32 @@ def fetch_metadata(
 
         elapsed = time.perf_counter() - t0
 
+        # Always print stderr from scan subprocess when debug is on
+        if _DEBUG:
+            scan_stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            if scan_stderr:
+                print(f"[comfy-env] Metadata scan stderr for {package_name}:", file=sys.stderr, flush=True)
+                for line in scan_stderr.splitlines():
+                    print(f"[comfy-env]   {line}", file=sys.stderr, flush=True)
+
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             print(f"[comfy-env] Metadata scan failed for {package_name} "
-                  f"(exit {result.returncode}, {elapsed:.1f}s):")
+                  f"(exit {result.returncode}, {elapsed:.1f}s):", file=sys.stderr, flush=True)
             for line in stderr.splitlines()[-10:]:
-                print(f"[comfy-env]   {line}")
+                print(f"[comfy-env]   {line}", file=sys.stderr, flush=True)
             return {"nodes": {}, "display": {}}
 
         raw = result.stdout.strip()
         if not raw:
-            print(f"[comfy-env] Metadata scan returned empty for {package_name}")
+            print(f"[comfy-env] Metadata scan returned empty for {package_name}", file=sys.stderr, flush=True)
             return {"nodes": {}, "display": {}}
 
         payload = pickle.loads(base64.b64decode(raw))
 
         node_count = len(payload.get("nodes", {}))
         if _DEBUG or node_count > 0:
-            print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)")
+            print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)", file=sys.stderr, flush=True)
 
         return payload
 
