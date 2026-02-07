@@ -424,7 +424,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
-        package_root = _find_package_root(cf.parent)
+        package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
             "dir": cf.parent,
             "env_dir": env_dir,
