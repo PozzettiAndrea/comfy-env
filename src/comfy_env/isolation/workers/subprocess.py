@@ -366,8 +366,11 @@ def _from_shm(obj, unlink=True):
             block.unlink()
         # Convert back to tensor if it was originally a tensor
         if obj.get("__was_tensor__"):
-            import torch
-            return torch.from_numpy(arr)
+            try:
+                import torch
+                return torch.from_numpy(arr)
+            except Exception:
+                pass
         return arr
 
     # trimesh (pickled to preserve visual, metadata, normals)
@@ -598,8 +601,8 @@ try:
     import torch.multiprocessing as mp
     mp.set_sharing_strategy("file_system")
     wlog("[worker] PyTorch sharing strategy set to file_system")
-except ImportError:
-    wlog("[worker] PyTorch not available")
+except Exception as e:
+    wlog(f"[worker] PyTorch not available: {e}")
 
 
 # Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
@@ -689,14 +692,21 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # ndarray -> convert to tensor, use PyTorch's native shared memory
+    # ndarray -> prefer torch native shm, fallback to plain shm
     if t == 'ndarray':
-        import torch
         arr = np.ascontiguousarray(obj)
-        tensor = torch.from_numpy(arr)
-        result = _serialize_tensor_native(tensor, registry)
-        result["__was_numpy__"] = True
-        result["numpy_dtype"] = str(arr.dtype)
+        try:
+            import torch
+            tensor = torch.from_numpy(arr)
+            result = _serialize_tensor_native(tensor, registry)
+            result["__was_numpy__"] = True
+            result["numpy_dtype"] = str(arr.dtype)
+        except Exception:
+            block = shm.SharedMemory(create=True, size=arr.nbytes)
+            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+            registry.append(block)
+            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype),
+                       "__was_tensor__": True}
         visited[obj_id] = result
         return result
 
@@ -811,8 +821,11 @@ def _from_shm(obj):
             print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
         # Convert back to tensor if it was originally a tensor
         if obj.get("__was_tensor__"):
-            import torch
-            return torch.from_numpy(arr)
+            try:
+                import torch
+                return torch.from_numpy(arr)
+            except Exception:
+                pass
         return arr
 
     # trimesh (pickled)
@@ -1070,8 +1083,8 @@ def main():
         import torch
         _HAS_TORCH = True
         wlog(f"[worker] Torch imported: {torch.__version__}")
-    except ImportError:
-        wlog("[worker] Torch not available, using pickle for serialization")
+    except Exception as e:
+        wlog(f"[worker] Torch not available: {e}")
 
     # Setup log forwarding to host
     # This makes print() and logging statements in node code visible to the user
