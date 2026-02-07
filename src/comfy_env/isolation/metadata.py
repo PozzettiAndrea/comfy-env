@@ -69,7 +69,7 @@ if _debug:
                 except OSError as _e:
                     print(f"[meta-scan]   FAIL {_d}: {_e}", file=sys.stderr, flush=True)
         else:
-            # Deduplicate versioned symlinks: libfoo.so.1.2.0 → libfoo.so
+            # Deduplicate versioned symlinks: libfoo.so.1.2.0 -> libfoo.so
             import re
             _seen = set()
             _deduped = []
@@ -176,7 +176,8 @@ def fetch_metadata(
     script_file = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", prefix="comfy_meta_", delete=False
+            mode="w", suffix=".py", prefix="comfy_meta_", delete=False,
+            encoding="utf-8",
         ) as f:
             f.write(_METADATA_SCRIPT)
             script_file = f.name
