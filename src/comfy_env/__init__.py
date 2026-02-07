@@ -27,7 +27,7 @@ from .environment.setup import setup_env
 from .environment.paths import copy_files
 
 # Isolation
-from .isolation import wrap_isolated_nodes, wrap_nodes
+from .isolation import wrap_isolated_nodes, wrap_nodes, register_nodes
 
 
 # =============================================================================
@@ -126,6 +126,7 @@ __all__ = [
     # Isolation
     "wrap_isolated_nodes",
     "wrap_nodes",
+    "register_nodes",
     # Config
     "ComfyEnvConfig",
     "NodeDependency",
@@ -186,9 +187,15 @@ def _mock_cuda_packages():
     if not mock_packages:
         return
 
+    import importlib.util
+
     for pkg in mock_packages.split(","):
         pkg = pkg.strip()
         if not pkg or pkg in sys.modules:
+            continue
+
+        # Skip packages that are already installable (e.g. torch from ComfyUI's requirements)
+        if importlib.util.find_spec(pkg) is not None:
             continue
 
         mock_module = types.ModuleType(pkg)

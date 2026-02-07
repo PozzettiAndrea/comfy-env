@@ -7,6 +7,7 @@ Wraps node classes to execute in isolated subprocess environments.
 from .wrap import (
     wrap_isolated_nodes,
     wrap_nodes,
+    register_nodes,
 )
 from .workers import (
     Worker,
@@ -25,6 +26,7 @@ __all__ = [
     # Node wrapping
     "wrap_isolated_nodes",
     "wrap_nodes",
+    "register_nodes",
     # Workers
     "Worker",
     "WorkerError",

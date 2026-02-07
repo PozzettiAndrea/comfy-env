@@ -342,3 +342,196 @@ def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -
             _wrap_node_class(cls, env_dir, nodes_dir, sys_path, lib_path, env_vars, health_check_timeout)
 
     return node_class_mappings
+
+
+def register_nodes(nodes_package: str = "nodes") -> tuple:
+    """Discover and register all nodes — main-process and isolation.
+
+    Replaces the old pattern of:
+        from .nodes import NODE_CLASS_MAPPINGS
+        wrap_nodes()
+
+    Usage in custom node __init__.py:
+        from comfy_env import register_nodes
+        NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = register_nodes()
+
+    For main-process dirs (no comfy-env.toml): imports normally.
+    For isolation dirs (comfy-env.toml + _env_*): subprocess metadata scan + proxy classes.
+
+    Args:
+        nodes_package: Name of the nodes subpackage (default: "nodes")
+
+    Returns:
+        (NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS)
+    """
+    import importlib
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .metadata import fetch_metadata, build_proxy_class
+
+    # Log version
+    try:
+        from importlib.metadata import version as get_version
+        print(f"[comfy-env] Version: {get_version('comfy-env')}")
+    except Exception:
+        pass
+
+    _cleanup_stale_workers()
+
+    # Get caller info
+    frame = inspect.stack()[1]
+    caller_module = inspect.getmodule(frame.frame)
+    pkg_dir = Path(frame.filename).resolve().parent
+    caller_pkg_name = caller_module.__name__ if caller_module else None
+
+    if _DEBUG:
+        print(f"[comfy-env] register_nodes: pkg_dir={pkg_dir}, caller={caller_pkg_name}")
+
+    nodes_dir = pkg_dir / nodes_package
+    if not nodes_dir.is_dir():
+        print(f"[comfy-env] No '{nodes_package}/' directory in {pkg_dir}")
+        return {}, {}
+
+    # Discover isolation configs
+    isolation_envs = {}  # {resolved_dir: env_config}
+    config_files = list(pkg_dir.rglob("comfy-env.toml"))
+
+    try:
+        import folder_paths
+        comfyui_base = folder_paths.base_path
+    except ImportError:
+        comfyui_base = None
+
+    for cf in config_files:
+        if cf.name == "comfy-env-root.toml":
+            continue
+        env_dir = _find_env_dir(cf.parent)
+        if not env_dir:
+            continue
+        sp, lib = _get_env_paths(env_dir)
+        if not sp:
+            continue
+
+        env_vars = {}
+        health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
+        try:
+            import tomli
+            with open(cf, "rb") as f:
+                toml_data = tomli.load(f)
+                env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
+                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
+        except Exception as e:
+            print(f"[comfy-env] Failed to parse {cf}: {e}")
+        if comfyui_base:
+            env_vars["COMFYUI_BASE"] = str(comfyui_base)
+
+        package_root = _find_package_root(cf.parent)
+        isolation_envs[cf.parent.resolve()] = {
+            "dir": cf.parent,
+            "env_dir": env_dir,
+            "sp": sp,
+            "lib": lib,
+            "env_vars": env_vars,
+            "health_check_timeout": health_check_timeout,
+            "package_root": package_root,
+        }
+
+    if _DEBUG:
+        print(f"[comfy-env] Found {len(isolation_envs)} isolation env(s)")
+
+    all_mappings = {}
+    all_display = {}
+    enabled = _is_enabled() and os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
+
+    # Walk node subdirectories
+    main_dirs = []
+    isolation_dirs = []
+
+    for subdir in sorted(nodes_dir.iterdir()):
+        if not subdir.is_dir():
+            continue
+        if not (subdir / "__init__.py").exists():
+            continue
+        if subdir.name.startswith("_") or subdir.name.startswith("."):
+            continue
+
+        if subdir.resolve() in isolation_envs:
+            isolation_dirs.append(subdir)
+        else:
+            main_dirs.append(subdir)
+
+    # Import main-process dirs normally
+    for subdir in main_dirs:
+        module_path = f".{nodes_package}.{subdir.name}"
+        try:
+            mod = importlib.import_module(module_path, package=caller_pkg_name)
+            mappings = getattr(mod, "NODE_CLASS_MAPPINGS", {})
+            display = getattr(mod, "NODE_DISPLAY_NAME_MAPPINGS", {})
+            all_mappings.update(mappings)
+            all_display.update(display)
+            if _DEBUG:
+                print(f"[comfy-env] Imported {subdir.name}: {len(mappings)} nodes")
+        except Exception as e:
+            print(f"[comfy-env] Failed to import {module_path}: {e}")
+
+    # Subprocess-scan isolation dirs (in parallel)
+    if enabled and isolation_dirs:
+        def _scan_isolation(subdir):
+            env = isolation_envs[subdir.resolve()]
+            package_name = f"{nodes_package}.{subdir.name}"
+            return subdir, env, fetch_metadata(
+                env_dir=env["env_dir"],
+                node_dir=subdir,
+                package_name=package_name,
+                working_dir=pkg_dir,
+            )
+
+        with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:
+            futures = {executor.submit(_scan_isolation, d): d for d in isolation_dirs}
+            for future in as_completed(futures):
+                try:
+                    subdir, env, metadata = future.result()
+                except Exception as e:
+                    subdir = futures[future]
+                    print(f"[comfy-env] Metadata scan failed for {subdir.name}: {e}")
+                    continue
+
+                nodes_meta = metadata.get("nodes", {})
+                display = metadata.get("display", {})
+
+                package_root = env["package_root"]
+                sys_path_list = [str(env["sp"]), str(package_root)]
+                lib_path = str(env["lib"]) if env["lib"] else None
+
+                for name, meta in nodes_meta.items():
+                    all_mappings[name] = build_proxy_class(
+                        node_name=name,
+                        meta=meta,
+                        env_dir=env["env_dir"],
+                        package_root=package_root,
+                        sys_path=sys_path_list,
+                        lib_path=lib_path,
+                        env_vars=env["env_vars"],
+                        health_check_timeout=env["health_check_timeout"],
+                    )
+
+                all_display.update(display)
+                if nodes_meta:
+                    print(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
+
+    elif isolation_dirs and not enabled:
+        if _DEBUG:
+            print(f"[comfy-env] Isolation disabled, skipping {len(isolation_dirs)} dirs")
+
+    # Report skipped isolation dirs (no _env_* installed)
+    for cf in config_files:
+        if cf.name == "comfy-env-root.toml":
+            continue
+        if cf.parent.resolve() not in isolation_envs:
+            env_dir = _find_env_dir(cf.parent)
+            if not env_dir:
+                print(f"[comfy-env] No env for {cf.parent.name} — run 'comfy-env install'")
+
+    print(f"[comfy-env] Registered {len(all_mappings)} total nodes "
+          f"({len(main_dirs)} main + {len(isolation_dirs)} isolation dirs)")
+
+    return all_mappings, all_display
