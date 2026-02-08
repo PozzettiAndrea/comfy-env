@@ -44,6 +44,21 @@ def _find_main_node_dir(node_dir: Path) -> Path:
     return node_dir
 
 
+def _find_uv() -> str:
+    """Find the uv binary installed alongside comfy-env."""
+    import shutil
+    exe_dir = Path(sys.executable).parent
+    scripts_dir = exe_dir / "Scripts" if sys.platform == "win32" else exe_dir
+    candidate = scripts_dir / ("uv.exe" if sys.platform == "win32" else "uv")
+    if candidate.exists():
+        return str(candidate)
+    # Fallback to PATH
+    uv = shutil.which("uv")
+    if uv:
+        return uv
+    raise FileNotFoundError("uv binary not found")
+
+
 def install(
     config: Optional[Union[str, Path]] = None,
     node_dir: Optional[Path] = None,
@@ -237,6 +252,8 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                                capture_output=True, text=True)
         py_version = result.stdout.strip() if result.returncode == 0 else f"{sys.version_info.major}.{sys.version_info.minor}"
 
+        uv_path = _find_uv()
+
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
         torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
 
@@ -258,7 +275,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:
                     pin_version = pin_torch_version
                 pkg_spec = f"{package}=={pin_version}.*"
-                pip_cmd = ["uv", "pip", "install", "--python", str(python_path),
+                pip_cmd = [uv_path, "pip", "install", "--python", str(python_path),
                           "--extra-index-url", pytorch_index, "--index-strategy", "unsafe-best-match", pkg_spec]
                 log(f"  {' '.join(pip_cmd)}")
                 result = subprocess.run(pip_cmd, capture_output=True, text=True)
@@ -269,8 +286,8 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 if not wheel_url:
                     raise RuntimeError(f"No wheel for {package}")
                 log(f"  {package} from {wheel_url}")
-                result = subprocess.run(["uv", "pip", "install", "--python", str(python_path), "--no-deps", wheel_url],
-                                       capture_output=True, text=True)
+                cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", wheel_url]
+                result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode != 0:
                     raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
             else:
@@ -311,9 +328,9 @@ def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[
     log(f"\nInstalling to {sys.executable}")
     if dry_run: return
 
-    use_uv = shutil.which("uv")
+    uv_path = _find_uv()
     if pip_packages:
-        cmd = ["uv", "pip", "install", "--python", sys.executable] + pip_packages if use_uv else [sys.executable, "-m", "pip", "install"] + pip_packages
+        cmd = [uv_path, "pip", "install", "--python", sys.executable] + pip_packages
         subprocess.run(cmd, capture_output=True)
 
     if cfg.cuda_packages:
@@ -325,7 +342,7 @@ def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[
         for package in cfg.cuda_packages:
             wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
             if wheel_url:
-                cmd = ["uv", "pip", "install", "--python", sys.executable, "--no-deps", wheel_url] if use_uv else [sys.executable, "-m", "pip", "install", "--no-deps", wheel_url]
+                cmd = [uv_path, "pip", "install", "--python", sys.executable, "--no-deps", wheel_url]
                 subprocess.run(cmd, capture_output=True)
 
 
