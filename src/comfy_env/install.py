@@ -302,13 +302,28 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     # Move env from build dir to final location
     pixi_default = build_dir / ".pixi" / "envs" / "default"
     if pixi_default.exists():
-        if env_path.exists():
-            shutil.rmtree(env_path)
-        shutil.move(str(pixi_default), str(env_path))
-        shutil.rmtree(build_dir, ignore_errors=True)
-        # Clean up any old .pixi in node_dir
+        if sys.platform == "win32":
+            # Leave env at short build path (LoadLibrary ignores LongPathsEnabled)
+            # and junction from the long env_path to it
+            if env_path.is_junction():
+                env_path.rmdir()
+            elif env_path.exists():
+                shutil.rmtree(env_path)
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            final_short = build_dir / "env"
+            if final_short.exists():
+                shutil.rmtree(final_short)
+            shutil.move(str(pixi_default), str(final_short))
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
+                          capture_output=True)
+            log(f"Env: {env_path} -> {final_short}")
+        else:
+            if env_path.exists():
+                shutil.rmtree(env_path)
+            shutil.move(str(pixi_default), str(env_path))
+            shutil.rmtree(build_dir, ignore_errors=True)
+            log(f"Env: {env_path}")
         shutil.rmtree(node_dir / ".pixi", ignore_errors=True)
-        log(f"Env: {env_path}")
 
 
 def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
