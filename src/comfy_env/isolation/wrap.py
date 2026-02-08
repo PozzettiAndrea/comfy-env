@@ -204,6 +204,9 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     try:
         for item in node_dir.iterdir():
             if item.name.startswith("_env_") and item.is_dir():
+                # On Windows, resolve junctions to keep paths under MAX_PATH for LoadLibrary
+                if sys.platform == "win32" and item.is_junction():
+                    return item.resolve()
                 return item
     except OSError:
         pass
