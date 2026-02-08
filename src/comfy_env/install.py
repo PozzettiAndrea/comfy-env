@@ -258,8 +258,8 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:
                     pin_version = pin_torch_version
                 pkg_spec = f"{package}=={pin_version}.*"
-                pip_cmd = [str(python_path), "-m", "pip", "install",
-                          "--extra-index-url", pytorch_index, pkg_spec]
+                pip_cmd = ["uv", "pip", "install", "--python", str(python_path),
+                          "--extra-index-url", pytorch_index, "--index-strategy", "unsafe-best-match", pkg_spec]
                 log(f"  {' '.join(pip_cmd)}")
                 result = subprocess.run(pip_cmd, capture_output=True, text=True)
                 if result.returncode != 0:
@@ -269,7 +269,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 if not wheel_url:
                     raise RuntimeError(f"No wheel for {package}")
                 log(f"  {package} from {wheel_url}")
-                result = subprocess.run([str(python_path), "-m", "pip", "install", "--no-deps", wheel_url],
+                result = subprocess.run(["uv", "pip", "install", "--python", str(python_path), "--no-deps", wheel_url],
                                        capture_output=True, text=True)
                 if result.returncode != 0:
                     raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")

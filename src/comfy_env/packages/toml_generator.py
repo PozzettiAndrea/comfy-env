@@ -82,6 +82,10 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     dependencies.setdefault("python", f"{py_version}.*")
     dependencies.setdefault("pip", "*")
 
+    # Always require modern setuptools (fixes conda-forge Python version string parsing)
+    pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
+    pypi_deps.setdefault("setuptools", ">=75.0")
+
     # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
     if sys.platform == "darwin":
         pypi_deps = pixi_data.get("pypi-dependencies", {})
@@ -101,6 +105,7 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
             log("No GPU detected - using PyTorch CPU index")
         extra_urls = pypi_options.setdefault("extra-index-urls", [])
         if pytorch_index not in extra_urls: extra_urls.append(pytorch_index)
+        pypi_options["index-strategy"] = "unsafe-best-match"
 
     return pixi_data
 
