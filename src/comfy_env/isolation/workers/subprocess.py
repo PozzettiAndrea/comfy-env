@@ -1284,9 +1284,7 @@ class SubprocessWorker(Worker):
         self._socket_addr: Optional[str] = None
         self._transport: Optional[SocketTransport] = None
 
-        # Stderr buffer for crash diagnostics
-        self._stderr_buffer: List[str] = []
-        self._stderr_lock = threading.Lock()
+        # Stderr inherits from parent (no pipe — avoids tqdm/\r deadlock)
 
         # Write worker script to temp file
         self._worker_script = self._temp_dir / "persistent_worker.py"
@@ -1453,53 +1451,23 @@ class SubprocessWorker(Worker):
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,  # DEVNULL to prevent pipe buffer deadlock
-            stderr=subprocess.PIPE,  # Capture stderr separately for crash diagnostics
+            stdout=subprocess.DEVNULL,
+            stderr=None,  # Inherit parent stderr (avoids pipe deadlock with tqdm)
             cwd=str(self.working_dir),
             env=launch_env,
         )
-
-        # Clear stderr buffer for new process
-        with self._stderr_lock:
-            self._stderr_buffer.clear()
-
-        # Start stderr capture thread (buffer for crash diagnostics)
-        # Read raw chunks instead of lines — tqdm uses \r without \n,
-        # which blocks line-based iteration and deadlocks the pipe.
-        def capture_stderr():
-            try:
-                while True:
-                    chunk = self._process.stderr.read(4096)
-                    if not chunk:
-                        break
-                    text = chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else chunk
-                    sys.stderr.write(text)
-                    sys.stderr.flush()
-                    with self._stderr_lock:
-                        for line in text.splitlines():
-                            self._stderr_buffer.append(line)
-                        if len(self._stderr_buffer) > 50:
-                            self._stderr_buffer[:] = self._stderr_buffer[-50:]
-            except:
-                pass
-        self._stderr_thread = threading.Thread(target=capture_stderr, daemon=True)
-        self._stderr_thread.start()
 
         # Accept connection from worker with timeout
         self._server_socket.settimeout(60)
         try:
             client_sock, _ = self._server_socket.accept()
         except socket.timeout:
-            # Collect stderr from buffer
-            time.sleep(0.2)  # Give stderr thread time to capture
-            with self._stderr_lock:
-                stderr = "\n".join(self._stderr_buffer) if self._stderr_buffer else "(no stderr captured)"
             try:
                 self._process.kill()
                 self._process.wait(timeout=5)
             except:
                 pass
-            raise RuntimeError(f"{self.name}: Worker failed to connect (timeout).\nStderr:\n{stderr}")
+            raise RuntimeError(f"{self.name}: Worker failed to connect (timeout). Check stderr output above.")
         finally:
             self._server_socket.settimeout(None)
 
@@ -1557,27 +1525,20 @@ class SubprocessWorker(Worker):
         except ConnectionError as e:
             # Socket closed - check if worker process died
             self._shutdown = True
-            time.sleep(0.2)  # Give process time to fully exit and stderr to flush
             exit_code = None
             if self._process:
                 exit_code = self._process.poll()
 
-            # Get captured stderr
-            with self._stderr_lock:
-                stderr_output = "\n".join(self._stderr_buffer) if self._stderr_buffer else "(no stderr captured)"
-
             if exit_code is not None:
                 raise RuntimeError(
                     f"{self.name}: Worker process died with exit code {exit_code}. "
-                    f"This usually indicates a crash in native code (CGAL, pymeshlab, etc.).\n"
-                    f"Stderr:\n{stderr_output}"
+                    f"This usually indicates a crash in native code (CGAL, pymeshlab, etc.). "
+                    f"Check stderr output above."
                 ) from e
             else:
-                # Process still alive but socket closed - something weird
                 raise RuntimeError(
                     f"{self.name}: Socket closed but worker process still running. "
-                    f"This may indicate a protocol error or worker bug.\n"
-                    f"Stderr:\n{stderr_output}"
+                    f"This may indicate a protocol error or worker bug."
                 ) from e
 
         if response is None:
