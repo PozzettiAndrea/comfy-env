@@ -195,7 +195,14 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         env_path = get_local_env_path(main_node_dir, config_path)
 
     # Build in a temp dir, then move to final location
-    build_dir = env_path.parent / f"{env_path.name}_build"
+    if sys.platform == "win32":
+        import hashlib
+        short_hash = hashlib.sha256(str(env_path).encode()).hexdigest()[:8]
+        short_base = Path("C:/ce")
+        short_base.mkdir(parents=True, exist_ok=True)
+        build_dir = short_base / short_hash
+    else:
+        build_dir = env_path.parent / f"{env_path.name}_build"
     log(f"[comfy-env] build_dir={build_dir}")
     log(f"[comfy-env] env_path={env_path}")
 
