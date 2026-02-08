@@ -9,6 +9,37 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, List, Optional
 
+_PIXI_MANIFEST_XML = """\
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1"
+    xmlns:asmv3="urn:schemas-microsoft-com:asm.v3" manifestVersion="1.0">
+    <asmv3:application>
+        <asmv3:windowsSettings>
+            <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+        </asmv3:windowsSettings>
+    </asmv3:application>
+</assembly>
+"""
+
+
+def _ensure_longpath_manifest(pixi_path: Path, log: Callable[[str], None] = print) -> None:
+    """Write an external Windows manifest enabling long path support next to pixi.exe."""
+    if sys.platform != "win32":
+        return
+    manifest_path = pixi_path.parent / (pixi_path.name + ".manifest")
+    if manifest_path.exists():
+        return
+    try:
+        manifest_path.write_text(_PIXI_MANIFEST_XML, encoding="utf-8")
+        log(f"[comfy-env] Wrote long path manifest: {manifest_path}")
+    except OSError:
+        log(
+            f"[comfy-env] ERROR: Cannot write {manifest_path} — "
+            f"pixi will hit the 260-char path limit on Windows. "
+            f"Move pixi to a user-writable directory or fix permissions."
+        )
+
+
 PIXI_URLS = {
     ("Linux", "x86_64"): "https://github.com/prefix-dev/pixi/releases/latest/download/pixi-x86_64-unknown-linux-musl",
     ("Linux", "aarch64"): "https://github.com/prefix-dev/pixi/releases/latest/download/pixi-aarch64-unknown-linux-musl",
@@ -49,7 +80,9 @@ def get_pixi_path() -> Optional[Path]:
 
 def ensure_pixi(install_dir: Optional[Path] = None, log: Callable[[str], None] = print) -> Path:
     """Ensure pixi is installed, downloading if necessary."""
-    if existing := get_pixi_path(): return existing
+    if existing := get_pixi_path():
+        _ensure_longpath_manifest(existing, log)
+        return existing
 
     log("Pixi not found, downloading...")
     install_dir = install_dir or Path.home() / ".local/bin"
@@ -69,7 +102,9 @@ def ensure_pixi(install_dir: Optional[Path] = None, log: Callable[[str], None] =
         result = subprocess.run(["curl", "-fsSL", "-o", str(pixi_path), PIXI_URLS[(system, machine)]], capture_output=True, text=True)
         if result.returncode != 0: raise RuntimeError(f"Failed to download pixi") from e
 
-    if system != "Windows":
+    if system == "Windows":
+        _ensure_longpath_manifest(pixi_path, log)
+    else:
         pixi_path.chmod(pixi_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     log(f"Installed pixi: {pixi_path}")
