@@ -48,10 +48,16 @@ def _find_uv() -> str:
     """Find the uv binary installed alongside comfy-env."""
     import shutil
     exe_dir = Path(sys.executable).parent
-    scripts_dir = exe_dir / "Scripts" if sys.platform == "win32" else exe_dir
-    candidate = scripts_dir / ("uv.exe" if sys.platform == "win32" else "uv")
+    uv_name = "uv.exe" if sys.platform == "win32" else "uv"
+    # Check next to python executable (venvs on Windows, bin/ on Unix)
+    candidate = exe_dir / uv_name
     if candidate.exists():
         return str(candidate)
+    # Check Scripts subdirectory (embedded Python on Windows)
+    if sys.platform == "win32":
+        candidate = exe_dir / "Scripts" / uv_name
+        if candidate.exists():
+            return str(candidate)
     # Fallback to PATH
     uv = shutil.which("uv")
     if uv:
