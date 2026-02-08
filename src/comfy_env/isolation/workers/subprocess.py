@@ -1464,19 +1464,22 @@ class SubprocessWorker(Worker):
             self._stderr_buffer.clear()
 
         # Start stderr capture thread (buffer for crash diagnostics)
+        # Read raw chunks instead of lines — tqdm uses \r without \n,
+        # which blocks line-based iteration and deadlocks the pipe.
         def capture_stderr():
             try:
-                for line in self._process.stderr:
-                    if isinstance(line, bytes):
-                        line = line.decode('utf-8', errors='replace')
-                    # Print to terminal AND buffer for crash reporting
-                    sys.stderr.write(f"  [stderr] {line}")
+                while True:
+                    chunk = self._process.stderr.read(4096)
+                    if not chunk:
+                        break
+                    text = chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else chunk
+                    sys.stderr.write(text)
                     sys.stderr.flush()
                     with self._stderr_lock:
-                        self._stderr_buffer.append(line.rstrip())
-                        # Keep last 50 lines
+                        for line in text.splitlines():
+                            self._stderr_buffer.append(line)
                         if len(self._stderr_buffer) > 50:
-                            self._stderr_buffer.pop(0)
+                            self._stderr_buffer[:] = self._stderr_buffer[-50:]
             except:
                 pass
         self._stderr_thread = threading.Thread(target=capture_stderr, daemon=True)
