@@ -101,6 +101,11 @@ _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
 
+# Redirect stdout to stderr during import so that any print() calls
+# from imported code don't corrupt our base64 payload on stdout.
+_real_stdout = sys.stdout
+sys.stdout = sys.stderr
+
 if _debug:
     print(f"[meta-scan] importing {package_name} from {working_dir}", file=sys.stderr, flush=True)
 module = importlib.import_module(package_name)
@@ -133,6 +138,9 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
 display = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
 
 payload = {"nodes": nodes, "display": display}
+
+# Restore real stdout for the payload write
+sys.stdout = _real_stdout
 sys.stdout.buffer.write(base64.b64encode(pickle.dumps(payload)))
 '''
 
@@ -232,7 +240,7 @@ def fetch_metadata(
         return payload
 
     except Exception as e:
-        print(f"[comfy-env] Metadata scan error for {package_name}: {e}")
+        print(f"[comfy-env] Metadata scan error for {package_name}: {e}", file=sys.stderr, flush=True)
         return {"nodes": {}, "display": {}}
     finally:
         if script_file and os.path.exists(script_file):
