@@ -12,6 +12,19 @@ from .environment.cache import get_root_env_path, get_local_env_path
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
 
+def _rmtree(path) -> None:
+    """shutil.rmtree that handles read-only files and long paths on Windows."""
+    import shutil
+    if sys.platform == "win32":
+        import stat
+        def _on_error(func, fpath, _exc_info):
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        shutil.rmtree("\\\\?\\" + str(Path(path).resolve()), onerror=_on_error)
+    else:
+        shutil.rmtree(path)
+
+
 def _is_comfy_env_enabled() -> bool:
     return os.environ.get(USE_COMFY_ENV_VAR, "1").lower() not in ("0", "false", "no", "off")
 
@@ -226,7 +239,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     log(f"[comfy-env] env_path={env_path}")
 
     if build_dir.exists():
-        shutil.rmtree(build_dir)
+        _rmtree(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
 
     pixi_path = ensure_pixi(log=log)
@@ -306,22 +319,24 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             if env_path.is_junction():
                 env_path.rmdir()
             elif env_path.exists():
-                shutil.rmtree(env_path)
+                _rmtree(env_path)
             env_path.parent.mkdir(parents=True, exist_ok=True)
             final_short = build_dir / "env"
             if final_short.exists():
-                shutil.rmtree(final_short)
+                _rmtree(final_short)
             shutil.move(str(pixi_default), str(final_short))
             subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
                           capture_output=True)
             log(f"Env: {env_path} -> {final_short}")
         else:
             if env_path.exists():
-                shutil.rmtree(env_path)
+                _rmtree(env_path)
             shutil.move(str(pixi_default), str(env_path))
-            shutil.rmtree(build_dir, ignore_errors=True)
+            try: _rmtree(build_dir)
+            except OSError: pass
             log(f"Env: {env_path}")
-        shutil.rmtree(node_dir / ".pixi", ignore_errors=True)
+        try: _rmtree(node_dir / ".pixi")
+        except OSError: pass
 
 
 def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
