@@ -13,14 +13,20 @@ USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
 
 def _rmtree(path) -> None:
-    """shutil.rmtree that handles read-only files and long paths on Windows."""
+    """rmtree that handles read-only files and long paths on Windows."""
     import shutil
     if sys.platform == "win32":
-        import stat
-        def _on_error(func, fpath, _exc_info):
-            os.chmod(fpath, stat.S_IWRITE)
-            func(fpath)
-        shutil.rmtree("\\\\?\\" + str(Path(path).resolve()), onerror=_on_error)
+        import subprocess, tempfile
+        target = str(Path(path).resolve())
+        empty = tempfile.mkdtemp()
+        try:
+            subprocess.run(
+                ["robocopy", empty, target, "/MIR", "/W:0", "/R:0"],
+                capture_output=True,
+            )
+            shutil.rmtree(target, ignore_errors=True)
+        finally:
+            shutil.rmtree(empty, ignore_errors=True)
     else:
         shutil.rmtree(path)
 
