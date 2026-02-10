@@ -236,8 +236,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
     # Build in a temp dir, then move to final location
     if sys.platform == "win32":
-        drive = env_path.drive or "C:"
-        short_base = Path(f"{drive}/ce")
+        short_base = Path("C:/ce")
         short_base.mkdir(parents=True, exist_ok=True)
         build_dir = short_base / env_path.name
     else:
@@ -264,15 +263,14 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
     # Fast path: env already built
     if sys.platform == "win32" and done_marker.exists():
-        # On Windows, env stays at build_dir/env — just re-create the junction
-        log("[comfy-env] Env already built, reusing")
+        log(f"[comfy-env] Env already built, reusing (done_marker={done_marker})")
+        log(f"[comfy-env] env={build_dir / 'env'}")
         _create_junction()
         try: _rmtree(node_dir / ".pixi")
         except OSError: pass
         return
     elif sys.platform != "win32" and env_path.exists():
-        # On Linux/Mac, env was moved to env_path — if it's there, we're done
-        log("[comfy-env] Env already exists, skipping build")
+        log(f"[comfy-env] Env already exists, skipping build (env_path={env_path})")
         try: _rmtree(node_dir / ".pixi")
         except OSError: pass
         return
@@ -303,6 +301,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     # We own the build
     try:
         pixi_path = ensure_pixi(log=log)
+        log(f"[comfy-env] pixi={pixi_path}")
 
         cuda_version = torch_version = None
         if cfg.has_cuda and sys.platform != "darwin":
@@ -330,6 +329,8 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             py_version = result.stdout.strip() if result.returncode == 0 else f"{sys.version_info.major}.{sys.version_info.minor}"
 
             uv_path = _find_uv()
+            log(f"[comfy-env] uv={uv_path}")
+            log(f"[comfy-env] python={python_path} (py{py_version})")
 
             pytorch_packages = {"torch", "torchvision", "torchaudio"}
             torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
