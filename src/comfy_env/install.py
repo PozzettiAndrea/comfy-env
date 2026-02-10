@@ -211,7 +211,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
     from .detection import get_recommended_cuda_version
-    import shutil, subprocess, tempfile
+    import shutil, subprocess, tempfile, time
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
     pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})
@@ -245,104 +245,162 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     log(f"[comfy-env] build_dir={build_dir}")
     log(f"[comfy-env] env_path={env_path}")
 
-    if build_dir.exists():
-        _rmtree(build_dir)
-    build_dir.mkdir(parents=True, exist_ok=True)
+    done_marker = build_dir / ".done"
+    lock_dir = build_dir / ".building"
 
-    pixi_path = ensure_pixi(log=log)
+    def _create_junction():
+        """Create junction from env_path to the built env (Windows only)."""
+        final_short = build_dir / "env"
+        if not final_short.exists():
+            return
+        if env_path.is_junction():
+            env_path.rmdir()
+        elif env_path.exists():
+            _rmtree(env_path)
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
+                      capture_output=True)
+        log(f"Env: {env_path} -> {final_short}")
 
-    cuda_version = torch_version = None
-    if cfg.has_cuda and sys.platform != "darwin":
-        cuda_version = get_recommended_cuda_version()
-        if cuda_version:
-            torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
-
-    write_pixi_toml(cfg, build_dir, log)
-    log("Running pixi install...")
-    pixi_env = dict(os.environ)
-    pixi_env["UV_PYTHON_INSTALL_DIR"] = str(build_dir / "_no_python")
-    pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
-    result = subprocess.run([str(pixi_path), "install"], cwd=build_dir, capture_output=True, text=True, env=pixi_env)
-    if result.returncode != 0:
-        raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
-
-    if cfg.cuda_packages and sys.platform != "darwin":
-        pixi_default = build_dir / ".pixi" / "envs" / "default"
-        python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
-        if not python_path.exists():
-            raise RuntimeError(f"No Python in pixi env: {python_path}")
-
-        result = subprocess.run([str(python_path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                               capture_output=True, text=True)
-        py_version = result.stdout.strip() if result.returncode == 0 else f"{sys.version_info.major}.{sys.version_info.minor}"
-
-        uv_path = _find_uv()
-
-        pytorch_packages = {"torch", "torchvision", "torchaudio"}
-        torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
-
-        if cuda_version:
-            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
-            pin_torch_version = torch_version
-            log(f"Installing CUDA packages from {pytorch_index}")
-        else:
-            pytorch_index = "https://download.pytorch.org/whl/cpu"
-            pin_torch_version = "2.8"
-            log(f"Installing CPU packages from {pytorch_index}")
-
-        for package in cfg.cuda_packages:
-            if package in pytorch_packages:
-                if package == "torch":
-                    pin_version = pin_torch_version
-                elif package == "torchvision":
-                    pin_version = torchvision_map.get(pin_torch_version, "0.23")
-                else:
-                    pin_version = pin_torch_version
-                pkg_spec = f"{package}=={pin_version}.*"
-                pip_cmd = [uv_path, "pip", "install", "--python", str(python_path),
-                          "--extra-index-url", pytorch_index, "--index-strategy", "unsafe-best-match", pkg_spec]
-                log(f"  {' '.join(pip_cmd)}")
-                result = subprocess.run(pip_cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
-            elif cuda_version:
-                wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
-                if not wheel_url:
-                    raise RuntimeError(f"No wheel for {package}")
-                log(f"  {package} from {wheel_url}")
-                cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", wheel_url]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
-            else:
-                log(f"  {package} (skipped - GPU only)")
-
-    # Move env from build dir to final location
-    pixi_default = build_dir / ".pixi" / "envs" / "default"
-    if pixi_default.exists():
-        if sys.platform == "win32":
-            # Leave env at short build path (LoadLibrary ignores LongPathsEnabled)
-            # and junction from the long env_path to it
-            if env_path.is_junction():
-                env_path.rmdir()
-            elif env_path.exists():
-                _rmtree(env_path)
-            env_path.parent.mkdir(parents=True, exist_ok=True)
-            final_short = build_dir / "env"
-            if final_short.exists():
-                _rmtree(final_short)
-            shutil.move(str(pixi_default), str(final_short))
-            subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
-                          capture_output=True)
-            log(f"Env: {env_path} -> {final_short}")
-        else:
-            if env_path.exists():
-                _rmtree(env_path)
-            shutil.move(str(pixi_default), str(env_path))
-            try: _rmtree(build_dir)
-            except OSError: pass
-            log(f"Env: {env_path}")
+    # Fast path: env already built
+    if sys.platform == "win32" and done_marker.exists():
+        # On Windows, env stays at build_dir/env — just re-create the junction
+        log("[comfy-env] Env already built, reusing")
+        _create_junction()
         try: _rmtree(node_dir / ".pixi")
+        except OSError: pass
+        return
+    elif sys.platform != "win32" and env_path.exists():
+        # On Linux/Mac, env was moved to env_path — if it's there, we're done
+        log("[comfy-env] Env already exists, skipping build")
+        try: _rmtree(node_dir / ".pixi")
+        except OSError: pass
+        return
+
+    # Try to acquire build lock (mkdir is atomic)
+    try:
+        build_dir.mkdir(parents=True, exist_ok=True)
+        lock_dir.mkdir(exist_ok=False)
+    except FileExistsError:
+        # Another process is building — wait for completion
+        log("[comfy-env] Another build in progress, waiting...")
+        wait_for = done_marker if sys.platform == "win32" else env_path
+        for _ in range(600):  # 10 min timeout
+            if wait_for.exists():
+                log("[comfy-env] Build completed by other process, reusing")
+                if sys.platform == "win32":
+                    _create_junction()
+                try: _rmtree(node_dir / ".pixi")
+                except OSError: pass
+                return
+            time.sleep(1)
+        # Stale lock from crashed build — nuke and take over
+        log("[comfy-env] Stale lock detected, rebuilding...")
+        _rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        lock_dir.mkdir(exist_ok=True)
+
+    # We own the build
+    try:
+        pixi_path = ensure_pixi(log=log)
+
+        cuda_version = torch_version = None
+        if cfg.has_cuda and sys.platform != "darwin":
+            cuda_version = get_recommended_cuda_version()
+            if cuda_version:
+                torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+
+        write_pixi_toml(cfg, build_dir, log)
+        log("Running pixi install...")
+        pixi_env = dict(os.environ)
+        pixi_env["UV_PYTHON_INSTALL_DIR"] = str(build_dir / "_no_python")
+        pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
+        result = subprocess.run([str(pixi_path), "install"], cwd=build_dir, capture_output=True, text=True, env=pixi_env)
+        if result.returncode != 0:
+            raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+
+        if cfg.cuda_packages and sys.platform != "darwin":
+            pixi_default = build_dir / ".pixi" / "envs" / "default"
+            python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
+            if not python_path.exists():
+                raise RuntimeError(f"No Python in pixi env: {python_path}")
+
+            result = subprocess.run([str(python_path), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+                                   capture_output=True, text=True)
+            py_version = result.stdout.strip() if result.returncode == 0 else f"{sys.version_info.major}.{sys.version_info.minor}"
+
+            uv_path = _find_uv()
+
+            pytorch_packages = {"torch", "torchvision", "torchaudio"}
+            torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
+
+            if cuda_version:
+                pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
+                pin_torch_version = torch_version
+                log(f"Installing CUDA packages from {pytorch_index}")
+            else:
+                pytorch_index = "https://download.pytorch.org/whl/cpu"
+                pin_torch_version = "2.8"
+                log(f"Installing CPU packages from {pytorch_index}")
+
+            for package in cfg.cuda_packages:
+                if package in pytorch_packages:
+                    if package == "torch":
+                        pin_version = pin_torch_version
+                    elif package == "torchvision":
+                        pin_version = torchvision_map.get(pin_torch_version, "0.23")
+                    else:
+                        pin_version = pin_torch_version
+                    pkg_spec = f"{package}=={pin_version}.*"
+                    pip_cmd = [uv_path, "pip", "install", "--python", str(python_path),
+                              "--extra-index-url", pytorch_index, "--index-strategy", "unsafe-best-match", pkg_spec]
+                    log(f"  {' '.join(pip_cmd)}")
+                    result = subprocess.run(pip_cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+                elif cuda_version:
+                    wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
+                    if not wheel_url:
+                        raise RuntimeError(f"No wheel for {package}")
+                    log(f"  {package} from {wheel_url}")
+                    cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", wheel_url]
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+                else:
+                    log(f"  {package} (skipped - GPU only)")
+
+        # Move env from build dir to final location
+        pixi_default = build_dir / ".pixi" / "envs" / "default"
+        if pixi_default.exists():
+            if sys.platform == "win32":
+                # Leave env at short build path (LoadLibrary ignores LongPathsEnabled)
+                # and junction from the long env_path to it
+                if env_path.is_junction():
+                    env_path.rmdir()
+                elif env_path.exists():
+                    _rmtree(env_path)
+                env_path.parent.mkdir(parents=True, exist_ok=True)
+                final_short = build_dir / "env"
+                if final_short.exists():
+                    _rmtree(final_short)
+                shutil.move(str(pixi_default), str(final_short))
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
+                              capture_output=True)
+                log(f"Env: {env_path} -> {final_short}")
+            else:
+                if env_path.exists():
+                    _rmtree(env_path)
+                shutil.move(str(pixi_default), str(env_path))
+                try: _rmtree(build_dir)
+                except OSError: pass
+                log(f"Env: {env_path}")
+            try: _rmtree(node_dir / ".pixi")
+            except OSError: pass
+
+        done_marker.touch()
+    finally:
+        try: lock_dir.rmdir()
         except OSError: pass
 
 
