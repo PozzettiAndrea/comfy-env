@@ -66,7 +66,16 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     workspace.setdefault("name", node_dir.name)
     workspace.setdefault("version", "0.1.0")
     workspace.setdefault("channels", ["conda-forge"])
-    workspace.setdefault("platforms", [get_pixi_platform()])
+    current_platform = get_pixi_platform()
+    workspace.setdefault("platforms", [current_platform])
+
+    # Strip target sections for other platforms (pixi errors on unmatched targets)
+    if "target" in pixi_data:
+        non_matching = [k for k in pixi_data["target"] if k != current_platform]
+        for k in non_matching:
+            del pixi_data["target"][k]
+        if not pixi_data["target"]:
+            del pixi_data["target"]
 
     # System requirements
     if sys.platform.startswith("linux") or cuda_version:
