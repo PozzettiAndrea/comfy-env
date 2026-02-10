@@ -299,8 +299,26 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # primitives pass through
-    return obj
+    # primitives pass through (str, int, float, bool, None)
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Fallback: pickle any remaining object to shared memory
+    import pickle
+    try:
+        obj_bytes = pickle.dumps(obj)
+        block = shm.SharedMemory(create=True, size=len(obj_bytes))
+        block.buf[:len(obj_bytes)] = obj_bytes
+        registry.append(block)
+        result = {
+            "__shm_pickle__": True,
+            "name": block.name,
+            "size": len(obj_bytes),
+        }
+        visited[obj_id] = result
+        return result
+    except Exception:
+        return obj
 
 
 def _deserialize_tensor_ref(data):
@@ -382,6 +400,16 @@ def _from_shm(obj, unlink=True):
         if unlink:
             block.unlink()
         return pickle.loads(mesh_bytes)
+
+    # generic pickled object (VideoFromFile, etc.)
+    if "__shm_pickle__" in obj:
+        import pickle
+        block = shm.SharedMemory(name=obj["name"])
+        obj_bytes = bytes(block.buf[:obj["size"]])
+        block.close()
+        if unlink:
+            block.unlink()
+        return pickle.loads(obj_bytes)
 
     # regular dict - recurse
     return {k: _from_shm(v, unlink) for k, v in obj.items()}
@@ -865,6 +893,20 @@ def _from_shm(obj, _depth=0, _key="root"):
         block.close()
         # Don't unlink - parent will clean up
         return pickle.loads(mesh_bytes)
+
+    # generic pickled object (VideoFromFile, etc.)
+    if "__shm_pickle__" in obj:
+        import pickle
+        wlog(f"[_from_shm] {_key}: pickled obj shm '{obj['name']}' size={obj['size']}")
+        block = shm.SharedMemory(name=obj["name"])
+        try:
+            from multiprocessing.resource_tracker import unregister
+            unregister(block._name, "shared_memory")
+        except Exception:
+            pass
+        obj_bytes = bytes(block.buf[:obj["size"]])
+        block.close()
+        return pickle.loads(obj_bytes)
 
     # Dict - recurse with key names for debugging
     if _depth == 0:
