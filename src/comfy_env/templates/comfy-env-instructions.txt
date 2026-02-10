@@ -1,0 +1,46 @@
+comfy-env Setup Instructions
+============================
+
+All dependencies go through pixi (conda + pip unified).
+GPU is auto-detected to select the right CUDA version.
+
+QUICK START
+-----------
+1. pip install comfy-env
+2. comfy-env init
+3. Edit comfy-env.toml
+4. comfy-env install
+
+CONFIG FORMAT
+-------------
+[cuda]
+packages = ["nvdiffrast", "pytorch3d"]
+
+[conda]
+channels = ["conda-forge"]
+packages = ["mesalib", "ffmpeg"]
+
+[packages]
+requirements = ["numpy", "trimesh"]
+
+[node_reqs]
+SomeNode = "owner/repo"
+
+USAGE IN __init__.py
+--------------------
+from comfy_env import install
+install()  # That's it!
+
+For isolated nodes:
+from comfy_env import wrap_isolated_nodes
+NODE_CLASS_MAPPINGS.update(
+    wrap_isolated_nodes(isolated_nodes, Path(__file__).parent / "nodes/isolated")
+)
+
+CLI COMMANDS
+------------
+comfy-env init           Create comfy-env.toml template
+comfy-env install        Install all dependencies
+comfy-env info           Show detected GPU and CUDA version
+
+For more: https://github.com/PozzettiAndrea/comfy-env
