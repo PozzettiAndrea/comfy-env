@@ -236,7 +236,8 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
     # Build in a temp dir, then move to final location
     if sys.platform == "win32":
-        short_base = Path("C:/ce")
+        drive = env_path.drive or "C:"
+        short_base = Path(f"{drive}/ce")
         short_base.mkdir(parents=True, exist_ok=True)
         build_dir = short_base / env_path.name
     else:
