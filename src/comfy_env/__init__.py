@@ -108,6 +108,8 @@ from .isolation import (
     SubprocessWorker,
     # Tensor utilities
     TensorKeeper,
+    release_tensor,
+    release_tensors_recursive,
 )
 
 
@@ -165,6 +167,8 @@ __all__ = [
     "WorkerError",
     "SubprocessWorker",
     "TensorKeeper",
+    "release_tensor",
+    "release_tensors_recursive",
 ]
 
 
