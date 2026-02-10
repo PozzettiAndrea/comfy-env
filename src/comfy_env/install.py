@@ -210,7 +210,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.pixi import ensure_pixi
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
-    from .detection import get_recommended_cuda_version
+    from .detection import get_recommended_cuda_version, get_gpu_summary
     import shutil, subprocess, tempfile, time
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
@@ -247,13 +247,27 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     done_marker = build_dir / ".done"
     lock_dir = build_dir / ".building"
 
+    def _is_link_or_junction(p):
+        """Check if path is a symlink or NTFS junction (works on Python 3.10+)."""
+        if p.is_symlink():
+            return True
+        if sys.platform == "win32":
+            import stat
+            try:
+                return bool(os.lstat(str(p)).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            except (OSError, AttributeError):
+                pass
+        return False
+
     def _link_env():
         """Link env_path -> build_dir/env (junction on Windows, symlink elsewhere)."""
         target = build_dir / "env"
         if not target.exists():
             return
-        if env_path.is_symlink() or env_path.is_junction():
-            env_path.unlink(missing_ok=True)
+        if _is_link_or_junction(env_path):
+            # unlink for symlinks, rmdir for junctions — never _rmtree (would follow the link)
+            try: env_path.unlink()
+            except OSError: env_path.rmdir()
         elif env_path.exists():
             _rmtree(env_path)
         env_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,9 +315,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         cuda_version = torch_version = None
         if cfg.has_cuda and sys.platform != "darwin":
+            log(f"[comfy-env] GPU: {get_gpu_summary()}")
             cuda_version = get_recommended_cuda_version()
             if cuda_version:
                 torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+                log(f"[comfy-env] Selected: CUDA {cuda_version} + PyTorch {torch_version}")
+            else:
+                log("[comfy-env] No GPU detected, using CPU")
 
         write_pixi_toml(cfg, build_dir, log)
         log("Running pixi install...")

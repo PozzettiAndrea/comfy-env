@@ -832,10 +832,10 @@ def _from_shm(obj, _depth=0, _key="root"):
             unregister(block._name, "shared_memory")
         except Exception:
             pass
-        wlog(f"[_from_shm] {_key}: copying {nbytes/1e6:.1f} MB from shm...")
-        arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf).copy()
-        wlog(f"[_from_shm] {_key}: copy done, arr.shape={arr.shape}")
-        block.close()
+        wlog(f"[_from_shm] {_key}: mapping {nbytes/1e6:.1f} MB from shm (zero-copy)")
+        arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf)
+        _input_shm_blocks.append(block)  # keep alive — parent cleans up after we respond
+        wlog(f"[_from_shm] {_key}: mapped, arr.shape={arr.shape}")
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
         # Convert back to tensor if it was originally a tensor
@@ -898,6 +898,8 @@ class ShmKeeper:
                 _cleanup_shm(old_blocks)
 
 _shm_keeper = ShmKeeper()
+
+_input_shm_blocks = []  # Keep parent->worker shm blocks alive during request processing
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -1176,6 +1178,14 @@ def main():
             # Health check - respond immediately
             transport.send({"status": "pong"})
             continue
+
+        # Release input shm blocks from previous request
+        for _old_block in _input_shm_blocks:
+            try:
+                _old_block.close()
+            except Exception:
+                pass
+        _input_shm_blocks.clear()
 
         shm_registry = []
         try:
