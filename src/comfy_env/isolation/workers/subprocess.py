@@ -498,6 +498,15 @@ from types import SimpleNamespace
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
+# Also dump to a file so we can see segfaults even if stderr is lost
+import tempfile as _fh_tempfile
+_faulthandler_log = os.path.join(_fh_tempfile.gettempdir(), "comfy_worker_faulthandler.log")
+try:
+    _fh_file = open(_faulthandler_log, "a")
+    faulthandler.enable(file=_fh_file, all_threads=True)
+except Exception:
+    pass
+
 # Debug logging (set COMFY_ENV_DEBUG=1 to enable)
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
@@ -783,20 +792,22 @@ def _deserialize_tensor_native(data):
     return tensor
 
 
-def _from_shm(obj):
+def _from_shm(obj, _depth=0, _key="root"):
     """Reconstruct from shared memory metadata. Does NOT unlink - caller handles that."""
     if _DEBUG and isinstance(obj, dict) and any(k in obj for k in ("__type__", "__shm_np__", "tensor_size")):
         print(f"[comfy-env] _from_shm got dict with keys: {list(obj.keys())[:5]}", file=sys.stderr, flush=True)
     if not isinstance(obj, dict):
         if isinstance(obj, list):
-            return [_from_shm(v) for v in obj]
+            return [_from_shm(v, _depth+1, f"{_key}[{i}]") for i, v in enumerate(obj)]
         return obj
 
     # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
     if obj.get("__type__") == "TensorRef":
+        wlog(f"[_from_shm] {_key}: TensorRef tensor_size={obj.get('tensor_size')}")
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZE TensorRef: tensor_size={obj.get('tensor_size')}", file=sys.stderr, flush=True)
         tensor = _deserialize_tensor_native(obj)
+        wlog(f"[_from_shm] {_key}: TensorRef deserialized shape={tensor.shape}")
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZED tensor shape: {tensor.shape}", file=sys.stderr, flush=True)
         # Convert back to numpy if it was originally numpy
@@ -806,16 +817,24 @@ def _from_shm(obj):
 
     # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
     if "__shm_np__" in obj:
+        shm_name = obj["__shm_np__"]
+        shape = tuple(obj["shape"])
+        dtype = obj["dtype"]
+        nbytes = np.prod(shape) * np.dtype(dtype).itemsize
+        wlog(f"[_from_shm] {_key}: opening shm '{shm_name}' shape={shape} dtype={dtype} ({nbytes/1e6:.1f} MB)")
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZE __shm_np__: shape={obj.get('shape')}, was_tensor={obj.get('__was_tensor__')}", file=sys.stderr, flush=True)
-        block = shm.SharedMemory(name=obj["__shm_np__"])
+        block = shm.SharedMemory(name=shm_name)
+        wlog(f"[_from_shm] {_key}: shm opened, block.size={block.size}")
         # Unregister from resource_tracker - parent owns these blocks and will clean them up
         try:
             from multiprocessing.resource_tracker import unregister
             unregister(block._name, "shared_memory")
         except Exception:
             pass
-        arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
+        wlog(f"[_from_shm] {_key}: copying {nbytes/1e6:.1f} MB from shm...")
+        arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf).copy()
+        wlog(f"[_from_shm] {_key}: copy done, arr.shape={arr.shape}")
         block.close()
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
@@ -823,7 +842,10 @@ def _from_shm(obj):
         if obj.get("__was_tensor__"):
             try:
                 import torch
-                return torch.from_numpy(arr)
+                wlog(f"[_from_shm] {_key}: converting to torch tensor")
+                result = torch.from_numpy(arr)
+                wlog(f"[_from_shm] {_key}: torch tensor ready shape={result.shape}")
+                return result
             except Exception:
                 pass
         return arr
@@ -831,6 +853,7 @@ def _from_shm(obj):
     # trimesh (pickled)
     if "__shm_trimesh__" in obj:
         import pickle
+        wlog(f"[_from_shm] {_key}: trimesh shm '{obj['name']}' size={obj['size']}")
         block = shm.SharedMemory(name=obj["name"])
         # Unregister from resource_tracker - parent owns these blocks
         try:
@@ -843,7 +866,10 @@ def _from_shm(obj):
         # Don't unlink - parent will clean up
         return pickle.loads(mesh_bytes)
 
-    return {k: _from_shm(v) for k, v in obj.items()}
+    # Dict - recurse with key names for debugging
+    if _depth == 0:
+        wlog(f"[_from_shm] top-level keys: {list(obj.keys())}")
+    return {k: _from_shm(v, _depth+1, k) for k, v in obj.items()}
 
 def _cleanup_shm(registry):
     for block in registry:

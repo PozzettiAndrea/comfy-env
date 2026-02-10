@@ -60,15 +60,9 @@ def get_root_env_path(node_dir: Path) -> Path:
 
 
 def get_local_env_path(main_node_dir: Path, config_path: Path) -> Path:
-    """Return path for _env_* folder directly in config_path.parent (subdirectory envs only)."""
-    plugin = sanitize_name(main_node_dir.name)
-    subfolder = sanitize_name(config_path.parent.name)
+    """Return path for _env_* symlink in config_path.parent. Hash-only name so identical configs share envs."""
     h = compute_config_hash(config_path)[:6]
-    if subfolder == plugin or config_path.parent == main_node_dir:
-        name = f"_env_{plugin}_{h}"
-    else:
-        name = f"_env_{plugin}_{subfolder}_{h}"
-    return config_path.parent / name
+    return config_path.parent / f"_env_{h}"
 
 
 def resolve_env_path(node_dir: Path) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:

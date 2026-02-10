@@ -234,43 +234,41 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         main_node_dir = _find_main_node_dir(node_dir)
         env_path = get_local_env_path(main_node_dir, config_path)
 
-    # Build in a temp dir, then move to final location
+    # Central build dir — shared across nodes with same config hash
     if sys.platform == "win32":
-        short_base = Path("C:/ce")
-        short_base.mkdir(parents=True, exist_ok=True)
-        build_dir = short_base / env_path.name
+        build_base = Path("C:/ce")
     else:
-        build_dir = env_path.parent / f"{env_path.name}_build"
+        build_base = Path.home() / ".ce"
+    build_base.mkdir(parents=True, exist_ok=True)
+    build_dir = build_base / env_path.name
     log(f"[comfy-env] build_dir={build_dir}")
     log(f"[comfy-env] env_path={env_path}")
 
     done_marker = build_dir / ".done"
     lock_dir = build_dir / ".building"
 
-    def _create_junction():
-        """Create junction from env_path to the built env (Windows only)."""
-        final_short = build_dir / "env"
-        if not final_short.exists():
+    def _link_env():
+        """Link env_path -> build_dir/env (junction on Windows, symlink elsewhere)."""
+        target = build_dir / "env"
+        if not target.exists():
             return
-        if env_path.is_junction():
-            env_path.rmdir()
+        if env_path.is_symlink() or env_path.is_junction():
+            env_path.unlink(missing_ok=True)
         elif env_path.exists():
             _rmtree(env_path)
         env_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
-                      capture_output=True)
-        log(f"Env: {env_path} -> {final_short}")
+        if sys.platform == "win32":
+            # Junctions don't require Developer Mode; symlinks do
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(target)],
+                          capture_output=True)
+        else:
+            env_path.symlink_to(target)
+        log(f"Env: {env_path} -> {target}")
 
     # Fast path: env already built
-    if sys.platform == "win32" and done_marker.exists():
-        log(f"[comfy-env] Env already built, reusing (done_marker={done_marker})")
-        log(f"[comfy-env] env={build_dir / 'env'}")
-        _create_junction()
-        try: _rmtree(node_dir / ".pixi")
-        except OSError: pass
-        return
-    elif sys.platform != "win32" and env_path.exists():
-        log(f"[comfy-env] Env already exists, skipping build (env_path={env_path})")
+    if done_marker.exists():
+        log(f"[comfy-env] Found existing env for {env_path.name}, skipping install ({build_dir / 'env'})")
+        _link_env()
         try: _rmtree(node_dir / ".pixi")
         except OSError: pass
         return
@@ -282,12 +280,10 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     except FileExistsError:
         # Another process is building — wait for completion
         log("[comfy-env] Another build in progress, waiting...")
-        wait_for = done_marker if sys.platform == "win32" else env_path
         for _ in range(600):  # 10 min timeout
-            if wait_for.exists():
+            if done_marker.exists():
                 log("[comfy-env] Build completed by other process, reusing")
-                if sys.platform == "win32":
-                    _create_junction()
+                _link_env()
                 try: _rmtree(node_dir / ".pixi")
                 except OSError: pass
                 return
@@ -371,31 +367,14 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:
                     log(f"  {package} (skipped - GPU only)")
 
-        # Move env from build dir to final location
+        # Move env to build_dir/env, then link env_path -> build_dir/env
         pixi_default = build_dir / ".pixi" / "envs" / "default"
         if pixi_default.exists():
-            if sys.platform == "win32":
-                # Leave env at short build path (LoadLibrary ignores LongPathsEnabled)
-                # and junction from the long env_path to it
-                if env_path.is_junction():
-                    env_path.rmdir()
-                elif env_path.exists():
-                    _rmtree(env_path)
-                env_path.parent.mkdir(parents=True, exist_ok=True)
-                final_short = build_dir / "env"
-                if final_short.exists():
-                    _rmtree(final_short)
-                shutil.move(str(pixi_default), str(final_short))
-                subprocess.run(["cmd", "/c", "mklink", "/J", str(env_path), str(final_short)],
-                              capture_output=True)
-                log(f"Env: {env_path} -> {final_short}")
-            else:
-                if env_path.exists():
-                    _rmtree(env_path)
-                shutil.move(str(pixi_default), str(env_path))
-                try: _rmtree(build_dir)
-                except OSError: pass
-                log(f"Env: {env_path}")
+            final_short = build_dir / "env"
+            if final_short.exists():
+                _rmtree(final_short)
+            shutil.move(str(pixi_default), str(final_short))
+            _link_env()
             try: _rmtree(node_dir / ".pixi")
             except OSError: pass
 
