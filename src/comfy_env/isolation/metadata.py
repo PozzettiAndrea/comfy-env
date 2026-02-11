@@ -2,7 +2,7 @@
 
 Spawns a short-lived subprocess in the isolation env's Python to import node modules
 and extract class metadata (INPUT_TYPES, RETURN_TYPES, etc.). The main process never
-imports isolation code — it builds proxy classes from the serialized metadata.
+imports isolation code -- it builds proxy classes from the serialized metadata.
 """
 
 import base64
@@ -299,7 +299,7 @@ def build_proxy_class(
         return _cached
     attrs["INPUT_TYPES"] = _input_types
 
-    # Proxy FUNCTION method — spawns SubprocessWorker for each call
+    # Proxy FUNCTION method -- spawns SubprocessWorker for each call
     def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct):
         def proxy(self, **kwargs):
             from .wrap import _create_worker
