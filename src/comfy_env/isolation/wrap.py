@@ -19,7 +19,7 @@ _CLEANUP_DONE = False
 
 
 def _log(msg: str) -> None:
-    """Print to stderr with flush — survives process crashes."""
+    """Print to stderr with flush -- survives process crashes."""
     print(msg, file=sys.stderr, flush=True)
 
 
@@ -420,7 +420,7 @@ def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -
 
 
 def register_nodes(nodes_package: str = "nodes") -> tuple:
-    """Discover and register all nodes — main-process and isolation.
+    """Discover and register all nodes -- main-process and isolation.
 
     Replaces the old pattern of:
         from .nodes import NODE_CLASS_MAPPINGS
@@ -529,7 +529,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     # --- Pattern 1: nodes/ root ---
     if root_resolved in isolation_envs and enabled:
-        # Isolation env at root — subprocess scan
+        # Isolation env at root -- subprocess scan
         env = isolation_envs[root_resolved]
         _log(f"[comfy-env] Importing {nodes_package} (isolation root)...")
         try:
@@ -564,7 +564,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _log(f"[comfy-env] Failed to scan {nodes_package} root: {e}")
 
     elif root_resolved not in isolation_envs:
-        # No isolation at root — try direct import
+        # No isolation at root -- try direct import
         _log(f"[comfy-env] Importing {nodes_package} (root)...")
         try:
             mod = importlib.import_module(f".{nodes_package}", package=caller_pkg_name)
@@ -577,7 +577,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _log(f"[comfy-env] Failed to import {nodes_package} root: {e}")
 
     # --- Pattern 2: subdirectories (only if root yielded nothing) ---
-    # Skip if root was an isolation env (even if scan returned 0 nodes) — subdirs
+    # Skip if root was an isolation env (even if scan returned 0 nodes) -- subdirs
     # are part of that isolation env and must not be direct-imported.
     if not all_mappings and root_resolved not in isolation_envs:
         main_dirs = []
@@ -667,7 +667,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if cf.parent.resolve() not in isolation_envs:
             env_dir = _find_env_dir(cf.parent)
             if not env_dir:
-                _log(f"[comfy-env] No env for {cf.parent.name} — run 'comfy-env install'")
+                _log(f"[comfy-env] No env for {cf.parent.name} -- run 'comfy-env install'")
 
     _log(f"[comfy-env] Registered {len(all_mappings)} total nodes")
 

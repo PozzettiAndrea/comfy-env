@@ -234,7 +234,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         main_node_dir = _find_main_node_dir(node_dir)
         env_path = get_local_env_path(main_node_dir, config_path)
 
-    # Central build dir — shared across nodes with same config hash
+    # Central build dir -- shared across nodes with same config hash
     if sys.platform == "win32":
         build_base = Path("C:/ce")
     else:
@@ -265,7 +265,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         if not target.exists():
             return
         if _is_link_or_junction(env_path):
-            # unlink for symlinks, rmdir for junctions — never _rmtree (would follow the link)
+            # unlink for symlinks, rmdir for junctions -- never _rmtree (would follow the link)
             try: env_path.unlink()
             except OSError: env_path.rmdir()
         elif env_path.exists():
@@ -292,7 +292,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         build_dir.mkdir(parents=True, exist_ok=True)
         lock_dir.mkdir(exist_ok=False)
     except FileExistsError:
-        # Another process is building — wait for completion
+        # Another process is building -- wait for completion
         log("[comfy-env] Another build in progress, waiting...")
         for _ in range(600):  # 10 min timeout
             if done_marker.exists():
@@ -302,7 +302,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 except OSError: pass
                 return
             time.sleep(1)
-        # Stale lock from crashed build — nuke and take over
+        # Stale lock from crashed build -- nuke and take over
         log("[comfy-env] Stale lock detected, rebuilding...")
         _rmtree(build_dir)
         build_dir.mkdir(parents=True, exist_ok=True)
