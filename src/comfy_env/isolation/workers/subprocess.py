@@ -632,6 +632,17 @@ if sys.platform == "win32":
 from multiprocessing import shared_memory as shm
 import numpy as np
 
+# Pin to single CPU core before importing torch to prevent TSC non-monotonicity
+# during libc10_cuda.so static initialization (WSL has imprecise per-core TSC sync).
+# See: https://github.com/pytorch/pytorch/issues/129992
+_affinity_pinned = False
+if sys.platform == "linux":
+    try:
+        os.sched_setaffinity(0, {0})
+        _affinity_pinned = True
+    except OSError:
+        pass
+
 # Set PyTorch to use file_system sharing (uses /dev/shm, no resource_tracker)
 try:
     import torch
@@ -640,6 +651,13 @@ try:
     wlog("[worker] PyTorch sharing strategy set to file_system")
 except Exception as e:
     wlog(f"[worker] PyTorch not available: {e}")
+
+# Release CPU affinity back to all cores for actual GPU work
+if _affinity_pinned:
+    try:
+        os.sched_setaffinity(0, set(range(os.cpu_count() or 1)))
+    except OSError:
+        pass
 
 
 # Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
