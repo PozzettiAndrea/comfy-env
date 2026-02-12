@@ -108,8 +108,8 @@ def release_tensor(t: Any) -> bool:
     """Release shared memory pages from this process's RSS via madvise(MADV_DONTNEED).
 
     Call this after you've copied the data you need (e.g., to a numpy array).
-    The tensor remains valid — re-accessing it will fault pages back in from
-    the page cache — but the physical pages are removed from this process's
+    The tensor remains valid -- re-accessing it will fault pages back in from
+    the page cache -- but the physical pages are removed from this process's
     resident set.
 
     Returns True if pages were released, False if not applicable (non-Linux,

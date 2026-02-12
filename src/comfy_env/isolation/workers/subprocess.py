@@ -862,7 +862,7 @@ def _from_shm(obj, _depth=0, _key="root"):
             pass
         wlog(f"[_from_shm] {_key}: mapping {nbytes/1e6:.1f} MB from shm (zero-copy)")
         arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf)
-        _input_shm_blocks.append(block)  # keep alive — parent cleans up after we respond
+        _input_shm_blocks.append(block)  # keep alive -- parent cleans up after we respond
         wlog(f"[_from_shm] {_key}: mapped, arr.shape={arr.shape}")
         if _DEBUG:
             print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
@@ -1362,11 +1362,11 @@ class SubprocessWorker(Worker):
         self._socket_addr: Optional[str] = None
         self._transport: Optional[SocketTransport] = None
 
-        # Stderr inherits from parent (no pipe — avoids tqdm/\r deadlock)
+        # Stderr inherits from parent (no pipe -- avoids tqdm/\r deadlock)
 
         # Write worker script to temp file
         self._worker_script = self._temp_dir / "persistent_worker.py"
-        self._worker_script.write_text(_PERSISTENT_WORKER_SCRIPT)
+        self._worker_script.write_text(_PERSISTENT_WORKER_SCRIPT, encoding="utf-8")
 
     def _find_comfyui_base(self) -> Optional[Path]:
         """Find ComfyUI base directory."""

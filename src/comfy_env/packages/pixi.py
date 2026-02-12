@@ -34,7 +34,7 @@ def _ensure_longpath_manifest(pixi_path: Path, log: Callable[[str], None] = prin
         log(f"[comfy-env] Wrote long path manifest: {manifest_path}")
     except OSError:
         log(
-            f"[comfy-env] ERROR: Cannot write {manifest_path} — "
+            f"[comfy-env] ERROR: Cannot write {manifest_path} -- "
             f"pixi will hit the 260-char path limit on Windows. "
             f"Move pixi to a user-writable directory or fix permissions."
         )
