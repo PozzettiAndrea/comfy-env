@@ -386,12 +386,21 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                     log(f"  {package} (skipped - GPU only)")
 
         # Move env to build_dir/env, then link env_path -> build_dir/env
+        # Also create a junction back from the original pixi path so that
+        # conda packages with hardcoded RPATHs can still resolve their libs.
         pixi_default = build_dir / ".pixi" / "envs" / "default"
         if pixi_default.exists():
             final_short = build_dir / "env"
             if final_short.exists():
                 _rmtree(final_short)
             shutil.move(str(pixi_default), str(final_short))
+            # Symlink .pixi/envs/default -> env so RPATH lookups work
+            pixi_default.parent.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(pixi_default), str(final_short)],
+                              capture_output=True)
+            else:
+                pixi_default.symlink_to(final_short)
             _link_env()
             try: _rmtree(node_dir / ".pixi")
             except OSError: pass
