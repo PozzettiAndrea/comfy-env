@@ -110,6 +110,7 @@ def install(
         raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
     if cfg.apt_packages: _install_apt_packages(cfg.apt_packages, log, dry_run)
+    if cfg.brew_packages: _install_brew_packages(cfg.brew_packages, log, dry_run)
     if cfg.env_vars: _set_persistent_env_vars(cfg.env_vars, log, dry_run)
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
@@ -136,6 +137,18 @@ def _install_apt_packages(packages: List[str], log: Callable[[str], None], dry_r
         success = apt_install(packages, log)
         if not success:
             log("[apt] WARNING: Some apt packages failed to install. This may cause issues.")
+
+
+def _install_brew_packages(packages: List[str], log: Callable[[str], None], dry_run: bool) -> None:
+    from .packages.brew import brew_install
+    import platform
+    if platform.system() != "Darwin":
+        return
+    log(f"\n[brew] Installing: {', '.join(packages)}")
+    if not dry_run:
+        success = brew_install(packages, log)
+        if not success:
+            log("[brew] WARNING: Some brew packages failed to install. This may cause issues.")
 
 
 def _set_persistent_env_vars(env_vars: dict, log: Callable[[str], None], dry_run: bool) -> None:
@@ -385,22 +398,22 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:
                     log(f"  {package} (skipped - GPU only)")
 
-        # Move env to build_dir/env, then link env_path -> build_dir/env
-        # Also create a junction back from the original pixi path so that
-        # conda packages with hardcoded RPATHs can still resolve their libs.
+        # Create build_dir/env as symlink/junction to .pixi/envs/default.
+        # We do NOT move the env -- conda packages have hardcoded RPATHs
+        # pointing to .pixi/envs/default/lib/ and moving breaks them.
         pixi_default = build_dir / ".pixi" / "envs" / "default"
         if pixi_default.exists():
             final_short = build_dir / "env"
-            if final_short.exists():
+            if _is_link_or_junction(final_short):
+                try: final_short.unlink()
+                except OSError: final_short.rmdir()
+            elif final_short.exists():
                 _rmtree(final_short)
-            shutil.move(str(pixi_default), str(final_short))
-            # Symlink .pixi/envs/default -> env so RPATH lookups work
-            pixi_default.parent.mkdir(parents=True, exist_ok=True)
             if sys.platform == "win32":
-                subprocess.run(["cmd", "/c", "mklink", "/J", str(pixi_default), str(final_short)],
+                subprocess.run(["cmd", "/c", "mklink", "/J", str(final_short), str(pixi_default)],
                               capture_output=True)
             else:
-                pixi_default.symlink_to(final_short)
+                final_short.symlink_to(pixi_default)
             _link_env()
             try: _rmtree(node_dir / ".pixi")
             except OSError: pass

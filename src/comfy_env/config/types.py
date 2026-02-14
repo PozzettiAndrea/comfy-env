@@ -29,6 +29,7 @@ class ComfyEnvConfig:
     python: Optional[str] = None
     cuda_packages: List[str] = field(default_factory=list)
     apt_packages: List[str] = field(default_factory=list)
+    brew_packages: List[str] = field(default_factory=list)
     env_vars: Dict[str, str] = field(default_factory=dict)
     node_reqs: List[NodeDependency] = field(default_factory=list)
     options: ComfyEnvOptions = field(default_factory=ComfyEnvOptions)
@@ -41,7 +42,7 @@ class ComfyEnvConfig:
     @property
     def has_dependencies(self) -> bool:
         return bool(
-            self.cuda_packages or self.apt_packages or self.node_reqs
+            self.cuda_packages or self.apt_packages or self.brew_packages or self.node_reqs
             or self.pixi_passthrough.get("dependencies")
             or self.pixi_passthrough.get("pypi-dependencies")
         )

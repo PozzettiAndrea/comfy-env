@@ -41,6 +41,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
 
     cuda_packages = _ensure_list(data.pop("cuda", {}).get("packages", []))
     apt_packages = _ensure_list(data.pop("apt", {}).get("packages", []))
+    brew_packages = _ensure_list(data.pop("brew", {}).get("packages", []))
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
     node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
     options = _parse_options(data.pop("options", {}))
@@ -49,6 +50,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
         python=python_version,
         cuda_packages=cuda_packages,
         apt_packages=apt_packages,
+        brew_packages=brew_packages,
         env_vars=env_vars,
         node_reqs=node_reqs,
         options=options,
