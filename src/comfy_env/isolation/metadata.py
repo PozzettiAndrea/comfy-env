@@ -7,6 +7,7 @@ imports isolation code -- it builds proxy classes from the serialized metadata.
 
 import base64
 import glob
+import hashlib
 import os
 import pickle
 import subprocess
@@ -20,6 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+_CACHE_VERSION = "1"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +176,32 @@ def fetch_metadata(
         print(f"[comfy-env] No Python in {env_dir}, skipping metadata scan")
         return {"nodes": {}, "display": {}}
 
+    # --- Metadata cache ---
+    cache_file = env_dir / ".metadata_cache.pkl"
+    init_file = working_dir / package_name.replace(".", "/") / "__init__.py"
+    try:
+        init_hash = hashlib.sha256(init_file.read_bytes()).hexdigest()[:16]
+    except (OSError, FileNotFoundError):
+        init_hash = "missing"
+    cache_key = f"v{_CACHE_VERSION}:{init_hash}"
+
+    if cache_file.exists():
+        try:
+            cached = pickle.loads(cache_file.read_bytes())
+            if cached.get("cache_key") == cache_key:
+                payload = cached["payload"]
+                node_count = len(payload.get("nodes", {}))
+                if _DEBUG or node_count > 0:
+                    print(f"[comfy-env] Cache hit for {package_name}: {node_count} nodes",
+                          file=sys.stderr, flush=True)
+                return payload
+            elif _DEBUG:
+                print(f"[comfy-env] Cache stale for {package_name} "
+                      f"(key {cached.get('cache_key')} != {cache_key})",
+                      file=sys.stderr, flush=True)
+        except Exception:
+            pass  # Corrupted cache, fall through to scan
+
     # Build proper subprocess environment (DLL paths, library paths, etc.)
     from .wrap import build_isolation_env
     scan_env = build_isolation_env(python, env_vars)
@@ -236,6 +264,12 @@ def fetch_metadata(
         node_count = len(payload.get("nodes", {}))
         if _DEBUG or node_count > 0:
             print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)", file=sys.stderr, flush=True)
+
+        # --- Write cache ---
+        try:
+            cache_file.write_bytes(pickle.dumps({"cache_key": cache_key, "payload": payload}))
+        except Exception:
+            pass  # Non-fatal
 
         return payload
 
