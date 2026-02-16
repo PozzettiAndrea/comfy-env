@@ -117,6 +117,8 @@ def install(
         _reinstall_main_requirements(node_dir, log, dry_run)
 
     if _is_comfy_env_enabled():
+        if cfg.cuda_packages:
+            _install_cuda_to_host(cfg, log, dry_run)
         _install_via_pixi(cfg, node_dir, log, dry_run)
         _install_isolated_subdirs(node_dir, log, dry_run)
     else:
@@ -219,6 +221,57 @@ def _has_isolated_subdirs(node_dir: Path) -> bool:
     return False
 
 
+def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_run: bool) -> None:
+    """Install [cuda] packages from root config to host Python env."""
+    from .packages.cuda_wheels import get_wheel_url
+    import subprocess
+
+    if not cfg.cuda_packages or sys.platform == "darwin":
+        return
+
+    log(f"\n[cuda] Installing to host Python: {', '.join(cfg.cuda_packages)}")
+    if dry_run: return
+
+    uv_path = _find_uv()
+    python_path = sys.executable
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    # Query host env for torch + CUDA versions
+    try:
+        import torch
+        torch_version = torch.__version__.split("+")[0]
+        cuda_version = torch.version.cuda
+    except ImportError:
+        torch_version = None
+        cuda_version = None
+
+    if torch_version:
+        torch_short = ".".join(torch_version.split(".")[:2])
+        log(f"[cuda] Host: Python {py_version}, PyTorch {torch_version}, CUDA {cuda_version}")
+    else:
+        log(f"[cuda] Host: Python {py_version}, no PyTorch found")
+        torch_short = None
+
+    for package in cfg.cuda_packages:
+        cmd = None
+        # Try cuda-wheels index first (needs torch + CUDA)
+        if torch_short and cuda_version:
+            wheel_url = get_wheel_url(package, torch_short, cuda_version, py_version)
+            if wheel_url:
+                log(f"  {package}: found in cuda-wheels index")
+                cmd = [uv_path, "pip", "install", "--python", python_path, "--no-deps", wheel_url]
+
+        # Fallback: plain uv pip install from PyPI
+        if cmd is None:
+            log(f"  {package}: installing from PyPI")
+            cmd = [uv_path, "pip", "install", "--python", python_path, package]
+
+        log(f"  {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+
+
 def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool, is_root: bool = True) -> None:
     from .packages.pixi import ensure_pixi
     from .packages.toml_generator import write_pixi_toml
@@ -228,13 +281,14 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
     pypi_deps = cfg.pixi_passthrough.get("pypi-dependencies", {})
-    if not cfg.cuda_packages and not deps and not pypi_deps:
-        if not is_root or not _has_isolated_subdirs(node_dir):
-            log("No packages to install")
+    # For root configs, CUDA is handled by _install_cuda_to_host — only need pixi for conda/pypi deps
+    has_pixi_deps = bool(deps or pypi_deps)
+    has_cuda_for_pixi = bool(cfg.cuda_packages) and not is_root  # subdirs still use pixi for CUDA
+    if not has_pixi_deps and not has_cuda_for_pixi:
         return
 
     log(f"\nInstalling via pixi:")
-    if cfg.cuda_packages: log(f"  CUDA: {', '.join(cfg.cuda_packages)}")
+    if has_cuda_for_pixi: log(f"  CUDA: {', '.join(cfg.cuda_packages)}")
     if deps: log(f"  Conda: {len(deps)}")
     if pypi_deps: log(f"  PyPI: {len(pypi_deps)}")
     if dry_run: return
@@ -346,7 +400,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         if result.returncode != 0:
             raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
-        if cfg.cuda_packages and sys.platform != "darwin":
+        if cfg.cuda_packages and sys.platform != "darwin" and not is_root:
             pixi_default = build_dir / ".pixi" / "envs" / "default"
             python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
             if not python_path.exists():

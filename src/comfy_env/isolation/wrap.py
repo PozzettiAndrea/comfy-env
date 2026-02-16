@@ -1,5 +1,6 @@
 """Process isolation for ComfyUI nodes - wraps FUNCTION methods to run in isolated env."""
 
+import atexit
 import glob
 import inspect
 import os
@@ -7,6 +8,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from functools import wraps
 from pathlib import Path
@@ -16,6 +18,13 @@ from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 _CLEANUP_DONE = False
+
+# ---------------------------------------------------------------------------
+# Persistent worker pool — one worker per isolation env, reused across calls.
+# Workers auto-restart on crash (native segfault, etc.).
+# ---------------------------------------------------------------------------
+_WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> SubprocessWorker
+_POOL_LOCK = threading.Lock()
 
 
 def _log(msg: str) -> None:
@@ -239,7 +248,7 @@ def _get_python_version(env_dir: Path) -> Optional[str]:
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                    lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
-    """Create a fresh subprocess worker. Never reused - caller must shutdown after use."""
+    """Create a fresh subprocess worker."""
     python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
     from .workers.subprocess import SubprocessWorker
     if _DEBUG:
@@ -250,6 +259,47 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         python=str(python), working_dir=working_dir, sys_path=sys_path,
         name=working_dir.name, env=env_vars, health_check_timeout=health_check_timeout
     )
+
+
+def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
+                          lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                          health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
+    """Get existing worker for this env, or create a new one."""
+    key = str(env_dir)
+    with _POOL_LOCK:
+        worker = _WORKER_POOL.get(key)
+        if worker and worker.is_alive():
+            return worker
+        # Dead or missing — create new
+        if worker:
+            try:
+                worker.shutdown()
+            except Exception:
+                pass
+        worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        _WORKER_POOL[key] = worker
+        return worker
+
+
+def _remove_worker(env_dir):
+    """Remove a dead worker from the pool (called after crash)."""
+    key = str(env_dir)
+    with _POOL_LOCK:
+        _WORKER_POOL.pop(key, None)
+
+
+def _shutdown_all_workers():
+    """Shut down all persistent workers. Called via atexit."""
+    with _POOL_LOCK:
+        for key, worker in list(_WORKER_POOL.items()):
+            try:
+                worker.shutdown()
+            except Exception:
+                pass
+        _WORKER_POOL.clear()
+
+
+atexit.register(_shutdown_all_workers)
 
 
 def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
@@ -268,8 +318,7 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
     @wraps(original)
     def proxy(self, **kwargs):
-        # Create fresh worker for each call - never reuse to avoid stale state
-        worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        worker = _get_or_create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
         try:
             # Prepare tensors for IPC
             try:
@@ -288,9 +337,9 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
                 result = prepare_for_ipc_recursive(result)
             except ImportError: pass
             return result
-        finally:
-            # Always shutdown worker after use
-            worker.shutdown()
+        except (RuntimeError, ConnectionError):
+            _remove_worker(env_dir)
+            raise
 
     setattr(cls, func_name, proxy)
     cls._comfy_env_isolated = True
