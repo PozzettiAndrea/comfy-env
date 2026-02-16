@@ -1,9 +1,12 @@
 """CUDA wheels index integration. See: https://pozzettiandrea.github.io/cuda-wheels/"""
 
+import logging
 import re
 import sys
 import urllib.request
 from typing import List, Optional
+
+logger = logging.getLogger("comfy-env.cuda-wheels")
 
 CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
@@ -30,24 +33,33 @@ def _platform_tag() -> Optional[str]:
 def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str) -> Optional[str]:
     """Get direct URL to matching wheel from cuda-wheels index."""
     cuda_short = cuda_version.replace(".", "")[:3]
-    torch_short = torch_version.replace(".", "")[:2]
+    torch_short = torch_version.replace(".", "")
     py_tag = f"cp{python_version.replace('.', '')}"
     platform_tag = _platform_tag()
 
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     link_pattern = re.compile(r'href="([^"]+\.whl)"[^>]*>([^<]+)</a>', re.IGNORECASE)
 
+    logger.info(f"Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {platform_tag or 'any'}")
+
     for pkg_dir in _pkg_variants(package):
+        index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
         try:
-            with urllib.request.urlopen(f"{CUDA_WHEELS_INDEX}{pkg_dir}/", timeout=10) as resp:
+            with urllib.request.urlopen(index_url, timeout=10) as resp:
                 html = resp.read().decode("utf-8")
-        except Exception: continue
+        except Exception as e:
+            logger.debug(f"  {index_url}: {e}")
+            continue
 
         for match in link_pattern.finditer(html):
             wheel_url, display = match.group(1), match.group(2)
             if any(p in display for p in local_patterns) and py_tag in display:
                 if platform_tag is None or platform_tag in display:
-                    return wheel_url if wheel_url.startswith("http") else f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
+                    url = wheel_url if wheel_url.startswith("http") else f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
+                    logger.info(f"  Found: {display}")
+                    return url
+
+    logger.info(f"  No matching wheel found")
     return None
 
 
@@ -69,7 +81,7 @@ def find_available_wheels(package: str) -> List[str]:
 def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
     """Find wheel matching CUDA/torch version, return version spec."""
     cuda_short = cuda_version.replace(".", "")[:3]
-    torch_short = torch_version.replace(".", "")[:2]
+    torch_short = torch_version.replace(".", "")
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     wheel_pattern = re.compile(r'href="[^"]*?([^"/]+\.whl)"', re.IGNORECASE)
 
