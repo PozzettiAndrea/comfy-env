@@ -256,10 +256,13 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
         cmd = None
         # Try cuda-wheels index first (needs torch + CUDA)
         if torch_short and cuda_version:
+            log(f"  {package}: looking up in cuda-wheels index (cu{cuda_version.replace('.', '')[:3]} torch{torch_short.replace('.', '')} cp{py_version.replace('.', '')})")
             wheel_url = get_wheel_url(package, torch_short, cuda_version, py_version)
             if wheel_url:
                 log(f"  {package}: found in cuda-wheels index")
                 cmd = [uv_path, "pip", "install", "--python", python_path, "--no-deps", wheel_url]
+            else:
+                log(f"  {package}: not found in cuda-wheels index")
 
         # Fallback: plain uv pip install from PyPI (only if CUDA is available —
         # CUDA-only packages like cc_torch won't exist on PyPI)
@@ -267,13 +270,16 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
             if not cuda_version:
                 log(f"  {package}: skipped (no CUDA runtime)")
                 continue
-            log(f"  {package}: installing from PyPI")
+            log(f"  {package}: falling back to PyPI")
             cmd = [uv_path, "pip", "install", "--python", python_path, package]
 
         log(f"  {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+            stderr_last = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown error"
+            log(f"  {package}: install failed (non-fatal, will use fallback)")
+            log(f"    {stderr_last}")
+            continue
 
 
 def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None], dry_run: bool, is_root: bool = True) -> None:
