@@ -10,7 +10,6 @@ from .libomp import dedupe_libomp
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"
-ROOT_ENV_DIR_NAME = "_root_env"
 
 
 def is_comfy_env_enabled() -> bool:
@@ -62,7 +61,7 @@ def _find_env_dirs(node_dir: str) -> list:
         for d in dirs:
             if d.startswith("_env_"):
                 envs.append(os.path.join(root, d))
-        dirs[:] = [d for d in dirs if not d.startswith(("_env_", "_root_env"))]
+        dirs[:] = [d for d in dirs if not d.startswith("_env_")]
     return envs
 
 
@@ -75,14 +74,25 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     import faulthandler
     faulthandler.enable(file=sys.stderr)
 
-    # Print all detected envs first
-    root_env = os.path.join(node_dir, ROOT_ENV_DIR_NAME)
-    has_root = os.path.isdir(root_env)
-    sub_envs = _find_env_dirs(node_dir)
+    # Find root env (_env_* in node dir, created from comfy-env-root.toml)
+    root_config = os.path.join(node_dir, ROOT_CONFIG_FILE_NAME)
+    has_root = os.path.exists(root_config)
+    root_env = None
     if has_root:
-        print(f"[comfy-env] {os.path.basename(node_dir)}: _root_env -> {root_env}", file=sys.stderr)
+        for item in os.listdir(node_dir):
+            if item.startswith("_env_") and os.path.isdir(os.path.join(node_dir, item)):
+                root_env = os.path.join(node_dir, item)
+                break
+
+    sub_envs = _find_env_dirs(node_dir)
+    node_name = os.path.basename(node_dir)
+    if root_env:
+        resolved = os.path.realpath(root_env) if os.path.islink(root_env) else root_env
+        print(f"[comfy-env] {node_name}: {os.path.basename(root_env)} -> {resolved}", file=sys.stderr)
+    elif has_root:
+        print(f"[comfy-env] {node_name}: root config found but env not built yet", file=sys.stderr)
     else:
-        print(f"[comfy-env] {os.path.basename(node_dir)}: no _root_env", file=sys.stderr)
+        print(f"[comfy-env] {node_name}: no root config", file=sys.stderr)
     if sub_envs:
         print(f"[comfy-env] {len(sub_envs)} isolation env(s):", file=sys.stderr)
         for env_path in sub_envs:
@@ -92,13 +102,12 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     dedupe_libomp()
 
     # Apply env vars (check root config first, then regular)
-    root_config = os.path.join(node_dir, ROOT_CONFIG_FILE_NAME)
-    config = root_config if os.path.exists(root_config) else os.path.join(node_dir, "comfy-env.toml")
+    config = root_config if has_root else os.path.join(node_dir, "comfy-env.toml")
     for k, v in load_env_vars(config).items():
         os.environ[k] = v
 
-    # Handle _root_env only -- inject site-packages + set library paths
-    if has_root:
+    # Inject root env site-packages + set library paths
+    if root_env:
         sp = inject_site_packages(root_env)
         _set_library_paths(root_env)
         if sp:
