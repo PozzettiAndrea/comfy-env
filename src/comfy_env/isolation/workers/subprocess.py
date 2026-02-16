@@ -1212,6 +1212,90 @@ def main():
 
     wlog("[worker] Print and logging forwarding enabled")
 
+    # ---------------------------------------------------------------
+    # Model registry — tracks nn.Module instances on CUDA so the main
+    # process can command device moves via IPC for VRAM management.
+    #
+    # Auto-detection: hooks Module.to() and .cuda() to catch any
+    # module that lands on CUDA.  No manual registration needed.
+    # ---------------------------------------------------------------
+    _model_registry = {}          # model_id -> nn.Module
+    _model_registry_meta = {}     # model_id -> {"size": int, "kind": str}
+    _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
+    _model_counter = [0]          # mutable counter in list for closure access
+    _new_models_this_call = []    # populated during call, sent in response
+
+    def _compute_model_size(model):
+        """Compute size in bytes: parameters + buffers."""
+        size = 0
+        if hasattr(model, "parameters"):
+            size += sum(p.numel() * p.element_size() for p in model.parameters())
+        if hasattr(model, "buffers"):
+            size += sum(b.numel() * b.element_size() for b in model.buffers())
+        return size
+
+    def _register_model(model_id, model, kind="other"):
+        """Register a model explicitly (optional — auto-hook handles most cases)."""
+        _model_registry[model_id] = model
+        _model_id_by_obj[id(model)] = model_id
+        size = _compute_model_size(model)
+        _model_registry_meta[model_id] = {"size": size, "kind": kind}
+        _new_models_this_call.append({"id": model_id, "size": size, "kind": kind})
+        wlog(f"[worker] Registered model '{model_id}': {size / 1e9:.2f} GB, kind={kind}")
+        return size
+
+    def _auto_register_if_cuda(module):
+        """Auto-register an nn.Module if it just landed on CUDA."""
+        obj_id = id(module)
+        if obj_id in _model_id_by_obj:
+            return  # Already registered
+        try:
+            first_param = next(module.parameters(), None)
+            if first_param is None or first_param.device.type != "cuda":
+                return
+        except Exception:
+            return
+        _model_counter[0] += 1
+        model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
+        size = _compute_model_size(module)
+        _model_registry[model_id] = module
+        _model_registry_meta[model_id] = {"size": size, "kind": "other"}
+        _model_id_by_obj[obj_id] = model_id
+        _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
+        wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
+
+    # Install hooks on Module.to() and .cuda()
+    # Module.to() only fires for the outermost call — PyTorch recurses
+    # through children via _apply(), not .to(), so we naturally catch
+    # only top-level models.
+    try:
+        import torch as _torch
+        _orig_module_to = _torch.nn.Module.to
+        _orig_module_cuda = _torch.nn.Module.cuda
+
+        def _hooked_to(self, *args, **kwargs):
+            result = _orig_module_to(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
+
+        def _hooked_cuda(self, *args, **kwargs):
+            result = _orig_module_cuda(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
+
+        _torch.nn.Module.to = _hooked_to
+        _torch.nn.Module.cuda = _hooked_cuda
+        wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
+    except ImportError:
+        wlog("[worker] torch not available, skipping auto-registration hooks")
+
+    # Expose explicit API as comfy_worker module (optional override)
+    import types as _types
+    _comfy_worker = _types.ModuleType("comfy_worker")
+    _comfy_worker.__doc__ = "Helper for registering models with the comfy-env worker."
+    _comfy_worker.register_model = _register_model
+    sys.modules["comfy_worker"] = _comfy_worker
+
     # Signal ready
     transport.send({"status": "ready"})
     wlog("[worker] Ready, entering request loop...")
@@ -1239,6 +1323,47 @@ def main():
             transport.send({"status": "pong"})
             continue
 
+        if request.get("method") == "model_to_device":
+            # Move a registered model to a device (cuda/cpu)
+            _mid = request.get("model_id")
+            _target = request.get("device", "cpu")
+            _model = _model_registry.get(_mid)
+            if _model is None:
+                transport.send({"status": "error",
+                                "error": f"Model '{_mid}' not registered"})
+                continue
+            try:
+                import torch as _torch
+                _target_dev = _torch.device(_target)
+                # Check if already on target device — idempotent
+                _current_dev = None
+                try:
+                    _first_param = next(_model.parameters(), None)
+                    if _first_param is not None:
+                        _current_dev = _first_param.device
+                except Exception:
+                    pass
+                if _current_dev is not None and _current_dev == _target_dev:
+                    wlog(f"[worker] model_to_device: '{_mid}' already on {_target}")
+                    transport.send({"status": "ok", "device": _target, "moved": False})
+                    continue
+                _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
+                wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
+                _model.to(_target_dev)
+                # Only empty cache if we actually freed CUDA tensors
+                if _was_cuda and _target_dev.type == "cpu":
+                    _torch.cuda.empty_cache()
+                transport.send({"status": "ok", "device": _target, "moved": True})
+            except Exception as _e:
+                wlog(f"[worker] model_to_device error: {_e}")
+                transport.send({"status": "error", "error": str(_e)})
+            continue
+
+        if request.get("method") == "list_models":
+            # Return registered model metadata
+            transport.send({"status": "ok", "models": _model_registry_meta})
+            continue
+
         # Release input shm blocks from previous request
         for _old_block in _input_shm_blocks:
             try:
@@ -1246,6 +1371,9 @@ def main():
             except Exception:
                 pass
         _input_shm_blocks.clear()
+
+        # Clear new-models tracker for this call
+        _new_models_this_call.clear()
 
         shm_registry = []
         try:
@@ -1300,7 +1428,10 @@ def main():
             result_meta = _to_shm(result, shm_registry)
             wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
-            transport.send({"status": "ok", "result": result_meta})
+            response = {"status": "ok", "result": result_meta}
+            if _new_models_this_call:
+                response["_new_models"] = list(_new_models_this_call)
+            transport.send(response)
             _shm_keeper.keep(shm_registry)  # Keep alive for 30s until host reads
 
         except Exception as e:
@@ -1374,6 +1505,7 @@ class SubprocessWorker(Worker):
         self._process: Optional[subprocess.Popen] = None
         self._shutdown = False
         self._lock = threading.Lock()
+        self._last_new_models = []  # Auto-detected models from last call
 
         # Socket IPC
         self._server_socket: Optional[socket.socket] = None
@@ -1721,6 +1853,9 @@ class SubprocessWorker(Worker):
                         traceback=response.get("traceback"),
                     )
 
+                # Store newly auto-registered models (for proxy to create patchers)
+                self._last_new_models = response.get("_new_models", [])
+
                 # Reconstruct result from shared memory
                 result_meta = response.get("result")
                 if result_meta is not None:
@@ -1768,6 +1903,23 @@ class SubprocessWorker(Worker):
 
             finally:
                 _cleanup_shm(shm_registry)
+
+    def send_command(self, method, **params):
+        """Send a management command to the worker (model device moves, etc.).
+
+        Uses the same socket transport as call_method but expects a simple
+        JSON response (no shared-memory result).
+        """
+        with self._lock:
+            self._ensure_started()
+            request = {"method": method, **params}
+            response = self._send_request(request, timeout=60.0)
+            if response.get("status") == "error":
+                raise RuntimeError(
+                    f"{self.name}: Command '{method}' failed: "
+                    f"{response.get('error', 'Unknown error')}"
+                )
+            return response
 
     def shutdown(self) -> None:
         """Shut down the persistent worker."""
