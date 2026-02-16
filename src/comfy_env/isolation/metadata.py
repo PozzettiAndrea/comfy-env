@@ -336,9 +336,13 @@ def build_proxy_class(
     # Proxy FUNCTION method -- reuses persistent worker across calls
     def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct):
         def proxy(self, **kwargs):
-            from .wrap import _get_or_create_worker, _remove_worker
-            worker = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
+            from .wrap import (_get_or_create_worker, _remove_worker,
+                               _load_worker_models, _register_new_patchers)
+            worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
             try:
+                # Ensure any previously-registered subprocess models are on GPU
+                _load_worker_models(ed)
+
                 try:
                     from .tensor_utils import prepare_for_ipc_recursive
                     kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
@@ -359,6 +363,9 @@ def build_proxy_class(
                     result = prepare_for_ipc_recursive(result)
                 except ImportError:
                     pass
+
+                # Create patchers for any models auto-detected during this call
+                _register_new_patchers(ed, worker, gen)
                 return result
             except (RuntimeError, ConnectionError):
                 _remove_worker(ed)

@@ -23,8 +23,10 @@ _CLEANUP_DONE = False
 # Persistent worker pool — one worker per isolation env, reused across calls.
 # Workers auto-restart on crash (native segfault, etc.).
 # ---------------------------------------------------------------------------
-_WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> SubprocessWorker
+_WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> (SubprocessWorker, generation)
+_WORKER_PATCHERS: Dict[str, Dict[str, Any]] = {}  # str(env_dir) -> {model_id: SubprocessModelPatcher}
 _POOL_LOCK = threading.Lock()
+_WORKER_GENERATION = 0  # Monotonically increasing; incremented on each new worker
 
 
 def _log(msg: str) -> None:
@@ -264,42 +266,127 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
-    """Get existing worker for this env, or create a new one."""
+    """Get existing worker for this env, or create a new one.
+
+    Returns (worker, generation) tuple.  The generation is a monotonically
+    increasing integer used to detect stale ModelPatchers after worker restart.
+    """
+    global _WORKER_GENERATION
     key = str(env_dir)
     with _POOL_LOCK:
-        worker = _WORKER_POOL.get(key)
-        if worker and worker.is_alive():
-            return worker
-        # Dead or missing — create new
-        if worker:
+        entry = _WORKER_POOL.get(key)
+        if entry is not None:
+            worker, gen = entry
+            if worker.is_alive():
+                return worker, gen
+            # Dead — clean up
             try:
                 worker.shutdown()
             except Exception:
                 pass
+        _WORKER_GENERATION += 1
+        gen = _WORKER_GENERATION
         worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
-        _WORKER_POOL[key] = worker
-        return worker
+        _WORKER_POOL[key] = (worker, gen)
+        return worker, gen
 
 
 def _remove_worker(env_dir):
     """Remove a dead worker from the pool (called after crash)."""
     key = str(env_dir)
     with _POOL_LOCK:
-        _WORKER_POOL.pop(key, None)
+        entry = _WORKER_POOL.pop(key, None)
+        _WORKER_PATCHERS.pop(key, None)
+        if entry is not None:
+            worker, _ = entry
+            try:
+                worker.shutdown()
+            except Exception:
+                pass
 
 
 def _shutdown_all_workers():
     """Shut down all persistent workers. Called via atexit."""
     with _POOL_LOCK:
-        for key, worker in list(_WORKER_POOL.items()):
+        for key, (worker, _gen) in list(_WORKER_POOL.items()):
             try:
                 worker.shutdown()
             except Exception:
                 pass
         _WORKER_POOL.clear()
+        _WORKER_PATCHERS.clear()
 
 
 atexit.register(_shutdown_all_workers)
+
+
+def _register_new_patchers(env_dir, worker, generation):
+    """Create SubprocessModelPatchers for any models auto-detected during the last call.
+
+    Called after each call_method.  The worker's Module.to()/cuda() hooks
+    auto-register nn.Modules that land on CUDA; the worker returns their
+    metadata in response['_new_models'].  We create patchers here and register
+    them with ComfyUI's memory manager so they participate in VRAM eviction.
+    """
+    new_models = getattr(worker, '_last_new_models', [])
+    if not new_models:
+        return
+
+    from .model_patcher import SubprocessModelPatcher
+
+    try:
+        import comfy.model_management
+        load_device = comfy.model_management.get_torch_device()
+        offload_device = comfy.model_management.unet_offload_device()
+    except Exception:
+        return
+
+    key = str(env_dir)
+    patchers = _WORKER_PATCHERS.setdefault(key, {})
+
+    created = []
+    for ref in new_models:
+        model_id = ref["id"]
+        if model_id in patchers:
+            continue  # Already tracked
+        patcher = SubprocessModelPatcher(
+            worker=worker,
+            worker_generation=generation,
+            model_id=model_id,
+            model_size=ref["size"],
+            load_device=load_device,
+            offload_device=offload_device,
+            kind=ref.get("kind", "other"),
+        )
+        # Mark as already loaded (the model is on GPU right now)
+        patcher.model.device = load_device
+        patcher.model.model_loaded_weight_memory = ref["size"]
+        patchers[model_id] = patcher
+        created.append(model_id)
+
+    if created:
+        if _DEBUG:
+            _log(f"[comfy-env] Created {len(created)} model patchers: {created}")
+        # Register with ComfyUI memory manager (models are already on GPU)
+        comfy.model_management.load_models_gpu(list(patchers.values()))
+
+
+def _load_worker_models(env_dir):
+    """Ensure all tracked models for this worker are on GPU before a call.
+
+    Called before each call_method.  If ComfyUI evicted models between calls,
+    load_models_gpu will send IPC commands to move them back.
+    """
+    key = str(env_dir)
+    patchers = _WORKER_PATCHERS.get(key)
+    if not patchers:
+        return
+
+    try:
+        import comfy.model_management
+        comfy.model_management.load_models_gpu(list(patchers.values()))
+    except Exception:
+        pass
 
 
 def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
@@ -318,8 +405,11 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
 
     @wraps(original)
     def proxy(self, **kwargs):
-        worker = _get_or_create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        worker, gen = _get_or_create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
         try:
+            # Ensure any previously-registered subprocess models are on GPU
+            _load_worker_models(env_dir)
+
             # Prepare tensors for IPC
             try:
                 from .tensor_utils import prepare_for_ipc_recursive
@@ -336,6 +426,9 @@ def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list
                 from .tensor_utils import prepare_for_ipc_recursive
                 result = prepare_for_ipc_recursive(result)
             except ImportError: pass
+
+            # Create patchers for any models auto-detected during this call
+            _register_new_patchers(env_dir, worker, gen)
             return result
         except (RuntimeError, ConnectionError):
             _remove_worker(env_dir)
