@@ -261,8 +261,12 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
                 log(f"  {package}: found in cuda-wheels index")
                 cmd = [uv_path, "pip", "install", "--python", python_path, "--no-deps", wheel_url]
 
-        # Fallback: plain uv pip install from PyPI
+        # Fallback: plain uv pip install from PyPI (only if CUDA is available —
+        # CUDA-only packages like cc_torch won't exist on PyPI)
         if cmd is None:
+            if not cuda_version:
+                log(f"  {package}: skipped (no CUDA runtime)")
+                continue
             log(f"  {package}: installing from PyPI")
             cmd = [uv_path, "pip", "install", "--python", python_path, package]
 
