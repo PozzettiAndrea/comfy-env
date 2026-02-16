@@ -333,11 +333,11 @@ def build_proxy_class(
         return _cached
     attrs["INPUT_TYPES"] = _input_types
 
-    # Proxy FUNCTION method -- spawns SubprocessWorker for each call
+    # Proxy FUNCTION method -- reuses persistent worker across calls
     def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct):
         def proxy(self, **kwargs):
-            from .wrap import _create_worker
-            worker = _create_worker(ed, pr, sp, lp, ev, hct)
+            from .wrap import _get_or_create_worker, _remove_worker
+            worker = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
             try:
                 try:
                     from .tensor_utils import prepare_for_ipc_recursive
@@ -360,8 +360,9 @@ def build_proxy_class(
                 except ImportError:
                     pass
                 return result
-            finally:
-                worker.shutdown()
+            except (RuntimeError, ConnectionError):
+                _remove_worker(ed)
+                raise
         return proxy
 
     attrs[func_name] = _make_proxy(
