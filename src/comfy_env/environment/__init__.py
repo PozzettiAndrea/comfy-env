@@ -9,7 +9,6 @@ from .cache import (
     get_cache_dir,
     get_env_name,
     get_local_env_path,
-    get_root_env_path,
     resolve_env_path,
 )
 from .paths import (
@@ -32,7 +31,6 @@ __all__ = [
     "get_cache_dir",
     "get_env_name",
     "get_local_env_path",
-    "get_root_env_path",
     "resolve_env_path",
     # Path resolution
     "get_site_packages_path",

@@ -51,14 +51,6 @@ def get_env_name(node_dir: Path, config_path: Path) -> str:
     return f"{node_name}_{subfolder}_{compute_config_hash(config_path)}"
 
 
-ROOT_ENV_DIR_NAME = "_root_env"
-
-
-def get_root_env_path(node_dir: Path) -> Path:
-    """Return path for root env: node_dir/_root_env."""
-    return node_dir / ROOT_ENV_DIR_NAME
-
-
 def get_local_env_path(main_node_dir: Path, config_path: Path) -> Path:
     """Return path for _env_* symlink in config_path.parent. Hash-only name so identical configs share envs."""
     h = compute_config_hash(config_path)[:6]

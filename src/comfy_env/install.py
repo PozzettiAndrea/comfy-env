@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Set, Union
 
 from .config import ComfyEnvConfig, NodeDependency, load_config, discover_config, CONFIG_FILE_NAME, ROOT_CONFIG_FILE_NAME
-from .environment.cache import get_root_env_path, get_local_env_path
+from .environment.cache import get_local_env_path
 
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
@@ -239,9 +239,10 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     if pypi_deps: log(f"  PyPI: {len(pypi_deps)}")
     if dry_run: return
 
-    # Root config -> _root_env, subdirectory config -> _env_*
+    # Both root and subdirectory configs use _env_<hash> naming
     if is_root:
-        env_path = get_root_env_path(node_dir)
+        config_path = node_dir / ROOT_CONFIG_FILE_NAME
+        env_path = get_local_env_path(node_dir, config_path)
     else:
         config_path = node_dir / CONFIG_FILE_NAME
         main_node_dir = _find_main_node_dir(node_dir)
