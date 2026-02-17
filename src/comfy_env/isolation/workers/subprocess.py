@@ -191,7 +191,93 @@ class SocketTransport:
 # =============================================================================
 
 from multiprocessing import shared_memory as shm
+import base64
 import numpy as np
+
+
+# =============================================================================
+# CUDA IPC - zero-copy GPU tensor transfer (Linux only)
+# =============================================================================
+
+_cuda_ipc_supported: Optional[bool] = None
+
+
+def _probe_cuda_ipc() -> bool:
+    """Check if CUDA IPC is available (Linux only, requires CUDA)."""
+    global _cuda_ipc_supported
+    if _cuda_ipc_supported is not None:
+        return _cuda_ipc_supported
+    if sys.platform != "linux":
+        _cuda_ipc_supported = False
+        return False
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            _cuda_ipc_supported = False
+            return False
+        torch.cuda.current_device()
+        _ = torch.cuda.Event(interprocess=True)
+        _ = torch.empty(1, device="cuda")
+        _cuda_ipc_supported = True
+    except Exception:
+        _cuda_ipc_supported = False
+    return _cuda_ipc_supported
+
+
+def _serialize_cuda_ipc(t) -> dict:
+    """Serialize CUDA tensor via IPC handle (zero-copy, JSON-safe)."""
+    import torch.multiprocessing.reductions as reductions
+    try:
+        func, args = reductions.reduce_tensor(t)
+    except RuntimeError as e:
+        if "received from another process" in str(e):
+            t = t.clone()
+            func, args = reductions.reduce_tensor(t)
+        else:
+            raise
+    return {
+        "__type__": "CudaIPC",
+        "tensor_size": list(args[1]),
+        "tensor_stride": list(args[2]),
+        "tensor_offset": args[3],
+        "dtype": str(args[5]),
+        "device_idx": args[6],
+        "handle": base64.b64encode(args[7]).decode("ascii"),
+        "storage_size": args[8],
+        "storage_offset": args[9],
+        "requires_grad": args[10],
+        "ref_counter_handle": base64.b64encode(args[11]).decode("ascii"),
+        "ref_counter_offset": args[12],
+        "event_handle": base64.b64encode(args[13]).decode("ascii") if args[13] else None,
+        "event_sync_required": args[14],
+    }
+
+
+def _deserialize_cuda_ipc(data: dict):
+    """Deserialize CUDA tensor from IPC handle."""
+    import torch
+    import torch.multiprocessing.reductions as reductions
+    dtype = getattr(torch, data["dtype"].split(".")[-1])
+    handle = base64.b64decode(data["handle"])
+    ref_counter_handle = base64.b64decode(data["ref_counter_handle"])
+    event_handle = base64.b64decode(data["event_handle"]) if data["event_handle"] else None
+    return reductions.rebuild_cuda_tensor(
+        torch.Tensor,
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["tensor_offset"],
+        torch.storage.TypedStorage,
+        dtype,
+        data["device_idx"],
+        handle,
+        data["storage_size"],
+        data["storage_offset"],
+        data["requires_grad"],
+        ref_counter_handle,
+        data["ref_counter_offset"],
+        event_handle,
+        data["event_sync_required"],
+    )
 
 
 def _prepare_trimesh_for_pickle(mesh):
@@ -248,10 +334,15 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # torch.Tensor -> convert to numpy -> shared memory (with marker to restore type)
+    # torch.Tensor -> CUDA IPC (zero-copy) or numpy -> shared memory
     # IMPORTANT: Inline serialization to avoid caching ephemeral numpy array by id().
     # The temp array can be GC'd and its address reused, causing cache collisions.
     if t == 'Tensor':
+        # CUDA IPC: zero-copy GPU-to-GPU transfer (Linux only)
+        if obj.is_cuda and _probe_cuda_ipc():
+            result = _serialize_cuda_ipc(obj)
+            visited[obj_id] = result
+            return result
         arr = np.ascontiguousarray(obj.detach().cpu().numpy())
         block = shm.SharedMemory(create=True, size=arr.nbytes)
         np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
@@ -366,6 +457,10 @@ def _from_shm(obj, unlink=True):
         if isinstance(obj, list):
             return [_from_shm(v, unlink) for v in obj]
         return obj
+
+    # CudaIPC -> zero-copy CUDA tensor deserialization
+    if obj.get("__type__") == "CudaIPC":
+        return _deserialize_cuda_ipc(obj)
 
     # TensorRef -> use PyTorch's native deserialization (new format)
     if obj.get("__type__") == "TensorRef":
@@ -678,6 +773,88 @@ class TensorKeeper:
 
 _tensor_keeper = TensorKeeper()
 
+# CUDA IPC - zero-copy GPU tensor transfer (Linux only)
+import base64 as _b64
+
+_cuda_ipc_supported = None
+
+def _probe_cuda_ipc():
+    global _cuda_ipc_supported
+    if _cuda_ipc_supported is not None:
+        return _cuda_ipc_supported
+    if sys.platform != "linux":
+        _cuda_ipc_supported = False
+        return False
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            _cuda_ipc_supported = False
+            return False
+        torch.cuda.current_device()
+        _ = torch.cuda.Event(interprocess=True)
+        _ = torch.empty(1, device="cuda")
+        _cuda_ipc_supported = True
+        wlog("[worker] CUDA IPC supported")
+    except Exception:
+        _cuda_ipc_supported = False
+        wlog("[worker] CUDA IPC not supported")
+    return _cuda_ipc_supported
+
+
+def _serialize_cuda_ipc(t):
+    import torch.multiprocessing.reductions as reductions
+    try:
+        func, args = reductions.reduce_tensor(t)
+    except RuntimeError as e:
+        if "received from another process" in str(e):
+            t = t.clone()
+            func, args = reductions.reduce_tensor(t)
+        else:
+            raise
+    _tensor_keeper.keep(t)
+    return {
+        "__type__": "CudaIPC",
+        "tensor_size": list(args[1]),
+        "tensor_stride": list(args[2]),
+        "tensor_offset": args[3],
+        "dtype": str(args[5]),
+        "device_idx": args[6],
+        "handle": _b64.b64encode(args[7]).decode("ascii"),
+        "storage_size": args[8],
+        "storage_offset": args[9],
+        "requires_grad": args[10],
+        "ref_counter_handle": _b64.b64encode(args[11]).decode("ascii"),
+        "ref_counter_offset": args[12],
+        "event_handle": _b64.b64encode(args[13]).decode("ascii") if args[13] else None,
+        "event_sync_required": args[14],
+    }
+
+
+def _deserialize_cuda_ipc(data):
+    import torch
+    import torch.multiprocessing.reductions as reductions
+    dtype = getattr(torch, data["dtype"].split(".")[-1])
+    handle = _b64.b64decode(data["handle"])
+    ref_counter_handle = _b64.b64decode(data["ref_counter_handle"])
+    event_handle = _b64.b64decode(data["event_handle"]) if data["event_handle"] else None
+    return reductions.rebuild_cuda_tensor(
+        torch.Tensor,
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["tensor_offset"],
+        torch.storage.TypedStorage,
+        dtype,
+        data["device_idx"],
+        handle,
+        data["storage_size"],
+        data["storage_offset"],
+        data["requires_grad"],
+        ref_counter_handle,
+        data["ref_counter_offset"],
+        event_handle,
+        data["event_sync_required"],
+    )
+
 
 def _prepare_trimesh_for_pickle(mesh):
     """
@@ -739,9 +916,14 @@ def _to_shm(obj, registry, visited=None):
         return visited[obj_id]
     t = type(obj).__name__
 
-    # Tensor -> use PyTorch's native shared memory (bypasses resource_tracker)
+    # Tensor -> CUDA IPC (zero-copy) or PyTorch native shared memory
     if t == 'Tensor':
         import torch
+        # CUDA IPC: zero-copy GPU-to-GPU transfer (Linux only)
+        if obj.is_cuda and _probe_cuda_ipc():
+            result = _serialize_cuda_ipc(obj)
+            visited[obj_id] = result
+            return result
         tensor = obj.detach().cpu().contiguous()
         result = _serialize_tensor_native(tensor, registry)
         visited[obj_id] = result
@@ -846,6 +1028,11 @@ def _from_shm(obj, _depth=0, _key="root"):
         if isinstance(obj, list):
             return [_from_shm(v, _depth+1, f"{_key}[{i}]") for i, v in enumerate(obj)]
         return obj
+
+    # CudaIPC -> zero-copy CUDA tensor deserialization
+    if obj.get("__type__") == "CudaIPC":
+        wlog(f"[_from_shm] {_key}: CudaIPC tensor_size={obj.get('tensor_size')}")
+        return _deserialize_cuda_ipc(obj)
 
     # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
     if obj.get("__type__") == "TensorRef":
@@ -1224,6 +1411,7 @@ def main():
     _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
     _model_counter = [0]          # mutable counter in list for closure access
     _new_models_this_call = []    # populated during call, sent in response
+    _loading_via_shim = [False]   # suppress auto-detection during shimmed load_models_gpu
 
     def _compute_model_size(model):
         """Compute size in bytes: parameters + buffers."""
@@ -1246,6 +1434,8 @@ def main():
 
     def _auto_register_if_cuda(module):
         """Auto-register an nn.Module if it just landed on CUDA."""
+        if _loading_via_shim[0]:
+            return  # Parent already coordinates VRAM during shimmed loads
         obj_id = id(module)
         if obj_id in _model_id_by_obj:
             return  # Already registered
@@ -1289,11 +1479,135 @@ def main():
     except ImportError:
         wlog("[worker] torch not available, skipping auto-registration hooks")
 
+    # ---------------------------------------------------------------
+    # Bidirectional RPC — call parent methods during execution
+    # ---------------------------------------------------------------
+    def _call_parent(method, **params):
+        """Call a method on the parent process and wait for result.
+
+        Can only be called during method execution (while transport is active).
+        The parent handles the callback and sends back a response.
+        """
+        transport.send({"type": "callback", "method": method, **params})
+        response = transport.recv()
+        if response is None:
+            raise RuntimeError("Parent disconnected during callback")
+        if response.get("type") != "callback_response":
+            raise RuntimeError(f"Expected callback_response, got {response.get('type')}")
+        if response.get("status") == "error":
+            raise RuntimeError(response.get("error", "Callback failed"))
+        return response.get("result")
+
+    # ---------------------------------------------------------------
+    # Auto-enable fastest attention backend before comfy modules are
+    # imported.  In the subprocess, comfy.cli_args.args is parsed with
+    # empty argv so --use-sage-attention / --use-flash-attention are
+    # False.  Setting them here lets comfy.ldm.modules.attention pick
+    # up sage/flash when it is first imported below.
+    # ---------------------------------------------------------------
+    try:
+        import torch as _torch_check
+        if _torch_check.cuda.is_available() and _torch_check.cuda.get_device_capability()[0] >= 8:
+            from comfy.cli_args import args as _cli_args
+            try:
+                import sageattention  # noqa: F401
+                _cli_args.use_sage_attention = True
+                wlog("[worker] Auto-enabled sage attention")
+            except ImportError:
+                pass
+            try:
+                import flash_attn  # noqa: F401
+                _cli_args.use_flash_attention = True
+                wlog("[worker] Auto-enabled flash attention")
+            except ImportError:
+                pass
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------------
+    # Shim comfy.model_management.load_models_gpu — tell parent to
+    # make room first, then let the real load_models_gpu handle the
+    # actual loading (it already calculates lowvram_model_memory from
+    # get_free_memory internally).
+    # This eliminates dual VRAM management (subprocess + parent).
+    # ---------------------------------------------------------------
+    try:
+        import comfy.model_management as _cmm
+        _original_load_models_gpu = _cmm.load_models_gpu
+
+        def _shimmed_load_models_gpu(models, *args, **kwargs):
+            """Ask parent to free VRAM, then run real load_models_gpu."""
+            _loading_via_shim[0] = True
+            try:
+                model_info = []
+                for m in models:
+                    size = m.model_size() if hasattr(m, 'model_size') else 0
+                    model_info.append({"size": size, "key": str(id(m))})
+
+                total_size = sum(mi["size"] for mi in model_info)
+                wlog(f"[worker] load_models_gpu shim: {len(models)} models, {total_size / 1e9:.2f} GB total")
+
+                # Ask parent to evict its models and make room
+                result = _call_parent("request_vram_budget",
+                             model_info=model_info,
+                             total_size=total_size)
+
+                # Propagate parent's VRAM constraints to subprocess
+                if result:
+                    extra_reserved = result.get("extra_reserved_vram")
+                    if extra_reserved is not None:
+                        _cmm.EXTRA_RESERVED_VRAM = extra_reserved
+                        wlog(f"[worker] Set EXTRA_RESERVED_VRAM = {extra_reserved / 1e9:.2f} GB")
+
+                    parent_vram_state = result.get("vram_state")
+                    if parent_vram_state:
+                        try:
+                            _cmm.vram_state = _cmm.VRAMState[parent_vram_state]
+                            wlog(f"[worker] Set vram_state = {parent_vram_state}")
+                        except (KeyError, AttributeError):
+                            pass
+
+                # Now run the real load_models_gpu — it calls get_free_memory()
+                # which uses EXTRA_RESERVED_VRAM via minimum_inference_memory(),
+                # so it will calculate lowvram_model_memory correctly.
+                _original_load_models_gpu(models, *args, **kwargs)
+                wlog(f"[worker] Models loaded via real load_models_gpu")
+            finally:
+                _loading_via_shim[0] = False
+
+        _cmm.load_models_gpu = _shimmed_load_models_gpu
+        wlog("[worker] Installed load_models_gpu shim (budget-based)")
+    except ImportError:
+        wlog("[worker] comfy.model_management not available, skipping load_models_gpu shim")
+
+    # Set up progress bar forwarding to parent process.
+    # The subprocess's comfy.utils.PROGRESS_BAR_HOOK is None (server.py never ran here).
+    # Setting it lets any ProgressBar created in subprocess code (e.g. stages.py)
+    # automatically forward updates to the parent, which relays to the ComfyUI frontend.
+    try:
+        import comfy.utils as _cu
+        class _InterruptedError(RuntimeError):
+            """Raised when the user cancels the current run."""
+            pass
+        def _progress_hook(value, total, preview=None, node_id=None):
+            try:
+                _call_parent("report_progress", value=value, total=total)
+            except RuntimeError as e:
+                if "interrupted" in str(e).lower():
+                    raise _InterruptedError(str(e))
+            except Exception:
+                pass
+        _cu.set_progress_bar_global_hook(_progress_hook)
+        wlog("[worker] Installed progress bar hook (forwards to parent)")
+    except ImportError:
+        wlog("[worker] comfy.utils not available, skipping progress hook")
+
     # Expose explicit API as comfy_worker module (optional override)
     import types as _types
     _comfy_worker = _types.ModuleType("comfy_worker")
     _comfy_worker.__doc__ = "Helper for registering models with the comfy-env worker."
     _comfy_worker.register_model = _register_model
+    _comfy_worker.call_parent = _call_parent
     sys.modules["comfy_worker"] = _comfy_worker
 
     # Signal ready
@@ -1506,6 +1820,7 @@ class SubprocessWorker(Worker):
         self._shutdown = False
         self._lock = threading.Lock()
         self._last_new_models = []  # Auto-detected models from last call
+        self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
 
         # Socket IPC
         self._server_socket: Optional[socket.socket] = None
@@ -1707,10 +2022,16 @@ class SubprocessWorker(Worker):
         }
         self._transport.send(config)
 
-        # Wait for ready signal
-        msg = self._transport.recv(timeout=60)
-        if not msg:
-            raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
+        # Wait for ready signal (skip any log messages from worker startup)
+        while True:
+            msg = self._transport.recv(timeout=60)
+            if not msg:
+                raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
+            if msg.get("type") == "log":
+                # Worker sends log messages during startup (e.g. comfy imports)
+                print(f"[worker:{self.name}] {msg.get('message', '')}", file=sys.stderr, flush=True)
+                continue
+            break
 
         if msg.get("status") != "ready":
             raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
@@ -1727,6 +2048,31 @@ class SubprocessWorker(Worker):
             f"{self.name}: Use call_module(module='...', func='...') instead."
         )
 
+    def register_callback(self, method: str, handler: Callable) -> None:
+        """Register a handler for worker callbacks (bidirectional RPC).
+
+        When the worker calls _call_parent(method, ...) during execution,
+        the parent dispatches to the registered handler and sends the result back.
+
+        Args:
+            method: Callback method name (e.g., "request_vram_budget").
+            handler: Function(request_dict) -> result_dict.
+        """
+        self._callback_handlers[method] = handler
+
+    def _handle_callback(self, request: dict) -> dict:
+        """Execute a callback request from the worker."""
+        method = request.get("method")
+        handler = self._callback_handlers.get(method)
+        if not handler:
+            return {"type": "callback_response", "status": "error",
+                    "error": f"Unknown callback method: {method}"}
+        try:
+            result = handler(request)
+            return {"type": "callback_response", "status": "ok", "result": result}
+        except Exception as e:
+            return {"type": "callback_response", "status": "error", "error": str(e)}
+
     def _send_request(self, request: dict, timeout: float) -> dict:
         """Send request via socket and read response with timeout."""
         if not self._transport:
@@ -1735,7 +2081,7 @@ class SubprocessWorker(Worker):
         # Send request
         self._transport.send(request)
 
-        # Read response with timeout, handling log messages along the way
+        # Read response with timeout, handling log/callback messages along the way
         try:
             while True:
                 response = self._transport.recv(timeout=timeout)
@@ -1746,6 +2092,12 @@ class SubprocessWorker(Worker):
                 if response.get("type") == "log":
                     msg = response.get("message", "")
                     print(f"[worker:{self.name}] {msg}", file=sys.stderr, flush=True)
+                    continue  # Keep waiting for actual response
+
+                # Handle callback from worker (bidirectional RPC)
+                if response.get("type") == "callback":
+                    callback_response = self._handle_callback(response)
+                    self._transport.send(callback_response)
                     continue  # Keep waiting for actual response
 
                 # Got a real response
