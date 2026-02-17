@@ -5,13 +5,40 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 
 CUDA_VERSION_ENV_VAR = "COMFY_ENV_CUDA_VERSION"
 
 
+def has_nvidia_gpu() -> bool:
+    """Check if NVIDIA GPU hardware is present without loading CUDA/torch."""
+    try:
+        r = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return True
+    except Exception:
+        pass
+    if sys.platform == "linux":
+        from pathlib import Path
+        try:
+            for d in Path("/sys/bus/pci/devices").iterdir():
+                vendor = (d / "vendor").read_text().strip().lower() if (d / "vendor").exists() else ""
+                if "10de" in vendor:
+                    cls = (d / "class").read_text().strip() if (d / "class").exists() else ""
+                    if cls.startswith("0x0300") or cls.startswith("0x0302"):
+                        return True
+        except Exception:
+            pass
+    return False
+
+
 def detect_cuda_version() -> str | None:
     """Detect CUDA version from available sources."""
-    return get_cuda_from_env() or get_cuda_from_torch() or get_cuda_from_nvcc()
+    if env_cuda := get_cuda_from_env():
+        return env_cuda
+    if not has_nvidia_gpu():
+        return None
+    return get_cuda_from_torch() or get_cuda_from_nvcc()
 
 
 def get_cuda_from_env() -> str | None:
