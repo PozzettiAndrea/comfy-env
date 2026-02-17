@@ -24,10 +24,13 @@ def _pkg_variants(package: str) -> List[str]:
     return [package, package.replace("-", "_"), package.replace("_", "-")]
 
 
-def _platform_tag() -> Optional[str]:
-    if sys.platform.startswith("linux"): return "linux_x86_64"
-    if sys.platform == "win32": return "win_amd64"
-    return None
+def _platform_tags() -> List[str]:
+    """Return platform tags to match against wheel filenames (most specific first)."""
+    if sys.platform.startswith("linux"):
+        return ["linux_x86_64", "manylinux"]
+    if sys.platform == "win32":
+        return ["win_amd64"]
+    return []
 
 
 def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str) -> Optional[str]:
@@ -35,12 +38,12 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
     cuda_short = cuda_version.replace(".", "")[:3]
     torch_short = torch_version.replace(".", "")
     py_tag = f"cp{python_version.replace('.', '')}"
-    platform_tag = _platform_tag()
+    platform_tags = _platform_tags()
 
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     link_pattern = re.compile(r'href="([^"]+\.whl)"[^>]*>([^<]+)</a>', re.IGNORECASE)
 
-    logger.info(f"Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {platform_tag or 'any'}")
+    logger.info(f"Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {' '.join(platform_tags) or 'any'}")
 
     for pkg_dir in _pkg_variants(package):
         index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
@@ -54,7 +57,7 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
         for match in link_pattern.finditer(html):
             wheel_url, display = match.group(1), match.group(2)
             if any(p in display for p in local_patterns) and py_tag in display:
-                if platform_tag is None or platform_tag in display:
+                if not platform_tags or any(t in display for t in platform_tags):
                     url = wheel_url if wheel_url.startswith("http") else f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
                     logger.info(f"  Found: {display}")
                     return url
