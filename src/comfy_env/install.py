@@ -229,6 +229,13 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
     if not cfg.cuda_packages or sys.platform == "darwin":
         return
 
+    # Check for actual GPU hardware before attempting CUDA package install
+    # (torch.version.cuda reports compile-time CUDA even without a GPU)
+    from .detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log(f"\n[cuda] No GPU detected, skipping CUDA packages: {', '.join(cfg.cuda_packages)}")
+        return
+
     log(f"\n[cuda] Installing to host Python: {', '.join(cfg.cuda_packages)}")
     if dry_run: return
 
