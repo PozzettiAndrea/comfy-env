@@ -65,6 +65,40 @@ def _find_env_dirs(node_dir: str) -> list:
     return envs
 
 
+def _auto_enable_attention():
+    """Auto-enable fastest attention backend if installed and GPU supports it.
+
+    Sets comfy.cli_args flags so that comfy.ldm.modules.attention picks up
+    sage/flash when the module is imported later. Only runs when:
+    - CUDA is available with SM 8.0+ (Ampere or newer)
+    - The attention package is importable
+    - The flag isn't already set (respects user's explicit CLI flags)
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return
+        if torch.cuda.get_device_capability()[0] < 8:
+            return
+        from comfy.cli_args import args
+        if not args.use_sage_attention:
+            try:
+                import sageattention  # noqa: F401
+                args.use_sage_attention = True
+                print("[comfy-env] Auto-enabled sage attention", file=sys.stderr)
+            except ImportError:
+                pass
+        if not args.use_flash_attention:
+            try:
+                import flash_attn  # noqa: F401
+                args.use_flash_attention = True
+                print("[comfy-env] Auto-enabled flash attention", file=sys.stderr)
+            except ImportError:
+                pass
+    except Exception:
+        pass
+
+
 def setup_env(node_dir: Optional[str] = None) -> None:
     """Set up env for pixi libraries. Call in prestartup_script.py before native imports."""
     if node_dir is None:
@@ -123,3 +157,4 @@ def setup_env(node_dir: Optional[str] = None) -> None:
                 print(f"[comfy-env]   {k}={v}", file=sys.stderr, flush=True)
 
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)
+    _auto_enable_attention()

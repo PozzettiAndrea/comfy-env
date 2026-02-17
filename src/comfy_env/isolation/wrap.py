@@ -263,6 +263,62 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     )
 
 
+def _handle_progress(request: dict) -> dict:
+    """Parent-side callback: forward subprocess progress to ComfyUI frontend.
+
+    Also checks if the user clicked cancel — if so, returns an error
+    so the subprocess can stop processing.
+    """
+    try:
+        import comfy.model_management as mm
+        mm.throw_exception_if_processing_interrupted()
+    except Exception:
+        return {"status": "error", "error": "Processing interrupted by user"}
+    try:
+        import comfy.utils
+        if comfy.utils.PROGRESS_BAR_HOOK:
+            value = request.get("value", 0)
+            total = request.get("total", 1)
+            comfy.utils.PROGRESS_BAR_HOOK(value, total, None)
+    except Exception:
+        pass
+    return {}
+
+
+def _handle_vram_budget(request: dict) -> dict:
+    """Parent-side callback: free VRAM for subprocess model loading.
+
+    Called when the worker's shimmed load_models_gpu() needs to load models.
+    The parent evicts its own models (via free_memory) so the subprocess's
+    real load_models_gpu() sees enough free VRAM via get_free_memory().
+    """
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return {"device": "cuda"}
+
+    total_requested = request.get("total_size", 0)
+    device = mm.get_torch_device()
+
+    if _DEBUG:
+        free_before = mm.get_free_memory(device)
+        _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB, "
+             f"free before eviction: {free_before / 1e9:.2f}GB")
+
+    # Evict parent-side models to make room (with 10% headroom)
+    mm.free_memory(total_requested * 1.1, device)
+
+    if _DEBUG:
+        free_after = mm.get_free_memory(device)
+        _log(f"[comfy-env] VRAM after eviction: {free_after / 1e9:.2f}GB")
+
+    return {
+        "device": str(device),
+        "extra_reserved_vram": mm.EXTRA_RESERVED_VRAM,
+        "vram_state": mm.vram_state.name,
+    }
+
+
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -287,6 +343,9 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         _WORKER_GENERATION += 1
         gen = _WORKER_GENERATION
         worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        # Register bidirectional RPC callbacks
+        worker.register_callback("request_vram_budget", _handle_vram_budget)
+        worker.register_callback("report_progress", _handle_progress)
         _WORKER_POOL[key] = (worker, gen)
         return worker, gen
 
