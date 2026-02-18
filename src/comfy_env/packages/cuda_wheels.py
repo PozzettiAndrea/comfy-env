@@ -27,7 +27,7 @@ def _pkg_variants(package: str) -> List[str]:
 def _platform_tags() -> List[str]:
     """Return platform tags to match against wheel filenames (most specific first)."""
     if sys.platform.startswith("linux"):
-        return ["linux_x86_64", "manylinux"]
+        return ["manylinux"]
     if sys.platform == "win32":
         return ["win_amd64"]
     return []
