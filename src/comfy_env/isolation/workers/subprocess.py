@@ -369,6 +369,19 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
+    # SparseTensor -> decompose to coords + feats CPU tensors
+    if t == 'SparseTensor':
+        feats_cpu = obj.feats.detach().cpu().contiguous()
+        coords_cpu = obj.coords.detach().cpu().contiguous()
+        result = {
+            "__shm_sparse_tensor__": True,
+            "coords": _to_shm(coords_cpu, registry, visited),
+            "feats": _to_shm(feats_cpu, registry, visited),
+            "feats_dtype": str(feats_cpu.dtype),
+        }
+        visited[obj_id] = result
+        return result
+
     # Path -> string
     from pathlib import PurePath
     if isinstance(obj, PurePath):
@@ -495,6 +508,22 @@ def _from_shm(obj, unlink=True):
         if unlink:
             block.unlink()
         return pickle.loads(mesh_bytes)
+
+    # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
+    if "__shm_sparse_tensor__" in obj:
+        import torch
+        feats = _from_shm(obj["feats"], unlink)
+        # Restore original dtype if metadata available (guards against shm dtype loss)
+        feats_dtype = obj.get("feats_dtype")
+        if feats_dtype and hasattr(torch, feats_dtype.split(".")[-1]):
+            expected = getattr(torch, feats_dtype.split(".")[-1])
+            if feats.dtype != expected:
+                feats = feats.to(expected)
+        return {
+            "__sparse_tensor_data__": True,
+            "coords": _from_shm(obj["coords"], unlink),
+            "feats": feats,
+        }
 
     # generic pickled object (VideoFromFile, etc.)
     if "__shm_pickle__" in obj:
@@ -965,6 +994,16 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
+    # SparseTensor -> decompose to coords + feats CPU tensors
+    if t == 'SparseTensor':
+        result = {
+            "__shm_sparse_tensor__": True,
+            "coords": _to_shm(obj.coords.cpu(), registry, visited),
+            "feats": _to_shm(obj.feats.cpu(), registry, visited),
+        }
+        visited[obj_id] = result
+        return result
+
     if isinstance(obj, dict):
         result = {k: _to_shm(v, registry, visited) for k, v in obj.items()}
         visited[obj_id] = result
@@ -1098,6 +1137,24 @@ def _from_shm(obj, _depth=0, _key="root"):
         block.close()
         # Don't unlink - parent will clean up
         return pickle.loads(mesh_bytes)
+
+    # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
+    if "__shm_sparse_tensor__" in obj:
+        wlog(f"[_from_shm] {_key}: SparseTensor")
+        import torch
+        feats = _from_shm(obj["feats"], _depth+1, f"{_key}.feats")
+        # Restore original dtype if metadata available (guards against shm dtype loss)
+        feats_dtype = obj.get("feats_dtype")
+        if feats_dtype and hasattr(torch, feats_dtype.split(".")[-1]):
+            expected = getattr(torch, feats_dtype.split(".")[-1])
+            if feats.dtype != expected:
+                wlog(f"[_from_shm] {_key}: feats dtype mismatch {feats.dtype} -> {expected}")
+                feats = feats.to(expected)
+        return {
+            "__sparse_tensor_data__": True,
+            "coords": _from_shm(obj["coords"], _depth+1, f"{_key}.coords"),
+            "feats": feats,
+        }
 
     # generic pickled object (VideoFromFile, etc.)
     if "__shm_pickle__" in obj:

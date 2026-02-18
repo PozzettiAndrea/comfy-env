@@ -29,10 +29,29 @@ def install_requirements(node_dir: Path, log: Callable[[str], None] = print) -> 
     req_file = node_dir / "requirements.txt"
     if not req_file.exists(): return
     log(f"  Installing requirements for {node_dir.name}...")
-    cmd = ["uv", "pip", "install", "-r", str(req_file), "--python", sys.executable] if shutil.which("uv") else [sys.executable, "-m", "pip", "install", "-r", str(req_file)]
+
+    # Filter out comfy-env and sister packages to prevent self-downgrade
+    _PROTECTED = {"comfy-env", "comfy_env", "comfy-test", "comfy_test", "comfy-3d-viewers", "comfy_3d_viewers", "comfy-attn", "comfy_attn"}
+    import tempfile
+    lines = req_file.read_text().splitlines()
+    filtered = [l for l in lines if not any(l.strip().lower().startswith(p) for p in _PROTECTED)]
+    if len(filtered) < len(lines):
+        # Write filtered requirements to temp file
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        tmp.write("\n".join(filtered) + "\n")
+        tmp.close()
+        target = tmp.name
+    else:
+        target = str(req_file)
+
+    cmd = ["uv", "pip", "install", "-r", target, "--python", sys.executable] if shutil.which("uv") else [sys.executable, "-m", "pip", "install", "-r", target]
     result = subprocess.run(cmd, cwd=node_dir, capture_output=True, text=True)
     if result.returncode != 0:
         log(f"  Warning: requirements failed: {result.stderr.strip()[:200]}")
+
+    if target != str(req_file):
+        import os
+        os.unlink(target)
 
 
 def run_install_script(node_dir: Path, log: Callable[[str], None] = print) -> None:

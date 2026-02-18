@@ -27,7 +27,7 @@ def _pkg_variants(package: str) -> List[str]:
 def _platform_tags() -> List[str]:
     """Return platform tags to match against wheel filenames (most specific first)."""
     if sys.platform.startswith("linux"):
-        return ["manylinux"]
+        return ["manylinux", "linux"]
     if sys.platform == "win32":
         return ["win_amd64"]
     return []
@@ -45,6 +45,7 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
 
     logger.info(f"Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {' '.join(platform_tags) or 'any'}")
 
+    candidates = []
     for pkg_dir in _pkg_variants(package):
         index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
         try:
@@ -59,8 +60,17 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
             if any(p in display for p in local_patterns) and py_tag in display:
                 if not platform_tags or any(t in display for t in platform_tags):
                     url = wheel_url if wheel_url.startswith("http") else f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
-                    logger.info(f"  Found: {display}")
-                    return url
+                    candidates.append((url, display))
+
+    if candidates:
+        # Prefer manylinux wheels over plain linux
+        for url, display in candidates:
+            if "manylinux" in display:
+                logger.info(f"  Found: {display}")
+                return url
+        url, display = candidates[0]
+        logger.info(f"  Found: {display}")
+        return url
 
     logger.info(f"  No matching wheel found")
     return None
