@@ -343,11 +343,31 @@ def _to_shm(obj, registry, visited=None):
             result = _serialize_cuda_ipc(obj)
             visited[obj_id] = result
             return result
-        arr = np.ascontiguousarray(obj.detach().cpu().numpy())
-        block = shm.SharedMemory(create=True, size=arr.nbytes)
-        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-        registry.append(block)
-        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype), "__was_tensor__": True}
+        tensor = obj.detach().cpu().contiguous()
+        try:
+            # Numpy path (fastest for numpy-compatible dtypes)
+            arr = np.ascontiguousarray(tensor.numpy())
+            block = shm.SharedMemory(create=True, size=arr.nbytes)
+            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+            registry.append(block)
+            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype), "__was_tensor__": True}
+        except TypeError:
+            # Numpy doesn't support this dtype (e.g. bfloat16, float8)
+            # Fall back to raw bytes via untyped_storage
+            import torch
+            storage = tensor.untyped_storage()
+            nbytes = storage.nbytes()
+            block = shm.SharedMemory(create=True, size=nbytes)
+            block.buf[:nbytes] = storage
+            registry.append(block)
+            result = {
+                "__shm_raw_tensor__": block.name,
+                "shape": list(tensor.shape),
+                "stride": list(tensor.stride()),
+                "dtype": str(tensor.dtype),
+                "nbytes": nbytes,
+                "storage_offset": tensor.storage_offset(),
+            }
         visited[obj_id] = result  # Cache by tensor id, not temp array id
         return result
 
@@ -481,6 +501,28 @@ def _from_shm(obj, unlink=True):
         # Convert back to numpy if it was originally numpy
         if obj.get("__was_numpy__"):
             return tensor.numpy()
+        return tensor
+
+    # Raw tensor (non-numpy dtype like bfloat16) - uses untyped_storage
+    if "__shm_raw_tensor__" in obj:
+        import torch
+        block = shm.SharedMemory(name=obj["__shm_raw_tensor__"])
+        nbytes = obj["nbytes"]
+        dtype_str = obj["dtype"].replace("torch.", "")
+        dtype = getattr(torch, dtype_str)
+        storage = torch.UntypedStorage(nbytes)
+        storage[:nbytes] = torch.UntypedStorage.from_buffer(block.buf[:nbytes], byte_order='native')
+        tensor = torch.as_strided(
+            torch.empty([], dtype=dtype).set_(
+                torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
+            ),
+            obj["shape"],
+            obj["stride"],
+            obj["storage_offset"],
+        )
+        block.close()
+        if unlink:
+            block.unlink()
         return tensor
 
     # numpy array (or tensor that was converted to numpy) - legacy format
@@ -1085,6 +1127,35 @@ def _from_shm(obj, _depth=0, _key="root"):
         # Convert back to numpy if it was originally numpy
         if obj.get("__was_numpy__"):
             return tensor.numpy()
+        return tensor
+
+    # __shm_raw_tensor__ -> raw bytes format for non-numpy dtypes (e.g. bfloat16)
+    if "__shm_raw_tensor__" in obj:
+        import torch
+        shm_name = obj["__shm_raw_tensor__"]
+        nbytes = obj["nbytes"]
+        dtype_str = obj["dtype"].replace("torch.", "")
+        dtype = getattr(torch, dtype_str)
+        wlog(f"[_from_shm] {_key}: opening raw tensor shm '{shm_name}' shape={obj['shape']} dtype={dtype} ({nbytes/1e6:.1f} MB)")
+        block = shm.SharedMemory(name=shm_name)
+        # Unregister from resource_tracker - parent owns these blocks
+        try:
+            from multiprocessing.resource_tracker import unregister
+            unregister(block._name, "shared_memory")
+        except Exception:
+            pass
+        storage = torch.UntypedStorage(nbytes)
+        storage[:nbytes] = torch.UntypedStorage.from_buffer(block.buf[:nbytes], byte_order='native')
+        tensor = torch.as_strided(
+            torch.empty([], dtype=dtype).set_(
+                torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
+            ),
+            obj["shape"],
+            obj["stride"],
+            obj["storage_offset"],
+        )
+        _input_shm_blocks.append(block)  # keep alive -- parent cleans up after we respond
+        wlog(f"[_from_shm] {_key}: raw tensor deserialized shape={tensor.shape} dtype={tensor.dtype}")
         return tensor
 
     # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
