@@ -194,6 +194,79 @@ from multiprocessing import shared_memory as shm
 import base64
 import numpy as np
 
+# --- PyTorch native tensor sharing (parent side) ---
+# Uses share_memory_() to put tensors in /dev/shm via file_system strategy.
+# Zero-copy: no numpy intermediary, no memcpy, no Python SharedMemory objects.
+# This matches the worker→parent path (TensorRef format) for consistency.
+
+from collections import deque as _deque
+
+class _TensorKeeper:
+    """Hold shared tensor references to prevent GC before worker reads them."""
+    def __init__(self, retention_seconds=60.0):
+        self.retention_seconds = retention_seconds
+        self._keeper = _deque()
+        self._lock = threading.Lock()
+
+    def keep(self, t):
+        now = time.time()
+        with self._lock:
+            self._keeper.append((now, t))
+            while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
+                self._keeper.popleft()
+
+_parent_tensor_keeper = _TensorKeeper()
+_parent_sharing_strategy_set = False
+
+
+def _serialize_tensor_native_parent(t, registry):
+    """Serialize CPU tensor via PyTorch native shared memory (zero-copy to worker).
+
+    Uses share_memory_() which mmaps tensor storage to a /dev/shm file.
+    Worker maps the same file via rebuild_storage_filename. No copies.
+    Handles all dtypes natively (bf16, fp8, etc.) — no numpy conversion.
+    """
+    global _parent_sharing_strategy_set
+    import torch
+    import torch.multiprocessing as mp
+    import torch.multiprocessing.reductions as reductions
+
+    if not _parent_sharing_strategy_set:
+        try:
+            mp.set_sharing_strategy("file_system")
+        except RuntimeError:
+            pass
+        _parent_sharing_strategy_set = True
+
+    # Keep tensor alive until worker finishes reading
+    _parent_tensor_keeper.keep(t)
+
+    if not t.is_shared():
+        t.share_memory_()
+
+    storage = t.untyped_storage()
+    sfunc, sargs = reductions.reduce_storage(storage)
+
+    if sfunc.__name__ == "rebuild_storage_filename":
+        return {
+            "__type__": "TensorRef",
+            "strategy": "file_system",
+            "manager_path": sargs[1].decode("utf-8") if isinstance(sargs[1], bytes) else sargs[1],
+            "storage_key": sargs[2].decode("utf-8") if isinstance(sargs[2], bytes) else sargs[2],
+            "storage_size": sargs[3],
+            "dtype": str(t.dtype),
+            "tensor_size": list(t.size()),
+            "tensor_stride": list(t.stride()),
+            "tensor_offset": t.storage_offset(),
+            "requires_grad": t.requires_grad,
+        }
+    else:
+        # Force file_system strategy and retry
+        mp.set_sharing_strategy("file_system")
+        _parent_sharing_strategy_set = True
+        t.share_memory_()
+        return _serialize_tensor_native_parent(t, registry)
+
 
 # =============================================================================
 # CUDA IPC - zero-copy GPU tensor transfer (Linux only)
@@ -324,19 +397,25 @@ def _to_shm(obj, registry, visited=None):
 
     t = type(obj).__name__
 
-    # numpy array -> direct shared memory
+    # numpy array -> PyTorch native shared memory (zero-copy), fallback to shm copy
     if t == 'ndarray':
         arr = np.ascontiguousarray(obj)
-        block = shm.SharedMemory(create=True, size=arr.nbytes)
-        np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-        registry.append(block)
-        result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+        try:
+            import torch
+            tensor = torch.from_numpy(arr)
+            result = _serialize_tensor_native_parent(tensor, registry)
+            result["__was_numpy__"] = True
+            result["numpy_dtype"] = str(arr.dtype)
+        except Exception:
+            # torch not available — fall back to Python SharedMemory copy
+            block = shm.SharedMemory(create=True, size=arr.nbytes)
+            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+            registry.append(block)
+            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
         visited[obj_id] = result
         return result
 
-    # torch.Tensor -> CUDA IPC (zero-copy) or numpy -> shared memory
-    # IMPORTANT: Inline serialization to avoid caching ephemeral numpy array by id().
-    # The temp array can be GC'd and its address reused, causing cache collisions.
+    # torch.Tensor -> CUDA IPC (zero-copy GPU) or PyTorch native shared memory (zero-copy CPU)
     if t == 'Tensor':
         # CUDA IPC: zero-copy GPU-to-GPU transfer (Linux only)
         if obj.is_cuda and _probe_cuda_ipc():
@@ -344,31 +423,8 @@ def _to_shm(obj, registry, visited=None):
             visited[obj_id] = result
             return result
         tensor = obj.detach().cpu().contiguous()
-        try:
-            # Numpy path (fastest for numpy-compatible dtypes)
-            arr = np.ascontiguousarray(tensor.numpy())
-            block = shm.SharedMemory(create=True, size=arr.nbytes)
-            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-            registry.append(block)
-            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype), "__was_tensor__": True}
-        except TypeError:
-            # Numpy doesn't support this dtype (e.g. bfloat16, float8)
-            # Fall back to raw bytes via untyped_storage
-            import torch
-            storage = tensor.untyped_storage()
-            nbytes = storage.nbytes()
-            block = shm.SharedMemory(create=True, size=nbytes)
-            block.buf[:nbytes] = bytes(storage)
-            registry.append(block)
-            result = {
-                "__shm_raw_tensor__": block.name,
-                "shape": list(tensor.shape),
-                "stride": list(tensor.stride()),
-                "dtype": str(tensor.dtype),
-                "nbytes": nbytes,
-                "storage_offset": tensor.storage_offset(),
-            }
-        visited[obj_id] = result  # Cache by tensor id, not temp array id
+        result = _serialize_tensor_native_parent(tensor, registry)
+        visited[obj_id] = result
         return result
 
     # trimesh.Trimesh -> pickle -> shared memory (preserves visual, metadata, normals)
@@ -503,44 +559,13 @@ def _from_shm(obj, unlink=True):
             return tensor.numpy()
         return tensor
 
-    # Raw tensor (non-numpy dtype like bfloat16) - uses untyped_storage
-    if "__shm_raw_tensor__" in obj:
-        import ctypes
-        import torch
-        block = shm.SharedMemory(name=obj["__shm_raw_tensor__"])
-        nbytes = obj["nbytes"]
-        dtype_str = obj["dtype"].replace("torch.", "")
-        dtype = getattr(torch, dtype_str)
-        storage = torch.UntypedStorage(nbytes)
-        src = (ctypes.c_char * nbytes).from_buffer(block.buf)
-        ctypes.memmove(storage.data_ptr(), src, nbytes)
-        tensor = torch.as_strided(
-            torch.empty([], dtype=dtype).set_(
-                torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
-            ),
-            obj["shape"],
-            obj["stride"],
-            obj["storage_offset"],
-        )
-        block.close()
-        if unlink:
-            block.unlink()
-        return tensor
-
-    # numpy array (or tensor that was converted to numpy) - legacy format
+    # numpy array via Python SharedMemory (fallback when torch unavailable)
     if "__shm_np__" in obj:
         block = shm.SharedMemory(name=obj["__shm_np__"])
         arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
         block.close()
         if unlink:
             block.unlink()
-        # Convert back to tensor if it was originally a tensor
-        if obj.get("__was_tensor__"):
-            try:
-                import torch
-                return torch.from_numpy(arr)
-            except Exception:
-                pass
         return arr
 
     # trimesh (pickled to preserve visual, metadata, normals)
@@ -1015,8 +1040,7 @@ def _to_shm(obj, registry, visited=None):
             block = shm.SharedMemory(create=True, size=arr.nbytes)
             np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
             registry.append(block)
-            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype),
-                       "__was_tensor__": True}
+            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
         visited[obj_id] = result
         return result
 
@@ -1117,7 +1141,7 @@ def _from_shm(obj, _depth=0, _key="root"):
         wlog(f"[_from_shm] {_key}: CudaIPC tensor_size={obj.get('tensor_size')}")
         return _deserialize_cuda_ipc(obj)
 
-    # TensorRef -> use PyTorch's native deserialization (new format, worker->parent)
+    # TensorRef -> use PyTorch's native deserialization (both directions)
     if obj.get("__type__") == "TensorRef":
         wlog(f"[_from_shm] {_key}: TensorRef tensor_size={obj.get('tensor_size')}")
         if _DEBUG:
@@ -1131,70 +1155,22 @@ def _from_shm(obj, _depth=0, _key="root"):
             return tensor.numpy()
         return tensor
 
-    # __shm_raw_tensor__ -> raw bytes format for non-numpy dtypes (e.g. bfloat16)
-    if "__shm_raw_tensor__" in obj:
-        import torch
-        shm_name = obj["__shm_raw_tensor__"]
-        nbytes = obj["nbytes"]
-        dtype_str = obj["dtype"].replace("torch.", "")
-        dtype = getattr(torch, dtype_str)
-        wlog(f"[_from_shm] {_key}: opening raw tensor shm '{shm_name}' shape={obj['shape']} dtype={dtype} ({nbytes/1e6:.1f} MB)")
-        block = shm.SharedMemory(name=shm_name)
-        # Unregister from resource_tracker - parent owns these blocks
-        try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(block._name, "shared_memory")
-        except Exception:
-            pass
-        # Zero-copy: view shm as uint8 numpy array, then reinterpret as target dtype
-        raw = np.frombuffer(block.buf, dtype=np.uint8, count=nbytes)
-        uint8_tensor = torch.from_numpy(raw)  # shares numpy memory (no copy)
-        storage = uint8_tensor.untyped_storage()  # same underlying shm memory
-        tensor = torch.as_strided(
-            torch.empty([], dtype=dtype).set_(
-                torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
-            ),
-            obj["shape"],
-            obj["stride"],
-            obj["storage_offset"],
-        )
-        _input_shm_blocks.append(block)  # keep alive -- parent cleans up after we respond
-        wlog(f"[_from_shm] {_key}: raw tensor deserialized shape={tensor.shape} dtype={tensor.dtype}")
-        return tensor
-
-    # __shm_np__ -> legacy format (parent->worker, uses Python SharedMemory)
+    # __shm_np__ -> numpy array via Python SharedMemory (fallback when torch unavailable)
     if "__shm_np__" in obj:
         shm_name = obj["__shm_np__"]
         shape = tuple(obj["shape"])
         dtype = obj["dtype"]
         nbytes = np.prod(shape) * np.dtype(dtype).itemsize
         wlog(f"[_from_shm] {_key}: opening shm '{shm_name}' shape={shape} dtype={dtype} ({nbytes/1e6:.1f} MB)")
-        if _DEBUG:
-            print(f"[comfy-env] DESERIALIZE __shm_np__: shape={obj.get('shape')}, was_tensor={obj.get('__was_tensor__')}", file=sys.stderr, flush=True)
         block = shm.SharedMemory(name=shm_name)
-        wlog(f"[_from_shm] {_key}: shm opened, block.size={block.size}")
-        # Unregister from resource_tracker - parent owns these blocks and will clean them up
         try:
             from multiprocessing.resource_tracker import unregister
             unregister(block._name, "shared_memory")
         except Exception:
             pass
-        wlog(f"[_from_shm] {_key}: mapping {nbytes/1e6:.1f} MB from shm (zero-copy)")
         arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf)
-        _input_shm_blocks.append(block)  # keep alive -- parent cleans up after we respond
-        wlog(f"[_from_shm] {_key}: mapped, arr.shape={arr.shape}")
-        if _DEBUG:
-            print(f"[comfy-env] DESERIALIZED arr shape: {arr.shape}", file=sys.stderr, flush=True)
-        # Convert back to tensor if it was originally a tensor
-        if obj.get("__was_tensor__"):
-            try:
-                import torch
-                wlog(f"[_from_shm] {_key}: converting to torch tensor")
-                result = torch.from_numpy(arr)
-                wlog(f"[_from_shm] {_key}: torch tensor ready shape={result.shape}")
-                return result
-            except Exception:
-                pass
+        _input_shm_blocks.append(block)
+        wlog(f"[_from_shm] {_key}: mapped arr shape={arr.shape}")
         return arr
 
     # trimesh (pickled)
