@@ -358,7 +358,7 @@ def _to_shm(obj, registry, visited=None):
             storage = tensor.untyped_storage()
             nbytes = storage.nbytes()
             block = shm.SharedMemory(create=True, size=nbytes)
-            block.buf[:nbytes] = storage
+            block.buf[:nbytes] = bytes(storage)
             registry.append(block)
             result = {
                 "__shm_raw_tensor__": block.name,
@@ -505,13 +505,15 @@ def _from_shm(obj, unlink=True):
 
     # Raw tensor (non-numpy dtype like bfloat16) - uses untyped_storage
     if "__shm_raw_tensor__" in obj:
+        import ctypes
         import torch
         block = shm.SharedMemory(name=obj["__shm_raw_tensor__"])
         nbytes = obj["nbytes"]
         dtype_str = obj["dtype"].replace("torch.", "")
         dtype = getattr(torch, dtype_str)
         storage = torch.UntypedStorage(nbytes)
-        storage[:nbytes] = torch.UntypedStorage.from_buffer(block.buf[:nbytes], byte_order='native')
+        src = (ctypes.c_char * nbytes).from_buffer(block.buf)
+        ctypes.memmove(storage.data_ptr(), src, nbytes)
         tensor = torch.as_strided(
             torch.empty([], dtype=dtype).set_(
                 torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
@@ -1144,8 +1146,10 @@ def _from_shm(obj, _depth=0, _key="root"):
             unregister(block._name, "shared_memory")
         except Exception:
             pass
-        storage = torch.UntypedStorage(nbytes)
-        storage[:nbytes] = torch.UntypedStorage.from_buffer(block.buf[:nbytes], byte_order='native')
+        # Zero-copy: view shm as uint8 numpy array, then reinterpret as target dtype
+        raw = np.frombuffer(block.buf, dtype=np.uint8, count=nbytes)
+        uint8_tensor = torch.from_numpy(raw)  # shares numpy memory (no copy)
+        storage = uint8_tensor.untyped_storage()  # same underlying shm memory
         tensor = torch.as_strided(
             torch.empty([], dtype=dtype).set_(
                 torch.storage.TypedStorage(wrap_storage=storage, dtype=dtype, _internal=True),
