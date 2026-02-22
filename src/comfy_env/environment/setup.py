@@ -99,6 +99,23 @@ def _auto_enable_attention():
         pass
 
 
+def _ensure_base_directory():
+    """Ensure comfy.cli_args.args.base_directory is set.
+
+    Some nodes (e.g. KJNodes) resolve relative paths via args.base_directory.
+    If the user didn't pass --base-directory, it defaults to None and relative
+    paths break when cwd != ComfyUI root (common on CI / portable builds).
+    """
+    try:
+        from comfy.cli_args import args
+        if args.base_directory:
+            return
+        import folder_paths
+        args.base_directory = folder_paths.base_path
+    except Exception:
+        pass
+
+
 def setup_env(node_dir: Optional[str] = None) -> None:
     """Set up env for pixi libraries. Call in prestartup_script.py before native imports."""
     if node_dir is None:
@@ -156,5 +173,6 @@ def setup_env(node_dir: Optional[str] = None) -> None:
             if v:
                 print(f"[comfy-env]   {k}={v}", file=sys.stderr, flush=True)
 
+    _ensure_base_directory()
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)
     _auto_enable_attention()

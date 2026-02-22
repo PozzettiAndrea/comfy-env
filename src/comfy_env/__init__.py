@@ -24,7 +24,7 @@ from .install import install, verify_installation, USE_COMFY_ENV_VAR
 
 # Prestartup helpers
 from .environment.setup import setup_env
-from .environment.paths import copy_files
+from .environment.paths import copy_files, get_comfyui_dir
 
 # Isolation
 from .isolation import wrap_isolated_nodes, wrap_nodes, register_nodes
@@ -125,6 +125,7 @@ __all__ = [
     # Prestartup
     "setup_env",
     "copy_files",
+    "get_comfyui_dir",
     # Isolation
     "wrap_isolated_nodes",
     "wrap_nodes",

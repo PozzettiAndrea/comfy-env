@@ -7,6 +7,31 @@ from typing import Optional, Tuple
 from .cache import resolve_env_path as _resolve_env_path
 
 
+def get_comfyui_dir(node_dir: Optional[Path] = None) -> Optional[Path]:
+    """Find the ComfyUI base directory.
+
+    Resolution order:
+    1. folder_paths.base_path (canonical, available at prestartup time)
+    2. Walk up from node_dir looking for ComfyUI markers (main.py + comfy/)
+    """
+    # 1. Use folder_paths (always available during prestartup)
+    try:
+        import folder_paths
+        return Path(folder_paths.base_path)
+    except ImportError:
+        pass
+
+    # 2. Walk up from node_dir
+    if node_dir is not None:
+        current = Path(node_dir).resolve()
+        for _ in range(10):
+            if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            current = current.parent
+
+    return None
+
+
 def get_site_packages_path(node_dir: Path) -> Optional[Path]:
     _, site_packages, _ = _resolve_env_path(node_dir)
     return site_packages
