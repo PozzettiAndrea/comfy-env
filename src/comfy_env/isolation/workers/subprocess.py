@@ -1824,6 +1824,7 @@ def main():
             module = importlib.import_module(module_name)
             wlog(f"[worker] Module imported")
 
+            import torch as _torch_worker
             if request_type == "call_method":
                 class_name = request["class_name"]
                 method_name = request["method_name"]
@@ -1838,12 +1839,14 @@ def main():
                     instance.__dict__.update(self_state)
                 wlog(f"[worker] Calling {method_name}...")
                 method = getattr(instance, method_name)
-                result = method(**inputs)
+                with _torch_worker.inference_mode():
+                    result = method(**inputs)
                 wlog(f"[worker] Method returned")
             else:
                 func_name = request["func"]
                 func = getattr(module, func_name)
-                result = func(**inputs)
+                with _torch_worker.inference_mode():
+                    result = func(**inputs)
 
             # Serialize result to shared memory
             wlog(f"[worker] Serializing result to shm...")
