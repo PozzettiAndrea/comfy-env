@@ -79,11 +79,23 @@ class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
     def _send_device_command(self, device_str):
         """Send model_to_device IPC command."""
         self._check_worker()
-        self._worker.send_command(
-            "model_to_device",
-            model_id=self._model_id,
-            device=device_str,
-        )
+        try:
+            self._worker.send_command(
+                "model_to_device",
+                model_id=self._model_id,
+                device=device_str,
+            )
+        except RuntimeError as e:
+            if "not registered" in str(e):
+                # Worker was restarted — model no longer exists in subprocess.
+                # For offload: model is already gone from VRAM, just update state.
+                log.warning("Model '%s' gone from worker (restarted?), treating as offloaded",
+                            self._model_id)
+                self.model.device = self.offload_device
+                self.model.model_loaded_weight_memory = 0
+                self.model.model_offload_buffer_memory = 0
+                return
+            raise
 
     # -- ModelPatcher overrides --
 
