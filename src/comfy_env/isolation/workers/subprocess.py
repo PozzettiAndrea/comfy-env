@@ -2069,6 +2069,8 @@ class SubprocessWorker(Worker):
                     self._on_restart()
                 except Exception:
                     pass
+            self._last_new_models = []  # Clear stale model registry
+            self._process = None  # Prevent second _on_restart fire below
 
         # Process is dead or never started — fire restart callback if replacing
         if self._process is not None and self._on_restart:
@@ -2076,6 +2078,7 @@ class SubprocessWorker(Worker):
                 self._on_restart()
             except Exception:
                 pass
+            self._last_new_models = []  # Clear stale model registry
 
         # Clean up any previous socket
         if self._transport:

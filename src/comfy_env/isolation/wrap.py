@@ -320,26 +320,24 @@ def _handle_vram_budget(request: dict) -> dict:
 
 
 def _cleanup_stale_patchers(env_dir):
-    """Remove stale SubprocessModelPatchers from ComfyUI's memory manager.
+    """Mark stale SubprocessModelPatchers for cleanup.
 
-    Called when a worker is replaced (crash/restart).  The old patchers point
-    to models that no longer exist in the new worker process, so leaving them
-    in current_loaded_models would crash unload_all_models().
+    Called when a worker is replaced (crash/restart).  We clear the patcher
+    registry so they won't be re-registered.  The patchers themselves stay in
+    ComfyUI's current_loaded_models — the safety net in _send_device_command
+    handles "not registered" IPC errors gracefully, and free_memory will
+    remove them during its normal unload loop.
+
+    We must NOT modify current_loaded_models here because this callback can
+    fire inside free_memory's iteration (via model_unload → send_command →
+    _ensure_started → _on_restart), which would invalidate captured indices.
     """
     key = str(env_dir)
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
-    try:
-        import comfy.model_management as mm
-        stale = set(old_patchers.values())
-        mm.current_loaded_models[:] = [
-            lm for lm in mm.current_loaded_models
-            if lm.model not in stale
-        ]
-        _log(f"[comfy-env] Cleaned up {len(old_patchers)} stale model patchers")
-    except Exception:
-        pass
+    _log(f"[comfy-env] Invalidated {len(old_patchers)} stale model patchers "
+         f"(will be cleaned up during next unload)")
 
 
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
