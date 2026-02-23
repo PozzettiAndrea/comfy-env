@@ -1685,8 +1685,8 @@ def main():
 
         _cmm.load_models_gpu = _shimmed_load_models_gpu
         wlog("[worker] Installed load_models_gpu shim (budget-based)")
-    except ImportError:
-        wlog("[worker] comfy.model_management not available, skipping load_models_gpu shim")
+    except Exception as e:
+        wlog(f"[worker] comfy.model_management not available ({type(e).__name__}: {e}), skipping load_models_gpu shim")
 
     # Set up progress bar forwarding to parent process.
     # The subprocess's comfy.utils.PROGRESS_BAR_HOOK is None (server.py never ran here).
@@ -1707,8 +1707,8 @@ def main():
                 pass
         _cu.set_progress_bar_global_hook(_progress_hook)
         wlog("[worker] Installed progress bar hook (forwards to parent)")
-    except ImportError:
-        wlog("[worker] comfy.utils not available, skipping progress hook")
+    except Exception as e:
+        wlog(f"[worker] comfy.utils not available ({type(e).__name__}: {e}), skipping progress hook")
 
     # Expose explicit API as comfy_worker module (optional override)
     import types as _types
@@ -2012,6 +2012,45 @@ class SubprocessWorker(Worker):
                 pass
             self._server_socket = None
 
+    def _worker_exit_diagnostic(self) -> str:
+        """Collect diagnostic info when the worker process dies unexpectedly."""
+        lines = []
+        if self._process:
+            rc = self._process.poll()
+            lines.append(f"  exit code: {rc}")
+            if rc is not None and rc < 0:
+                import signal as _sig
+                try:
+                    sig_name = _sig.Signals(-rc).name
+                    lines.append(f"  killed by signal: {sig_name}")
+                except (ValueError, AttributeError):
+                    pass
+        # Check worker debug log
+        worker_log = os.path.join(tempfile.gettempdir(), "comfy_worker_debug.log")
+        if os.path.exists(worker_log):
+            try:
+                with open(worker_log, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                    tail = content.strip().split("\n")[-20:]
+                    lines.append(f"  worker log ({worker_log}, last 20 lines):")
+                    for l in tail:
+                        lines.append(f"    {l}")
+            except Exception:
+                pass
+        # Check faulthandler dump
+        fault_file = os.path.join(tempfile.gettempdir(), "comfy_worker_faulthandler.txt")
+        if os.path.exists(fault_file):
+            try:
+                with open(fault_file, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read().strip()
+                if content:
+                    lines.append(f"  faulthandler dump ({fault_file}):")
+                    for l in content.split("\n")[-20:]:
+                        lines.append(f"    {l}")
+            except Exception:
+                pass
+        return "\n".join(lines) if lines else "  (no diagnostic info available)"
+
     def _ensure_started(self):
         """Start persistent worker subprocess if not running."""
         if self._shutdown:
@@ -2139,15 +2178,19 @@ class SubprocessWorker(Worker):
         self._transport.send(config)
 
         # Wait for ready signal (skip any log messages from worker startup)
-        while True:
-            msg = self._transport.recv(timeout=60)
-            if not msg:
-                raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
-            if msg.get("type") == "log":
-                # Worker sends log messages during startup (e.g. comfy imports)
-                print(f"[worker:{self.name}] {msg.get('message', '')}", file=sys.stderr, flush=True)
-                continue
-            break
+        try:
+            while True:
+                msg = self._transport.recv(timeout=60)
+                if not msg:
+                    raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
+                if msg.get("type") == "log":
+                    # Worker sends log messages during startup (e.g. comfy imports)
+                    print(f"[worker:{self.name}] {msg.get('message', '')}", file=sys.stderr, flush=True)
+                    continue
+                break
+        except (ConnectionError, ConnectionResetError, OSError) as e:
+            diag = self._worker_exit_diagnostic()
+            raise RuntimeError(f"{self.name}: Worker died during startup: {e}\n{diag}") from e
 
         if msg.get("status") != "ready":
             raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
@@ -2225,16 +2268,14 @@ class SubprocessWorker(Worker):
             if self._process:
                 exit_code = self._process.poll()
 
+            diag = self._worker_exit_diagnostic()
             if exit_code is not None:
                 raise RuntimeError(
-                    f"{self.name}: Worker process died with exit code {exit_code}. "
-                    f"This usually indicates a crash in native code (CGAL, pymeshlab, etc.). "
-                    f"Check stderr output above."
+                    f"{self.name}: Worker process died with exit code {exit_code}.\n{diag}"
                 ) from e
             else:
                 raise RuntimeError(
-                    f"{self.name}: Socket closed but worker process still running. "
-                    f"This may indicate a protocol error or worker bug."
+                    f"{self.name}: Socket closed but worker process still running.\n{diag}"
                 ) from e
 
         if response is None:
