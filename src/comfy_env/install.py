@@ -133,44 +133,39 @@ def install(
     if node_dir is None:
         node_dir = Path(inspect.stack()[1].filename).parent.resolve()
 
-    _log = log_callback or print
-    log = _make_tee_log(_log, node_dir / "install.log")
+    log = log_callback or print
 
-    try:
-        _enable_windows_long_paths(log)
+    _enable_windows_long_paths(log)
 
-        if config is not None:
-            config_path = Path(config)
-            if not config_path.is_absolute():
-                config_path = node_dir / config_path
-            cfg = load_config(config_path)
-        else:
-            cfg = discover_config(node_dir, root=True)
+    if config is not None:
+        config_path = Path(config)
+        if not config_path.is_absolute():
+            config_path = node_dir / config_path
+        cfg = load_config(config_path)
+    else:
+        cfg = discover_config(node_dir, root=True)
 
-        if cfg is None:
-            raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
+    if cfg is None:
+        raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
-        if cfg.apt_packages: _install_apt_packages(cfg.apt_packages, log, dry_run)
-        if cfg.brew_packages: _install_brew_packages(cfg.brew_packages, log, dry_run)
-        if cfg.env_vars: _set_persistent_env_vars(cfg.env_vars, log, dry_run)
-        if cfg.node_reqs:
-            _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
-            _reinstall_main_requirements(node_dir, log, dry_run)
+    if cfg.apt_packages: _install_apt_packages(cfg.apt_packages, log, dry_run)
+    if cfg.brew_packages: _install_brew_packages(cfg.brew_packages, log, dry_run)
+    if cfg.env_vars: _set_persistent_env_vars(cfg.env_vars, log, dry_run)
+    if cfg.node_reqs:
+        _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
+        _reinstall_main_requirements(node_dir, log, dry_run)
 
-        if _is_comfy_env_enabled():
-            if cfg.cuda_packages:
-                _install_cuda_to_host(cfg, log, dry_run)
-            _install_via_pixi(cfg, node_dir, log, dry_run)
-            _install_isolated_subdirs(node_dir, log, dry_run)
-        else:
-            log("\n[comfy-env] Isolation disabled (USE_COMFY_ENV=0)")
-            _install_to_host_python(cfg, node_dir, log, dry_run)
+    if _is_comfy_env_enabled():
+        if cfg.cuda_packages:
+            _install_cuda_to_host(cfg, log, dry_run)
+        _install_via_pixi(cfg, node_dir, log, dry_run)
+        _install_isolated_subdirs(node_dir, log, dry_run)
+    else:
+        log("\n[comfy-env] Isolation disabled (USE_COMFY_ENV=0)")
+        _install_to_host_python(cfg, node_dir, log, dry_run)
 
-        log("\nInstallation complete!")
-        log(f"[comfy-env] Install log saved to: {log.path}")
-        return True
-    finally:
-        log.close()
+    log("\nInstallation complete!")
+    return True
 
 
 def _install_apt_packages(packages: List[str], log: Callable[[str], None], dry_run: bool) -> None:
@@ -334,17 +329,6 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
             continue
 
 
-def _save_install_log(log: Callable, build_dir: Path) -> None:
-    """Copy the current install log into the build directory."""
-    try:
-        log_path = getattr(log, "path", None)
-        if log_path and Path(log_path).exists():
-            import shutil
-            shutil.copy2(str(log_path), str(build_dir / "install.log"))
-    except Exception:
-        pass  # Non-fatal
-
-
 def _save_env_metadata(build_dir: Path, node_dir: Path, config_path: Path) -> None:
     """Save source config metadata alongside the built environment."""
     import json
@@ -376,6 +360,7 @@ def _save_env_metadata(build_dir: Path, node_dir: Path, config_path: Path) -> No
         meta = {
             "node_name": node_label,
             "config_file": config_path.name,
+            "config_content": config_path.read_text(encoding="utf-8"),
             **summary,
         }
         (build_dir / ".comfy-env-meta.json").write_text(
@@ -543,7 +528,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         lock_dir.mkdir(exist_ok=True)
 
     # We own the build
+    tee_log = None
     try:
+        # Tee all output to build_dir/install.log
+        build_dir.mkdir(parents=True, exist_ok=True)
+        tee_log = _make_tee_log(log, build_dir / "install.log")
+        log = tee_log
+
         pixi_path = ensure_pixi(log=log)
         log(f"[comfy-env] pixi={pixi_path}")
 
@@ -644,10 +635,10 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         done_marker.touch()
         _save_env_metadata(build_dir, node_dir, config_path)
-
-        # Copy install log into build_dir so it persists with the env
-        _save_install_log(log, build_dir)
+        log(f"[comfy-env] Install log: {build_dir / 'install.log'}")
     finally:
+        if tee_log:
+            tee_log.close()
         try: lock_dir.rmdir()
         except OSError: pass
 
