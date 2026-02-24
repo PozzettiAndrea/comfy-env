@@ -267,7 +267,7 @@ def _install_cuda_to_host(cfg: ComfyEnvConfig, log: Callable[[str], None], dry_r
             wheel_url = get_wheel_url(package, torch_short, cuda_version, py_version)
             if wheel_url:
                 log(f"  {package}: found in cuda-wheels index")
-                cmd = [uv_path, "pip", "install", "--python", python_path, "--no-deps", wheel_url]
+                cmd = [uv_path, "pip", "install", "--python", python_path, "--no-deps", "--no-cache", wheel_url]
             else:
                 log(f"  {package}: not found in cuda-wheels index")
 
@@ -489,7 +489,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                     if not wheel_url:
                         raise RuntimeError(f"No wheel for {package}")
                     log(f"  {package} from {wheel_url}")
-                    cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", wheel_url]
+                    cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", "--no-cache", wheel_url]
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode != 0:
                         raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
@@ -560,7 +560,7 @@ def _install_to_host_python(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[
         for package in cfg.cuda_packages:
             wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
             if wheel_url:
-                cmd = [uv_path, "pip", "install", "--python", sys.executable, "--no-deps", wheel_url]
+                cmd = [uv_path, "pip", "install", "--python", sys.executable, "--no-deps", "--no-cache", wheel_url]
                 subprocess.run(cmd, capture_output=True)
 
 
