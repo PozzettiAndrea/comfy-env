@@ -177,13 +177,23 @@ def fetch_metadata(
         return {"nodes": {}, "display": {}}
 
     # --- Metadata cache ---
+    # Invalidate when ANY .py file in the package changes (not just __init__.py).
+    # Uses max mtime of all .py files -- fast (stat calls only, no file reads).
     cache_file = env_dir / ".metadata_cache.pkl"
-    init_file = working_dir / package_name.replace(".", "/") / "__init__.py"
+    pkg_dir = working_dir / package_name.replace(".", "/")
     try:
-        init_hash = hashlib.sha256(init_file.read_bytes()).hexdigest()[:16]
+        py_files = sorted(pkg_dir.rglob("*.py"))
+        if py_files:
+            mtimes = "|".join(
+                f"{f.relative_to(pkg_dir)}:{f.stat().st_mtime_ns}"
+                for f in py_files
+            )
+            pkg_hash = hashlib.sha256(mtimes.encode()).hexdigest()[:16]
+        else:
+            pkg_hash = "empty"
     except (OSError, FileNotFoundError):
-        init_hash = "missing"
-    cache_key = f"v{_CACHE_VERSION}:{init_hash}"
+        pkg_hash = "missing"
+    cache_key = f"v{_CACHE_VERSION}:{pkg_hash}"
 
     if cache_file.exists():
         try:
