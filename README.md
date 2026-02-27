@@ -77,6 +77,7 @@ pip install comfy-env
 - [Config Reference](docs/config-reference.md) — all config options for both files
 - [CLI](docs/cli.md) — command-line tools
 - [Build Internals](docs/isolation-build.md) — how isolated environments are built
+- [Worker Architecture](docs/worker-overview.md) — subprocess IPC, serialization, memory, lifecycle
 
 ## Example
 

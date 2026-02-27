@@ -274,6 +274,11 @@ def _serialize_tensor_native_parent(t, registry):
 
 _cuda_ipc_supported: Optional[bool] = None
 
+# IPC handle forwarding cache: avoids cloning when re-sharing CUDA tensors
+# that were received via IPC from another worker. Keyed by id(storage).
+_cuda_ipc_metadata_cache: Dict[int, dict] = {}
+_cuda_ipc_cache_tensors: Dict[int, Any] = {}  # hold tensor refs to keep storage IDs stable
+
 
 def _probe_cuda_ipc() -> bool:
     """Check if CUDA IPC is available (Linux only, requires CUDA)."""
@@ -298,7 +303,33 @@ def _probe_cuda_ipc() -> bool:
 
 
 def _serialize_cuda_ipc(t) -> dict:
-    """Serialize CUDA tensor via IPC handle (zero-copy, JSON-safe)."""
+    """Serialize CUDA tensor via IPC handle (zero-copy, JSON-safe).
+
+    If the tensor was previously received via IPC (from another worker),
+    forward the cached IPC handle instead of cloning. This enables true
+    zero-copy for multi-hop chains (Worker A → Parent → Worker B).
+    """
+    # Check IPC handle cache — forward original handle if available
+    try:
+        storage_id = id(t.untyped_storage())
+        cached = _cuda_ipc_metadata_cache.get(storage_id)
+        if cached is not None:
+            # Same tensor (not a view) — forward metadata directly
+            if (list(t.size()) == cached["tensor_size"]
+                    and list(t.stride()) == cached["tensor_stride"]
+                    and t.storage_offset() == cached.get("tensor_offset", 0)):
+                if _DEBUG:
+                    print(f"[comfy-env] CUDA IPC cache hit — forwarding handle (no clone)", file=sys.stderr, flush=True)
+                return cached
+            # View of the same storage — forward handle with adjusted shape
+            if _DEBUG:
+                print(f"[comfy-env] CUDA IPC cache hit (view) — forwarding handle with adjusted shape", file=sys.stderr, flush=True)
+            return {**cached, "tensor_size": list(t.size()),
+                    "tensor_stride": list(t.stride()),
+                    "tensor_offset": t.storage_offset()}
+    except Exception:
+        pass  # Fall through to standard path
+
     import torch.multiprocessing.reductions as reductions
     try:
         func, args = reductions.reduce_tensor(t)
@@ -327,14 +358,18 @@ def _serialize_cuda_ipc(t) -> dict:
 
 
 def _deserialize_cuda_ipc(data: dict):
-    """Deserialize CUDA tensor from IPC handle."""
+    """Deserialize CUDA tensor from IPC handle.
+
+    Caches the IPC metadata so the handle can be forwarded if this tensor
+    is later sent to another worker (avoids cloning).
+    """
     import torch
     import torch.multiprocessing.reductions as reductions
     dtype = getattr(torch, data["dtype"].split(".")[-1])
     handle = base64.b64decode(data["handle"])
     ref_counter_handle = base64.b64decode(data["ref_counter_handle"])
     event_handle = base64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    return reductions.rebuild_cuda_tensor(
+    tensor = reductions.rebuild_cuda_tensor(
         torch.Tensor,
         tuple(data["tensor_size"]),
         tuple(data["tensor_stride"]),
@@ -351,6 +386,14 @@ def _deserialize_cuda_ipc(data: dict):
         event_handle,
         data["event_sync_required"],
     )
+    # Cache IPC metadata for handle forwarding (zero-copy re-sharing)
+    try:
+        storage_id = id(tensor.untyped_storage())
+        _cuda_ipc_metadata_cache[storage_id] = data
+        _cuda_ipc_cache_tensors[storage_id] = tensor
+    except Exception:
+        pass
+    return tensor
 
 
 def _prepare_trimesh_for_pickle(mesh):
@@ -617,6 +660,21 @@ def _cleanup_shm(registry):
         except Exception:
             pass
     registry.clear()
+
+
+def _cleanup_ipc_cache():
+    """Remove stale entries from the CUDA IPC handle forwarding cache."""
+    if not _cuda_ipc_cache_tensors:
+        return
+    try:
+        import torch
+        dead = [k for k, t in _cuda_ipc_cache_tensors.items()
+                if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
+    except Exception:
+        dead = []
+    for k in dead:
+        _cuda_ipc_metadata_cache.pop(k, None)
+        _cuda_ipc_cache_tensors.pop(k, None)
 
 
 # =============================================================================
@@ -898,9 +956,28 @@ def _probe_cuda_ipc():
         wlog("[worker] CUDA IPC not supported")
     return _cuda_ipc_supported
 
+# IPC handle forwarding cache (worker-side, for passthrough tensors)
+_cuda_ipc_metadata_cache = {}
+_cuda_ipc_cache_tensors = {}
 
 def _serialize_cuda_ipc(t):
     import torch.multiprocessing.reductions as reductions
+    # Check IPC handle cache — forward original handle if available
+    try:
+        storage_id = id(t.untyped_storage())
+        cached = _cuda_ipc_metadata_cache.get(storage_id)
+        if cached is not None:
+            if (list(t.size()) == cached["tensor_size"]
+                    and list(t.stride()) == cached["tensor_stride"]
+                    and t.storage_offset() == cached.get("tensor_offset", 0)):
+                wlog("[worker] CUDA IPC cache hit — forwarding handle (no clone)")
+                return cached
+            wlog("[worker] CUDA IPC cache hit (view) — forwarding with adjusted shape")
+            return {**cached, "tensor_size": list(t.size()),
+                    "tensor_stride": list(t.stride()),
+                    "tensor_offset": t.storage_offset()}
+    except Exception:
+        pass
     try:
         func, args = reductions.reduce_tensor(t)
     except RuntimeError as e:
@@ -935,7 +1012,7 @@ def _deserialize_cuda_ipc(data):
     handle = _b64.b64decode(data["handle"])
     ref_counter_handle = _b64.b64decode(data["ref_counter_handle"])
     event_handle = _b64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    return reductions.rebuild_cuda_tensor(
+    tensor = reductions.rebuild_cuda_tensor(
         torch.Tensor,
         tuple(data["tensor_size"]),
         tuple(data["tensor_stride"]),
@@ -952,6 +1029,14 @@ def _deserialize_cuda_ipc(data):
         event_handle,
         data["event_sync_required"],
     )
+    # Cache IPC metadata for handle forwarding (zero-copy passthrough)
+    try:
+        storage_id = id(tensor.untyped_storage())
+        _cuda_ipc_metadata_cache[storage_id] = data
+        _cuda_ipc_cache_tensors[storage_id] = tensor
+    except Exception:
+        pass
+    return tensor
 
 
 def _prepare_trimesh_for_pickle(mesh):
@@ -1590,13 +1675,15 @@ def main():
     # ---------------------------------------------------------------
     # Bidirectional RPC — call parent methods during execution
     # ---------------------------------------------------------------
+    _current_call_id = None  # Tracks call_id of the request being processed
+
     def _call_parent(method, **params):
         """Call a method on the parent process and wait for result.
 
         Can only be called during method execution (while transport is active).
         The parent handles the callback and sends back a response.
         """
-        transport.send({"type": "callback", "method": method, **params})
+        transport.send({"type": "callback", "method": method, "call_id": _current_call_id, **params})
         response = transport.recv()
         if response is None:
             raise RuntimeError("Parent disconnected during callback")
@@ -1736,13 +1823,15 @@ def main():
             wlog(f"[worker] Exception receiving request: {e}")
             break
 
+        _current_call_id = request.get("call_id")
+
         if request.get("method") == "shutdown":
             wlog("[worker] Shutdown requested")
             break
 
         if request.get("method") == "ping":
             # Health check - respond immediately
-            transport.send({"status": "pong"})
+            transport.send({"status": "pong", "call_id": _current_call_id})
             continue
 
         if request.get("method") == "model_to_device":
@@ -1751,7 +1840,7 @@ def main():
             _target = request.get("device", "cpu")
             _model = _model_registry.get(_mid)
             if _model is None:
-                transport.send({"status": "error",
+                transport.send({"status": "error", "call_id": _current_call_id,
                                 "error": f"Model '{_mid}' not registered"})
                 continue
             try:
@@ -1767,7 +1856,7 @@ def main():
                     pass
                 if _current_dev is not None and _current_dev == _target_dev:
                     wlog(f"[worker] model_to_device: '{_mid}' already on {_target}")
-                    transport.send({"status": "ok", "device": _target, "moved": False})
+                    transport.send({"status": "ok", "call_id": _current_call_id, "device": _target, "moved": False})
                     continue
                 _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
                 wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
@@ -1775,15 +1864,15 @@ def main():
                 # Only empty cache if we actually freed CUDA tensors
                 if _was_cuda and _target_dev.type == "cpu":
                     _torch.cuda.empty_cache()
-                transport.send({"status": "ok", "device": _target, "moved": True})
+                transport.send({"status": "ok", "call_id": _current_call_id, "device": _target, "moved": True})
             except Exception as _e:
                 wlog(f"[worker] model_to_device error: {_e}")
-                transport.send({"status": "error", "error": str(_e)})
+                transport.send({"status": "error", "call_id": _current_call_id, "error": str(_e)})
             continue
 
         if request.get("method") == "list_models":
             # Return registered model metadata
-            transport.send({"status": "ok", "models": _model_registry_meta})
+            transport.send({"status": "ok", "call_id": _current_call_id, "models": _model_registry_meta})
             continue
 
         # Release input shm blocks from previous request
@@ -1801,7 +1890,7 @@ def main():
         try:
             request_type = request.get("type", "call_module")
             module_name = request["module"]
-            wlog(f"[worker] Request: {request_type} {module_name}")
+            wlog(f"[worker] Request: {request_type} {module_name} call_id={_current_call_id}")
 
             # Load inputs from shared memory
             kwargs_meta = request.get("kwargs")
@@ -1858,7 +1947,7 @@ def main():
             result_meta = _to_shm(result, shm_registry)
             wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
-            response = {"status": "ok", "result": result_meta}
+            response = {"status": "ok", "call_id": _current_call_id, "result": result_meta}
             if _new_models_this_call:
                 response["_new_models"] = list(_new_models_this_call)
             transport.send(response)
@@ -1869,6 +1958,7 @@ def main():
             _cleanup_shm(shm_registry)
             transport.send({
                 "status": "error",
+                "call_id": _current_call_id,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             })
@@ -1937,6 +2027,7 @@ class SubprocessWorker(Worker):
         self._lock = threading.Lock()
         self._last_new_models = []  # Auto-detected models from last call
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
+        self._call_counter = 0  # Monotonic call ID for request correlation
         self._on_restart = None  # Called when worker process is replaced (stale model cleanup)
 
         # Socket IPC
@@ -2238,6 +2329,8 @@ class SubprocessWorker(Worker):
     def _handle_callback(self, request: dict) -> dict:
         """Execute a callback request from the worker."""
         method = request.get("method")
+        if _DEBUG:
+            print(f"[SubprocessWorker] callback '{method}' from call_id={request.get('call_id')}", file=sys.stderr, flush=True)
         handler = self._callback_handlers.get(method)
         if not handler:
             return {"type": "callback_response", "status": "error",
@@ -2252,6 +2345,11 @@ class SubprocessWorker(Worker):
         """Send request via socket and read response with timeout."""
         if not self._transport:
             raise RuntimeError(f"{self.name}: Transport not initialized")
+
+        call_id = request.get("call_id")
+        if _DEBUG:
+            msg_type = request.get("type", request.get("method", "?"))
+            print(f"[SubprocessWorker] call_id={call_id} sending {msg_type}", file=sys.stderr, flush=True)
 
         # Send request
         self._transport.send(request)
@@ -2301,7 +2399,7 @@ class SubprocessWorker(Worker):
             except:
                 pass
             self._shutdown = True
-            raise TimeoutError(f"{self.name}: Call timed out after {timeout}s")
+            raise TimeoutError(f"{self.name}: call_id={call_id} timed out after {timeout}s")
 
         return response
 
@@ -2358,8 +2456,10 @@ class SubprocessWorker(Worker):
                     kwargs_meta = None
 
                 # Send request with shared memory metadata
+                self._call_counter += 1
                 request = {
                     "type": "call_method",
+                    "call_id": self._call_counter,
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
@@ -2389,6 +2489,7 @@ class SubprocessWorker(Worker):
 
             finally:
                 _cleanup_shm(shm_registry)
+                _cleanup_ipc_cache()
 
     def call_module(
         self,
@@ -2407,8 +2508,10 @@ class SubprocessWorker(Worker):
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
 
+                self._call_counter += 1
                 request = {
                     "type": "call_module",
+                    "call_id": self._call_counter,
                     "module": module,
                     "func": func,
                     "kwargs": kwargs_meta,
@@ -2428,6 +2531,7 @@ class SubprocessWorker(Worker):
 
             finally:
                 _cleanup_shm(shm_registry)
+                _cleanup_ipc_cache()
 
     def send_command(self, method, **params):
         """Send a management command to the worker (model device moves, etc.).
@@ -2437,7 +2541,8 @@ class SubprocessWorker(Worker):
         """
         with self._lock:
             self._ensure_started()
-            request = {"method": method, **params}
+            self._call_counter += 1
+            request = {"method": method, "call_id": self._call_counter, **params}
             response = self._send_request(request, timeout=60.0)
             if response.get("status") == "error":
                 raise RuntimeError(
