@@ -9,12 +9,21 @@ DEFAULT_HEALTH_CHECK_TIMEOUT = 5.0
 
 @dataclass
 class NodeDependency:
-    """A ComfyUI custom node dependency."""
+    """A ComfyUI custom node dependency.
+
+    Supports two sources:
+    - GitHub: github="owner/repo", optional tag/branch/commit
+    - Registry: registry="node-id", optional version
+    """
     name: str
-    repo: str  # "owner/repo" or full URL
-
-
-NodeReq = NodeDependency  # Backwards compat
+    # GitHub source
+    github: Optional[str] = None   # "owner/repo" or full URL
+    tag: Optional[str] = None
+    branch: Optional[str] = None
+    commit: Optional[str] = None
+    # Registry source (api.comfy.org)
+    registry: Optional[str] = None  # registry node ID
+    version: Optional[str] = None   # semver for registry
 
 
 @dataclass

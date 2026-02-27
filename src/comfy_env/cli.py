@@ -71,18 +71,10 @@ def main(args: Optional[List[str]] = None) -> int:
 ROOT_DEFAULT_CONFIG = """\
 # comfy-env-root.toml - Main node config
 # PyPI deps go in requirements.txt
-
-[cuda]
-packages = []
+# CUDA/conda/pypi packages go in comfy-env.toml (isolated subfolders only)
 
 [apt]
 packages = []
-
-[dependencies]
-# cgal = "*"
-
-[env_vars]
-# KMP_DUPLICATE_LIB_OK = "TRUE"
 
 [node_reqs]
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"

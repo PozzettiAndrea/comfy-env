@@ -66,10 +66,23 @@ def _parse_options(data: Dict[str, Any]) -> ComfyEnvOptions:
 
 
 def _parse_node_reqs(data: Dict[str, Any]) -> List[NodeDependency]:
-    return [
-        NodeDependency(name=name, repo=value if isinstance(value, str) else value.get("repo", ""))
-        for name, value in data.items()
-    ]
+    result = []
+    for name, value in data.items():
+        if isinstance(value, str):
+            # Plain string: "owner/repo" or full URL
+            result.append(NodeDependency(name=name, github=value))
+        else:
+            # Dict: { github = "...", tag = "..." } or { registry = "...", version = "..." }
+            result.append(NodeDependency(
+                name=name,
+                github=value.get("github") or value.get("repo"),  # "repo" for backward compat
+                tag=value.get("tag"),
+                branch=value.get("branch"),
+                commit=value.get("commit"),
+                registry=value.get("registry"),
+                version=value.get("version"),
+            ))
+    return result
 
 
 def _ensure_list(value) -> List:

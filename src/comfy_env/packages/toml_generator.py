@@ -35,31 +35,34 @@ def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], No
 def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print) -> Dict[str, Any]:
     pixi_data = copy.deepcopy(cfg.pixi_passthrough)
 
-    cuda_version = torch_version = None
+    # Detect CUDA/PyTorch versions and compute PyTorch index URL
+    cuda_version = torch_version = pytorch_index = None
     if cfg.has_cuda and sys.platform != "darwin":
         cuda_version = get_recommended_cuda_version()
         if cuda_version:
             torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
             log(f"CUDA {cuda_version} -> PyTorch {torch_version}")
+        else:
+            pytorch_index = "https://download.pytorch.org/whl/cpu"
+            log("No GPU detected - using PyTorch CPU index")
 
-    # Pin torch/torchvision versions in pypi-dependencies if they're cuda packages
-    # This ensures transitive dependencies (pytorch_lightning, timm, etc.) get the correct torch version
+    # Add PyTorch packages to pypi-dependencies with per-package index.
+    # This lets pixi resolve torch alongside all other deps in a single pass,
+    # avoiding conflicts from a separate uv pip install step.
     pytorch_packages = {"torch", "torchvision", "torchaudio"}
     torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
 
-    if cfg.cuda_packages and sys.platform != "darwin":
+    if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
-        # Use detected torch_version for GPU, or default "2.8" for CPU
         pin_version = torch_version or "2.8"
         for pkg in cfg.cuda_packages:
             if pkg in pytorch_packages:
-                if pkg == "torch":
-                    pypi_deps[pkg] = f"=={pin_version}.*"
-                elif pkg == "torchvision":
-                    tv_version = torchvision_map.get(pin_version, "0.23")
-                    pypi_deps[pkg] = f"=={tv_version}.*"
-                elif pkg == "torchaudio":
-                    pypi_deps[pkg] = f"=={pin_version}.*"
+                if pkg == "torchvision":
+                    ver = torchvision_map.get(pin_version, "0.23")
+                else:
+                    ver = pin_version
+                pypi_deps[pkg] = {"version": f"=={ver}.*", "index": pytorch_index}
 
     # Workspace
     workspace = pixi_data.setdefault("workspace", {})
@@ -102,19 +105,6 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
         for k in cuda_pkgs:
             del pypi_deps[k]
             log(f"  Skipping {k} (CUDA-only, no macOS wheels)")
-
-    # PyTorch index (CUDA or CPU) - skip on macOS
-    if cfg.has_cuda and sys.platform != "darwin":
-        pypi_options = pixi_data.setdefault("pypi-options", {})
-        if cuda_version:
-            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
-        else:
-            # No GPU detected - use CPU index
-            pytorch_index = "https://download.pytorch.org/whl/cpu"
-            log("No GPU detected - using PyTorch CPU index")
-        extra_urls = pypi_options.setdefault("extra-index-urls", [])
-        if pytorch_index not in extra_urls: extra_urls.append(pytorch_index)
-        pypi_options["index-strategy"] = "unsafe-best-match"
 
     return pixi_data
 

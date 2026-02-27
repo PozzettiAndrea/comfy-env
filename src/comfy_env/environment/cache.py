@@ -26,8 +26,19 @@ def get_cache_dir() -> Path:
     return cache_dir
 
 
+def _get_version() -> str:
+    """Get comfy-env version string for cache busting."""
+    try:
+        from importlib.metadata import version
+        return version("comfy-env")
+    except Exception:
+        return "0.0.0-dev"
+
+
 def compute_config_hash(config_path: Path) -> str:
-    return hashlib.sha256(config_path.read_bytes()).hexdigest()[:8]
+    h = hashlib.sha256(config_path.read_bytes())
+    h.update(_get_version().encode())
+    return h.hexdigest()[:8]
 
 
 def sanitize_name(name: str) -> str:

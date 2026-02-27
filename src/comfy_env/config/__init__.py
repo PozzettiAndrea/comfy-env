@@ -3,7 +3,6 @@
 from .types import (
     ComfyEnvConfig,
     NodeDependency,
-    NodeReq,
 )
 from .parser import (
     ROOT_CONFIG_FILE_NAME,
@@ -16,7 +15,6 @@ from .parser import (
 __all__ = [
     "ComfyEnvConfig",
     "NodeDependency",
-    "NodeReq",
     "ROOT_CONFIG_FILE_NAME",
     "CONFIG_FILE_NAME",
     "load_config",

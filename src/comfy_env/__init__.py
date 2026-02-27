@@ -27,7 +27,7 @@ from .environment.setup import setup_env
 from .environment.paths import copy_files, get_comfyui_dir
 
 # Isolation
-from .isolation import wrap_isolated_nodes, wrap_nodes, register_nodes
+from .isolation import register_nodes
 
 
 # =============================================================================
@@ -37,7 +37,6 @@ from .isolation import wrap_isolated_nodes, wrap_nodes, register_nodes
 from .config import (
     ComfyEnvConfig,
     NodeDependency,
-    NodeReq,
     load_config,
     discover_config,
     CONFIG_FILE_NAME,
@@ -127,13 +126,10 @@ __all__ = [
     "copy_files",
     "get_comfyui_dir",
     # Isolation
-    "wrap_isolated_nodes",
-    "wrap_nodes",
     "register_nodes",
     # Config
     "ComfyEnvConfig",
     "NodeDependency",
-    "NodeReq",
     "load_config",
     "discover_config",
     "CONFIG_FILE_NAME",

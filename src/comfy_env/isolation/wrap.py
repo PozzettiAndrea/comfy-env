@@ -10,7 +10,6 @@ import sys
 import tempfile
 import threading
 import time
-from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -222,18 +221,6 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
     except OSError:
         pass
     return None
-
-
-def _find_package_root(start_dir: Path) -> Path:
-    """Find package root for import resolution.
-
-    If start_dir contains __init__.py (is a package), return its parent
-    so the package itself is importable. Otherwise return start_dir.
-    """
-    start_dir = start_dir.resolve()
-    if (start_dir / "__init__.py").exists():
-        return start_dir.parent
-    return start_dir
 
 
 def _get_python_version(env_dir: Path) -> Optional[str]:
@@ -472,184 +459,8 @@ def _load_worker_models(env_dir):
         pass
 
 
-def _wrap_node_class(cls: type, env_dir: Path, working_dir: Path, sys_path: list[str],
-                     lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
-                     health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT) -> type:
-    func_name = getattr(cls, "FUNCTION", None)
-    if not func_name: return cls
-    original = getattr(cls, func_name, None)
-    if not original: return cls
-
-    try:
-        source = Path(inspect.getfile(cls)).resolve()
-        module_name = str(source.relative_to(working_dir).with_suffix("")).replace("/", ".").replace("\\", ".")
-    except (TypeError, OSError, ValueError):
-        module_name = source.stem if 'source' in dir() else cls.__module__
-
-    @wraps(original)
-    def proxy(self, **kwargs):
-        worker, gen = _get_or_create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
-        try:
-            # Ensure any previously-registered subprocess models are on GPU
-            _load_worker_models(env_dir)
-
-            # Prepare tensors for IPC
-            try:
-                from .tensor_utils import prepare_for_ipc_recursive
-                kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
-            except ImportError: pass
-
-            result = worker.call_method(
-                module_name=module_name, class_name=cls.__name__, method_name=func_name,
-                self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
-                kwargs=kwargs, timeout=600.0,
-            )
-
-            try:
-                from .tensor_utils import prepare_for_ipc_recursive
-                result = prepare_for_ipc_recursive(result)
-            except ImportError: pass
-
-            # Create patchers for any models auto-detected during this call
-            _register_new_patchers(env_dir, worker, gen)
-            return result
-        except (RuntimeError, ConnectionError):
-            _remove_worker(env_dir)
-            raise
-
-    setattr(cls, func_name, proxy)
-    cls._comfy_env_isolated = True
-    return cls
-
-
-def wrap_nodes() -> None:
-    """Auto-wrap nodes for isolation. Call from __init__.py after NODE_CLASS_MAPPINGS."""
-    # Log version for debugging
-    try:
-        from importlib.metadata import version as get_version
-        print(f"[comfy-env] Version: {get_version('comfy-env')}")
-    except Exception:
-        pass
-
-    _cleanup_stale_workers()
-
-    if not _is_enabled() or os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
-        return
-
-    frame = inspect.stack()[1]
-    caller_module = inspect.getmodule(frame.frame)
-    if not caller_module: return
-
-    mappings = getattr(caller_module, "NODE_CLASS_MAPPINGS", None)
-    if not mappings: return
-
-    pkg_dir = Path(frame.filename).resolve().parent
-    config_files = list(pkg_dir.rglob("comfy-env.toml"))
-    if not config_files: return
-
-    try:
-        import folder_paths
-        comfyui_base = folder_paths.base_path
-    except ImportError:
-        comfyui_base = None
-
-    envs = []
-    for cf in config_files:
-        env_dir = _find_env_dir(cf.parent)
-        sp, lib = _get_env_paths(env_dir) if env_dir else (None, None)
-        if not env_dir or not sp: continue
-
-        env_vars = {}
-        health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
-        try:
-            import tomli
-            with open(cf, "rb") as f:
-                toml_data = tomli.load(f)
-                env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
-                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
-                print(f"[comfy-env] Parsed {cf}: health_check_timeout={health_check_timeout}")
-        except Exception as e:
-            print(f"[comfy-env] Failed to parse {cf}: {e}")
-        if comfyui_base: env_vars["COMFYUI_BASE"] = str(comfyui_base)
-
-        envs.append({"dir": cf.parent, "env_dir": env_dir, "sp": sp, "lib": lib, "env_vars": env_vars, "health_check_timeout": health_check_timeout})
-
-    wrapped = 0
-    for name, cls in mappings.items():
-        if not hasattr(cls, "FUNCTION"): continue
-        try:
-            src = Path(inspect.getfile(cls)).resolve()
-        except (TypeError, OSError): continue
-
-        for e in envs:
-            try:
-                src.relative_to(e["dir"])
-                # Find package root by walking up until no __init__.py
-                package_root = _find_package_root(e["dir"])
-                _wrap_node_class(cls, e["env_dir"], package_root, [str(e["sp"]), str(package_root)],
-                               str(e["lib"]) if e["lib"] else None, e["env_vars"], e.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
-                wrapped += 1
-                break
-            except ValueError: continue
-
-    if wrapped: print(f"[comfy-env] Wrapped {wrapped} nodes")
-
-
-def wrap_isolated_nodes(node_class_mappings: Dict[str, type], nodes_dir: Path) -> Dict[str, type]:
-    """Wrap nodes from a directory with comfy-env.toml for isolation."""
-    _cleanup_stale_workers()
-
-    if not _is_enabled() or os.environ.get("COMFYUI_ISOLATION_WORKER") == "1":
-        return node_class_mappings
-
-    try:
-        import folder_paths
-        comfyui_base = folder_paths.base_path
-    except ImportError:
-        comfyui_base = None
-
-    nodes_dir = Path(nodes_dir).resolve()
-    config = nodes_dir / "comfy-env.toml"
-    if not config.exists():
-        print(f"[comfy-env] No comfy-env.toml in {nodes_dir}")
-        return node_class_mappings
-
-    env_vars = {}
-    health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
-    try:
-        import tomli
-        with open(config, "rb") as f:
-            toml_data = tomli.load(f)
-            env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
-            health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
-            print(f"[comfy-env] Parsed {config}: health_check_timeout={health_check_timeout}")
-    except Exception as e:
-        print(f"[comfy-env] Failed to parse {config}: {e}")
-    if comfyui_base: env_vars["COMFYUI_BASE"] = str(comfyui_base)
-
-    env_dir = _find_env_dir(nodes_dir)
-    sp, lib = _get_env_paths(env_dir) if env_dir else (None, None)
-    if not env_dir or not sp:
-        print(f"[comfy-env] No env found. Run 'comfy-env install' in {nodes_dir}")
-        return node_class_mappings
-
-    sys_path = [str(sp), str(nodes_dir)]
-    lib_path = str(lib) if lib else None
-
-    print(f"[comfy-env] Wrapping {len(node_class_mappings)} nodes from {nodes_dir.name}")
-    for cls in node_class_mappings.values():
-        if hasattr(cls, "FUNCTION"):
-            _wrap_node_class(cls, env_dir, nodes_dir, sys_path, lib_path, env_vars, health_check_timeout)
-
-    return node_class_mappings
-
-
 def register_nodes(nodes_package: str = "nodes") -> tuple:
     """Discover and register all nodes -- main-process and isolation.
-
-    Replaces the old pattern of:
-        from .nodes import NODE_CLASS_MAPPINGS
-        wrap_nodes()
 
     Usage in custom node __init__.py:
         from comfy_env import register_nodes

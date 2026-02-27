@@ -110,24 +110,16 @@ packages = []
 # For nodes needing isolated environments, put comfy-env.toml in a subdirectory:
 #
 #   ComfyUI-MyPack/
-#   |-- comfy-env.toml       # Root: installs to main env
+#   |-- comfy-env-root.toml     # Root: installs to main env
 #   |-- __init__.py
 #   \-- nodes/
+#       |-- main/               # No comfy-env.toml -> runs in main process
+#       |   \-- __init__.py
 #       \-- isolated/
-#           |-- comfy-env.toml   # Subdirectory: isolated env
-#           \-- *.py
+#           |-- comfy-env.toml  # Subdirectory: isolated env
+#           \-- __init__.py
 #
-# In your nodes/__init__.py:
+# In your __init__.py:
 #
-#   from pathlib import Path
-#   from comfy_env import wrap_isolated_nodes
-#
-#   NODE_CLASS_MAPPINGS = {}
-#
-#   from .main import NODE_CLASS_MAPPINGS as main_nodes
-#   NODE_CLASS_MAPPINGS.update(main_nodes)
-#
-#   from .isolated import NODE_CLASS_MAPPINGS as isolated_nodes
-#   NODE_CLASS_MAPPINGS.update(
-#       wrap_isolated_nodes(isolated_nodes, Path(__file__).parent / "isolated")
-#   )
+#   from comfy_env import register_nodes
+#   NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = register_nodes()

@@ -18,8 +18,6 @@ from .paths import (
 )
 from .setup import (
     setup_env,
-    load_env_vars,
-    inject_site_packages,
 )
 from .libomp import (
     dedupe_libomp,
@@ -38,8 +36,6 @@ __all__ = [
     "copy_files",
     # Setup helpers
     "setup_env",
-    "load_env_vars",
-    "inject_site_packages",
     # macOS workaround
     "dedupe_libomp",
 ]
