@@ -615,6 +615,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 package_name=nodes_package,
                 working_dir=pkg_dir,
                 env_vars=env["env_vars"],
+                host_torch_sp=env.get("host_torch_sp"),
             )
             root_nodes = root_meta.get("nodes", {})
             root_display = root_meta.get("display", {})
@@ -699,6 +700,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     package_name=package_name,
                     working_dir=pkg_dir,
                     env_vars=env["env_vars"],
+                    host_torch_sp=env.get("host_torch_sp"),
                 )
 
             with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:

@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
-_CACHE_VERSION = "1"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "2"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,11 @@ _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
 
+# Add host site-packages for torch inheritance (share_torch)
+_host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
+if _host_sp and os.path.isdir(_host_sp) and _host_sp not in sys.path:
+    sys.path.insert(0, _host_sp)
+
 # Redirect stdout to stderr during import so that any print() calls
 # from imported code don't corrupt our base64 payload on stdout.
 _real_stdout = sys.stdout
@@ -157,6 +162,7 @@ def fetch_metadata(
     package_name: str,
     working_dir: Path,
     env_vars: Optional[Dict[str, str]] = None,
+    host_torch_sp: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Fetch node metadata by running a subprocess in the isolation env.
 
@@ -166,6 +172,7 @@ def fetch_metadata(
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         env_vars: Additional environment variables from comfy-env.toml
+        host_torch_sp: Host site-packages path for torch inheritance (share_torch)
 
     Returns:
         {"nodes": {name: meta_dict, ...}, "display": {name: display_name, ...}}
@@ -215,6 +222,8 @@ def fetch_metadata(
     # Build proper subprocess environment (DLL paths, library paths, etc.)
     from .wrap import build_isolation_env
     scan_env = build_isolation_env(python, env_vars)
+    if host_torch_sp:
+        scan_env["_COMFY_ENV_HOST_SP"] = str(host_torch_sp)
 
     # Write script to temp file
     script_file = None
