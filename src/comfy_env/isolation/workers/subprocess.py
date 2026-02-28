@@ -1995,7 +1995,6 @@ class SubprocessWorker(Worker):
         sys_path: Optional[List[str]] = None,
         env: Optional[Dict[str, str]] = None,
         name: Optional[str] = None,
-        share_torch: bool = True,  # Kept for API compatibility
         health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
     ):
         """
@@ -2007,7 +2006,6 @@ class SubprocessWorker(Worker):
             sys_path: Additional paths to add to sys.path.
             env: Additional environment variables.
             name: Optional name for logging.
-            share_torch: Ignored (kept for API compatibility).
             health_check_timeout: Timeout in seconds for worker health checks.
         """
         self.python = Path(python)

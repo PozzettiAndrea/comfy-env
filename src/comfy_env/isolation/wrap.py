@@ -234,6 +234,37 @@ def _get_python_version(env_dir: Path) -> Optional[str]:
     except Exception: return None
 
 
+def _get_host_torch_sp() -> Optional[Path]:
+    """Get the host's site-packages directory containing torch, or None if torch isn't imported."""
+    try:
+        import torch
+        return Path(torch.__file__).parent.parent
+    except (ImportError, AttributeError):
+        return None
+
+
+def _should_share_torch(env_dir: Path) -> bool:
+    """Determine if host torch should be shared with this worker env.
+
+    Shares automatically when the host has torch and the worker's Python
+    major.minor matches the host's.  Torch is a C extension — sharing across
+    Python minor versions would crash, so there's no manual override.
+    """
+    host_torch_sp = _get_host_torch_sp()
+    if host_torch_sp is None:
+        return False
+
+    host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    worker_version = _get_python_version(env_dir)
+    if worker_version is None:
+        return False
+
+    match = host_version == worker_version
+    if _DEBUG:
+        _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, match={match}")
+    return match
+
+
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                    lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -535,6 +566,13 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
+        # Determine if this env should inherit host torch
+        share_torch_active = _should_share_torch(env_dir)
+        host_torch_sp = _get_host_torch_sp() if share_torch_active else None
+
+        if share_torch_active and host_torch_sp:
+            _log(f"[comfy-env] {cf.parent.name}: sharing host torch from {host_torch_sp}")
+
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
             "dir": cf.parent,
@@ -544,6 +582,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             "env_vars": env_vars,
             "health_check_timeout": health_check_timeout,
             "package_root": package_root,
+            "share_torch": share_torch_active,
+            "host_torch_sp": host_torch_sp,
         }
 
     if _DEBUG:
@@ -581,6 +621,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
             package_root = env["package_root"]
             sys_path_list = [str(env["sp"]), str(package_root)]
+            if env.get("share_torch") and env.get("host_torch_sp"):
+                sys_path_list.insert(0, str(env["host_torch_sp"]))
             lib_path = str(env["lib"]) if env["lib"] else None
 
             for name, meta in root_nodes.items():
@@ -674,6 +716,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
                     package_root = env["package_root"]
                     sys_path_list = [str(env["sp"]), str(package_root)]
+                    if env.get("share_torch") and env.get("host_torch_sp"):
+                        sys_path_list.insert(0, str(env["host_torch_sp"]))
                     lib_path = str(env["lib"]) if env["lib"] else None
 
                     for name, meta in nodes_meta.items():

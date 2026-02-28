@@ -4,11 +4,14 @@ import copy
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from ..config import ComfyEnvConfig
 from ..detection import get_recommended_cuda_version, get_pixi_platform
 from .cuda_wheels import CUDA_TORCH_MAP
+
+# Torch bundle packages that can be inherited from the host
+_TORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
 
 
 def _require_tomli_w():
@@ -32,6 +35,26 @@ def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], No
     return pixi_toml
 
 
+def _should_skip_torch(cfg: ComfyEnvConfig, log: Callable[[str], None] = print) -> bool:
+    """Determine if torch packages should be skipped during install (inherited from host).
+
+    Skips when the host has torch and the worker's Python major.minor matches.
+    Torch is a C extension — it can only be shared when Python versions match.
+    """
+    try:
+        import torch as _torch
+    except ImportError:
+        return False
+
+    host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    worker_version = cfg.python or host_version  # No python specified = defaults to host
+    if host_version == worker_version:
+        log(f"  share_torch: Python {worker_version} matches host, skipping torch bundle install")
+        return True
+
+    return False
+
+
 def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print) -> Dict[str, Any]:
     pixi_data = copy.deepcopy(cfg.pixi_passthrough)
 
@@ -47,17 +70,22 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
             pytorch_index = "https://download.pytorch.org/whl/cpu"
             log("No GPU detected - using PyTorch CPU index")
 
+    # Determine if torch should be skipped (inherited from host at runtime)
+    skip_torch = _should_skip_torch(cfg, log)
+
     # Add PyTorch packages to pypi-dependencies with per-package index.
     # This lets pixi resolve torch alongside all other deps in a single pass,
     # avoiding conflicts from a separate uv pip install step.
-    pytorch_packages = {"torch", "torchvision", "torchaudio"}
     torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
 
     if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
         pin_version = torch_version or "2.8"
         for pkg in cfg.cuda_packages:
-            if pkg in pytorch_packages:
+            if pkg in _TORCH_PACKAGES:
+                if skip_torch:
+                    log(f"  Skipping {pkg} (will inherit from host via share_torch)")
+                    continue
                 if pkg == "torchvision":
                     ver = torchvision_map.get(pin_version, "0.23")
                 else:
@@ -97,6 +125,13 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     # Always require modern setuptools (fixes conda-forge Python version string parsing)
     pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
     pypi_deps.setdefault("setuptools", ">=75.0")
+
+    # Strip torch packages from passthrough pypi-dependencies when inheriting from host
+    if skip_torch:
+        for pkg in list(pypi_deps.keys()):
+            if pkg in _TORCH_PACKAGES:
+                del pypi_deps[pkg]
+                log(f"  Removed {pkg} from pypi-dependencies (will inherit from host)")
 
     # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
     if sys.platform == "darwin":
