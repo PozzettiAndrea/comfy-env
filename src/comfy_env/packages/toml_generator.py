@@ -22,15 +22,23 @@ def _require_tomli_w():
         raise ImportError("tomli-w required: pip install tomli-w")
 
 
-def generate_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print) -> str:
-    return _require_tomli_w().dumps(config_to_pixi_dict(cfg, node_dir, log))
+def generate_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
+                       cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
+                       force_install_torch: bool = False) -> str:
+    return _require_tomli_w().dumps(config_to_pixi_dict(cfg, node_dir, log,
+                                                         cuda_override=cuda_override, torch_override=torch_override,
+                                                         force_install_torch=force_install_torch))
 
 
-def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print) -> Path:
+def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
+                    cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
+                    force_install_torch: bool = False) -> Path:
     tomli_w = _require_tomli_w()
     pixi_toml = node_dir / "pixi.toml"
     with open(pixi_toml, "wb") as f:
-        tomli_w.dump(config_to_pixi_dict(cfg, node_dir, log), f)
+        tomli_w.dump(config_to_pixi_dict(cfg, node_dir, log,
+                                          cuda_override=cuda_override, torch_override=torch_override,
+                                          force_install_torch=force_install_torch), f)
     log(f"Generated {pixi_toml}")
     return pixi_toml
 
@@ -49,48 +57,56 @@ def _should_skip_torch(cfg: ComfyEnvConfig, log: Callable[[str], None] = print) 
     host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
     worker_version = cfg.python or host_version  # No python specified = defaults to host
     if host_version == worker_version:
-        log(f"  share_torch: Python {worker_version} matches host, skipping torch bundle install")
+        log(f"  share_torch: Python {worker_version} matches host, will use host torch at runtime")
         return True
 
     return False
 
 
-def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print) -> Dict[str, Any]:
+def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
+                        cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
+                        force_install_torch: bool = False) -> Dict[str, Any]:
     pixi_data = copy.deepcopy(cfg.pixi_passthrough)
 
-    # Detect CUDA/PyTorch versions and compute PyTorch index URL
+    # Detect CUDA/PyTorch versions and compute PyTorch index URL.
+    # Overrides allow the install logic to force a specific combo (e.g. fallback to cu128/2.8).
     cuda_version = torch_version = pytorch_index = None
     if cfg.has_cuda and sys.platform != "darwin":
-        cuda_version = get_recommended_cuda_version()
+        cuda_version = cuda_override or get_recommended_cuda_version()
         if cuda_version:
-            torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+            torch_version = torch_override or CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
             pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
             log(f"CUDA {cuda_version} -> PyTorch {torch_version}")
         else:
             pytorch_index = "https://download.pytorch.org/whl/cpu"
             log("No GPU detected - using PyTorch CPU index")
 
-    # Determine if torch should be skipped (inherited from host at runtime)
-    skip_torch = _should_skip_torch(cfg, log)
+    # Determine if torch should be skipped (inherited from host at runtime).
+    # force_install_torch overrides this when the fallback combo is used —
+    # we need pixi to install its own torch matching the fallback versions.
+    skip_torch = False if force_install_torch else _should_skip_torch(cfg, log)
 
     # Add PyTorch packages to pypi-dependencies with per-package index.
     # This lets pixi resolve torch alongside all other deps in a single pass,
     # avoiding conflicts from a separate uv pip install step.
-    torchvision_map = {"2.8": "0.23", "2.4": "0.19"}
+    torchvision_map = {
+        "2.4": "0.19", "2.5": "0.20", "2.6": "0.21",
+        "2.7": "0.22", "2.8": "0.23", "2.9": "0.24", "2.10": "0.25",
+    }
 
     if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
         pin_version = torch_version or "2.8"
         for pkg in cfg.cuda_packages:
             if pkg in _TORCH_PACKAGES:
-                if skip_torch:
-                    log(f"  Skipping {pkg} (will inherit from host via share_torch)")
-                    continue
                 if pkg == "torchvision":
                     ver = torchvision_map.get(pin_version, "0.23")
                 else:
                     ver = pin_version
                 pypi_deps[pkg] = {"version": f"=={ver}.*", "index": pytorch_index}
+                if skip_torch:
+                    log(f"  Pinning {pkg}=={ver}.* (ABI compat; host torch used at runtime)")
+                    continue
 
     # Workspace
     workspace = pixi_data.setdefault("workspace", {})
@@ -125,13 +141,6 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     # Always require modern setuptools (fixes conda-forge Python version string parsing)
     pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
     pypi_deps.setdefault("setuptools", ">=75.0")
-
-    # Strip torch packages from passthrough pypi-dependencies when inheriting from host
-    if skip_torch:
-        for pkg in list(pypi_deps.keys()):
-            if pkg in _TORCH_PACKAGES:
-                del pypi_deps[pkg]
-                log(f"  Removed {pkg} from pypi-dependencies (will inherit from host)")
 
     # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
     if sys.platform == "darwin":

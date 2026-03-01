@@ -311,7 +311,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     """Install dependencies into an isolated pixi environment (for comfy-env.toml subdirs only)."""
     from .packages.pixi import ensure_pixi
     from .packages.toml_generator import write_pixi_toml
-    from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
+    from .packages.cuda_wheels import get_wheel_url, check_all_wheels_available, CUDA_TORCH_MAP, FALLBACK_COMBO
     from .detection import get_recommended_cuda_version, get_gpu_summary
     import shutil, subprocess, tempfile, time
 
@@ -422,16 +422,59 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         log(f"[comfy-env] pixi={pixi_path}")
 
         cuda_version = torch_version = None
+        cuda_override = torch_override = None
+        force_install_torch = False
+        pytorch_packages = {"torch", "torchvision", "torchaudio"}
+        cuda_wheels_packages = [p for p in cfg.cuda_packages if p not in pytorch_packages]
+
         if cfg.has_cuda and sys.platform != "darwin":
             log(f"[comfy-env] GPU: {get_gpu_summary()}")
             cuda_version = get_recommended_cuda_version()
             if cuda_version:
-                torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+                # Try the host's actual torch version first — if all cuda-wheels
+                # are available for it, we can inherit torch from the host (zero-copy).
+                host_torch = None
+                host_cuda = None
+                try:
+                    import torch as _torch
+                    # e.g. "2.8.0+cu128" → "2.8"
+                    host_torch = ".".join(_torch.__version__.split(".")[:2])
+                    host_cuda = _torch.version.cuda  # e.g. "12.8"
+                except Exception:
+                    pass
+
+                py_version = cfg.python or f"{sys.version_info.major}.{sys.version_info.minor}"
+                if host_torch:
+                    log(f"[comfy-env] Main env: torch {_torch.__version__}, Python {py_version}")
+                else:
+                    log(f"[comfy-env] Main env: no torch, Python {py_version}")
+
+                if host_torch and cuda_wheels_packages:
+                    log(f"[comfy-env] Target: cu{cuda_version}/torch{host_torch}/py{py_version}")
+                    log(f"[comfy-env] Checking cuda-wheels for: {', '.join(cuda_wheels_packages)}")
+                    missing = check_all_wheels_available(cuda_wheels_packages, host_torch, cuda_version, py_version)
+                    if missing is None:
+                        torch_version = host_torch
+                        log(f"[comfy-env] All cuda-wheels available for "
+                            f"cu{cuda_version}/torch{torch_version}/py{py_version} — will share_torch")
+                    else:
+                        # Fall back to known-good combo and install torch via pixi
+                        fb_cuda, fb_torch = FALLBACK_COMBO
+                        log(f"[comfy-env] Missing wheel: {missing} "
+                            f"(cu{cuda_version}/torch{host_torch}/py{py_version})")
+                        log(f"[comfy-env] Falling back to cu{fb_cuda}/torch{fb_torch}")
+                        cuda_version, torch_version = fb_cuda, fb_torch
+                        cuda_override, torch_override = fb_cuda, fb_torch
+                        force_install_torch = True
+                else:
+                    torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
+
                 log(f"[comfy-env] Selected: CUDA {cuda_version} + PyTorch {torch_version}")
             else:
                 log("[comfy-env] No GPU detected, using CPU")
 
-        write_pixi_toml(cfg, build_dir, log)
+        write_pixi_toml(cfg, build_dir, log, cuda_override=cuda_override,
+                        torch_override=torch_override, force_install_torch=force_install_torch)
         log("Running pixi install...")
         pixi_env = dict(os.environ)
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(build_dir / "_no_python")
@@ -444,9 +487,6 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         # Install cuda-wheels packages (nvdiffrast, pytorch3d, etc.) via uv pip.
         # PyTorch packages (torch, torchvision, torchaudio) are handled by pixi
         # via per-package index URLs in the generated pixi.toml.
-        pytorch_packages = {"torch", "torchvision", "torchaudio"}
-        cuda_wheels_packages = [p for p in cfg.cuda_packages if p not in pytorch_packages]
-
         if cuda_wheels_packages and cuda_version and sys.platform != "darwin":
             pixi_default = build_dir / ".pixi" / "envs" / "default"
             python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
@@ -463,7 +503,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             for package in cuda_wheels_packages:
                 wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
                 if not wheel_url:
-                    raise RuntimeError(f"No wheel for {package}")
+                    raise RuntimeError(f"No wheel for {package} (cu{cuda_version}/torch{torch_version}/py{py_version})")
                 log(f"  {package} from {wheel_url}")
                 cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", "--no-cache", wheel_url]
                 result = subprocess.run(cmd, capture_output=True, text=True)

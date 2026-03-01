@@ -9,7 +9,13 @@ from typing import List, Optional
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
 CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
+
+# Fallback torch version for each CUDA version — used only when the host's
+# actual torch combo doesn't have all cuda-wheels available.
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
+
+# Known-good baseline where all cuda-wheels packages have wheels built.
+FALLBACK_COMBO = ("12.8", "2.8")
 
 
 def get_cuda_torch_mapping() -> dict:
@@ -18,6 +24,19 @@ def get_cuda_torch_mapping() -> dict:
 
 def get_torch_version_for_cuda(cuda_version: str) -> Optional[str]:
     return CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]))
+
+
+def check_all_wheels_available(packages: List[str], torch_version: str,
+                               cuda_version: str, python_version: str) -> Optional[str]:
+    """Check if all required cuda-wheels are available for this CUDA+torch combo.
+
+    Returns None if all packages have wheels, or the name of the first missing package.
+    """
+    for package in packages:
+        url = get_wheel_url(package, torch_version, cuda_version, python_version)
+        if not url:
+            return package
+    return None
 
 
 def _pkg_variants(package: str) -> List[str]:
