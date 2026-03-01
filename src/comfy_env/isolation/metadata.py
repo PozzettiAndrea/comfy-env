@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 _DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
-_CACHE_VERSION = "2"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "3"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 # ---------------------------------------------------------------------------
@@ -108,19 +108,6 @@ _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
 if _host_sp and os.path.isdir(_host_sp) and _host_sp not in sys.path:
     sys.path.insert(0, _host_sp)
 
-# Mock unavailable packages that comfy_api.latest imports unconditionally
-# (torch for type aliases, av for video types).  The scan never creates
-# tensors or opens video containers so stubs are sufficient.
-import types as _t
-for _mod_name, _attrs in [("torch", {"Tensor": type("Tensor", (), {})}),
-                           ("av", {})]:
-    try:
-        __import__(_mod_name)
-    except ImportError:
-        _m = _t.ModuleType(_mod_name)
-        for _a, _v in _attrs.items():
-            setattr(_m, _a, _v)
-        sys.modules[_mod_name] = _m
 
 # Redirect stdout to stderr during import so that any print() calls
 # from imported code don't corrupt our base64 payload on stdout.
