@@ -647,6 +647,14 @@ def _from_shm(obj, unlink=True):
             block.unlink()
         return pickle.loads(obj_bytes)
 
+    # V3 NodeOutput -> reconstruct
+    if "__node_output__" in obj:
+        from comfy_api.latest import io as _comfy_io
+        args = _from_shm(obj["args"], unlink)
+        ui = _from_shm(obj["ui"], unlink) if obj.get("ui") is not None else None
+        expand = _from_shm(obj["expand"], unlink) if obj.get("expand") is not None else None
+        return _comfy_io.NodeOutput(*args, ui=ui, expand=expand, block_execution=obj.get("block_execution"))
+
     # regular dict - recurse
     return {k: _from_shm(v, unlink) for k, v in obj.items()}
 
@@ -1153,6 +1161,21 @@ def _to_shm(obj, registry, visited=None):
             "__shm_sparse_tensor__": True,
             "coords": _to_shm(obj.coords.cpu(), registry, visited),
             "feats": _to_shm(obj.feats.cpu(), registry, visited),
+        }
+        visited[obj_id] = result
+        return result
+
+    # V3 NodeOutput -> tagged dict for IPC serialization
+    if t == 'NodeOutput':
+        ui_val = obj.ui
+        if hasattr(ui_val, 'as_dict'):
+            ui_val = ui_val.as_dict()
+        result = {
+            "__node_output__": True,
+            "args": _to_shm(list(obj.args), registry, visited),
+            "ui": _to_shm(ui_val, registry, visited) if ui_val is not None else None,
+            "expand": _to_shm(obj.expand, registry, visited) if obj.expand is not None else None,
+            "block_execution": obj.block_execution,
         }
         visited[obj_id] = result
         return result

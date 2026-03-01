@@ -108,6 +108,20 @@ _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
 if _host_sp and os.path.isdir(_host_sp) and _host_sp not in sys.path:
     sys.path.insert(0, _host_sp)
 
+# Mock unavailable packages that comfy_api.latest imports unconditionally
+# (torch for type aliases, av for video types).  The scan never creates
+# tensors or opens video containers so stubs are sufficient.
+import types as _t
+for _mod_name, _attrs in [("torch", {"Tensor": type("Tensor", (), {})}),
+                           ("av", {})]:
+    try:
+        __import__(_mod_name)
+    except ImportError:
+        _m = _t.ModuleType(_mod_name)
+        for _a, _v in _attrs.items():
+            setattr(_m, _a, _v)
+        sys.modules[_mod_name] = _m
+
 # Redirect stdout to stderr during import so that any print() calls
 # from imported code don't corrupt our base64 payload on stdout.
 _real_stdout = sys.stdout
@@ -327,6 +341,31 @@ def build_proxy_class(
     module_name = meta["module_name"]
     class_name = meta["class_name"]
     input_types = meta.get("input_types", {"required": {}})
+    input_types = {k: dict(v) for k, v in input_types.items()}  # shallow copy
+
+    # Expand DynamicCombo children for V1 compatibility.
+    # ComfyUI only expands DynamicCombo schemas for V3 nodes (subclasses of
+    # _ComfyNodeInternal).  Since the proxy is a V1 class, child inputs with
+    # dotted names (e.g. "backend.target_edge_length") are silently dropped by
+    # get_input_data().  We flatten all option children into "optional" so
+    # they survive, then nest them back in the proxy function before sending
+    # to the worker.
+    dynamic_combo_parents = set()
+    for section in ("required", "optional"):
+        if section not in input_types:
+            continue
+        for name, info in list(input_types[section].items()):
+            if (isinstance(info, (list, tuple)) and len(info) >= 1
+                    and info[0] == "COMFY_DYNAMICCOMBO_V3"):
+                dynamic_combo_parents.add(name)
+                opts_dict = info[1] if len(info) > 1 and isinstance(info[1], dict) else {}
+                for opt in opts_dict.get("options", []):
+                    child_inputs = opt.get("inputs", {})
+                    for child_section in ("required", "optional"):
+                        if child_section in child_inputs:
+                            for child_name, child_info in child_inputs[child_section].items():
+                                dotted = f"{name}.{child_name}"
+                                input_types.setdefault("optional", {})[dotted] = child_info
 
     # Build class attributes
     attrs = {
@@ -353,10 +392,28 @@ def build_proxy_class(
     attrs["INPUT_TYPES"] = _input_types
 
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp):
         def proxy(self, **kwargs):
             from .wrap import (_get_or_create_worker, _remove_worker,
                                _load_worker_models, _register_new_patchers)
+
+            # Nest DynamicCombo inputs: flat dotted keys → nested dicts.
+            # e.g. {"backend": "grid", "backend.smooth_normals": "true", ...}
+            #   →  {"backend": {"backend": "grid", "smooth_normals": "true"}, ...}
+            if dcp:
+                nested = {}
+                for k, v in kwargs.items():
+                    if '.' in k:
+                        parent, child = k.split('.', 1)
+                        if parent in dcp:
+                            nested.setdefault(parent, {})[child] = v
+                            continue
+                    if k in dcp:
+                        nested.setdefault(k, {})[k] = v
+                        continue
+                    nested[k] = v
+                kwargs = nested
+
             worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
             try:
                 # Ensure any previously-registered subprocess models are on GPU
@@ -394,6 +451,7 @@ def build_proxy_class(
     attrs[func_name] = _make_proxy(
         func_name, module_name, class_name,
         env_dir, package_root, sys_path, lib_path, env_vars, health_check_timeout,
+        dynamic_combo_parents,
     )
 
     # Create the class
