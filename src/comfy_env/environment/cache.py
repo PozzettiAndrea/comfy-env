@@ -38,6 +38,13 @@ def _get_version() -> str:
 def compute_config_hash(config_path: Path) -> str:
     h = hashlib.sha256(config_path.read_bytes())
     h.update(_get_version().encode())
+    h.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
+    # Include host torch version so CUDA wheel envs rebuild on torch upgrades
+    try:
+        import torch
+        h.update(torch.__version__.encode())
+    except ImportError:
+        pass
     return h.hexdigest()[:8]
 
 

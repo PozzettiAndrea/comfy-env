@@ -259,10 +259,22 @@ def _should_share_torch(env_dir: Path) -> bool:
     if worker_version is None:
         return False
 
-    match = host_version == worker_version
+    if host_version != worker_version:
+        return False
+
+    # If the env has its own torch, don't override with host torch.
+    # This happens when fallback combo was used and pixi installed a different torch version.
+    sp, _ = _get_env_paths(env_dir)
+    if sp:
+        env_torch = sp / "torch"
+        if env_torch.is_dir():
+            if _DEBUG:
+                _log(f"[comfy-env] share_torch: env has own torch at {env_torch}, not sharing")
+            return False
+
     if _DEBUG:
-        _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, match={match}")
-    return match
+        _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, sharing")
+    return True
 
 
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
