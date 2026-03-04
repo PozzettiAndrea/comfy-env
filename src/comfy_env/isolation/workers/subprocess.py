@@ -1011,6 +1011,7 @@ _DBG_WORKER = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_WORKER")
 _DBG_MODELS = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_MODELS")
 _DBG_STACKTRACE = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_STACKTRACE")
 _DBG_VRAM = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_VRAM")
+_DBG_WATCHDOG = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_WATCHDOG")
 _DEBUG = any((_DBG_SERIALIZE, _DBG_IPC, _DBG_WORKER, _DBG_MODELS))
 
 # Watchdog: dump all thread stacks every 60 seconds to catch hangs
@@ -1037,17 +1038,17 @@ def _watchdog():
             f.write("=== END ===\\n")
             f.flush()
 
-        # Also print (only if debug enabled)
-        if _DEBUG:
+        # Also print (only if watchdog debug enabled)
+        if _DBG_WATCHDOG:
             print(f"\\n=== WATCHDOG TICK {tick} ===", flush=True)
             print(dump, flush=True)
             print("=== END ===\\n", flush=True)
 
-# Only start watchdog when debugging (still logs to file if needed)
-if _DEBUG:
+# Start watchdog when its own flag or any debug is on (always logs to file, only prints if _DBG_WATCHDOG)
+if _DBG_WATCHDOG or _DEBUG:
     _watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
     _watchdog_thread.start()
-if _DEBUG:
+if _DBG_WATCHDOG:
     print(f"[worker] Watchdog started, logging to: {_watchdog_log}", flush=True)
 
 # File-based logging for debugging (persists even if stdout/stderr are swallowed)
