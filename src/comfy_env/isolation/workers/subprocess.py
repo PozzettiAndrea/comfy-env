@@ -878,18 +878,25 @@ def _cleanup_shm(registry):
 
 
 def _cleanup_ipc_cache():
-    """Remove stale entries from the CUDA IPC handle forwarding cache."""
-    if not _cuda_ipc_cache_tensors:
-        return
+    """Remove stale entries from CUDA IPC and Pool IPC forwarding caches."""
     try:
         import torch
-        dead = [k for k, t in _cuda_ipc_cache_tensors.items()
-                if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
+        # Legacy CUDA IPC cache
+        if _cuda_ipc_cache_tensors:
+            dead = [k for k, t in _cuda_ipc_cache_tensors.items()
+                    if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
+            for k in dead:
+                _cuda_ipc_metadata_cache.pop(k, None)
+                _cuda_ipc_cache_tensors.pop(k, None)
+        # Pool IPC cache
+        if _pool_ipc_cache_tensors:
+            dead = [k for k, t in _pool_ipc_cache_tensors.items()
+                    if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
+            for k in dead:
+                _pool_ipc_metadata_cache.pop(k, None)
+                _pool_ipc_cache_tensors.pop(k, None)
     except Exception:
-        dead = []
-    for k in dead:
-        _cuda_ipc_metadata_cache.pop(k, None)
-        _cuda_ipc_cache_tensors.pop(k, None)
+        pass
 
 
 # =============================================================================
@@ -2580,6 +2587,10 @@ class SubprocessWorker(Worker):
                 pass
             self._server_socket = None
         self._worker_pool = None
+        # Clear stale pool IPC caches — pointer export data from dead worker's
+        # pool is invalid and would corrupt CUDA state if reused with new pool
+        _pool_ipc_metadata_cache.clear()
+        _pool_ipc_cache_tensors.clear()
 
     def _worker_exit_diagnostic(self) -> str:
         """Collect diagnostic info when the worker process dies unexpectedly."""
