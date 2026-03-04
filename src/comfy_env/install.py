@@ -488,6 +488,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                     missing = check_all_wheels_available(cuda_wheels_packages, host_torch, cuda_version, py_version)
                     if missing is None:
                         torch_version = host_torch
+                        torch_override = host_torch
                         log(f"[comfy-env] All cuda-wheels available for "
                             f"cu{cuda_version}/torch{torch_version}/py{py_version} — will share_torch")
                     else:
