@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
+from ..debug import META as _DBG_META
 
-_DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+_DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
 _CACHE_VERSION = "3"  # Bump when _METADATA_SCRIPT or cache format changes
 
 

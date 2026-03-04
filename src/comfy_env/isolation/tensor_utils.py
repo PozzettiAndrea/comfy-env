@@ -72,7 +72,10 @@ def prepare_tensor_for_ipc(t: Any) -> Any:
             reductions.reduce_tensor(t)
             return t
         except RuntimeError as e:
-            if "received from another process" in str(e):
+            err_str = str(e)
+            if "cudaMallocAsync" in err_str or "shareIpcHandle" in err_str:
+                return t  # Pool IPC will handle this
+            if "received from another process" in err_str:
                 # No cache hit and can't reduce — must clone as fallback
                 size_mb = t.numel() * t.element_size() / (1024 * 1024)
                 if size_mb > 100:

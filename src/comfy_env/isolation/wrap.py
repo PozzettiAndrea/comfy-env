@@ -14,8 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
-
-_DEBUG = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
+from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, INSTALL as _DBG_INSTALL
 _CLEANUP_DONE = False
 
 # ---------------------------------------------------------------------------
@@ -150,11 +149,11 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     ]
     if library_bin.is_dir():
         minimal_path_parts.insert(1, str(library_bin))
-        if _DEBUG:
+        if _DBG_INSTALL:
             dll_count = len([f for f in library_bin.iterdir() if f.suffix.lower() == ".dll"])
             _log(f"[comfy-env] {env_root.name}: Library/bin has {dll_count} DLLs")
     else:
-        if _DEBUG:
+        if _DBG_INSTALL:
             _log(f"[comfy-env] {env_root.name}: Library/bin NOT FOUND at {library_bin}")
     env["PATH"] = ";".join(minimal_path_parts)
     env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
@@ -268,11 +267,11 @@ def _should_share_torch(env_dir: Path) -> bool:
     if sp:
         env_torch = sp / "torch"
         if env_torch.is_dir():
-            if _DEBUG:
+            if _DBG_WORKER:
                 _log(f"[comfy-env] share_torch: env has own torch at {env_torch}, not sharing")
             return False
 
-    if _DEBUG:
+    if _DBG_WORKER:
         _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, sharing")
     return True
 
@@ -283,7 +282,7 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     """Create a fresh subprocess worker."""
     python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
     from .workers.subprocess import SubprocessWorker
-    if _DEBUG:
+    if _DBG_WORKER:
         print(f"[comfy-env] SubprocessWorker: {python}")
         if env_vars:
             print(f"[comfy-env] env_vars: {env_vars}")
@@ -330,7 +329,7 @@ def _handle_vram_budget(request: dict) -> dict:
     total_requested = request.get("total_size", 0)
     device = mm.get_torch_device()
 
-    if _DEBUG:
+    if _DBG_MODELS:
         free_before = mm.get_free_memory(device)
         _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB, "
              f"free before eviction: {free_before / 1e9:.2f}GB")
@@ -338,7 +337,7 @@ def _handle_vram_budget(request: dict) -> dict:
     # Evict parent-side models to make room (with 10% headroom)
     mm.free_memory(total_requested * 1.1, device)
 
-    if _DEBUG:
+    if _DBG_MODELS:
         free_after = mm.get_free_memory(device)
         _log(f"[comfy-env] VRAM after eviction: {free_after / 1e9:.2f}GB")
 
@@ -478,7 +477,7 @@ def _register_new_patchers(env_dir, worker, generation):
         created.append(model_id)
 
     if created:
-        if _DEBUG:
+        if _DBG_MODELS:
             _log(f"[comfy-env] Created {len(created)} model patchers: {created}")
         # Register with ComfyUI memory manager (models are already on GPU)
         comfy.model_management.load_models_gpu(list(patchers.values()))
@@ -537,7 +536,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     pkg_dir = Path(frame.filename).resolve().parent
     caller_pkg_name = caller_module.__name__ if caller_module else None
 
-    if _DEBUG:
+    if _DBG_WORKER:
         _log(f"[comfy-env] register_nodes: pkg_dir={pkg_dir}, caller={caller_pkg_name}")
 
     nodes_dir = pkg_dir / nodes_package
@@ -598,7 +597,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             "host_torch_sp": host_torch_sp,
         }
 
-    if _DEBUG:
+    if _DBG_WORKER:
         _log(f"[comfy-env] Found {len(isolation_envs)} isolation env(s)")
 
     all_mappings = {}
@@ -751,7 +750,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                         _log(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
 
         elif isolation_dirs and not enabled:
-            if _DEBUG:
+            if _DBG_WORKER:
                 _log(f"[comfy-env] Isolation disabled, skipping {len(isolation_dirs)} dirs")
 
     # Report skipped isolation dirs (no _env_* installed)

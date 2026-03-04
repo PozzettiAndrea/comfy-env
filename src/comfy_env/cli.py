@@ -1,6 +1,7 @@
 """CLI for comfy-env."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -44,6 +45,9 @@ def main(args: Optional[List[str]] = None) -> int:
     p.add_argument("--config", "-c", type=str, help="Config path")
     p.add_argument("--dry-run", action="store_true", help="Preview only")
 
+    # debug
+    sub.add_parser("debug", help="Toggle debug logging categories")
+
     # cleanup
     sub.add_parser("cleanup", help="Remove orphaned environments")
 
@@ -55,7 +59,7 @@ def main(args: Optional[List[str]] = None) -> int:
     commands = {
         "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
         "info": cmd_info, "doctor": cmd_doctor, "apt-install": cmd_apt_install,
-        "cleanup": cmd_cleanup,
+        "debug": cmd_debug, "cleanup": cmd_cleanup,
     }
 
     try:
@@ -231,6 +235,194 @@ def cmd_apt_install(args) -> int:
     subprocess.run(prefix + ["apt-get", "update"], capture_output=False)
     result = subprocess.run(prefix + ["apt-get", "install", "-y"] + packages, capture_output=False)
     return result.returncode
+
+
+def cmd_debug(args) -> int:
+    """Toggle debug logging categories with a curses TUI."""
+    from .debug import CATEGORIES, SETTINGS_FILE
+
+    # Read current state from settings file
+    enabled = set()
+    if SETTINGS_FILE.exists():
+        try:
+            for line in SETTINGS_FILE.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if v.strip().lower() in ("1", "true", "yes"):
+                        enabled.add(k.strip())
+        except Exception:
+            pass
+
+    # Also check live env vars (they override the file)
+    for var, _ in CATEGORIES:
+        val = os.environ.get(var, "")
+        if val.lower() in ("1", "true", "yes"):
+            enabled.add(var)
+
+    try:
+        import curses
+        return _debug_tui(curses, CATEGORIES, enabled, SETTINGS_FILE)
+    except ImportError:
+        # No curses (Windows without windows-curses) — simple text fallback
+        return _debug_text(CATEGORIES, enabled, SETTINGS_FILE)
+
+
+def _debug_tui(curses, categories, enabled, settings_file):
+    """Curses-based checkbox TUI."""
+    import os
+
+    selected = [var in enabled for var, _ in categories]
+    n_cats = len(categories)
+    # cursor positions: 0..n_cats-1 = checkboxes, n_cats = "Apply & Exit", n_cats+1 = "Quit"
+    cursor = 0
+    status_msg = ""
+
+    def draw(stdscr):
+        nonlocal cursor, status_msg
+        curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+            curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            stdscr.addstr(0, 2, "comfy-env debug logging", curses.A_BOLD)
+            stdscr.addstr(1, 2, "\u2501" * min(40, w - 4))
+
+            for i, (var, label) in enumerate(categories):
+                y = i + 3
+                if y >= h - 4:
+                    break
+                check = "x" if selected[i] else " "
+                if i > 0 and selected[0] and not selected[i]:
+                    check = "*"
+                attr = curses.A_REVERSE if cursor == i else 0
+                line = f"  [{check}] {label:<40s} {var}"
+                stdscr.addstr(y, 0, line[:w-1], attr)
+
+            # Button row
+            btn_y = n_cats + 4
+            if btn_y < h - 2:
+                # "Apply & Exit" button
+                apply_attr = curses.A_REVERSE | curses.A_BOLD if cursor == n_cats else curses.A_BOLD
+                stdscr.addstr(btn_y, 2, "[ Apply & Exit ]", apply_attr)
+
+                # "Quit" button
+                quit_attr = curses.A_REVERSE if cursor == n_cats + 1 else 0
+                stdscr.addstr(btn_y, 22, "[ Quit ]", quit_attr)
+
+            # Help
+            help_y = btn_y + 2
+            if help_y < h:
+                stdscr.addstr(help_y, 2, "\u2191\u2193 navigate  Space toggle  Enter select  q quit",
+                              curses.A_DIM)
+                if help_y + 1 < h:
+                    stdscr.addstr(help_y + 1, 2, "* = enabled via master switch",
+                                  curses.A_DIM)
+
+            # Status message
+            if status_msg and help_y + 2 < h:
+                color = curses.color_pair(1) if curses.has_colors() else curses.A_BOLD
+                stdscr.addstr(help_y + 2, 2, status_msg, color)
+
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            status_msg = ""  # clear on next keypress
+
+            if key in (ord('q'), ord('Q'), 27):  # q or ESC
+                return 0
+            elif key == curses.KEY_UP and cursor > 0:
+                cursor -= 1
+            elif key == curses.KEY_DOWN and cursor < n_cats + 1:
+                cursor += 1
+            elif key == ord(' '):
+                if cursor < n_cats:
+                    selected[cursor] = not selected[cursor]
+                elif cursor == n_cats:
+                    _save_debug_settings(categories, selected, settings_file)
+                    return 0
+                elif cursor == n_cats + 1:
+                    return 0
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if cursor < n_cats:
+                    selected[cursor] = not selected[cursor]
+                elif cursor == n_cats:
+                    _save_debug_settings(categories, selected, settings_file)
+                    return 0
+                elif cursor == n_cats + 1:
+                    return 0
+            elif key == ord('a') or key == ord('A'):
+                # Shortcut: apply immediately
+                _save_debug_settings(categories, selected, settings_file)
+                return 0
+
+    return curses.wrapper(draw)
+
+
+def _debug_text(categories, enabled, settings_file):
+    """Simple text fallback for systems without curses."""
+    import os
+
+    selected = [var in enabled for var, _ in categories]
+
+    print("comfy-env debug logging")
+    print("=" * 40)
+    for i, (var, label) in enumerate(categories):
+        check = "x" if selected[i] else " "
+        if i > 0 and selected[0] and not selected[i]:
+            check = "*"
+        print(f"  {i}. [{check}] {label:<40s} {var}")
+    print()
+    print("Enter numbers to toggle (space-separated), or 'save' to save, 'quit' to exit:")
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        if line.lower() in ("q", "quit", "exit"):
+            return 0
+        if line.lower() in ("s", "save"):
+            _save_debug_settings(categories, selected, settings_file)
+            print("Saved.")
+            return 0
+        for part in line.split():
+            try:
+                idx = int(part)
+                if 0 <= idx < len(categories):
+                    selected[idx] = not selected[idx]
+            except ValueError:
+                pass
+        # Redisplay
+        for i, (var, label) in enumerate(categories):
+            check = "x" if selected[i] else " "
+            if i > 0 and selected[0] and not selected[i]:
+                check = "*"
+            print(f"  {i}. [{check}] {label:<40s} {var}")
+
+
+def _save_debug_settings(categories, selected, settings_file):
+    """Write debug settings to ~/.comfy-env/debug.env."""
+    import os
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# comfy-env debug settings (managed by `comfy-env debug`)\n"]
+    for i, (var, label) in enumerate(categories):
+        if selected[i]:
+            lines.append(f"{var}=1\n")
+        else:
+            lines.append(f"# {var}=1\n")
+    settings_file.write_text("".join(lines))
+    # Also update current process env so changes take effect immediately
+    for i, (var, _) in enumerate(categories):
+        if selected[i]:
+            os.environ[var] = "1"
+        else:
+            os.environ.pop(var, None)
+    print(f"Saved to {settings_file}")
 
 
 def cmd_cleanup(args) -> int:
