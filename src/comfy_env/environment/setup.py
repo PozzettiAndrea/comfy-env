@@ -44,56 +44,25 @@ def _ensure_base_directory():
 
 
 _shareable_pool_applied = False
-_attention_hook_applied = False
 
 
-def _register_attention_hook(flash=False, sage=False):
-    """Register sys.meta_path hook to set attention flags on comfy.cli_args.args.
-
-    Fires when comfy.cli_args is imported (before attention module reads the flags).
-    Sets use_flash_attention / use_sage_attention on the parsed args namespace.
-    """
-    global _attention_hook_applied
-    if _attention_hook_applied:
-        return
-
-    class _AttentionHook:
-
-        def find_module(self, fullname, path=None):
-            if fullname == "comfy.cli_args" and not _attention_hook_applied:
-                return self
-            return None
-
-        def load_module(self, fullname):
-            sys.meta_path.remove(self)
-            import importlib
-            mod = importlib.import_module(fullname)
-            sys.modules[fullname] = mod
-            self._apply(mod)
-            return mod
-
-        def _apply(self, cli_args_mod):
-            global _attention_hook_applied
-            if _attention_hook_applied:
-                return
-            _attention_hook_applied = True
-            try:
-                args = cli_args_mod.args
-                patches = []
-                if flash and not getattr(args, 'use_flash_attention', False):
-                    args.use_flash_attention = True
-                    patches.append("flash")
-                if sage and not getattr(args, 'use_sage_attention', False):
-                    args.use_sage_attention = True
-                    patches.append("sage")
-                if patches:
-                    print(f"[comfy-env] auto-activated {' + '.join(patches)} attention",
-                          file=sys.stderr, flush=True)
-            except Exception as e:
-                print(f"[comfy-env] attention patch FAILED: {e}",
-                      file=sys.stderr, flush=True)
-
-    sys.meta_path.insert(0, _AttentionHook())
+def _activate_attention(flash=False, sage=False):
+    """Set attention flags on comfy.cli_args.args (already imported at prestartup time)."""
+    try:
+        from comfy.cli_args import args
+        patches = []
+        if sage and not getattr(args, 'use_sage_attention', False):
+            args.use_sage_attention = True
+            patches.append("sage")
+        if flash and not getattr(args, 'use_flash_attention', False):
+            args.use_flash_attention = True
+            patches.append("flash")
+        if patches:
+            print(f"[comfy-env] auto-activated {' + '.join(patches)} attention",
+                  file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[comfy-env] attention patch FAILED: {e}",
+              file=sys.stderr, flush=True)
 
 
 def _register_shareable_pool_hook():
@@ -229,7 +198,7 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     use_sage = _is_on("COMFY_ENV_PATCH_SAGE_ATTENTION",
                        PATCH_DEFAULTS["COMFY_ENV_PATCH_SAGE_ATTENTION"])
     if use_flash or use_sage:
-        _register_attention_hook(flash=use_flash, sage=use_sage)
+        _activate_attention(flash=use_flash, sage=use_sage)
 
     _ensure_base_directory()
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)
