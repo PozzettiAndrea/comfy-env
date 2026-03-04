@@ -154,10 +154,13 @@ def install(
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
         _reinstall_main_requirements(node_dir, log, dry_run)
 
-    if _is_comfy_env_enabled():
+    from .settings import INSTALL_ISOLATED, INSTALL_MAIN
+    if INSTALL_ISOLATED:
         _install_isolated_subdirs(node_dir, log, dry_run)
-    else:
+    if INSTALL_MAIN:
         _install_to_main_env(node_dir, log, dry_run)
+    if not INSTALL_ISOLATED and not INSTALL_MAIN:
+        log("\n[comfy-env] Both install targets disabled — nothing to install")
 
     log("\nInstallation complete!")
     return True

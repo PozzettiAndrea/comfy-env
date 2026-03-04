@@ -24,15 +24,30 @@ if SETTINGS_FILE.exists():
     except Exception:
         pass
 
-# General settings: (env_var, label, default_on)
-# default_on=True means the feature is ON by default (env var unset or "1")
+# General settings: (env_var, label)
 GENERAL_SETTINGS = [
-    ("USE_COMFY_ENV", "Enable process isolation"),
+    ("COMFY_ENV_INSTALL_ISOLATED", "Install to isolated envs (pixi/venv)"),
+    ("COMFY_ENV_INSTALL_MAIN", "Install to main Python env (pip)"),
+    ("COMFY_ENV_ISOLATE", "Run nodes in subprocess workers"),
     ("COMFY_ENV_POOL_IPC", "Pool IPC (zero-copy GPU tensor transfer)"),
 ]
 
-# Defaults for general settings (True = feature is on when env var is unset)
+# Defaults (True = on when env var is unset)
 GENERAL_DEFAULTS = {
-    "USE_COMFY_ENV": True,
+    "COMFY_ENV_INSTALL_ISOLATED": True,
+    "COMFY_ENV_INSTALL_MAIN": False,
+    "COMFY_ENV_ISOLATE": True,
     "COMFY_ENV_POOL_IPC": False,
 }
+
+
+def _is_on(var: str, default: bool = False) -> bool:
+    val = os.environ.get(var, "")
+    if val == "":
+        return default
+    return val.lower() in ("1", "true", "yes")
+
+
+INSTALL_ISOLATED = _is_on("COMFY_ENV_INSTALL_ISOLATED", GENERAL_DEFAULTS["COMFY_ENV_INSTALL_ISOLATED"])
+INSTALL_MAIN = _is_on("COMFY_ENV_INSTALL_MAIN", GENERAL_DEFAULTS["COMFY_ENV_INSTALL_MAIN"])
+ISOLATE = _is_on("COMFY_ENV_ISOLATE", GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"])

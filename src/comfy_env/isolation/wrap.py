@@ -126,7 +126,8 @@ def _cleanup_stale_workers():
 
 
 def _is_enabled() -> bool:
-    return os.environ.get("USE_COMFY_ENV", "1").lower() not in ("0", "false", "no", "off")
+    from ..settings import ISOLATE
+    return ISOLATE
 
 
 # ---------------------------------------------------------------------------

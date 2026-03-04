@@ -7,11 +7,12 @@ from typing import Optional
 
 from .libomp import dedupe_libomp
 
-USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
+USE_COMFY_ENV_VAR = "USE_COMFY_ENV"  # kept for backwards compat
 
 
 def is_comfy_env_enabled() -> bool:
-    return os.environ.get(USE_COMFY_ENV_VAR, "1").lower() not in ("0", "false", "no", "off")
+    from ..settings import ISOLATE
+    return ISOLATE
 
 
 def _find_env_dirs(node_dir: str) -> list:
