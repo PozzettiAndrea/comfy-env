@@ -10,11 +10,30 @@ any nn.Module that lands on CUDA. Zero per-repo changes needed.
 """
 
 import logging
+import sys
 
 import comfy.model_patcher
 import comfy.model_management
 
+from ..debug import VRAM as _DBG_VRAM, MODELS as _DBG_MODELS
+
 log = logging.getLogger("comfy_env.model_patcher")
+
+
+def _log_vram(label: str) -> None:
+    """Log compact VRAM state around model load/unload."""
+    if not _DBG_VRAM:
+        return
+    try:
+        dev = comfy.model_management.get_torch_device()
+        if dev.type != "cuda":
+            return
+        total = comfy.model_management.get_total_memory(dev) // (1024 * 1024)
+        free = comfy.model_management.get_free_memory(dev) // (1024 * 1024)
+        used = total - free
+        print(f"[comfy-env] [VRAM] {label}: {used} / {total} MB", file=sys.stderr, flush=True)
+    except Exception:
+        pass
 
 
 class SubprocessModel:
@@ -103,18 +122,24 @@ class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
                     load_weights=True, force_patch_weights=False):
         """Load model to GPU in subprocess."""
         device_to = device_to or self.load_device
+        size_mb = self.size // (1024 * 1024)
+        _log_vram(f"Before load '{self._model_id}' ({size_mb} MB) → {device_to}")
         self._send_device_command(str(device_to))
         self.model.device = device_to
         self.model.model_loaded_weight_memory = self.size
+        _log_vram(f"After load '{self._model_id}' ({size_mb} MB)")
         return self.model
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         """Offload model to CPU in subprocess."""
         device_to = device_to or self.offload_device
+        size_mb = self.size // (1024 * 1024)
+        _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB) → {device_to}")
         self._send_device_command(str(device_to))
         self.model.device = device_to
         self.model.model_loaded_weight_memory = 0
         self.model.model_offload_buffer_memory = 0
+        _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
         """Full load (no partial loading for subprocess models)."""

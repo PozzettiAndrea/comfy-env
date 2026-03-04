@@ -41,10 +41,14 @@ MODELS = DEBUG or _is_on("COMFY_ENV_DEBUG_MODELS")
 META = DEBUG or _is_on("COMFY_ENV_DEBUG_META")
 INSTALL = DEBUG or _is_on("COMFY_ENV_DEBUG_INSTALL")
 STACKTRACE = DEBUG or _is_on("COMFY_ENV_DEBUG_STACKTRACE")
+INPUTS_OUTPUTS = DEBUG or _is_on("COMFY_ENV_DEBUG_INPUTS_OUTPUTS")
+VRAM = DEBUG or _is_on("COMFY_ENV_DEBUG_VRAM")
 
 # Ordered list for TUI display
 CATEGORIES = [
     ("COMFY_ENV_DEBUG", "All (master switch)"),
+    ("COMFY_ENV_DEBUG_INPUTS_OUTPUTS", "Node inputs/outputs (shapes, types, devices)"),
+    ("COMFY_ENV_DEBUG_VRAM", "GPU VRAM state before/after node execution"),
     ("COMFY_ENV_DEBUG_SERIALIZE", "Tensor serialization / deserialization"),
     ("COMFY_ENV_DEBUG_IPC", "CUDA IPC (legacy + pool)"),
     ("COMFY_ENV_DEBUG_WORKER", "Worker lifecycle (start/stop/crash)"),

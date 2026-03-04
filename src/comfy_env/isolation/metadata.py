@@ -19,10 +19,81 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import META as _DBG_META
+from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
 _CACHE_VERSION = "3"  # Bump when _METADATA_SCRIPT or cache format changes
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _describe_value(name: str, v) -> str:
+    """Single-line summary of a value for I/O logging."""
+    try:
+        import torch
+        if isinstance(v, torch.Tensor):
+            shape = ",".join(str(s) for s in v.shape)
+            return f"{name}: {v.dtype} [{shape}] {v.device}"
+    except ImportError:
+        pass
+    try:
+        import numpy as np
+        if isinstance(v, np.ndarray):
+            shape = ",".join(str(s) for s in v.shape)
+            return f"{name}: {v.dtype} [{shape}]"
+    except ImportError:
+        pass
+    if isinstance(v, (list, tuple)) and len(v) > 0:
+        first = v[0]
+        try:
+            import torch
+            if isinstance(first, torch.Tensor):
+                shape = ",".join(str(s) for s in first.shape)
+                return f"{name}: {len(v)}x {first.dtype} [{shape}] {first.device}"
+        except (ImportError, AttributeError):
+            pass
+        return f"{name}: {type(v).__name__}[{len(v)}]"
+    if isinstance(v, (str, int, float, bool)):
+        s = repr(v)
+        if len(s) > 60:
+            s = s[:57] + "..."
+        return f"{name}: {s}"
+    return f"{name}: {type(v).__name__}"
+
+
+def _log_vram(label: str) -> None:
+    """Log compact GPU memory state."""
+    try:
+        import comfy.model_management as mm
+        dev = mm.get_torch_device()
+        if dev.type != "cuda":
+            return
+        total = mm.get_total_memory(dev) // (1024 * 1024)
+        free = mm.get_free_memory(dev) // (1024 * 1024)
+        used = total - free
+        _log(f"[VRAM] {label}: {used} / {total} MB")
+        # Loaded models
+        loaded = mm.current_loaded_models
+        if loaded:
+            parts = []
+            for lm in loaded:
+                n = lm.model.model.__class__.__name__
+                gpu_mb = lm.model_loaded_memory() // (1024 * 1024)
+                parts.append(f"{n} ({gpu_mb} MB)")
+            _log(f"[VRAM] Loaded: {', '.join(parts)}")
+    except ImportError:
+        # No comfy — try raw torch
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free, total = torch.cuda.mem_get_info()
+                used = (total - free) // (1024 * 1024)
+                total_mb = total // (1024 * 1024)
+                _log(f"[VRAM] {label}: {used} / {total_mb} MB")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +451,7 @@ def build_proxy_class(
     attrs["INPUT_TYPES"] = _input_types
 
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn):
         def proxy(self, **kwargs):
             from .wrap import (_get_or_create_worker, _remove_worker,
                                _load_worker_models, _register_new_patchers)
@@ -402,7 +473,15 @@ def build_proxy_class(
                     nested[k] = v
                 kwargs = nested
 
+            # I/O + VRAM logging (before call)
+            if _DBG_IO:
+                inputs_desc = ", ".join(_describe_value(k, v) for k, v in kwargs.items())
+                _log(f"[comfy-env] Running {nn}: {inputs_desc}")
+            if _DBG_VRAM:
+                _log_vram(f"Before {nn}")
+
             worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
+            _t0 = time.perf_counter()
             try:
                 # Ensure any previously-registered subprocess models are on GPU
                 _load_worker_models(ed)
@@ -430,6 +509,20 @@ def build_proxy_class(
 
                 # Create patchers for any models auto-detected during this call
                 _register_new_patchers(ed, worker, gen)
+
+                # I/O + VRAM logging (after call)
+                if _DBG_IO:
+                    elapsed = time.perf_counter() - _t0
+                    if isinstance(result, tuple):
+                        out_desc = ", ".join(
+                            _describe_value(f"[{i}]", v) for i, v in enumerate(result)
+                        )
+                    else:
+                        out_desc = _describe_value("result", result)
+                    _log(f"[comfy-env] {nn} done ({elapsed:.2f}s): {out_desc}")
+                if _DBG_VRAM:
+                    _log_vram(f"After {nn}")
+
                 return result
             except (RuntimeError, ConnectionError):
                 _remove_worker(ed)
@@ -439,7 +532,7 @@ def build_proxy_class(
     attrs[func_name] = _make_proxy(
         func_name, module_name, class_name,
         env_dir, package_root, sys_path, lib_path, env_vars, health_check_timeout,
-        dynamic_combo_parents,
+        dynamic_combo_parents, node_name,
     )
 
     # Create the class

@@ -157,7 +157,7 @@ def install(
     if _is_comfy_env_enabled():
         _install_isolated_subdirs(node_dir, log, dry_run)
     else:
-        log("\n[comfy-env] Isolation disabled (USE_COMFY_ENV=0)")
+        _install_to_main_env(node_dir, log, dry_run)
 
     log("\nInstallation complete!")
     return True
@@ -576,6 +576,89 @@ def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_ru
         log(f"\n[isolated] {config_file.parent.relative_to(node_dir)}")
         if not dry_run:
             _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
+
+
+def _install_to_main_env(node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
+    """Install deps from comfy-env.toml files into the main Python env (isolation disabled)."""
+    import subprocess
+
+    log("\n[comfy-env] Isolation disabled — installing to main env")
+    all_pypi = {}
+    cuda_packages = []
+    conda_warnings = []
+
+    for config_file in node_dir.rglob(CONFIG_FILE_NAME):
+        if config_file.parent == node_dir:
+            continue
+        cfg = load_config(config_file)
+        rel = config_file.parent.relative_to(node_dir)
+        pypi = cfg.pixi_passthrough.get("pypi-dependencies", {})
+        conda = cfg.pixi_passthrough.get("dependencies", {})
+        if pypi:
+            log(f"  [{rel}] PyPI: {', '.join(pypi.keys())}")
+            all_pypi.update(pypi)
+        if cfg.cuda_packages:
+            cuda_packages.extend(cfg.cuda_packages)
+        if conda:
+            conda_warnings.append((rel, list(conda.keys())))
+
+    if conda_warnings:
+        for rel, pkgs in conda_warnings:
+            log(f"  WARNING: [{rel}] has conda deps ({', '.join(pkgs)}) — cannot install to main env")
+
+    if not all_pypi and not cuda_packages:
+        log("  No packages to install")
+        return
+
+    # Convert pypi dep specs to pip install args
+    pip_args = []
+    for name, spec in all_pypi.items():
+        if isinstance(spec, dict):
+            version = spec.get("version", "*")
+            extras = spec.get("extras", [])
+            pkg = name
+            if extras:
+                pkg = f"{name}[{','.join(extras)}]"
+            if version and version != "*":
+                pkg = f"{pkg}{version}"
+            pip_args.append(pkg)
+        elif isinstance(spec, str) and spec != "*":
+            pip_args.append(f"{name}{spec}")
+        else:
+            pip_args.append(name)
+
+    # cuda_packages that aren't torch/torchvision/torchaudio need cuda-wheels
+    pytorch_packages = {"torch", "torchvision", "torchaudio"}
+    cuda_only = [p for p in cuda_packages if p not in pytorch_packages]
+    if cuda_only:
+        try:
+            from .packages.cuda_wheels import get_wheel_url
+            from .detection import get_recommended_cuda_version
+            import torch
+            torch_ver = ".".join(torch.__version__.split(".")[:2])
+            cuda_ver = get_recommended_cuda_version()
+            py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+            for package in cuda_only:
+                url = get_wheel_url(package, torch_ver, cuda_ver, py_ver)
+                if url:
+                    pip_args.append(url)
+                    log(f"  {package} from {url}")
+                else:
+                    log(f"  WARNING: No cuda-wheel for {package} (cu{cuda_ver}/torch{torch_ver}/py{py_ver})")
+        except Exception as e:
+            log(f"  WARNING: Could not resolve cuda-wheels: {e}")
+
+    if pip_args:
+        log(f"\n  pip install {' '.join(pip_args)}")
+        if not dry_run:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install"] + pip_args,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                log(f"  WARNING: pip install failed:\n{result.stderr}")
+            else:
+                log("  Installed successfully")
 
 
 def verify_installation(packages: List[str], log: Callable[[str], None] = print) -> bool:

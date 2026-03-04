@@ -1010,6 +1010,7 @@ _DBG_IPC = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_IPC")
 _DBG_WORKER = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_WORKER")
 _DBG_MODELS = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_MODELS")
 _DBG_STACKTRACE = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_STACKTRACE")
+_DBG_VRAM = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_VRAM")
 _DEBUG = any((_DBG_SERIALIZE, _DBG_IPC, _DBG_WORKER, _DBG_MODELS))
 
 # Watchdog: dump all thread stacks every 60 seconds to catch hangs
@@ -1066,6 +1067,52 @@ def wlog(msg):
     # fills up and causes deadlock (parent blocked on recv, worker blocked on print)
 
 wlog(f"[worker] === Worker starting, log file: {_worker_log_file} ===")
+
+# VRAM poller: background thread that detects GPU memory changes
+_vram_poll_transport = None  # set in main() after transport is available
+if _DBG_VRAM:
+    def _vram_poller():
+        import time as _vt
+        threshold = 200 * 1024 * 1024  # 200MB — ignore attention transients
+        min_interval = 1.0              # max 1 log/sec
+        last_alloc = 0
+        last_log_time = 0.0
+        peak_alloc = 0
+        _torch = None
+        while True:
+            _vt.sleep(0.1)
+            try:
+                if _torch is None:
+                    import torch as _torch
+                    if not _torch.cuda.is_available():
+                        return
+                alloc = _torch.cuda.memory_allocated()
+                if alloc > peak_alloc:
+                    peak_alloc = alloc
+                delta = alloc - last_alloc
+                now = _vt.time()
+                if abs(delta) >= threshold and (now - last_log_time) >= min_interval:
+                    alloc_mb = alloc // (1024 * 1024)
+                    reserved_mb = _torch.cuda.memory_reserved() // (1024 * 1024)
+                    sign = "+" if delta > 0 else ""
+                    delta_mb = delta // (1024 * 1024)
+                    peak_mb = peak_alloc // (1024 * 1024)
+                    msg = f"[VRAM] {sign}{delta_mb}MB (now {alloc_mb}MB) reserved={reserved_mb}MB peak={peak_mb}MB"
+                    wlog(msg)
+                    if _vram_poll_transport is not None:
+                        try:
+                            _vram_poll_transport.send({"type": "log", "message": msg})
+                        except Exception:
+                            pass
+                    last_alloc = alloc
+                    last_log_time = now
+            except ImportError:
+                pass  # torch not yet imported, retry next tick
+            except Exception:
+                pass
+    _vram_thread = threading.Thread(target=_vram_poller, daemon=True)
+    _vram_thread.start()
+    wlog("[worker] VRAM poller started (200MB threshold, 100ms poll, 1s cooldown)")
 
 # Debug: print PATH at startup (only if debug enabled)
 if _DEBUG:
@@ -1921,6 +1968,9 @@ def main():
     # Connect to host process
     sock = _connect(socket_addr)
     transport = SocketTransport(sock)
+    # Give the VRAM poller access to transport for sending log messages to parent
+    global _vram_poll_transport
+    _vram_poll_transport = transport
     wlog("[worker] Connected, waiting for config...")
 
     # Read config as first message
