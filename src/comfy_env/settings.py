@@ -55,7 +55,11 @@ ISOLATE = _is_on("COMFY_ENV_ISOLATE", GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"])
 # Risky patches (monkey-patching ComfyUI internals)
 PATCH_SETTINGS = [
     ("COMFY_ENV_PATCH_SHAREABLE_POOL", "CUDA shareable pool (full zero-copy IPC)"),
+    ("COMFY_ENV_PATCH_FLASH_ATTENTION", "Auto-activate flash attention"),
+    ("COMFY_ENV_PATCH_SAGE_ATTENTION", "Auto-activate sage attention"),
 ]
 PATCH_DEFAULTS = {
     "COMFY_ENV_PATCH_SHAREABLE_POOL": False,
+    "COMFY_ENV_PATCH_FLASH_ATTENTION": False,
+    "COMFY_ENV_PATCH_SAGE_ATTENTION": False,
 }
