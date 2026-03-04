@@ -268,11 +268,13 @@ def cmd_debug(args) -> int:
 
 def _open_settings_tui(initial_tab=0) -> int:
     from .debug import CATEGORIES as DEBUG_CATEGORIES, SETTINGS_FILE as DEBUG_FILE
-    from .settings import GENERAL_SETTINGS, GENERAL_DEFAULTS, SETTINGS_FILE as GENERAL_FILE
+    from .settings import (GENERAL_SETTINGS, GENERAL_DEFAULTS, SETTINGS_FILE as GENERAL_FILE,
+                           PATCH_SETTINGS, PATCH_DEFAULTS)
 
     # Read current state
     debug_enabled = _read_env_file(DEBUG_FILE)
     general_enabled = _read_env_file(GENERAL_FILE)
+    patch_enabled = _read_env_file(GENERAL_FILE)  # patches stored in same file
 
     # Also check live env vars
     for var, _ in DEBUG_CATEGORIES:
@@ -284,10 +286,17 @@ def _open_settings_tui(initial_tab=0) -> int:
             general_enabled.add(var)
         elif val == "" and GENERAL_DEFAULTS.get(var, False):
             general_enabled.add(var)  # default on
+    for var, _ in PATCH_SETTINGS:
+        val = os.environ.get(var, "")
+        if val.lower() in ("1", "true", "yes"):
+            patch_enabled.add(var)
+        elif val == "" and PATCH_DEFAULTS.get(var, False):
+            patch_enabled.add(var)
 
     tabs = [
         ("General", GENERAL_SETTINGS, general_enabled, GENERAL_FILE),
         ("Debug", DEBUG_CATEGORIES, debug_enabled, DEBUG_FILE),
+        ("Patches", PATCH_SETTINGS, patch_enabled, GENERAL_FILE),
     ]
 
     try:
@@ -477,23 +486,25 @@ def _settings_text(tabs, initial_tab):
 
 
 def _save_all_settings(tab_items, tab_selected, tab_files):
-    """Write settings to their respective files."""
+    """Write settings to their respective files (merges tabs sharing the same file)."""
+    # Group by file path (General and Patches may share the same file)
+    from collections import defaultdict
+    file_entries = defaultdict(list)  # filepath -> [(var, enabled), ...]
     for items, selected, filepath in zip(tab_items, tab_selected, tab_files):
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        lines = [f"# comfy-env settings (managed by `comfy-env settings`)\n"]
-        for i, (var, label) in enumerate(items):
-            if selected[i]:
-                lines.append(f"{var}=1\n")
-            else:
-                lines.append(f"# {var}=0\n")
-        filepath.write_text("".join(lines))
-        # Update current process env
         for i, (var, _) in enumerate(items):
-            if selected[i]:
-                os.environ[var] = "1"
-            else:
-                os.environ.pop(var, None)
-    print(f"Saved to {', '.join(str(f) for f in tab_files)}")
+            file_entries[filepath].append((var, selected[i]))
+            # Update current process env
+            os.environ[var] = "1" if selected[i] else "0"
+
+    for filepath, entries in file_entries.items():
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# comfy-env settings (managed by `comfy-env settings`)\n"]
+        for var, enabled in entries:
+            lines.append(f"{var}={'1' if enabled else '0'}\n")
+        filepath.write_text("".join(lines))
+
+    unique_files = list(dict.fromkeys(str(f) for f in tab_files))
+    print(f"Saved to {', '.join(unique_files)}")
 
 
 def cmd_cleanup(args) -> int:

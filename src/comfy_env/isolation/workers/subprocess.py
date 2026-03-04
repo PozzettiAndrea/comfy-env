@@ -418,6 +418,7 @@ _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "t
 _pool_ipc_metadata_cache: Dict[int, dict] = {}
 _pool_ipc_cache_tensors: Dict[int, Any] = {}
 _active_worker_pool = None  # set per-call before _from_shm
+_parent_shareable_pool = None  # set once if PATCH_SHAREABLE_POOL is enabled
 
 
 def _pool_ipc_available() -> bool:
@@ -537,6 +538,27 @@ def _trim_pool(pool, min_bytes=0):
                 "cudaMemPoolTrimTo")
 
 
+# cudaMemPoolAttr enum values
+_CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 3
+_CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT = 5
+
+
+def _get_pool_mem_stats(pool):
+    """Query reserved and active bytes from a CUDA memory pool."""
+    cudart = _get_cudart()
+    if not cudart or not pool:
+        return 0, 0
+    reserved = ctypes.c_size_t(0)
+    active = ctypes.c_size_t(0)
+    cudart.cudaMemPoolGetAttribute(
+        pool, ctypes.c_int(_CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT),
+        ctypes.byref(reserved))
+    cudart.cudaMemPoolGetAttribute(
+        pool, ctypes.c_int(_CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT),
+        ctypes.byref(active))
+    return reserved.value, active.value
+
+
 # --- FD passing (SCM_RIGHTS) ---
 
 def _send_fd(sock, fd):
@@ -595,6 +617,47 @@ def _deserialize_pool_ipc(data, source_pool):
     except Exception:
         pass
     return tensor
+
+
+def _serialize_pool_ipc_parent(t):
+    """Serialize CUDA tensor via pool pointer export (parent side, zero-copy)."""
+    import torch
+    # Check cache
+    try:
+        storage_id = id(t.untyped_storage())
+        cached = _pool_ipc_metadata_cache.get(storage_id)
+        if cached is not None:
+            if (list(t.size()) == cached["tensor_size"]
+                    and list(t.stride()) == cached["tensor_stride"]
+                    and t.storage_offset() == cached.get("tensor_offset", 0)):
+                return cached
+            return {**cached, "tensor_size": list(t.size()),
+                    "tensor_stride": list(t.stride()),
+                    "tensor_offset": t.storage_offset()}
+    except Exception:
+        pass
+
+    torch.cuda.current_stream().synchronize()
+    storage = t.untyped_storage()
+    export_data = _export_pointer(storage.data_ptr())
+
+    result = {
+        "__type__": "PoolIPC",
+        "export_data": base64.b64encode(export_data).decode("ascii"),
+        "storage_size": storage.size(),
+        "dtype": str(t.dtype),
+        "tensor_size": list(t.size()),
+        "tensor_stride": list(t.stride()),
+        "tensor_offset": t.storage_offset(),
+        "device_idx": t.device.index or 0,
+        "requires_grad": t.requires_grad,
+    }
+    try:
+        _pool_ipc_metadata_cache[id(t.untyped_storage())] = result
+        _pool_ipc_cache_tensors[id(t.untyped_storage())] = t
+    except Exception:
+        pass
+    return result
 
 
 def _prepare_trimesh_for_pickle(mesh):
@@ -659,9 +722,14 @@ def _to_shm(obj, registry, visited=None):
         visited[obj_id] = result
         return result
 
-    # torch.Tensor -> CUDA IPC (zero-copy GPU) or PyTorch native shared memory (zero-copy CPU)
+    # torch.Tensor -> Pool IPC / CUDA IPC (zero-copy GPU) or PyTorch native shared memory (zero-copy CPU)
     if t == 'Tensor':
-        # CUDA IPC: zero-copy GPU-to-GPU transfer (Linux only)
+        # Pool IPC: zero-copy via shareable pool (parent has shareable pool enabled)
+        if obj.is_cuda and _parent_shareable_pool is not None:
+            result = _serialize_pool_ipc_parent(obj)
+            visited[obj_id] = result
+            return result
+        # Legacy CUDA IPC: zero-copy GPU-to-GPU transfer (Linux only)
         if obj.is_cuda and _probe_cuda_ipc():
             result = _serialize_cuda_ipc(obj)
             visited[obj_id] = result
@@ -1413,10 +1481,65 @@ def _trim_pool(pool, min_bytes=0):
     _cuda_check(cudart.cudaMemPoolTrimTo(pool, ctypes.c_size_t(min_bytes)),
                 "cudaMemPoolTrimTo")
 
+def _import_pool_from_fd(fd):
+    cudart = _get_cudart()
+    pool = ctypes.c_void_p()
+    fd_val = ctypes.c_int(fd)
+    _cuda_check(cudart.cudaMemPoolImportFromShareableHandle(
+        ctypes.byref(pool), ctypes.byref(fd_val),
+        ctypes.c_int(_CUDA_MEM_HANDLE_TYPE_POSIX_FD), ctypes.c_uint(0)),
+        "cudaMemPoolImportFromShareableHandle")
+    return pool
+
+def _import_pointer(pool, export_data_bytes):
+    cudart = _get_cudart()
+    export_data = _CudaMemPoolPtrExportData.from_buffer_copy(export_data_bytes)
+    ptr = ctypes.c_void_p()
+    _cuda_check(cudart.cudaMemPoolImportPointer(
+        ctypes.byref(ptr), pool, ctypes.byref(export_data)),
+        "cudaMemPoolImportPointer")
+    return ptr.value
+
+class _PoolPtr:
+    def __init__(self, ptr, nbytes):
+        self.__cuda_array_interface__ = {
+            'shape': (nbytes,), 'typestr': '|u1',
+            'data': (ptr, False), 'version': 3,
+        }
+
+def _deserialize_pool_ipc(data, source_pool):
+    import torch
+    export_data_bytes = _b64.b64decode(data["export_data"])
+    imported_ptr = _import_pointer(source_pool, export_data_bytes)
+    device_idx = data["device_idx"]
+    dtype = getattr(torch, data["dtype"].split(".")[-1])
+    storage_size = data["storage_size"]
+    raw = torch.as_tensor(_PoolPtr(imported_ptr, storage_size),
+                          device=torch.device(f"cuda:{device_idx}"))
+    tensor = torch.empty([], dtype=dtype, device=f"cuda:{device_idx}")
+    tensor.set_(raw.untyped_storage(), data["tensor_offset"],
+                tuple(data["tensor_size"]), tuple(data["tensor_stride"]))
+    tensor.requires_grad_(data["requires_grad"])
+    return tensor
+
 def _send_fd(sock, fd):
     import array as _array
     sock.sendmsg([b'\\x00'],
                  [(socket.SOL_SOCKET, socket.SCM_RIGHTS, _array.array('i', [fd]))])
+
+def _recv_fd(sock, timeout=10.0):
+    import array as _array
+    sock.settimeout(timeout)
+    try:
+        msg, ancdata, flags, addr = sock.recvmsg(1, socket.CMSG_LEN(4))
+        for level, type_, data in ancdata:
+            if level == socket.SOL_SOCKET and type_ == socket.SCM_RIGHTS:
+                fds = _array.array('i')
+                fds.frombytes(data[:fds.itemsize])
+                return fds[0]
+        raise RuntimeError("No FD in ancillary data")
+    finally:
+        sock.settimeout(None)
 
 def _serialize_pool_ipc(t):
     """Serialize CUDA tensor via pool pointer export (zero-copy)."""
@@ -1665,6 +1788,14 @@ def _from_shm(obj, _depth=0, _key="root"):
         if isinstance(obj, list):
             return [_from_shm(v, _depth+1, f"{_key}[{i}]") for i, v in enumerate(obj)]
         return obj
+
+    # PoolIPC -> zero-copy CUDA tensor via shareable pool (parent -> worker)
+    if obj.get("__type__") == "PoolIPC":
+        wlog(f"[_from_shm] {_key}: PoolIPC tensor_size={obj.get('tensor_size')}")
+        if _parent_pool is not None:
+            return _deserialize_pool_ipc(obj, _parent_pool)
+        wlog(f"[_from_shm] {_key}: PoolIPC but no parent pool, falling back to error")
+        raise RuntimeError("PoolIPC received but no parent pool handle available")
 
     # CudaIPC -> zero-copy CUDA tensor deserialization
     if obj.get("__type__") == "CudaIPC":
@@ -2291,6 +2422,21 @@ def main():
             _pool_ipc_ok = False
             _our_pool = None
 
+    # --- Receive parent's shareable pool FD (for parent→worker zero-copy) ---
+    _parent_pool = None
+    try:
+        msg = transport.recv(timeout=5)
+        if msg and msg.get("type") == "parent_pool_fd_sent":
+            parent_fd = _recv_fd(sock, timeout=5)
+            _parent_pool = _import_pool_from_fd(parent_fd)
+            os.close(parent_fd)
+            wlog("[worker] Pool IPC: imported parent pool for parent→worker zero-copy")
+        else:
+            wlog("[worker] No parent shareable pool (parent→worker uses CPU shm)")
+    except Exception as e:
+        wlog(f"[worker] Parent pool import skipped: {e}")
+        _parent_pool = None
+
     wlog("[worker] Entering request loop...")
 
     # Process requests
@@ -2807,6 +2953,23 @@ class SubprocessWorker(Worker):
                 if _DBG_IPC:
                     print(f"[{self.name}] Pool IPC handshake failed: {e}", file=sys.stderr, flush=True)
                 self._worker_pool = None
+
+        # --- Send parent's shareable pool FD to worker (for parent→worker zero-copy) ---
+        if _parent_shareable_pool is not None and _has_af_unix():
+            try:
+                parent_pool_fd = _export_pool_fd(_parent_shareable_pool)
+                self._transport.send({"type": "parent_pool_fd_sent"})
+                _send_fd(client_sock, parent_pool_fd)
+                os.close(parent_pool_fd)
+                if _DBG_IPC:
+                    print(f"[{self.name}] Pool IPC: sent parent pool FD to worker",
+                          file=sys.stderr, flush=True)
+            except Exception as e:
+                if _DBG_IPC:
+                    print(f"[{self.name}] Parent pool FD send failed: {e}",
+                          file=sys.stderr, flush=True)
+        else:
+            self._transport.send({"type": "no_parent_pool"})
 
     def call(
         self,

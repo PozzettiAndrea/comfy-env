@@ -654,7 +654,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         except Exception as e:
             _log(f"[comfy-env] Failed to scan {nodes_package} root: {e}")
 
-    elif root_resolved not in isolation_envs:
+    elif root_resolved not in isolation_envs or not enabled:
         # No isolation at root -- try direct import
         _log(f"[comfy-env] Importing {nodes_package} (root)...")
         try:
@@ -670,7 +670,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # --- Pattern 2: subdirectories (only if root yielded nothing) ---
     # Skip if root was an isolation env (even if scan returned 0 nodes) -- subdirs
     # are part of that isolation env and must not be direct-imported.
-    if not all_mappings and root_resolved not in isolation_envs:
+    if not all_mappings and (root_resolved not in isolation_envs or not enabled):
         main_dirs = []
         isolation_dirs = []
 
@@ -682,7 +682,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             if subdir.name.startswith("_") or subdir.name.startswith("."):
                 continue
 
-            if subdir.resolve() in isolation_envs:
+            if subdir.resolve() in isolation_envs and enabled:
                 isolation_dirs.append(subdir)
             else:
                 main_dirs.append(subdir)

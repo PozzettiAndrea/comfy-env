@@ -51,3 +51,11 @@ def _is_on(var: str, default: bool = False) -> bool:
 INSTALL_ISOLATED = _is_on("COMFY_ENV_INSTALL_ISOLATED", GENERAL_DEFAULTS["COMFY_ENV_INSTALL_ISOLATED"])
 INSTALL_MAIN = _is_on("COMFY_ENV_INSTALL_MAIN", GENERAL_DEFAULTS["COMFY_ENV_INSTALL_MAIN"])
 ISOLATE = _is_on("COMFY_ENV_ISOLATE", GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"])
+
+# Risky patches (monkey-patching ComfyUI internals)
+PATCH_SETTINGS = [
+    ("COMFY_ENV_PATCH_SHAREABLE_POOL", "CUDA shareable pool (full zero-copy IPC)"),
+]
+PATCH_DEFAULTS = {
+    "COMFY_ENV_PATCH_SHAREABLE_POOL": False,
+}
