@@ -52,11 +52,21 @@ def _activate_attention(flash=False, sage=False):
         from comfy.cli_args import args
         patches = []
         if sage and not getattr(args, 'use_sage_attention', False):
-            args.use_sage_attention = True
-            patches.append("sage")
+            try:
+                from sageattention import sageattn  # noqa: F401
+                args.use_sage_attention = True
+                patches.append("sage")
+            except Exception:
+                print("[comfy-env] sage attention requested but sageattention not importable",
+                      file=sys.stderr, flush=True)
         if flash and not getattr(args, 'use_flash_attention', False):
-            args.use_flash_attention = True
-            patches.append("flash")
+            try:
+                from flash_attn import flash_attn_func  # noqa: F401
+                args.use_flash_attention = True
+                patches.append("flash")
+            except Exception:
+                print("[comfy-env] flash attention requested but flash_attn not importable",
+                      file=sys.stderr, flush=True)
         if patches:
             print(f"[comfy-env] auto-activated {' + '.join(patches)} attention",
                   file=sys.stderr, flush=True)

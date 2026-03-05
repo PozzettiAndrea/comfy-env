@@ -52,6 +52,22 @@ INSTALL_ISOLATED = _is_on("COMFY_ENV_INSTALL_ISOLATED", GENERAL_DEFAULTS["COMFY_
 INSTALL_MAIN = _is_on("COMFY_ENV_INSTALL_MAIN", GENERAL_DEFAULTS["COMFY_ENV_INSTALL_MAIN"])
 ISOLATE = _is_on("COMFY_ENV_ISOLATE", GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"])
 
+# Numeric settings: (env_var, label, default_value, unit)
+NUMERIC_SETTINGS = [
+    ("COMFY_ENV_WORKER_VRAM_BUDGET", "Worker VRAM budget (GB, 0=auto)", 0, "GB"),
+]
+
+def get_numeric(var: str, default: float = 0) -> float:
+    val = os.environ.get(var, "")
+    if val == "":
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+WORKER_VRAM_BUDGET = get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0)
+
 # Risky patches (monkey-patching ComfyUI internals)
 PATCH_SETTINGS = [
     ("COMFY_ENV_PATCH_SHAREABLE_POOL", "CUDA shareable pool (full zero-copy IPC)"),

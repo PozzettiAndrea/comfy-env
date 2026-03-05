@@ -269,7 +269,8 @@ def cmd_debug(args) -> int:
 def _open_settings_tui(initial_tab=0) -> int:
     from .debug import CATEGORIES as DEBUG_CATEGORIES, SETTINGS_FILE as DEBUG_FILE
     from .settings import (GENERAL_SETTINGS, GENERAL_DEFAULTS, SETTINGS_FILE as GENERAL_FILE,
-                           PATCH_SETTINGS, PATCH_DEFAULTS)
+                           PATCH_SETTINGS, PATCH_DEFAULTS,
+                           NUMERIC_SETTINGS, get_numeric)
 
     # Read current state
     debug_enabled = _read_env_file(DEBUG_FILE)
@@ -293,6 +294,11 @@ def _open_settings_tui(initial_tab=0) -> int:
         elif val == "" and PATCH_DEFAULTS.get(var, False):
             patch_enabled.add(var)
 
+    # Read current numeric values: {var: current_value}
+    numeric_values = {}
+    for var, label, default, unit in NUMERIC_SETTINGS:
+        numeric_values[var] = get_numeric(var, default)
+
     tabs = [
         ("General", GENERAL_SETTINGS, general_enabled, GENERAL_FILE),
         ("Debug", DEBUG_CATEGORIES, debug_enabled, DEBUG_FILE),
@@ -301,18 +307,22 @@ def _open_settings_tui(initial_tab=0) -> int:
 
     try:
         import curses
-        return _settings_tui(curses, tabs, initial_tab)
+        return _settings_tui(curses, tabs, initial_tab, numeric_values, GENERAL_FILE)
     except ImportError:
-        return _settings_text(tabs, initial_tab)
+        return _settings_text(tabs, initial_tab, numeric_values, GENERAL_FILE)
 
 
-def _settings_tui(curses, tabs, initial_tab):
+def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=None):
     """Curses-based tabbed settings TUI."""
+    from .settings import NUMERIC_SETTINGS
 
     tab_names = [t[0] for t in tabs]
     tab_items = [t[1] for t in tabs]  # list of [(var, label), ...]
     tab_selected = [[var in t[2] for var, _ in t[1]] for t in tabs]
     tab_files = [t[3] for t in tabs]
+
+    if numeric_values is None:
+        numeric_values = {}
 
     active_tab = initial_tab
     cursor = 0
@@ -325,7 +335,40 @@ def _settings_tui(curses, tabs, initial_tab):
         return tab_selected[active_tab]
 
     def n_items():
-        return len(cur_items())
+        """Total items: boolean toggles + numeric settings (on General tab only)."""
+        n = len(cur_items())
+        if active_tab == 0:  # General tab
+            n += len(NUMERIC_SETTINGS)
+        return n
+
+    def _edit_numeric(stdscr, var, label, unit, h, w):
+        """Mini inline editor for a numeric value. Returns new value or None."""
+        curses.curs_set(1)
+        prompt = f"  {label} ({unit}): "
+        cur = str(numeric_values.get(var, 0))
+        buf = list(cur)
+        while True:
+            stdscr.move(h - 1, 0)
+            stdscr.clrtoeol()
+            stdscr.addstr(h - 1, 2, prompt + "".join(buf) + "_", curses.A_BOLD)
+            stdscr.refresh()
+            k = stdscr.getch()
+            if k in (10, 13, curses.KEY_ENTER):
+                curses.curs_set(0)
+                try:
+                    return float("".join(buf)) if buf else 0.0
+                except ValueError:
+                    return None
+            elif k == 27:  # ESC
+                curses.curs_set(0)
+                return None
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                if buf:
+                    buf.pop()
+            elif 32 <= k < 127:
+                ch = chr(k)
+                if ch in "0123456789.":
+                    buf.append(ch)
 
     def draw(stdscr):
         nonlocal active_tab, cursor, status_msg
@@ -358,7 +401,7 @@ def _settings_tui(curses, tabs, initial_tab):
             # Checkboxes
             items = cur_items()
             sel = cur_sel()
-            ni = n_items()
+            bool_count = len(items)
             for i, (var, label) in enumerate(items):
                 y = i + 4
                 if y >= h - 4:
@@ -370,6 +413,21 @@ def _settings_tui(curses, tabs, initial_tab):
                 attr = curses.A_REVERSE if cursor == i else 0
                 line = f"  [{check}] {label:<48s} {var}"
                 stdscr.addstr(y, 0, line[:w-1], attr)
+
+            # Numeric settings (General tab only, after boolean items)
+            if active_tab == 0 and NUMERIC_SETTINGS:
+                for ni_idx, (var, label, default, unit) in enumerate(NUMERIC_SETTINGS):
+                    row_idx = bool_count + ni_idx
+                    y = row_idx + 4
+                    if y >= h - 4:
+                        break
+                    val = numeric_values.get(var, default)
+                    val_str = f"{val:g}" if val != int(val) or val == 0 else f"{int(val)}"
+                    attr = curses.A_REVERSE if cursor == row_idx else 0
+                    line = f"  [{val_str:>4s}] {label:<46s} {var}"
+                    stdscr.addstr(y, 0, line[:w-1], attr)
+
+            ni = n_items()
 
             # Button row
             btn_y = ni + 5
@@ -383,7 +441,7 @@ def _settings_tui(curses, tabs, initial_tab):
             help_y = btn_y + 2
             if help_y < h:
                 stdscr.addstr(help_y, 2,
-                              "Tab/\u2190\u2192 switch tab  \u2191\u2193 navigate  Space toggle  q quit",
+                              "Tab/\u2190\u2192 switch tab  \u2191\u2193 navigate  Space toggle/edit  q quit",
                               curses.A_DIM)
                 if active_tab == 1 and help_y + 1 < h:
                     stdscr.addstr(help_y + 1, 2, "* = enabled via master switch",
@@ -400,7 +458,7 @@ def _settings_tui(curses, tabs, initial_tab):
             key = stdscr.getch()
             status_msg = ""
 
-            ni = n_items()  # refresh after potential tab switch
+            ni = n_items()
 
             if key in (ord('q'), ord('Q'), 27):  # q or ESC
                 return 0
@@ -412,45 +470,72 @@ def _settings_tui(curses, tabs, initial_tab):
                 cursor = 0
             elif key == curses.KEY_UP and cursor > 0:
                 cursor -= 1
-            elif key == curses.KEY_DOWN and cursor < n_items() + 1:
+            elif key == curses.KEY_DOWN and cursor < ni + 1:
                 cursor += 1
             elif key in (ord(' '), curses.KEY_ENTER, 10, 13):
-                ni = n_items()
-                if cursor < ni:
+                if cursor < bool_count:
                     cur_sel()[cursor] = not cur_sel()[cursor]
+                elif active_tab == 0 and cursor < bool_count + len(NUMERIC_SETTINGS):
+                    # Numeric setting — open inline editor
+                    num_idx = cursor - bool_count
+                    var, label, default, unit = NUMERIC_SETTINGS[num_idx]
+                    new_val = _edit_numeric(stdscr, var, label, unit, h, w)
+                    if new_val is not None:
+                        numeric_values[var] = new_val
+                        status_msg = f"Set {var}={new_val:g}"
                 elif cursor == ni:
-                    _save_all_settings(tab_items, tab_selected, tab_files)
+                    _save_all_settings(tab_items, tab_selected, tab_files,
+                                       numeric_values, numeric_file)
                     return 0
                 elif cursor == ni + 1:
                     return 0
             elif key in (ord('a'), ord('A')):
-                _save_all_settings(tab_items, tab_selected, tab_files)
+                _save_all_settings(tab_items, tab_selected, tab_files,
+                                   numeric_values, numeric_file)
                 return 0
 
     return curses.wrapper(draw)
 
 
-def _settings_text(tabs, initial_tab):
+def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
     """Simple text fallback for systems without curses."""
+    from .settings import NUMERIC_SETTINGS
+
     tab_items = [t[1] for t in tabs]
     tab_selected = [[var in t[2] for var, _ in t[1]] for t in tabs]
     tab_files = [t[3] for t in tabs]
 
-    print("comfy-env settings")
-    print("=" * 40)
+    if numeric_values is None:
+        numeric_values = {}
+
+    def _display():
+        nonlocal offset
+        offset = 0
+        offsets.clear()
+        for ti, (name, items, _, _) in enumerate(tabs):
+            print(f"\n  --- {name} ---")
+            offsets.append(offset)
+            for i, (var, label) in enumerate(items):
+                check = "x" if tab_selected[ti][i] else " "
+                if ti == 1 and i > 0 and tab_selected[ti][0] and not tab_selected[ti][i]:
+                    check = "*"
+                print(f"  {offset + i}. [{check}] {label:<48s} {var}")
+            offset += len(items)
+            # Numeric settings on General tab
+            if ti == 0 and NUMERIC_SETTINGS:
+                for var, label, default, unit in NUMERIC_SETTINGS:
+                    val = numeric_values.get(var, default)
+                    val_str = f"{val:g}"
+                    print(f"  {offset}. [{val_str:>4s}] {label:<46s} {var}")
+                    offset += 1
+
     offset = 0
     offsets = []
-    for ti, (name, items, _, _) in enumerate(tabs):
-        print(f"\n  --- {name} ---")
-        offsets.append(offset)
-        for i, (var, label) in enumerate(items):
-            check = "x" if tab_selected[ti][i] else " "
-            if ti == 1 and i > 0 and tab_selected[ti][0] and not tab_selected[ti][i]:
-                check = "*"
-            print(f"  {offset + i}. [{check}] {label:<48s} {var}")
-        offset += len(items)
+    print("comfy-env settings")
+    print("=" * 40)
+    _display()
     print()
-    print("Enter numbers to toggle (space-separated), 'save' to save, 'quit' to exit:")
+    print("Enter numbers to toggle (space-separated), 'set VAR=VALUE' for numeric, 'save' to save:")
 
     while True:
         try:
@@ -460,12 +545,35 @@ def _settings_text(tabs, initial_tab):
         if line.lower() in ("q", "quit", "exit"):
             return 0
         if line.lower() in ("s", "save"):
-            _save_all_settings(tab_items, tab_selected, tab_files)
+            _save_all_settings(tab_items, tab_selected, tab_files,
+                               numeric_values, numeric_file)
             print("Saved.")
             return 0
+        # Handle 'set VAR=VALUE'
+        if line.lower().startswith("set ") and "=" in line:
+            _, rest = line.split(None, 1)
+            k, v = rest.split("=", 1)
+            k = k.strip()
+            try:
+                numeric_values[k] = float(v.strip())
+                print(f"  Set {k}={numeric_values[k]:g}")
+            except ValueError:
+                print(f"  Invalid value: {v.strip()}")
+            continue
         for part in line.split():
             try:
                 idx = int(part)
+                # Check if it's a numeric setting index (on General tab)
+                bool_total = sum(len(t[1]) for t in tabs)
+                if idx >= bool_total and idx < bool_total + len(NUMERIC_SETTINGS):
+                    num_idx = idx - bool_total
+                    var, label, default, unit = NUMERIC_SETTINGS[num_idx]
+                    try:
+                        val = input(f"  {label} ({unit}): ").strip()
+                        numeric_values[var] = float(val) if val else default
+                    except (ValueError, EOFError):
+                        pass
+                    continue
                 # Find which tab and local index
                 for ti in range(len(tabs)):
                     if idx < offsets[ti] + len(tab_items[ti]):
@@ -475,36 +583,37 @@ def _settings_text(tabs, initial_tab):
                         break
             except ValueError:
                 pass
-        # Redisplay
-        for ti, (name, items, _, _) in enumerate(tabs):
-            print(f"\n  --- {name} ---")
-            for i, (var, label) in enumerate(items):
-                check = "x" if tab_selected[ti][i] else " "
-                if ti == 1 and i > 0 and tab_selected[ti][0] and not tab_selected[ti][i]:
-                    check = "*"
-                print(f"  {offsets[ti] + i}. [{check}] {label:<48s} {var}")
+        _display()
 
 
-def _save_all_settings(tab_items, tab_selected, tab_files):
+def _save_all_settings(tab_items, tab_selected, tab_files,
+                       numeric_values=None, numeric_file=None):
     """Write settings to their respective files (merges tabs sharing the same file)."""
     # Group by file path (General and Patches may share the same file)
     from collections import defaultdict
-    file_entries = defaultdict(list)  # filepath -> [(var, enabled), ...]
+    file_entries = defaultdict(list)  # filepath -> [(var, value_str), ...]
     for items, selected, filepath in zip(tab_items, tab_selected, tab_files):
         for i, (var, _) in enumerate(items):
-            file_entries[filepath].append((var, selected[i]))
-            # Update current process env
-            os.environ[var] = "1" if selected[i] else "0"
+            val_str = "1" if selected[i] else "0"
+            file_entries[filepath].append((var, val_str))
+            os.environ[var] = val_str
+
+    # Append numeric settings to their file
+    if numeric_values and numeric_file:
+        for var, val in numeric_values.items():
+            val_str = f"{val:g}"
+            file_entries[numeric_file].append((var, val_str))
+            os.environ[var] = val_str
 
     for filepath, entries in file_entries.items():
         filepath.parent.mkdir(parents=True, exist_ok=True)
         lines = ["# comfy-env settings (managed by `comfy-env settings`)\n"]
-        for var, enabled in entries:
-            lines.append(f"{var}={'1' if enabled else '0'}\n")
+        for var, val_str in entries:
+            lines.append(f"{var}={val_str}\n")
         filepath.write_text("".join(lines))
 
-    unique_files = list(dict.fromkeys(str(f) for f in tab_files))
-    print(f"Saved to {', '.join(unique_files)}")
+    all_files = list(dict.fromkeys(str(f) for f in tab_files))
+    print(f"Saved to {', '.join(all_files)}")
 
 
 def cmd_cleanup(args) -> int:

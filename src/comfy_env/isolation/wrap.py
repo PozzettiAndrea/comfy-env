@@ -342,10 +342,34 @@ def _handle_vram_budget(request: dict) -> dict:
         free_after = mm.get_free_memory(device)
         _log(f"[comfy-env] VRAM after eviction: {free_after / 1e9:.2f}GB")
 
+    # If a worker VRAM budget is configured, override vram_state and reserved
+    # so the subprocess gets NORMAL_VRAM with a capped budget instead of NO_VRAM.
+    vram_state_name = mm.vram_state.name
+    extra_reserved = mm.EXTRA_RESERVED_VRAM
+
+    from ..settings import get_numeric  # noqa: E402 — lazy to avoid circular
+    worker_vram_budget = get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0)
+    if worker_vram_budget > 0:
+        import torch
+        total_vram = torch.cuda.get_device_properties(device).total_memory
+        budget_bytes = worker_vram_budget * 1024 * 1024 * 1024
+        # ComfyUI's minimum_inference_memory() = 0.8GB + EXTRA_RESERVED,
+        # so actual usable = total - EXTRA_RESERVED - 0.8GB.
+        # Subtract the 0.8GB base so the effective budget matches the user's setting.
+        min_inference_base = int(0.8 * 1024 * 1024 * 1024)
+        extra_reserved = max(0, total_vram - budget_bytes - min_inference_base)
+        # Give the worker NORMAL_VRAM so it does partial weight loading
+        # instead of the NO_VRAM shuttle-everything pattern
+        if mm.vram_state.value <= mm.VRAMState.LOW_VRAM.value:
+            vram_state_name = "NORMAL_VRAM"
+        if _DBG_MODELS:
+            _log(f"[comfy-env] Worker VRAM budget: {worker_vram_budget}GB "
+                 f"(reserve={extra_reserved / 1e9:.2f}GB, state={vram_state_name})")
+
     return {
         "device": str(device),
-        "extra_reserved_vram": mm.EXTRA_RESERVED_VRAM,
-        "vram_state": mm.vram_state.name,
+        "extra_reserved_vram": extra_reserved,
+        "vram_state": vram_state_name,
     }
 
 
