@@ -2036,13 +2036,19 @@ class SocketTransport:
         msg = struct.pack(">I", len(data)) + data
         self._sock.sendall(msg)
 
-    def recv(self):
-        raw_len = self._recvall(4)
-        if not raw_len:
-            return None
-        msg_len = struct.unpack(">I", raw_len)[0]
-        data = self._recvall(msg_len)
-        return json.loads(data.decode("utf-8"))
+    def recv(self, timeout=None):
+        if timeout is not None:
+            self._sock.settimeout(timeout)
+        try:
+            raw_len = self._recvall(4)
+            if not raw_len:
+                return None
+            msg_len = struct.unpack(">I", raw_len)[0]
+            data = self._recvall(msg_len)
+            return json.loads(data.decode("utf-8"))
+        finally:
+            if timeout is not None:
+                self._sock.settimeout(None)
 
     def _recvall(self, n):
         data = bytearray()

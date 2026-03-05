@@ -150,15 +150,25 @@ def install(
 
     if cfg.apt_packages: _install_apt_packages(cfg.apt_packages, log, dry_run)
     if cfg.brew_packages: _install_brew_packages(cfg.brew_packages, log, dry_run)
+    node_req_dirs: List[Path] = []
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
         _reinstall_main_requirements(node_dir, log, dry_run)
+        node_req_dirs = _collect_node_req_dirs(cfg.node_reqs, node_dir.parent)
+        # Install apt/brew from node_req root configs
+        for nr_dir in node_req_dirs:
+            nr_cfg = discover_config(nr_dir, root=True)
+            if nr_cfg:
+                if nr_cfg.apt_packages:
+                    _install_apt_packages(nr_cfg.apt_packages, log, dry_run)
+                if nr_cfg.brew_packages:
+                    _install_brew_packages(nr_cfg.brew_packages, log, dry_run)
 
     from .settings import INSTALL_ISOLATED, INSTALL_MAIN
     if INSTALL_ISOLATED:
-        _install_isolated_subdirs(node_dir, log, dry_run)
+        _install_isolated_subdirs(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
     if INSTALL_MAIN:
-        _install_to_main_env(node_dir, log, dry_run)
+        _install_to_main_env(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
     if not INSTALL_ISOLATED and not INSTALL_MAIN:
         log("\n[comfy-env] Both install targets disabled — nothing to install")
 
@@ -572,38 +582,84 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         except OSError: pass
 
 
-def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
+def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_run: bool,
+                              node_req_dirs: Optional[List[Path]] = None) -> None:
     """Find and install comfy-env.toml in subdirectories (isolated folders only)."""
-    for config_file in node_dir.rglob(CONFIG_FILE_NAME):
-        if config_file.parent == node_dir: continue  # Skip root
-        log(f"\n[isolated] {config_file.parent.relative_to(node_dir)}")
-        if not dry_run:
-            _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
+    scan_dirs = [node_dir]
+    if node_req_dirs:
+        scan_dirs.extend(node_req_dirs)
+    for scan_dir in scan_dirs:
+        for config_file in scan_dir.rglob(CONFIG_FILE_NAME):
+            if config_file.parent == scan_dir: continue  # Skip root
+            try:
+                rel = config_file.parent.relative_to(scan_dir)
+                label = f"{scan_dir.name}/{rel}" if scan_dir != node_dir else str(rel)
+            except ValueError:
+                label = str(config_file.parent)
+            log(f"\n[isolated] {label}")
+            if not dry_run:
+                _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
 
 
-def _install_to_main_env(node_dir: Path, log: Callable[[str], None], dry_run: bool) -> None:
+def _collect_node_req_dirs(
+    node_reqs: List[NodeDependency],
+    custom_nodes_dir: Path,
+    visited: Optional[Set[str]] = None,
+) -> List[Path]:
+    """Recursively collect all directories of nodes installed via node_reqs."""
+    visited = visited or set()
+    result = []
+    for dep in node_reqs:
+        if dep.name in visited:
+            continue
+        visited.add(dep.name)
+        node_path = custom_nodes_dir / dep.name
+        if not node_path.exists():
+            continue
+        result.append(node_path)
+        # Recurse into nested node_reqs
+        nested_cfg = discover_config(node_path)
+        if nested_cfg and nested_cfg.node_reqs:
+            result.extend(_collect_node_req_dirs(nested_cfg.node_reqs, custom_nodes_dir, visited))
+    return result
+
+
+def _install_to_main_env(node_dir: Path, log: Callable[[str], None], dry_run: bool,
+                         node_req_dirs: Optional[List[Path]] = None) -> None:
     """Install deps from comfy-env.toml files into the main Python env (isolation disabled)."""
     import subprocess
 
-    log("\n[comfy-env] Isolation disabled — installing to main env")
+    log("\n[comfy-env] Installing to main env")
     all_pypi = {}
     cuda_packages = []
     conda_warnings = []
 
-    for config_file in node_dir.rglob(CONFIG_FILE_NAME):
-        if config_file.parent == node_dir:
-            continue
-        cfg = load_config(config_file)
-        rel = config_file.parent.relative_to(node_dir)
-        pypi = cfg.pixi_passthrough.get("pypi-dependencies", {})
-        conda = cfg.pixi_passthrough.get("dependencies", {})
-        if pypi:
-            log(f"  [{rel}] PyPI: {', '.join(pypi.keys())}")
-            all_pypi.update(pypi)
-        if cfg.cuda_packages:
-            cuda_packages.extend(cfg.cuda_packages)
-        if conda:
-            conda_warnings.append((rel, list(conda.keys())))
+    # Collect from own subdirectories
+    scan_dirs = [node_dir]
+    # Also collect from node_reqs sibling directories (recursively resolved)
+    if node_req_dirs:
+        scan_dirs.extend(node_req_dirs)
+        log(f"  Scanning {len(node_req_dirs)} node_req(s): {', '.join(d.name for d in node_req_dirs)}")
+
+    for scan_dir in scan_dirs:
+        for config_file in scan_dir.rglob(CONFIG_FILE_NAME):
+            if config_file.parent == scan_dir:
+                continue
+            cfg = load_config(config_file)
+            try:
+                rel = config_file.parent.relative_to(scan_dir)
+                label = f"{scan_dir.name}/{rel}" if scan_dir != node_dir else str(rel)
+            except ValueError:
+                label = str(config_file.parent)
+            pypi = cfg.pixi_passthrough.get("pypi-dependencies", {})
+            conda = cfg.pixi_passthrough.get("dependencies", {})
+            if pypi:
+                log(f"  [{label}] PyPI: {', '.join(pypi.keys())}")
+                all_pypi.update(pypi)
+            if cfg.cuda_packages:
+                cuda_packages.extend(cfg.cuda_packages)
+            if conda:
+                conda_warnings.append((label, list(conda.keys())))
 
     if conda_warnings:
         for rel, pkgs in conda_warnings:
