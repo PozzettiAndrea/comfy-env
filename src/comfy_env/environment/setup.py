@@ -182,23 +182,26 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     else:
         print(f"[comfy-env] {node_name}: no isolation envs", file=sys.stderr)
 
-    if not is_comfy_env_enabled(): return
-    dedupe_libomp()
-
-    # Patches
+    # Patches (apply regardless of isolation setting)
     from ..settings import _is_on, PATCH_DEFAULTS
-    if _is_on("COMFY_ENV_PATCH_SHAREABLE_POOL",
-              PATCH_DEFAULTS["COMFY_ENV_PATCH_SHAREABLE_POOL"]):
-        _register_shareable_pool_hook()
-        print("[comfy-env] shareable pool hook registered",
-              file=sys.stderr, flush=True)
-
     use_flash = _is_on("COMFY_ENV_PATCH_FLASH_ATTENTION",
                         PATCH_DEFAULTS["COMFY_ENV_PATCH_FLASH_ATTENTION"])
     use_sage = _is_on("COMFY_ENV_PATCH_SAGE_ATTENTION",
                        PATCH_DEFAULTS["COMFY_ENV_PATCH_SAGE_ATTENTION"])
     if use_flash or use_sage:
         _activate_attention(flash=use_flash, sage=use_sage)
+
+    if not is_comfy_env_enabled():
+        print("[comfy-env] prestartup complete (isolation disabled)",
+              file=sys.stderr, flush=True)
+        return
+    dedupe_libomp()
+
+    if _is_on("COMFY_ENV_PATCH_SHAREABLE_POOL",
+              PATCH_DEFAULTS["COMFY_ENV_PATCH_SHAREABLE_POOL"]):
+        _register_shareable_pool_hook()
+        print("[comfy-env] shareable pool hook registered",
+              file=sys.stderr, flush=True)
 
     _ensure_base_directory()
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)
