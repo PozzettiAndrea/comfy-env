@@ -219,6 +219,25 @@ display = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
 
 payload = {"nodes": nodes, "display": display}
 
+# Sanitize payload: coerce subclass instances (e.g. AnyType(str)) back to
+# plain built-in types so pickle doesn't embed module references that may
+# not be importable in the main process.
+_COERCE = {str: str, int: int, float: float, bool: bool, bytes: bytes}
+def _sanitize(obj):
+    if obj is None or type(obj) in (str, int, float, bool, bytes):
+        return obj
+    for base, ctor in _COERCE.items():
+        if isinstance(obj, base) and type(obj) is not base:
+            return ctor(obj)
+    if isinstance(obj, dict):
+        return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        sanitized = [_sanitize(v) for v in obj]
+        return type(obj)(sanitized) if type(obj) in (list, tuple) else list(sanitized)
+    return obj
+
+payload = _sanitize(payload)
+
 # Restore real stdout for the payload write
 sys.stdout = _real_stdout
 sys.stdout.buffer.write(base64.b64encode(pickle.dumps(payload)))
