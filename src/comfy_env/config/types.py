@@ -42,6 +42,7 @@ class ComfyEnvConfig:
     env_vars: Dict[str, str] = field(default_factory=dict)
     node_reqs: List[NodeDependency] = field(default_factory=list)
     options: ComfyEnvOptions = field(default_factory=ComfyEnvOptions)
+    settings: Dict[str, Any] = field(default_factory=dict)
     pixi_passthrough: Dict[str, Any] = field(default_factory=dict)
 
     @property

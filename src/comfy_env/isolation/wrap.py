@@ -627,7 +627,23 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     all_mappings = {}
     all_display = {}
-    enabled = _is_enabled() and os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
+
+    # Load per-node settings from comfy-env-root.toml (if present)
+    node_settings = None
+    try:
+        from ..config.parser import discover_config
+        root_cfg = discover_config(pkg_dir, root=True)
+        if root_cfg and root_cfg.settings:
+            node_settings = root_cfg.settings
+            if _DBG_WORKER:
+                _log(f"[comfy-env] Per-node settings from {pkg_dir}: {node_settings}")
+    except Exception as e:
+        if _DBG_WORKER:
+            _log(f"[comfy-env] Failed to load root config settings: {e}")
+
+    from ..settings import resolve_bool, GENERAL_DEFAULTS
+    enabled = resolve_bool("COMFY_ENV_ISOLATE", node_settings, GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"]) \
+        and os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
 
     # ==================================================================
     # Discover and import node sources

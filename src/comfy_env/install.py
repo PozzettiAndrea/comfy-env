@@ -164,12 +164,15 @@ def install(
                 if nr_cfg.brew_packages:
                     _install_brew_packages(nr_cfg.brew_packages, log, dry_run)
 
-    from .settings import INSTALL_ISOLATED, INSTALL_MAIN
-    if INSTALL_ISOLATED:
+    from .settings import resolve_bool, GENERAL_DEFAULTS
+    node_settings = cfg.settings if cfg.settings else None
+    install_isolated = resolve_bool("COMFY_ENV_INSTALL_ISOLATED", node_settings, GENERAL_DEFAULTS["COMFY_ENV_INSTALL_ISOLATED"])
+    install_main = resolve_bool("COMFY_ENV_INSTALL_MAIN", node_settings, GENERAL_DEFAULTS["COMFY_ENV_INSTALL_MAIN"])
+    if install_isolated:
         _install_isolated_subdirs(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
-    if INSTALL_MAIN:
+    if install_main:
         _install_to_main_env(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
-    if not INSTALL_ISOLATED and not INSTALL_MAIN:
+    if not install_isolated and not install_main:
         log("\n[comfy-env] Both install targets disabled — nothing to install")
 
     log("\nInstallation complete!")

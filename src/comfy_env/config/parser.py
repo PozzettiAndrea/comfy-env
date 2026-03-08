@@ -45,6 +45,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
     node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
     options = _parse_options(data.pop("options", {}))
+    settings = data.pop("settings", {})
 
     return ComfyEnvConfig(
         python=python_version,
@@ -54,6 +55,7 @@ def parse_config(data: Dict[str, Any]) -> ComfyEnvConfig:
         env_vars=env_vars,
         node_reqs=node_reqs,
         options=options,
+        settings=settings,
         pixi_passthrough=data,
     )
 
