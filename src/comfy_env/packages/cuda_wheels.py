@@ -8,7 +8,7 @@ from typing import List, Optional
 
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
-CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/"
+CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/v2/"
 
 # Fallback torch version for each CUDA version — used only when the host's
 # actual torch combo doesn't have all cuda-wheels available.
@@ -55,7 +55,7 @@ def _platform_tags() -> List[str]:
 def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str) -> Optional[str]:
     """Get direct URL to matching wheel from cuda-wheels index."""
     cuda_short = cuda_version.replace(".", "")[:3]
-    torch_short = ".".join(torch_version.split(".")[:2]).replace(".", "")
+    torch_short = ".".join(torch_version.split(".")[:2])
     py_tag = f"cp{python_version.replace('.', '')}"
     platform_tags = _platform_tags()
 
@@ -113,7 +113,7 @@ def find_available_wheels(package: str) -> List[str]:
 def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
     """Find wheel matching CUDA/torch version, return version spec."""
     cuda_short = cuda_version.replace(".", "")[:3]
-    torch_short = ".".join(torch_version.split(".")[:2]).replace(".", "")
+    torch_short = ".".join(torch_version.split(".")[:2])
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     wheel_pattern = re.compile(r'href="[^"]*?([^"/]+\.whl)"', re.IGNORECASE)
 
