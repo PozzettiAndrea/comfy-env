@@ -438,6 +438,7 @@ class _CudaMemPoolProps(ctypes.Structure):
         ("location_type", ctypes.c_int),
         ("location_id", ctypes.c_int),
         ("win32HandleMetaData", ctypes.c_void_p),
+        ("maxSize", ctypes.c_size_t),
         ("reserved", ctypes.c_ubyte * 56),
     ]
 
@@ -1411,6 +1412,7 @@ class _CudaMemPoolProps(ctypes.Structure):
         ("location_type", ctypes.c_int),
         ("location_id", ctypes.c_int),
         ("win32HandleMetaData", ctypes.c_void_p),
+        ("maxSize", ctypes.c_size_t),
         ("reserved", ctypes.c_ubyte * 56),
     ]
 
@@ -2943,8 +2945,13 @@ class SubprocessWorker(Worker):
             raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
 
         # --- Pool IPC handshake (receive worker's shareable pool FD) ---
+        # Check worker's env vars (not parent's _POOL_IPC_ENABLED which may be False)
         self._worker_pool = None
-        if _pool_ipc_available() and _has_af_unix():
+        _worker_wants_pool_ipc = (
+            self.extra_env.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
+            or _pool_ipc_available()
+        )
+        if _worker_wants_pool_ipc and sys.platform == "linux" and _has_af_unix():
             try:
                 worker_fd = _recv_fd(client_sock, timeout=5)
                 confirm = self._transport.recv(timeout=5)
