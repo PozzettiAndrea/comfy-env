@@ -22,7 +22,7 @@ from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
-_CACHE_VERSION = "3"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "4"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -217,7 +217,12 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
 
 display = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
 
-payload = {"nodes": nodes, "display": display}
+# Discover API routes declared via ROUTES convention
+routes = getattr(module, "ROUTES", [])
+for r in routes:
+    r.setdefault("module", package_name)
+
+payload = {"nodes": nodes, "display": display, "routes": routes}
 
 # Sanitize payload: coerce subclass instances (e.g. AnyType(str)) back to
 # plain built-in types so pickle doesn't embed module references that may

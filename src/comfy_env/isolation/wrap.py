@@ -394,6 +394,96 @@ def _cleanup_stale_patchers(env_dir):
          f"(will be cleaned up during next unload)")
 
 
+def _register_proxy_routes(routes, env_dir, package_root, sys_path, lib_path, env_vars,
+                           health_check_timeout):
+    """Register aiohttp routes in the main process that forward to the isolation worker.
+
+    Nodes in isolation environments can declare API routes via a module-level
+    ``ROUTES`` list.  Since the isolation subprocess has no access to the ComfyUI
+    HTTP server, this function registers proxy handlers in the main process that
+    forward JSON requests to the worker via IPC (``call_module``).
+
+    ROUTES convention::
+
+        ROUTES = [
+            {"method": "POST", "path": "/my/endpoint", "handler": "my_handler_func"},
+        ]
+
+        def my_handler_func(body: dict) -> dict:
+            # Runs in the isolation subprocess.
+            # Return {"_status": 400, "error": "..."} for non-200 responses.
+            return {"result": "ok"}
+    """
+    try:
+        import server
+        from aiohttp import web
+    except Exception:
+        return  # No server available (e.g. CLI mode, testing)
+
+    if not hasattr(server, 'PromptServer') or not hasattr(server.PromptServer, 'instance'):
+        return
+    if server.PromptServer.instance is None:
+        return
+
+    _proxy_call_counts = {}  # path -> call count (for first-call debug)
+
+    for route in routes:
+        method = route.get("method", "POST").upper()
+        path = route.get("path")
+        handler_func = route.get("handler")
+        module_name = route.get("module")
+        if not path or not handler_func or not module_name:
+            continue
+
+        # Each closure must capture its own copy of the loop variables
+        async def _make_proxy(request, _env_dir=env_dir, _pkg_root=package_root,
+                              _sys_path=sys_path, _lib_path=lib_path, _env_vars=env_vars,
+                              _module=module_name, _func=handler_func,
+                              _hc_timeout=health_check_timeout, _path=path,
+                              _counts=_proxy_call_counts):
+            _counts[_path] = _counts.get(_path, 0) + 1
+            _first = _counts[_path] == 1
+
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response({"error": "Invalid JSON"}, status=400)
+
+            if _first:
+                _log(f"[comfy-env] Route {_path}: first call, body keys={list(body.keys())}")
+
+            worker, _ = _get_or_create_worker(
+                _env_dir, _pkg_root, _sys_path, _lib_path, _env_vars, _hc_timeout,
+            )
+            if _first:
+                _log(f"[comfy-env] Route {_path}: worker={worker.name}, calling {_module}.{_func}")
+
+            import asyncio
+            loop = asyncio.get_event_loop()
+            try:
+                result = await loop.run_in_executor(
+                    None, lambda: worker.call_module(_module, _func, 120.0, body=body),
+                )
+            except Exception as exc:
+                _log(f"[comfy-env] Route {_path} error: {exc}")
+                return web.json_response({"error": str(exc)}, status=500)
+
+            if _first:
+                _log(f"[comfy-env] Route {_path}: result keys={list(result.keys()) if isinstance(result, dict) else type(result)}")
+
+            status = 200
+            if isinstance(result, dict) and "_status" in result:
+                status = result.pop("_status")
+            return web.json_response(result, status=status)
+
+        route_method = getattr(server.PromptServer.instance.routes, method.lower(), None)
+        if route_method is None:
+            _log(f"[comfy-env] Unknown HTTP method {method} for route {path}, skipping")
+            continue
+        route_method(path)(_make_proxy)
+        _log(f"[comfy-env] Registered proxy route: {method} {path} -> {module_name}.{handler_func}")
+
+
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -702,6 +792,14 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     health_check_timeout=env["health_check_timeout"],
                 )
             all_display.update(root_display)
+            # Register proxy routes for isolation API endpoints
+            root_routes = root_meta.get("routes", [])
+            if root_routes:
+                _register_proxy_routes(
+                    root_routes, env["env_dir"], package_root,
+                    sys_path_list, lib_path, env["env_vars"],
+                    env["health_check_timeout"],
+                )
             _log(f"[comfy-env] Imported {nodes_package} root: {len(root_nodes)} nodes (isolation)")
         except Exception as e:
             _log(f"[comfy-env] Failed to scan {nodes_package} root: {e}")
@@ -799,6 +897,14 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                         )
 
                     all_display.update(display)
+                    # Register proxy routes for isolation API endpoints
+                    sub_routes = metadata.get("routes", [])
+                    if sub_routes:
+                        _register_proxy_routes(
+                            sub_routes, env["env_dir"], package_root,
+                            sys_path_list, lib_path, env["env_vars"],
+                            env["health_check_timeout"],
+                        )
                     if nodes_meta:
                         _log(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
 
