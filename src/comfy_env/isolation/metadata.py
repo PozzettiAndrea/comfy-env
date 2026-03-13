@@ -22,7 +22,7 @@ from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
-_CACHE_VERSION = "4"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "7"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -217,8 +217,14 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
 
 display = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
 
-# Discover API routes declared via ROUTES convention
-routes = getattr(module, "ROUTES", [])
+# Discover API routes declared via ROUTES convention (walk all imported submodules)
+routes = list(getattr(module, "ROUTES", []))
+for mod_name, mod_obj in list(sys.modules.items()):
+    if mod_name == package_name or not mod_name.startswith(package_name + "."):
+        continue
+    for r in getattr(mod_obj, "ROUTES", []):
+        r.setdefault("module", mod_name)
+        routes.append(r)
 for r in routes:
     r.setdefault("module", package_name)
 
@@ -467,6 +473,15 @@ def build_proxy_class(
         attrs["OUTPUT_IS_LIST"] = tuple(meta["output_is_list"])
     if meta.get("input_is_list") is not None:
         attrs["INPUT_IS_LIST"] = meta["input_is_list"]
+
+    # V3 nodes wrap hidden values in tuples, e.g. ("UNIQUE_ID",), but V1
+    # hidden processing in execution.py compares bare strings.  Unwrap them
+    # so ComfyUI injects hidden values properly for proxy (V1) classes.
+    if "hidden" in input_types:
+        input_types["hidden"] = {
+            k: v[0] if isinstance(v, (list, tuple)) and len(v) == 1 else v
+            for k, v in input_types["hidden"].items()
+        }
 
     # INPUT_TYPES classmethod returning cached metadata
     @classmethod
