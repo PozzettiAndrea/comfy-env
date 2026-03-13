@@ -31,10 +31,10 @@ ComfyUI-MyPack/
     │   └── __init__.py
     └── cgal/                      # Has config → isolated subprocess
         ├── comfy-env.toml
-        ├── _env_a1b2c3 ─────────► ~/.ce/_env_a1b2c3/.pixi/envs/default
+        ├── _env_a1b2c3 ─────────► <drive>/ce/_env_a1b2c3/.pixi/envs/default
         └── __init__.py
 
-~/.ce/                             # Central build cache (C:/ce on Windows)
+<drive>/ce/                        # Central build cache (same drive as ComfyUI)
 └── _env_a1b2c3/                   # SHA256(config + comfy-env version)[:8]
     ├── .pixi/envs/default/        # Complete Python environment
     │   ├── bin/python
@@ -45,7 +45,7 @@ ComfyUI-MyPack/
 
 ## How It Works
 
-**Build time** (`install.py`): For each subdirectory with a `comfy-env.toml`, comfy-env hashes the config contents + its own package version, checks the central cache (`~/.ce`), and builds a pixi environment if needed. The result is linked into the node directory as `_env_<hash>` — symlink on Unix, NTFS junction on Windows (no admin required). Identical configs across different node packs share the same cached build.
+**Build time** (`install.py`): For each subdirectory with a `comfy-env.toml`, comfy-env hashes the config contents + its own package version, checks the central build cache (`<drive>/ce` on Windows, `~/.ce` on Unix; override with `COMFY_ENV_BUILD_BASE`), and builds a pixi environment if needed. The result is linked into the node directory as `_env_<hash>` — symlink on Unix, NTFS junction on Windows (no admin required). Identical configs across different node packs share the same cached build.
 
 **Runtime** (`register_nodes()`): Discovers all node subdirectories. Those with a built `_env_*` run in persistent subprocess workers using the isolated Python interpreter. Those without a config are imported normally. Workers communicate via Unix domain sockets (TCP on Windows) and support bidirectional callbacks for VRAM budget negotiation and progress reporting.
 

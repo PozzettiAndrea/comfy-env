@@ -55,6 +55,44 @@ def _enable_windows_long_paths(log: Callable[[str], None]) -> None:
         pass
 
 
+def _patch_uv_platform_py(log: Callable[[str], None] = print) -> None:
+    """Patch uv-managed Python's platform.py to handle conda-forge version strings.
+
+    conda-forge Python embeds '| packaged by conda-forge |' in sys.version.
+    When pixi's uv creates build-isolation venvs it may use a standard CPython
+    whose platform.py can't parse that string, crashing setuptools.  Apply the
+    same one-line regex fix that conda-forge ships in their own builds.
+    """
+    if sys.platform != "win32":
+        return
+    # Directories where uv / rattler cache Python installations
+    search_dirs = [
+        Path.home() / "AppData" / "Roaming" / "uv" / "python",
+        Path.home() / "AppData" / "Local" / "rattler" / "cache" / "python",
+    ]
+    MARKER = r"r'([\w.+]+)\s*'"
+    REPLACEMENT = r"r'([\w.+]+)\s*(?:\ \|\ packaged\ by\ conda\-forge\ \|)?\s*'"
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        for py_dir in search_dir.iterdir():
+            if not py_dir.name.startswith("cpython-"):
+                continue
+            platform_py = py_dir / "Lib" / "platform.py"
+            if not platform_py.exists():
+                continue
+            content = platform_py.read_text(encoding="utf-8")
+            if "packaged by conda" in content:
+                continue  # already patched
+            # Replace the first occurrence of the marker (which may have a comment after it)
+            idx = content.find(MARKER)
+            if idx == -1:
+                continue
+            patched = content[:idx] + REPLACEMENT + content[idx + len(MARKER):]
+            platform_py.write_text(patched, encoding="utf-8")
+            log(f"[comfy-env] Patched {platform_py} for conda-forge compat")
+
+
 def _find_main_node_dir(node_dir: Path) -> Path:
     """Walk up to find the custom_nodes/<plugin> root."""
     for parent in node_dir.parents:
@@ -360,6 +398,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     from .packages.toml_generator import write_pixi_toml
     from .packages.cuda_wheels import get_wheel_url, check_all_wheels_available, CUDA_TORCH_MAP, FALLBACK_COMBO
     from .detection import get_recommended_cuda_version, get_gpu_summary
+    from .environment.paths import get_comfyui_dir
     import shutil, subprocess, tempfile, time
 
     deps = cfg.pixi_passthrough.get("dependencies", {})
@@ -380,8 +419,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
     env_path = get_local_env_path(main_node_dir, config_path)
 
     # Central build dir -- shared across nodes with same config hash
-    if sys.platform == "win32":
-        build_base = Path("C:/ce")
+    _override = os.environ.get("COMFY_ENV_BUILD_BASE", "")
+    if _override:
+        build_base = Path(_override)
+    elif sys.platform == "win32":
+        _comfyui_dir = get_comfyui_dir(node_dir)
+        _drive = (_comfyui_dir or node_dir).resolve().drive  # e.g. "C:" or "D:"
+        build_base = Path(f"{_drive}/ce")
     else:
         build_base = Path.home() / ".ce"
     build_base.mkdir(parents=True, exist_ok=True)
@@ -529,6 +573,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         pixi_env = dict(os.environ)
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(build_dir / "_no_python")
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
+        _patch_uv_platform_py(log)
         result = subprocess.run([str(pixi_path), "install"], cwd=build_dir, capture_output=True, text=True, env=pixi_env)
         _log_subprocess(log, result, "pixi install")
         if result.returncode != 0:

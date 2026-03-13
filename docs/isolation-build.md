@@ -6,7 +6,7 @@ This documents the internals of how comfy-env creates and manages isolated Pytho
 
 Nodes that need conflicting dependencies (different Python versions, incompatible libraries) run in **isolated environments** — separate pixi (conda+pip) environments with their own Python interpreter. Each subdirectory with a `comfy-env.toml` gets its own environment.
 
-Environments are built once in a central cache (`~/.ce` on Unix, `C:/ce` on Windows) and linked into node directories as `_env_<hash>`. On Windows this uses NTFS junctions (no admin/Developer Mode required); on Unix, symlinks.
+Environments are built once in a central cache and linked into node directories as `_env_<hash>`. On Windows this uses NTFS junctions (no admin/Developer Mode required); on Unix, symlinks. The cache location is `~/.ce` on Unix; on Windows it defaults to `<drive>/ce` where `<drive>` is the drive ComfyUI is installed on (e.g. `D:\ce`). Override with the `COMFY_ENV_BUILD_BASE` environment variable.
 
 ## Config Hash & Env Identity
 
@@ -28,7 +28,7 @@ This means:
 ## Build Directory Structure
 
 ```
-~/.ce/                              # Central build cache
+<drive>/ce/                          # Central build cache (~/.ce on Unix)
 ├── _env_a1b2c3/                    # One per unique config hash
 │   ├── .done                       # Present = build complete
 │   ├── .building/                  # Lock dir (atomic mkdir)
@@ -46,7 +46,7 @@ This means:
 
 In the node directory:
 ```
-nodes/cgal/_env_a1b2c3  ->  ~/.ce/_env_a1b2c3/.pixi/envs/default
+nodes/cgal/_env_a1b2c3  ->  <drive>/ce/_env_a1b2c3/.pixi/envs/default
 ```
 
 ## Build Steps
@@ -56,7 +56,7 @@ Traced from `_install_via_pixi()` in `install.py`:
 ### 1. Hash & paths
 
 Compute config hash, determine:
-- `build_dir` = `~/.ce/_env_<hash>`
+- `build_dir` = `<drive>/ce/_env_<hash>`
 - `env_path` = `<node_dir>/_env_<hash>` (the link that will point to the build)
 
 ### 2. Fast path (reuse)
@@ -177,5 +177,5 @@ Workers support callbacks from subprocess to parent:
 ## Concurrency & Caching
 
 - **Build lock**: atomic `mkdir` prevents parallel builds of the same config hash
-- **Config hash**: changing the config or upgrading comfy-env creates new envs; old ones remain in `~/.ce/` until manual deletion
+- **Config hash**: changing the config or upgrading comfy-env creates new envs; old ones remain in the build cache until manual deletion
 - **Metadata cache**: subprocess node scans are cached in `_env_*/.metadata_cache.pkl`, invalidated when any `.py` file in the package changes (based on mtime hash)
