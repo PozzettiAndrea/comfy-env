@@ -22,7 +22,7 @@ from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
-_CACHE_VERSION = "7"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "8"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -489,15 +489,23 @@ def build_proxy_class(
         return _cached
     attrs["INPUT_TYPES"] = _input_types
 
+    # Hidden kwargs to strip before sending to worker (V3 execute() won't
+    # accept them).  Keep unique_id since isolated nodes may need it.
+    _hidden_strip = set(input_types.get("hidden", {}).keys()) - {"unique_id"}
+
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn, hsk):
         def proxy(self, **kwargs):
             from .wrap import (_get_or_create_worker, _remove_worker,
                                _load_worker_models, _register_new_patchers)
 
-            # Nest DynamicCombo inputs: flat dotted keys → nested dicts.
+            # Strip hidden kwargs that V3 execute() doesn't expect
+            if hsk:
+                kwargs = {k: v for k, v in kwargs.items() if k not in hsk}
+
+            # Nest DynamicCombo inputs: flat dotted keys -> nested dicts.
             # e.g. {"backend": "grid", "backend.smooth_normals": "true", ...}
-            #   →  {"backend": {"backend": "grid", "smooth_normals": "true"}, ...}
+            #   -> {"backend": {"backend": "grid", "smooth_normals": "true"}, ...}
             if dcp:
                 nested = {}
                 for k, v in kwargs.items():
@@ -571,7 +579,7 @@ def build_proxy_class(
     attrs[func_name] = _make_proxy(
         func_name, module_name, class_name,
         env_dir, package_root, sys_path, lib_path, env_vars, health_check_timeout,
-        dynamic_combo_parents, node_name,
+        dynamic_combo_parents, node_name, _hidden_strip,
     )
 
     # Create the class
