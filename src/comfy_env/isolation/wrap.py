@@ -160,13 +160,12 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
-    # Pixi/conda envs on Windows don't include the standard library, so Python
-    # resolves sys.prefix to the base UV/conda Python instead of the env.
-    # This means the env's site-packages never gets added to sys.path.
-    # Explicitly add it via PYTHONPATH so packages like CGAL are discoverable.
-    sp = env_root / "Lib" / "site-packages"
-    if sp.is_dir():
-        env["PYTHONPATH"] = str(sp)
+    # Pixi/conda envs on Windows: the Python binary resolves sys.prefix to the
+    # base UV/conda Python instead of the env, causing both stdlib version
+    # mismatches (SRE module mismatch) and missing site-packages (CGAL).
+    # PYTHONHOME forces Python to use the env's own stdlib and site-packages.
+    if (env_root / "Lib").is_dir():
+        env["PYTHONHOME"] = str(env_root)
     return env
 
 
