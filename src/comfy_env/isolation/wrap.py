@@ -160,6 +160,13 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
+    # Pixi/conda envs on Windows don't include the standard library, so Python
+    # resolves sys.prefix to the base UV/conda Python instead of the env.
+    # This means the env's site-packages never gets added to sys.path.
+    # Explicitly add it via PYTHONPATH so packages like CGAL are discoverable.
+    sp = env_root / "Lib" / "site-packages"
+    if sp.is_dir():
+        env["PYTHONPATH"] = str(sp)
     return env
 
 
@@ -215,7 +222,7 @@ def _find_env_dir(node_dir: Path) -> Optional[Path]:
         for item in node_dir.iterdir():
             if item.name.startswith("_env_") and item.is_dir():
                 # On Windows, resolve junctions to keep paths under MAX_PATH for LoadLibrary
-                if sys.platform == "win32" and item.is_junction():
+                if sys.platform == "win32":
                     return item.resolve()
                 return item
     except OSError:

@@ -138,6 +138,7 @@ def _make_tee_log(log_callback: Callable[[str], None], log_path: Path) -> Callab
 
     def tee(msg):
         log_callback(msg)
+        sys.stdout.flush()
         fh.write(msg + "\n")
         fh.flush()
 
@@ -579,9 +580,27 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         if result.returncode != 0:
             raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
+        # When sharing host torch, remove any torch that pixi pulled in as a
+        # transitive pypi dep (e.g. timm -> torch).  Without this, the pixi
+        # env ends up with CPU-only torch which shadows the host's CUDA torch
+        # at runtime via _should_share_torch().
+        if not force_install_torch:
+            from .packages.toml_generator import _should_skip_torch
+            if _should_skip_torch(cfg, log=lambda _: None):
+                pixi_default = build_dir / ".pixi" / "envs" / "default"
+                _py = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
+                if _py.exists():
+                    _uv = _find_uv()
+                    _pkgs = list(pytorch_packages)
+                    result = subprocess.run(
+                        [_uv, "pip", "uninstall", "--python", str(_py)] + _pkgs,
+                        capture_output=True, text=True
+                    )
+                    _log_subprocess(log, result, "pip uninstall torch (share_torch)")
+                else:
+                    log(f"[comfy-env] share_torch: pixi python not found at {_py}")
+
         # Install cuda-wheels packages (nvdiffrast, pytorch3d, etc.) via uv pip.
-        # PyTorch packages (torch, torchvision, torchaudio) are handled by pixi
-        # via per-package index URLs in the generated pixi.toml.
         if cuda_wheels_packages and cuda_version and sys.platform != "darwin":
             pixi_default = build_dir / ".pixi" / "envs" / "default"
             python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
