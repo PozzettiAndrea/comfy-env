@@ -1214,6 +1214,14 @@ if sys.platform == "win32":
         except Exception:
             pass
 
+    # Pixi env root — python310.dll, vcruntime, etc.
+    _env_root = os.path.dirname(sys.executable)
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(_env_root)
+        except Exception:
+            pass
+
     # For pixi environments with MKL, add Library/bin for MKL DLLs
     _pixi_library_bin = os.environ.get("COMFYUI_PIXI_LIBRARY_BIN")
     if _pixi_library_bin and hasattr(os, "add_dll_directory"):
@@ -1222,6 +1230,16 @@ if sys.platform == "win32":
             wlog(f"[worker] Added pixi Library/bin to DLL search: {_pixi_library_bin}")
         except Exception as e:
             wlog(f"[worker] Failed to add pixi Library/bin: {e}")
+
+    # Host torch lib — for share_torch, torch DLLs live in host venv
+    _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
+    if _host_sp and hasattr(os, "add_dll_directory"):
+        _torch_lib = os.path.join(_host_sp, "torch", "lib")
+        if os.path.isdir(_torch_lib):
+            try:
+                os.add_dll_directory(_torch_lib)
+            except Exception:
+                pass
 
 # =============================================================================
 # Shared Memory Serialization

@@ -107,6 +107,23 @@ import pickle
 import base64
 import importlib
 
+# Windows: register DLL directories BEFORE any extension module imports.
+# Python 3.8+ doesn't search PATH for DLLs — os.add_dll_directory() required.
+if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+    _env_root = os.path.dirname(sys.executable)
+    os.add_dll_directory(_env_root)
+    _lib_bin = os.path.join(_env_root, "Library", "bin")
+    if os.path.isdir(_lib_bin):
+        os.add_dll_directory(_lib_bin)
+    _dlls_dir = os.path.join(_env_root, "DLLs")
+    if os.path.isdir(_dlls_dir):
+        os.add_dll_directory(_dlls_dir)
+    _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
+    if _host_sp:
+        _torch_lib = os.path.join(_host_sp, "torch", "lib")
+        if os.path.isdir(_torch_lib):
+            os.add_dll_directory(_torch_lib)
+
 # Print environment diagnostics to stderr (survives crashes)
 _debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 if _debug:

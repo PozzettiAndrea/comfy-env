@@ -704,6 +704,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
         if share_torch_active and host_torch_sp:
             _log(f"[comfy-env] {cf.parent.name}: sharing host torch from {host_torch_sp}")
+            env_vars["_COMFY_ENV_HOST_SP"] = str(host_torch_sp)
 
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
