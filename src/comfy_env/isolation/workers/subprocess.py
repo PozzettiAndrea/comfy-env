@@ -2325,6 +2325,21 @@ def main():
         pass
 
     # ---------------------------------------------------------------
+    # Propagate --cpu flag from parent process.  When the parent is
+    # started with --cpu, it sets COMFY_CPU=1 in our env.  We mirror
+    # that into comfy.cli_args so comfy.model_management sets
+    # cpu_state = CPUState.CPU and get_torch_device() returns cpu.
+    # This MUST run before comfy.model_management is imported below.
+    # ---------------------------------------------------------------
+    if os.environ.get("COMFY_CPU") == "1":
+        try:
+            from comfy.cli_args import args as _cli_args
+            _cli_args.cpu = True
+            wlog("[worker] Set args.cpu=True (COMFY_CPU=1)")
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------------
     # Shim comfy.model_management.load_models_gpu — tell parent to
     # make room first, then let the real load_models_gpu handle the
     # actual loading (it already calculates lowvram_model_memory from
@@ -2845,6 +2860,14 @@ class SubprocessWorker(Worker):
         # Set up environment (shared with metadata scan)
         from ..wrap import build_isolation_env
         env = build_isolation_env(self.python, self.extra_env)
+
+        # Propagate --cpu flag to subprocess so get_torch_device() returns cpu there too
+        try:
+            from comfy.cli_args import args as _parent_args
+            if getattr(_parent_args, 'cpu', False):
+                env["COMFY_CPU"] = "1"
+        except Exception:
+            pass
 
         # Find ComfyUI base and add to sys_path for real folder_paths/comfy modules
         # This works because comfy.options.args_parsing=False by default, so folder_paths
