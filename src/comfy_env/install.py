@@ -162,6 +162,44 @@ def _log_subprocess(log: Callable, result, label: str = "") -> None:
     fh.flush()
 
 
+def _run_streaming(cmd, log: Callable, cwd=None, env=None):
+    """Run a subprocess, streaming stdout/stderr lines to log in real time."""
+    import subprocess
+    import threading
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+    def _read_stderr():
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    t = threading.Thread(target=_read_stderr, daemon=True)
+    t.start()
+
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line_text = line.rstrip("\n")
+        stdout_lines.append(line_text)
+        if line_text.strip():
+            log(f"  {line_text}")
+
+    proc.wait()
+    t.join(timeout=5)
+
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode,
+        "\n".join(stdout_lines),
+        "".join(stderr_lines),
+    )
+
+
 def install(
     config: Optional[Union[str, Path]] = None,
     node_dir: Optional[Path] = None,
@@ -575,7 +613,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(build_dir / "_no_python")
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
         _patch_uv_platform_py(log)
-        result = subprocess.run([str(pixi_path), "install"], cwd=build_dir, capture_output=True, text=True, env=pixi_env)
+        result = _run_streaming([str(pixi_path), "install"], log, cwd=build_dir, env=pixi_env)
         _log_subprocess(log, result, "pixi install")
         if result.returncode != 0:
             raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
