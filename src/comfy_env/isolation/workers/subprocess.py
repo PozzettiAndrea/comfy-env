@@ -1784,6 +1784,12 @@ def _deserialize_tensor_native(data):
         torch.UntypedStorage, manager_path, storage_key, storage_size
     )
 
+    # Prevent worker from unlinking parent-owned shm file on GC.
+    # Without this, torch's RefcountedMapAllocator::close() will shm_unlink
+    # the parent's /dev/shm file when the worker's tensor refcount hits 0.
+    rebuilt_storage._shared_incref()
+    _input_torch_storages.append(rebuilt_storage)
+
     # Wrap in TypedStorage
     typed_storage = torch.storage.TypedStorage(
         wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
@@ -1936,6 +1942,7 @@ class ShmKeeper:
 _shm_keeper = ShmKeeper()
 
 _input_shm_blocks = []  # Keep parent->worker shm blocks alive during request processing
+_input_torch_storages = []  # Track parent-owned torch storages to balance _shared_incref
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -2553,6 +2560,14 @@ def main():
             except Exception:
                 pass
         _input_shm_blocks.clear()
+
+        # Balance _shared_incref for parent-owned torch storages
+        for _old_storage in _input_torch_storages:
+            try:
+                _old_storage._shared_decref()
+            except Exception:
+                pass
+        _input_torch_storages.clear()
 
         # Clear new-models tracker for this call
         _new_models_this_call.clear()
