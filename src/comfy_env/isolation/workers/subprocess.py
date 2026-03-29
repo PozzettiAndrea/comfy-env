@@ -1265,15 +1265,21 @@ if sys.platform == "win32":
         except Exception as e:
             wlog(f"[worker] Failed to add pixi Library/bin: {e}")
 
-    # Host torch lib — for share_torch, torch DLLs live in host venv
+    # Host torch — for share_torch, ensure host site-packages is first on sys.path
+    # so host torch/torchvision win over any torch pixi installed transitively
     _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
-    if _host_sp and hasattr(os, "add_dll_directory"):
-        _torch_lib = os.path.join(_host_sp, "torch", "lib")
-        if os.path.isdir(_torch_lib):
-            try:
-                os.add_dll_directory(_torch_lib)
-            except Exception:
-                pass
+    if _host_sp:
+        if _host_sp not in sys.path:
+            sys.path.insert(0, _host_sp)
+        wlog(f"[worker] share_torch: prepended host site-packages: {_host_sp}")
+        # On Windows, also add DLL directory for torch C extensions
+        if hasattr(os, "add_dll_directory"):
+            _torch_lib = os.path.join(_host_sp, "torch", "lib")
+            if os.path.isdir(_torch_lib):
+                try:
+                    os.add_dll_directory(_torch_lib)
+                except Exception:
+                    pass
 
 # =============================================================================
 # Shared Memory Serialization
@@ -2974,42 +2980,47 @@ class SubprocessWorker(Worker):
         print(f"[{self.name}] python: {self.python}", flush=True)
         print(f"[{self.name}] sys_path sent to worker: {all_sys_path}", flush=True)
 
-        # Launch subprocess with the venv Python, passing socket address
-        # For pixi environments, use "pixi run python" to get proper environment activation
-        # (CONDA_PREFIX, Library paths, etc.) which fixes DLL loading issues with bpy
+        # Launch subprocess with the venv/pixi Python, passing socket address.
+        # For pixi environments, we set up the conda env vars manually instead of
+        # using "pixi run" — pixi run reinstalls packages from the lockfile which
+        # undoes the share_torch uninstall of transitive torch dependencies.
         is_pixi = '.pixi' in str(self.python)
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
-            # Find pixi project root (parent of .pixi directory)
-            pixi_project = self.python
-            while pixi_project.name != '.pixi' and pixi_project.parent != pixi_project:
-                pixi_project = pixi_project.parent
-            pixi_project = pixi_project.parent  # Go up from .pixi to project root
-            pixi_toml = pixi_project / "pixi.toml"
-            if _DBG_WORKER:
-                print(f"[SubprocessWorker] pixi_toml={pixi_toml}, exists={pixi_toml.exists()}", flush=True)
+            # Find pixi env root (the .pixi/envs/default directory)
+            pixi_env_root = self.python
+            while pixi_env_root.name != '.pixi' and pixi_env_root.parent != pixi_env_root:
+                pixi_env_root = pixi_env_root.parent
+            pixi_env_root = pixi_env_root / "envs" / "default"
 
-            if pixi_toml.exists():
-                pixi_exe = get_pixi_path()
-                if pixi_exe is None:
-                    raise WorkerError("pixi not found - required for isolated environment execution")
-                cmd = [str(pixi_exe), "run", "--manifest-path", str(pixi_toml),
-                       "python", str(self._worker_script), self._socket_addr]
-                # Clean PATH to remove ct-env entries that have conflicting DLLs
-                # Pixi will add its own environment paths
-                path_sep = ";" if sys.platform == "win32" else ":"
-                current_path = env.get("PATH", "")
-                # Filter out ct-envs and conda/mamba paths that could conflict
-                clean_path_parts = [
-                    p for p in current_path.split(path_sep)
-                    if not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+            cmd = [str(self.python), str(self._worker_script), self._socket_addr]
+
+            # Set up conda-like env vars that pixi run would normally provide
+            env["CONDA_PREFIX"] = str(pixi_env_root)
+
+            # Build PATH: pixi env paths first, then cleaned system PATH
+            path_sep = ";" if sys.platform == "win32" else ":"
+            current_path = env.get("PATH", "")
+            clean_path_parts = [
+                p for p in current_path.split(path_sep)
+                if not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+            ]
+            if sys.platform == "win32":
+                pixi_paths = [
+                    str(pixi_env_root),
+                    str(pixi_env_root / "Library" / "mingw-w64" / "bin"),
+                    str(pixi_env_root / "Library" / "usr" / "bin"),
+                    str(pixi_env_root / "Library" / "bin"),
+                    str(pixi_env_root / "Scripts"),
+                    str(pixi_env_root / "Library" / "bin" / "Lib" / "site-packages" / "bpy"),
                 ]
-                env["PATH"] = path_sep.join(clean_path_parts)
-                launch_env = env
             else:
-                cmd = [str(self.python), str(self._worker_script), self._socket_addr]
-                launch_env = env
+                pixi_paths = [
+                    str(pixi_env_root / "bin"),
+                ]
+            env["PATH"] = path_sep.join(pixi_paths + clean_path_parts)
+            launch_env = env
         else:
             cmd = [str(self.python), str(self._worker_script), self._socket_addr]
             launch_env = env
