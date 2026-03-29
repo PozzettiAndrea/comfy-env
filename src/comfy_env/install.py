@@ -624,17 +624,32 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         # at runtime via _should_share_torch().
         if not force_install_torch:
             from .packages.toml_generator import _should_skip_torch
-            if _should_skip_torch(cfg, log=lambda _: None):
+            if _should_skip_torch(cfg, log=log):
                 pixi_default = build_dir / ".pixi" / "envs" / "default"
                 _py = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
                 if _py.exists():
                     _uv = _find_uv()
                     _pkgs = list(pytorch_packages)
+                    log(f"[comfy-env] share_torch: removing transitive torch from pixi env: {_pkgs}")
                     result = subprocess.run(
                         [_uv, "pip", "uninstall", "--python", str(_py)] + _pkgs,
                         capture_output=True, text=True
                     )
+                    log(f"[comfy-env] share_torch: uninstall exit={result.returncode}")
+                    if result.stdout and result.stdout.strip():
+                        log(f"[comfy-env]   stdout: {result.stdout.strip()}")
+                    if result.stderr and result.stderr.strip():
+                        log(f"[comfy-env]   stderr: {result.stderr.strip()}")
                     _log_subprocess(log, result, "pip uninstall torch (share_torch)")
+                    # Verify torch is actually gone
+                    check = subprocess.run(
+                        [str(_py), "-c", "import torch; print(torch.__file__)"],
+                        capture_output=True, text=True
+                    )
+                    if check.returncode == 0:
+                        log(f"[comfy-env] WARNING: torch still present after uninstall: {check.stdout.strip()}")
+                    else:
+                        log(f"[comfy-env] share_torch: confirmed torch removed from pixi env")
                 else:
                     log(f"[comfy-env] share_torch: pixi python not found at {_py}")
 
