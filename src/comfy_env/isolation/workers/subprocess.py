@@ -222,27 +222,32 @@ class _TensorKeeper:
                 self._keeper.popleft()
 
 _parent_tensor_keeper = _TensorKeeper()
-_parent_sharing_strategy_set = False
+_parent_fd_registry = []  # Keep fds alive until worker reads them
+
+
+def _cleanup_parent_fds(registry):
+    """Close parent-side fds after worker has read them."""
+    for fd in registry:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    registry.clear()
 
 
 def _serialize_tensor_native_parent(t, registry):
-    """Serialize CPU tensor via PyTorch native shared memory (zero-copy to worker).
+    """Serialize CPU tensor via file_descriptor shared memory (zero-copy to worker).
 
-    Uses share_memory_() which mmaps tensor storage to a /dev/shm file.
-    Worker maps the same file via rebuild_storage_filename. No copies.
-    Handles all dtypes natively (bf16, fp8, etc.) — no numpy conversion.
+    Uses share_memory_() with file_descriptor strategy. The fd is kept open on
+    the parent side; the worker opens it via /proc/<pid>/fd/<N>. This avoids
+    torch's storage manager prematurely unlinking /dev/shm files (torch 2.8 bug).
     """
-    global _parent_sharing_strategy_set
     import torch
     import torch.multiprocessing as mp
     import torch.multiprocessing.reductions as reductions
 
-    if not _parent_sharing_strategy_set:
-        try:
-            mp.set_sharing_strategy("file_system")
-        except RuntimeError:
-            pass
-        _parent_sharing_strategy_set = True
+    # Use default file_descriptor strategy (NOT file_system which has a buggy manager)
+    # file_descriptor keeps the fd alive; no /dev/shm filename race.
 
     # Keep tensor alive until worker finishes reading
     _parent_tensor_keeper.keep(t)
@@ -253,7 +258,25 @@ def _serialize_tensor_native_parent(t, registry):
     storage = t.untyped_storage()
     sfunc, sargs = reductions.reduce_storage(storage)
 
-    if sfunc.__name__ == "rebuild_storage_filename":
+    if sfunc.__name__ == "rebuild_storage_fd":
+        # sargs: (cls, DupFd, size)
+        dupfd = sargs[1]
+        fd = dupfd.detach()
+        _parent_fd_registry.append(fd)
+        return {
+            "__type__": "TensorRef",
+            "strategy": "file_descriptor",
+            "parent_pid": os.getpid(),
+            "fd": fd,
+            "storage_size": sargs[2],
+            "dtype": str(t.dtype),
+            "tensor_size": list(t.size()),
+            "tensor_stride": list(t.stride()),
+            "tensor_offset": t.storage_offset(),
+            "requires_grad": t.requires_grad,
+        }
+    elif sfunc.__name__ == "rebuild_storage_filename":
+        # Fallback for platforms where file_descriptor isn't available
         return {
             "__type__": "TensorRef",
             "strategy": "file_system",
@@ -267,11 +290,7 @@ def _serialize_tensor_native_parent(t, registry):
             "requires_grad": t.requires_grad,
         }
     else:
-        # Force file_system strategy and retry
-        mp.set_sharing_strategy("file_system")
-        _parent_sharing_strategy_set = True
-        t.share_memory_()
-        return _serialize_tensor_native_parent(t, registry)
+        raise RuntimeError(f"Unexpected reduce function: {sfunc.__name__}")
 
 
 # =============================================================================
@@ -815,42 +834,57 @@ def _to_shm(obj, registry, visited=None):
 
 
 def _deserialize_tensor_ref(data):
-    """Deserialize tensor from PyTorch shared memory (TensorRef format)."""
+    """Deserialize tensor from shared memory (TensorRef format).
+
+    Supports file_descriptor (via /proc/<pid>/fd/<N>) and file_system (legacy).
+    """
     import torch
-    import torch.multiprocessing.reductions as reductions
 
     dtype_str = data["dtype"]
     dtype = getattr(torch, dtype_str.split(".")[-1])
+    strategy = data.get("strategy", "file_system")
 
-    manager_path = data["manager_path"]
-    storage_key = data["storage_key"]
-    storage_size = data["storage_size"]
+    if strategy == "file_descriptor":
+        import mmap as _mmap
+        worker_pid = data["parent_pid"]  # "parent_pid" is the sender's pid
+        sender_fd = data["fd"]
+        storage_size = data["storage_size"]
 
-    # Encode to bytes if needed
-    if isinstance(manager_path, str):
-        manager_path = manager_path.encode("utf-8")
-    if isinstance(storage_key, str):
-        storage_key = storage_key.encode("utf-8")
+        fd = os.open(f"/proc/{worker_pid}/fd/{sender_fd}", os.O_RDWR)
+        buf = _mmap.mmap(fd, storage_size, _mmap.MAP_SHARED, _mmap.PROT_READ | _mmap.PROT_WRITE)
+        os.close(fd)
 
-    # Rebuild storage from shared memory file
-    rebuilt_storage = reductions.rebuild_storage_filename(
-        torch.UntypedStorage, manager_path, storage_key, storage_size
-    )
+        flat = torch.frombuffer(buf, dtype=dtype)
+        tensor = flat.view(tuple(data["tensor_size"]))
+        tensor._shm_buf = buf
+        return tensor
+    else:
+        import torch.multiprocessing.reductions as reductions
 
-    # Wrap in TypedStorage
-    typed_storage = torch.storage.TypedStorage(
-        wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
-    )
+        manager_path = data["manager_path"]
+        storage_key = data["storage_key"]
+        storage_size = data["storage_size"]
 
-    # Rebuild tensor
-    metadata = (
-        data["tensor_offset"],
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["requires_grad"],
-    )
-    tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
-    return tensor
+        if isinstance(manager_path, str):
+            manager_path = manager_path.encode("utf-8")
+        if isinstance(storage_key, str):
+            storage_key = storage_key.encode("utf-8")
+
+        rebuilt_storage = reductions.rebuild_storage_filename(
+            torch.UntypedStorage, manager_path, storage_key, storage_size
+        )
+
+        typed_storage = torch.storage.TypedStorage(
+            wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
+        )
+        metadata = (
+            data["tensor_offset"],
+            tuple(data["tensor_size"]),
+            tuple(data["tensor_stride"]),
+            data["requires_grad"],
+        )
+        tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
+        return tensor
 
 
 def _from_shm(obj, unlink=True):
@@ -1259,12 +1293,12 @@ if sys.platform == "linux":
     except OSError:
         pass
 
-# Set PyTorch to use file_system sharing (uses /dev/shm, no resource_tracker)
+# Use default sharing strategy (file_descriptor on Linux).
+# Do NOT force file_system — its torch_shm_manager prematurely unlinks files in torch 2.8.
 try:
     import torch
     import torch.multiprocessing as mp
-    mp.set_sharing_strategy("file_system")
-    wlog("[worker] PyTorch sharing strategy set to file_system")
+    wlog(f"[worker] PyTorch sharing strategy: {mp.get_sharing_strategy()}")
 except Exception as e:
     wlog(f"[worker] PyTorch not available: {e}")
 
@@ -1618,22 +1652,36 @@ def _prepare_trimesh_for_pickle(mesh):
 
 
 def _serialize_tensor_native(t, registry):
-    """Serialize tensor using PyTorch's native shared memory (no resource_tracker)."""
+    """Serialize tensor using file_descriptor shared memory (zero-copy to parent)."""
     import torch
     import torch.multiprocessing.reductions as reductions
 
     # Keep tensor alive until parent reads it
     _tensor_keeper.keep(t)
 
-    # Put tensor in shared memory via PyTorch's manager
     if not t.is_shared():
         t.share_memory_()
 
     storage = t.untyped_storage()
     sfunc, sargs = reductions.reduce_storage(storage)
 
-    if sfunc.__name__ == "rebuild_storage_filename":
-        # sargs: (cls, manager_path, storage_key, size)
+    if sfunc.__name__ == "rebuild_storage_fd":
+        dupfd = sargs[1]
+        fd = dupfd.detach()
+        _worker_fd_registry.append(fd)
+        return {
+            "__type__": "TensorRef",
+            "strategy": "file_descriptor",
+            "parent_pid": os.getpid(),
+            "fd": fd,
+            "storage_size": sargs[2],
+            "dtype": str(t.dtype),
+            "tensor_size": list(t.size()),
+            "tensor_stride": list(t.stride()),
+            "tensor_offset": t.storage_offset(),
+            "requires_grad": t.requires_grad,
+        }
+    elif sfunc.__name__ == "rebuild_storage_filename":
         return {
             "__type__": "TensorRef",
             "strategy": "file_system",
@@ -1647,11 +1695,7 @@ def _serialize_tensor_native(t, registry):
             "requires_grad": t.requires_grad,
         }
     else:
-        # Fallback: force file_system strategy
-        import torch.multiprocessing as mp
-        mp.set_sharing_strategy("file_system")
-        t.share_memory_()
-        return _serialize_tensor_native(t, registry)
+        raise RuntimeError(f"Unexpected reduce function: {sfunc.__name__}")
 
 
 def _to_shm(obj, registry, visited=None):
@@ -1762,48 +1806,68 @@ def _to_shm(obj, registry, visited=None):
 
 
 def _deserialize_tensor_native(data):
-    """Deserialize tensor from PyTorch shared memory."""
+    """Deserialize tensor from parent's shared memory.
+
+    Supports two strategies:
+    - file_descriptor: opens parent's fd via /proc/<pid>/fd/<N>, mmaps it,
+      wraps with torch.frombuffer. No torch storage manager involvement.
+    - file_system: legacy fallback using rebuild_storage_filename.
+    """
     import torch
-    import torch.multiprocessing.reductions as reductions
 
     dtype_str = data["dtype"]
     dtype = getattr(torch, dtype_str.split(".")[-1])
+    strategy = data.get("strategy", "file_system")
 
-    manager_path = data["manager_path"]
-    storage_key = data["storage_key"]
-    storage_size = data["storage_size"]
+    if strategy == "file_descriptor":
+        import mmap as _mmap
+        parent_pid = data["parent_pid"]
+        parent_fd = data["fd"]
+        storage_size = data["storage_size"]
 
-    # Encode to bytes if needed
-    if isinstance(manager_path, str):
-        manager_path = manager_path.encode("utf-8")
-    if isinstance(storage_key, str):
-        storage_key = storage_key.encode("utf-8")
+        # Open the parent's fd via /proc — zero-copy mmap
+        fd = os.open(f"/proc/{parent_pid}/fd/{parent_fd}", os.O_RDWR)
+        buf = _mmap.mmap(fd, storage_size, _mmap.MAP_SHARED, _mmap.PROT_READ | _mmap.PROT_WRITE)
+        os.close(fd)  # mmap holds its own reference
 
-    # Rebuild storage from shared memory file
-    rebuilt_storage = reductions.rebuild_storage_filename(
-        torch.UntypedStorage, manager_path, storage_key, storage_size
-    )
+        # Wrap the mmap as a tensor — zero-copy
+        flat = torch.frombuffer(buf, dtype=dtype)
+        tensor = flat.view(tuple(data["tensor_size"]))
+        # Keep mmap alive as long as tensor is in use
+        tensor._shm_buf = buf
+        return tensor
+    else:
+        # Legacy file_system fallback
+        import torch.multiprocessing.reductions as reductions
 
-    # Prevent worker from unlinking parent-owned shm file on GC.
-    # Without this, torch's RefcountedMapAllocator::close() will shm_unlink
-    # the parent's /dev/shm file when the worker's tensor refcount hits 0.
-    rebuilt_storage._shared_incref()
-    _input_torch_storages.append(rebuilt_storage)
+        manager_path = data["manager_path"]
+        storage_key = data["storage_key"]
+        storage_size = data["storage_size"]
 
-    # Wrap in TypedStorage
-    typed_storage = torch.storage.TypedStorage(
-        wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
-    )
+        if isinstance(manager_path, str):
+            manager_path = manager_path.encode("utf-8")
+        if isinstance(storage_key, str):
+            storage_key = storage_key.encode("utf-8")
 
-    # Rebuild tensor
-    metadata = (
-        data["tensor_offset"],
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["requires_grad"],
-    )
-    tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
-    return tensor
+        rebuilt_storage = reductions.rebuild_storage_filename(
+            torch.UntypedStorage, manager_path, storage_key, storage_size
+        )
+
+        # Prevent worker from unlinking parent-owned shm file on GC
+        rebuilt_storage._shared_incref()
+        _input_torch_storages.append(rebuilt_storage)
+
+        typed_storage = torch.storage.TypedStorage(
+            wrap_storage=rebuilt_storage, dtype=dtype, _internal=True
+        )
+        metadata = (
+            data["tensor_offset"],
+            tuple(data["tensor_size"]),
+            tuple(data["tensor_stride"]),
+            data["requires_grad"],
+        )
+        tensor = reductions.rebuild_tensor(torch.Tensor, typed_storage, metadata)
+        return tensor
 
 
 def _from_shm(obj, _depth=0, _key="root"):
@@ -1943,6 +2007,7 @@ _shm_keeper = ShmKeeper()
 
 _input_shm_blocks = []  # Keep parent->worker shm blocks alive during request processing
 _input_torch_storages = []  # Track parent-owned torch storages to balance _shared_incref
+_worker_fd_registry = []  # Keep worker fds alive for worker->parent tensor transfer
 
 # =============================================================================
 # Object Reference System - keep complex objects in worker, pass refs to host
@@ -2568,6 +2633,14 @@ def main():
             except Exception:
                 pass
         _input_torch_storages.clear()
+
+        # Close fds from previous worker->parent result transfer
+        for _old_fd in _worker_fd_registry:
+            try:
+                os.close(_old_fd)
+            except OSError:
+                pass
+        _worker_fd_registry.clear()
 
         # Clear new-models tracker for this call
         _new_models_this_call.clear()
@@ -3232,6 +3305,7 @@ class SubprocessWorker(Worker):
 
             finally:
                 _cleanup_shm(shm_registry)
+                _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
 
     def call_module(
@@ -3279,6 +3353,7 @@ class SubprocessWorker(Worker):
 
             finally:
                 _cleanup_shm(shm_registry)
+                _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
 
     def send_command(self, method, **params):
