@@ -575,6 +575,11 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 except Exception:
                     pass
 
+                # When host torch exists, use its CUDA version for wheel
+                # resolution so cuda-wheels DLLs match the host runtime.
+                if host_cuda:
+                    cuda_version = host_cuda
+
                 py_version = cfg.python or f"{sys.version_info.major}.{sys.version_info.minor}"
                 if host_torch:
                     log(f"[comfy-env] Main env: torch {_torch.__version__}, Python {py_version}")
