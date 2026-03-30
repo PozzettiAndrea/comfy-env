@@ -674,10 +674,17 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                     raise RuntimeError(f"No wheel for {package} (cu{cuda_version}/torch{torch_version}/py{py_version})")
                 resolved_wheels[package] = wheel_url
                 log(f"  {package} from {wheel_url}")
-                cmd = [uv_path, "pip", "install", "--python", str(python_path), "--no-deps", "--no-cache", wheel_url]
+                # Use pip instead of uv: uv rejects local version tags like
+                # +cu128torch2.8 ("expected version to start with a number").
+                # pip may crash in post-install summary on pixi envs with
+                # non-PEP 440 metadata, so verify by checking the package dir.
+                cmd = [str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url]
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 _log_subprocess(log, result, f"pip install {package}")
-                if result.returncode != 0:
+                pkg_import_name = package.replace("-", "_")
+                pkg_dir = pixi_default / "Lib" / "site-packages" / pkg_import_name if sys.platform == "win32" \
+                    else pixi_default / "lib" / f"python{py_version}" / "site-packages" / pkg_import_name
+                if not pkg_dir.exists():
                     raise RuntimeError(f"Failed to install {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
 
         # Link _env_<hash> directly to .pixi/envs/default.

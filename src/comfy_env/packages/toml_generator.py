@@ -97,6 +97,16 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
         pin_version = torch_version or "2.8"
+
+        # When force_install_torch is set (fallback combo), explicitly add
+        # torch to pypi-deps with the CUDA index so pixi doesn't pull in
+        # CPU-only torch as a transitive dep (e.g. from timm).
+        if force_install_torch:
+            pypi_deps["torch"] = {"version": f"=={pin_version}.*", "index": pytorch_index}
+            tv_ver = torchvision_map.get(pin_version, "0.23")
+            pypi_deps["torchvision"] = {"version": f"=={tv_ver}.*", "index": pytorch_index}
+            log(f"  force_install_torch: torch=={pin_version}.* torchvision=={tv_ver}.* from {pytorch_index}")
+
         for pkg in cfg.cuda_packages:
             if pkg in _TORCH_PACKAGES:
                 if pkg == "torchvision":
