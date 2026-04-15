@@ -730,7 +730,10 @@ def _install_isolated_subdirs(node_dir: Path, log: Callable[[str], None], dry_ru
                 label = str(config_file.parent)
             log(f"\n[isolated] {label}")
             if not dry_run:
-                _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
+                try:
+                    _install_via_pixi(load_config(config_file), config_file.parent, log, dry_run)
+                except Exception as e:
+                    log(f"[comfy-env] WARNING: Failed to install {label}: {e}")
 
 
 def _collect_node_req_dirs(
