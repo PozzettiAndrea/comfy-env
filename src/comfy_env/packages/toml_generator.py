@@ -148,9 +148,11 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     dependencies.setdefault("python", f"{py_version}.*")
     dependencies.setdefault("pip", "*")
 
-    # Always require modern setuptools (fixes conda-forge Python version string parsing)
-    pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
-    pypi_deps.setdefault("setuptools", ">=75.0")
+    # Pin setuptools in conda deps (not pypi) to avoid pypi/conda version conflicts.
+    # Range >=75.0,<82 satisfies both:
+    #   - >=75.0 fixes conda-forge Python version string parsing
+    #   - <82 satisfies torch (>=2.10) which requires setuptools<82
+    dependencies.setdefault("setuptools", ">=75.0,<82")
 
     # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
     if sys.platform == "darwin":
