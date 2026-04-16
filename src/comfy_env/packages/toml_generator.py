@@ -92,6 +92,7 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     torchvision_map = {
         "2.4": "0.19", "2.5": "0.20", "2.6": "0.21",
         "2.7": "0.22", "2.8": "0.23", "2.9": "0.24", "2.10": "0.25",
+        "2.11": "0.26",
     }
 
     if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
