@@ -192,12 +192,41 @@ _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
 
-# Add host site-packages for torch inheritance (share_torch)
+# Add host torch to pixi env via symlink/junction (share_torch)
+# Only link torch family — don't expose entire host site-packages to avoid
+# C extension conflicts (e.g. pip numpy/scipy vs conda on macOS Accelerate)
 _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
-if _host_sp and os.path.isdir(_host_sp) and _host_sp not in sys.path:
-    if sys.platform == "darwin":
-        sys.path.append(_host_sp)
+if _host_sp and os.path.isdir(_host_sp):
+    _pixi_sp = None
+    for p in sys.path:
+        if "site-packages" in p and (".pixi" in p or "_env_" in p):
+            _pixi_sp = p
+            break
+    if _pixi_sp:
+        _torch_pkgs = ("torch", "torchvision", "torchaudio")
+        for _pkg in _torch_pkgs:
+            _src = os.path.join(_host_sp, _pkg)
+            _dst = os.path.join(_pixi_sp, _pkg)
+            if os.path.isdir(_src) and not os.path.exists(_dst):
+                if sys.platform == "win32":
+                    import subprocess as _sp
+                    _sp.run(["cmd", "/c", "mklink", "/J", _dst, _src],
+                            capture_output=True)
+                else:
+                    os.symlink(_src, _dst)
+            # Also link dist-info for importlib.metadata
+            for _di in os.listdir(_host_sp):
+                if _di.startswith(_pkg) and _di.endswith(".dist-info"):
+                    _di_dst = os.path.join(_pixi_sp, _di)
+                    if not os.path.exists(_di_dst):
+                        if sys.platform == "win32":
+                            _sp.run(["cmd", "/c", "mklink", "/J", _di_dst,
+                                     os.path.join(_host_sp, _di)],
+                                    capture_output=True)
+                        else:
+                            os.symlink(os.path.join(_host_sp, _di), _di_dst)
     else:
+        # Fallback: no pixi site-packages found, use sys.path
         sys.path.insert(0, _host_sp)
 
 
