@@ -203,7 +203,7 @@ if _host_sp and os.path.isdir(_host_sp):
             _pixi_sp = p
             break
     if _pixi_sp:
-        _torch_pkgs = ("torch", "torchvision", "torchaudio")
+        _torch_pkgs = ("torch", "torchvision", "torchaudio", "torchgen", "functorch")
         for _pkg in _torch_pkgs:
             _src = os.path.join(_host_sp, _pkg)
             _dst = os.path.join(_pixi_sp, _pkg)

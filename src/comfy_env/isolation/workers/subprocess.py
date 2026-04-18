@@ -1276,7 +1276,7 @@ if sys.platform == "win32":
                 _pixi_sp = _p
                 break
         if _pixi_sp:
-            _torch_pkgs = ("torch", "torchvision", "torchaudio")
+            _torch_pkgs = ("torch", "torchvision", "torchaudio", "torchgen", "functorch")
             _linked = []
             for _pkg in _torch_pkgs:
                 _src = os.path.join(_host_sp, _pkg)
