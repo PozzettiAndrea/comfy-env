@@ -195,7 +195,10 @@ if _comfyui_base and _comfyui_base not in sys.path:
 # Add host site-packages for torch inheritance (share_torch)
 _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
 if _host_sp and os.path.isdir(_host_sp) and _host_sp not in sys.path:
-    sys.path.insert(0, _host_sp)
+    if sys.platform == "darwin":
+        sys.path.append(_host_sp)
+    else:
+        sys.path.insert(0, _host_sp)
 
 
 # Redirect stdout to stderr during import so that any print() calls

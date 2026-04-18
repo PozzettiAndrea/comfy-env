@@ -1270,8 +1270,11 @@ if sys.platform == "win32":
     _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
     if _host_sp:
         if _host_sp not in sys.path:
-            sys.path.insert(0, _host_sp)
-        wlog(f"[worker] share_torch: prepended host site-packages: {_host_sp}")
+            if sys.platform == "darwin":
+                sys.path.append(_host_sp)
+            else:
+                sys.path.insert(0, _host_sp)
+        wlog(f"[worker] share_torch: {'appended' if sys.platform == 'darwin' else 'prepended'} host site-packages: {_host_sp}")
         # On Windows, also add DLL directory for torch C extensions
         if hasattr(os, "add_dll_directory"):
             _torch_lib = os.path.join(_host_sp, "torch", "lib")
