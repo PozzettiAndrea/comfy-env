@@ -783,8 +783,9 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
             package_root = env["package_root"]
             sys_path_list = [str(env["sp"]), str(package_root)]
-            if env.get("share_torch") and env.get("host_torch_sp"):
-                sys_path_list.insert(0, str(env["host_torch_sp"]))
+            # Don't add host site-packages to sys_path — torch is symlinked
+            # into pixi env by metadata.py/subprocess.py. Adding host sp leaks
+            # pip C-extension packages (scipy, numpy) that crash on macOS.
             lib_path = str(env["lib"]) if env["lib"] else None
 
             for name, meta in root_nodes.items():
@@ -887,8 +888,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
                     package_root = env["package_root"]
                     sys_path_list = [str(env["sp"]), str(package_root)]
-                    if env.get("share_torch") and env.get("host_torch_sp"):
-                        sys_path_list.insert(0, str(env["host_torch_sp"]))
+                    # Don't add host site-packages — torch is symlinked into pixi env
                     lib_path = str(env["lib"]) if env["lib"] else None
 
                     for name, meta in nodes_meta.items():
