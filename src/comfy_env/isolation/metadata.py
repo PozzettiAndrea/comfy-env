@@ -124,6 +124,18 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
         if os.path.isdir(_torch_lib):
             os.add_dll_directory(_torch_lib)
 
+# Pre-import torch on Windows so its bundled libiomp5md.dll/fbgemm.dll claim the
+# DLL name slots before anything else loads them. The diagnostic probe below and
+# any later numpy/MKL import will otherwise pull conda-forge's libiomp5md.dll
+# under the same name; torch's own libiomp is then shadowed and fbgemm's import
+# table calls into mismatched exports -> WinError 127 on first `import torch`.
+# DO NOT reorder.
+if sys.platform == "win32":
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        pass
+
 # Print environment diagnostics to stderr (survives crashes)
 _debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 if _debug:
