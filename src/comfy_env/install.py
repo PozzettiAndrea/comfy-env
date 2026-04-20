@@ -892,15 +892,18 @@ def _verify_pixi_env_packages(python_path: Path, packages: List[str],
             seen.add(name)
             pkg_list.append(name)
     log(f"[comfy-env] Verifying {len(pkg_list)} package(s) in pixi env...")
+    # Iterate distributions and PEP 503-canonicalize Name fields manually.
+    # Don't use m.version(pkg) -- Python 3.10's importlib.metadata normalizes
+    # lookups to underscores instead of PEP 503 hyphens, so it misses any
+    # dist-info dir whose name contains hyphens (e.g. cc-torch-*.dist-info).
     script = (
         "import sys\n"
+        "import re\n"
         "import importlib.metadata as m\n"
-        "missing = []\n"
-        f"for pkg in {pkg_list!r}:\n"
-        "    try:\n"
-        "        m.version(pkg)\n"
-        "    except m.PackageNotFoundError:\n"
-        "        missing.append(pkg)\n"
+        "def canon(n): return re.sub(r'[-_.]+', '-', n).lower() if n else ''\n"
+        "installed = {canon(d.metadata['Name']) for d in m.distributions() if d.metadata['Name']}\n"
+        f"requested = {pkg_list!r}\n"
+        "missing = [p for p in requested if canon(p) not in installed]\n"
         "if missing:\n"
         "    print('MISSING:' + ','.join(missing))\n"
         "    sys.exit(1)\n"
