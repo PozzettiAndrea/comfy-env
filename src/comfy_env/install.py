@@ -674,9 +674,6 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             uv_path = _find_uv()
             log(f"[comfy-env] Installing cuda-wheels packages (uv={uv_path}, python={python_path})")
 
-            site_pkgs = pixi_default / "Lib" / "site-packages" if sys.platform == "win32" \
-                else pixi_default / "lib" / f"python{py_version}" / "site-packages"
-
             for package in cuda_wheels_packages:
                 wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
                 if not wheel_url:
@@ -688,23 +685,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 cmd = [str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url]
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 _log_subprocess(log, result, f"pip install {package}")
-
-                # pip 25.x crashes in installed_packages_summary on pixi envs with
-                # non-PEP-440 metadata even when the install succeeded. Trust the
-                # dist-info presence as the source of truth, not pip's exit code.
-                pkg_normalized = package.replace("-", "_").lower()
-                dist_info_found = any(
-                    d.name.lower().startswith(f"{pkg_normalized}-") and d.name.endswith(".dist-info")
-                    for d in site_pkgs.iterdir() if d.is_dir()
-                )
-                if not dist_info_found:
-                    raise RuntimeError(
-                        f"pip install failed for {package} (exit={result.returncode}, "
-                        f"no dist-info found):\nstderr: {result.stderr}\nstdout: {result.stdout}"
-                    )
+                # pip's exit code is advisory: pip 25.x crashes in
+                # installed_packages_summary on pixi envs with non-PEP-440
+                # metadata even when the install succeeded. The post-install
+                # verify below is the authoritative gate.
                 if result.returncode != 0:
-                    log(f"  {package}: pip exit={result.returncode} but dist-info present "
-                        f"(pip 25 post-install summary bug, install OK)")
+                    log(f"  {package}: pip exit={result.returncode} "
+                        f"(likely pip 25 summary bug; verifying after install loop)")
 
         # Post-install verification: the env's python must be able to find each
         # declared package. This is the source of truth for "install succeeded";
