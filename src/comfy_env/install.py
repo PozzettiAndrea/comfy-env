@@ -658,10 +658,12 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 else:
                     log(f"[comfy-env] share_torch: pixi python not found at {_py}")
 
-        # Install cuda-wheels packages (nvdiffrast, pytorch3d, etc.) via uv pip.
+        # Pixi env's python — needed for cuda-wheels install and post-install verify.
+        pixi_default = build_dir / ".pixi" / "envs" / "default"
+        python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
+
+        # Install cuda-wheels packages (nvdiffrast, pytorch3d, etc.) via pip in the pixi env.
         if cuda_wheels_packages and cuda_version and sys.platform != "darwin":
-            pixi_default = build_dir / ".pixi" / "envs" / "default"
-            python_path = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
             if not python_path.exists():
                 raise RuntimeError(f"No Python in pixi env: {python_path}")
 
@@ -672,7 +674,9 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             uv_path = _find_uv()
             log(f"[comfy-env] Installing cuda-wheels packages (uv={uv_path}, python={python_path})")
 
-            resolved_wheels = {}
+            site_pkgs = pixi_default / "Lib" / "site-packages" if sys.platform == "win32" \
+                else pixi_default / "lib" / f"python{py_version}" / "site-packages"
+
             for package in cuda_wheels_packages:
                 wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
                 if not wheel_url:
@@ -681,27 +685,41 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 log(f"  {package} from {wheel_url}")
                 # Use pip instead of uv: uv rejects local version tags like
                 # +cu128torch2.8 ("expected version to start with a number").
-                # pip may crash in post-install summary on pixi envs with
-                # non-PEP 440 metadata, so verify by checking the package dir.
                 cmd = [str(python_path), "-m", "pip", "install", "--no-deps", "--no-cache-dir", wheel_url]
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 _log_subprocess(log, result, f"pip install {package}")
-                if result.returncode != 0:
-                    raise RuntimeError(f"pip install failed for {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
-                # Verify install actually landed: pip can succeed in reporting but
-                # crash in post-install summary on pixi envs with non-PEP 440 metadata.
-                # Look for a *.dist-info directory matching the package name (the most
-                # reliable indicator since wheels don't always ship a directory matching
-                # their dist name -- e.g. dpvo_cuda ships top-level .so files + a dpvo/ pkg).
-                site_pkgs = pixi_default / "Lib" / "site-packages" if sys.platform == "win32" \
-                    else pixi_default / "lib" / f"python{py_version}" / "site-packages"
+
+                # pip 25.x crashes in installed_packages_summary on pixi envs with
+                # non-PEP-440 metadata even when the install succeeded. Trust the
+                # dist-info presence as the source of truth, not pip's exit code.
                 pkg_normalized = package.replace("-", "_").lower()
                 dist_info_found = any(
                     d.name.lower().startswith(f"{pkg_normalized}-") and d.name.endswith(".dist-info")
                     for d in site_pkgs.iterdir() if d.is_dir()
                 )
                 if not dist_info_found:
-                    raise RuntimeError(f"pip install reported success but no dist-info found for {package}:\nstderr: {result.stderr}\nstdout: {result.stdout}")
+                    raise RuntimeError(
+                        f"pip install failed for {package} (exit={result.returncode}, "
+                        f"no dist-info found):\nstderr: {result.stderr}\nstdout: {result.stdout}"
+                    )
+                if result.returncode != 0:
+                    log(f"  {package}: pip exit={result.returncode} but dist-info present "
+                        f"(pip 25 post-install summary bug, install OK)")
+
+        # Post-install verification: the env's python must be able to find each
+        # declared package. This is the source of truth for "install succeeded";
+        # subprocess return codes are advisory. Catches half-built envs that were
+        # silently abandoned (e.g. pip exits non-zero from the summary bug, the
+        # exception is swallowed by _install_isolated_subdirs, and the env is
+        # marked .done with packages missing).
+        verify_pkgs = list(pypi_deps.keys()) + list(cuda_wheels_packages or [])
+        if verify_pkgs and python_path.exists():
+            missing = _verify_pixi_env_packages(python_path, verify_pkgs, log)
+            if missing:
+                raise RuntimeError(
+                    f"Post-install verification failed: {missing!r} not found in pixi env "
+                    f"({python_path}). Declared in comfy-env.toml but missing after install."
+                )
 
         # Link _env_<hash> directly to .pixi/envs/default.
         # We do NOT move the env -- conda packages have hardcoded RPATHs
@@ -864,6 +882,55 @@ def _install_to_main_env(node_dir: Path, log: Callable[[str], None], dry_run: bo
                 log(f"  WARNING: pip install failed:\n{result.stderr}")
             else:
                 log("  Installed successfully")
+
+
+def _verify_pixi_env_packages(python_path: Path, packages: List[str],
+                              log: Callable[[str], None]) -> Optional[str]:
+    """Check that each package is installed in the pixi env's python.
+
+    Uses importlib.metadata.version() in a subprocess against the env's interpreter.
+    Robust to import-name vs dist-name confusion (e.g. opencv-python -> cv2): we
+    only verify the package is installed, not that the import name resolves.
+
+    Returns the first missing package, or None if all are present.
+    """
+    if not packages:
+        return None
+    import subprocess
+    seen: Set[str] = set()
+    pkg_list: List[str] = []
+    for p in packages:
+        name = p.split("[")[0].strip()
+        if name and name not in seen:
+            seen.add(name)
+            pkg_list.append(name)
+    log(f"[comfy-env] Verifying {len(pkg_list)} package(s) in pixi env...")
+    script = (
+        "import sys\n"
+        "import importlib.metadata as m\n"
+        "missing = []\n"
+        f"for pkg in {pkg_list!r}:\n"
+        "    try:\n"
+        "        m.version(pkg)\n"
+        "    except m.PackageNotFoundError:\n"
+        "        missing.append(pkg)\n"
+        "if missing:\n"
+        "    print('MISSING:' + ','.join(missing))\n"
+        "    sys.exit(1)\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run([str(python_path), "-c", script],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        log(f"  All {len(pkg_list)} packages present")
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("MISSING:"):
+            missing = [p for p in line[len("MISSING:"):].split(",") if p]
+            log(f"  Missing: {', '.join(missing)}")
+            return missing[0] if missing else "?"
+    log(f"  Verify subprocess failed (exit={result.returncode}): {result.stderr.strip()}")
+    return "?"
 
 
 def verify_installation(packages: List[str], log: Callable[[str], None] = print) -> bool:
