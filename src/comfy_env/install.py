@@ -553,7 +553,11 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         cuda_version = torch_version = None
         cuda_override = torch_override = None
-        force_install_torch = False
+        # Under COMFY_ENV_PIXI_COMPOSE=1 we never symlink host torch into the pixi env —
+        # pixi installs its own torch (from the correct CUDA index) and its cache dedupes
+        # via reflinks. Start with force_install_torch=True so the explicit torch+index
+        # pin gets written into the generated pixi.toml for both host-match and fallback paths.
+        force_install_torch = bool(os.environ.get("COMFY_ENV_PIXI_COMPOSE"))
         host_torch = None
         resolved_wheels = {}
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
