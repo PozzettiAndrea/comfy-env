@@ -51,6 +51,20 @@ ComfyUI-MyPack/
 
 **CUDA packages**: Listed in `[cuda]`, installed from the PyTorch wheel index or [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) — pre-built wheels for nvdiffrast, pytorch3d, gsplat, etc. No CUDA toolkit or C++ compiler needed.
 
+## Future work: replace `share_torch` with pixi's Multi-Environment feature
+
+Today, when the host ComfyUI venv and an isolation env agree on torch version, `share_torch` installs torch into the isolation env, then `uv pip uninstall`s it, and redirects the worker's `sys.path` to the host's torch at runtime. This is fragile on Windows: the uninstall leaves `torch/lib/*.dll` files on disk (pip/uv strip the dist-info but not the DLLs), which causes `OSError: [WinError 127]` in cold-install scenarios because Python finds the half-gutted `torch/` folder and tries to load its stranded DLLs.
+
+The intended fix is to drop the strip-after-install approach entirely and use pixi's [Multi-Environment feature](https://pixi.prefix.dev/latest/workspace/multi_environment/). Pixi lets you declare `[feature.X]` tables (e.g., a shared `host-torch` feature with the same torch/torchvision the host uses) and compose them into named environments. Packages present in multiple environments at the same version are stored **once on disk and hardlinked** into each environment — no physical duplication, no runtime sys.path hacks, no uninstall step that Windows can't do cleanly.
+
+Concrete migration sketch:
+
+1. Generate a single `pixi.toml` for the whole node pack with a `host-torch` feature (torch, torchvision, CUDA wheels) and one feature per isolation env.
+2. Define one `environment` per isolation env as `[host-torch, <node-feature>]`.
+3. Drop the `share_torch` codepath; workers use their composed env directly.
+
+Research on alternatives (April 2026): pip/uv/pixi/poetry overrides only change *versions*, not install decisions — "constraints and overrides cannot exclude packages from installation" (uv docs). conda's `--stack` mutates sys.path at activate time and is known to break (base-env packages sometimes unimportable). Multi-Environment is the only first-class primitive that actually composes envs with real on-disk dedup.
+
 ## Usage
 
 ```python

@@ -646,6 +646,22 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                     if result.stderr and result.stderr.strip():
                         log(f"[comfy-env]   stderr: {result.stderr.strip()}")
                     _log_subprocess(log, result, "pip uninstall torch (share_torch)")
+                    # uv pip uninstall removes the *-dist-info but leaves the package directory
+                    # itself — including `torch/lib/*.dll` on Windows. Python's importer then finds
+                    # the half-gutted torch/ folder before the host's real one, loads stranded DLLs,
+                    # and fails with OSError: [WinError 127]. Rmtree the leftover package dirs so
+                    # the pixi env is actually free of torch and the worker falls through to host.
+                    sp_q = subprocess.run(
+                        [str(_py), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                        capture_output=True, text=True
+                    )
+                    if sp_q.returncode == 0 and sp_q.stdout.strip():
+                        _sp = Path(sp_q.stdout.strip())
+                        for _pkg in _pkgs:
+                            _pkg_dir = _sp / _pkg
+                            if _pkg_dir.is_dir():
+                                _rmtree(_pkg_dir)
+                                log(f"[comfy-env] share_torch: rmtree leftover {_pkg_dir}")
                     # Verify torch is actually gone
                     check = subprocess.run(
                         [str(_py), "-c", "import torch; print(torch.__file__)"],
