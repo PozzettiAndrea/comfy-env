@@ -256,6 +256,12 @@ def _should_share_torch(env_dir: Path) -> bool:
     major.minor matches the host's.  Torch is a C extension — sharing across
     Python minor versions would crash, so there's no manual override.
     """
+    # Gate: COMFY_ENV_PIXI_COMPOSE=1 disables share_torch. Each pixi env gets its own torch;
+    # pixi's cache reflinks/hardlinks across envs for dedup. Avoids the uninstall+symlink
+    # fragility that produces WinError 127 on Windows cold installs.
+    if os.environ.get("COMFY_ENV_PIXI_COMPOSE"):
+        return False
+
     host_torch_sp = _get_host_torch_sp()
     if host_torch_sp is None:
         return False

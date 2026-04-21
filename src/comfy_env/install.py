@@ -627,7 +627,13 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         # transitive pypi dep (e.g. timm -> torch).  Without this, the pixi
         # env ends up with CPU-only torch which shadows the host's CUDA torch
         # at runtime via _should_share_torch().
-        if not force_install_torch:
+        #
+        # Gate: COMFY_ENV_PIXI_COMPOSE=1 disables share_torch entirely. Pixi keeps its own torch
+        # in each env (transitively); pixi's cache dedupes physical bytes via reflinks/hardlinks
+        # across envs, so disk cost stays at 2 copies total (host venv + pixi cache) regardless
+        # of how many isolation envs exist. Avoids the fragile uninstall + symlink-to-host dance
+        # that triggers OSError: [WinError 127] on Windows cold installs.
+        if not force_install_torch and not os.environ.get("COMFY_ENV_PIXI_COMPOSE"):
             from .packages.toml_generator import _should_skip_torch
             if _should_skip_torch(cfg, log=log):
                 pixi_default = build_dir / ".pixi" / "envs" / "default"
