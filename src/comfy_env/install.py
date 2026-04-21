@@ -553,11 +553,10 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
 
         cuda_version = torch_version = None
         cuda_override = torch_override = None
-        # Under COMFY_ENV_PIXI_COMPOSE=1 we never symlink host torch into the pixi env —
-        # pixi installs its own torch (from the correct CUDA index) and its cache dedupes
-        # via reflinks. Start with force_install_torch=True so the explicit torch+index
-        # pin gets written into the generated pixi.toml for both host-match and fallback paths.
-        force_install_torch = bool(os.environ.get("COMFY_ENV_PIXI_COMPOSE"))
+        # Pixi always installs its own torch (from the correct CUDA index) into each isolation env.
+        # Pixi's cache dedupes physical bytes via reflinks/hardlinks across envs, so disk cost stays
+        # at 2 copies total (host venv + pixi cache) regardless of how many isolation envs exist.
+        force_install_torch = True
         host_torch = None
         resolved_wheels = {}
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
@@ -598,16 +597,15 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                         torch_version = host_torch
                         torch_override = host_torch
                         log(f"[comfy-env] All cuda-wheels available for "
-                            f"cu{cuda_version}/torch{torch_version}/py{py_version} — will share_torch")
+                            f"cu{cuda_version}/torch{torch_version}/py{py_version}")
                     else:
-                        # Fall back to known-good combo and install torch via pixi
+                        # Fall back to known-good combo (same pixi install; different pins)
                         fb_cuda, fb_torch = FALLBACK_COMBO
                         log(f"[comfy-env] Missing wheel: {missing} "
                             f"(cu{cuda_version}/torch{host_torch}/py{py_version})")
                         log(f"[comfy-env] Falling back to cu{fb_cuda}/torch{fb_torch}")
                         cuda_version, torch_version = fb_cuda, fb_torch
                         cuda_override, torch_override = fb_cuda, fb_torch
-                        force_install_torch = True
                 else:
                     torch_version = CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
 
@@ -626,63 +624,6 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         _log_subprocess(log, result, "pixi install")
         if result.returncode != 0:
             raise RuntimeError(f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}")
-
-        # When sharing host torch, remove any torch that pixi pulled in as a
-        # transitive pypi dep (e.g. timm -> torch).  Without this, the pixi
-        # env ends up with CPU-only torch which shadows the host's CUDA torch
-        # at runtime via _should_share_torch().
-        #
-        # Gate: COMFY_ENV_PIXI_COMPOSE=1 disables share_torch entirely. Pixi keeps its own torch
-        # in each env (transitively); pixi's cache dedupes physical bytes via reflinks/hardlinks
-        # across envs, so disk cost stays at 2 copies total (host venv + pixi cache) regardless
-        # of how many isolation envs exist. Avoids the fragile uninstall + symlink-to-host dance
-        # that triggers OSError: [WinError 127] on Windows cold installs.
-        if not force_install_torch and not os.environ.get("COMFY_ENV_PIXI_COMPOSE"):
-            from .packages.toml_generator import _should_skip_torch
-            if _should_skip_torch(cfg, log=log):
-                pixi_default = build_dir / ".pixi" / "envs" / "default"
-                _py = pixi_default / ("python.exe" if sys.platform == "win32" else "bin/python")
-                if _py.exists():
-                    _uv = _find_uv()
-                    _pkgs = list(pytorch_packages)
-                    log(f"[comfy-env] share_torch: removing transitive torch from pixi env: {_pkgs}")
-                    result = subprocess.run(
-                        [_uv, "pip", "uninstall", "--python", str(_py)] + _pkgs,
-                        capture_output=True, text=True
-                    )
-                    log(f"[comfy-env] share_torch: uninstall exit={result.returncode}")
-                    if result.stdout and result.stdout.strip():
-                        log(f"[comfy-env]   stdout: {result.stdout.strip()}")
-                    if result.stderr and result.stderr.strip():
-                        log(f"[comfy-env]   stderr: {result.stderr.strip()}")
-                    _log_subprocess(log, result, "pip uninstall torch (share_torch)")
-                    # uv pip uninstall removes the *-dist-info but leaves the package directory
-                    # itself — including `torch/lib/*.dll` on Windows. Python's importer then finds
-                    # the half-gutted torch/ folder before the host's real one, loads stranded DLLs,
-                    # and fails with OSError: [WinError 127]. Rmtree the leftover package dirs so
-                    # the pixi env is actually free of torch and the worker falls through to host.
-                    sp_q = subprocess.run(
-                        [str(_py), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-                        capture_output=True, text=True
-                    )
-                    if sp_q.returncode == 0 and sp_q.stdout.strip():
-                        _sp = Path(sp_q.stdout.strip())
-                        for _pkg in _pkgs:
-                            _pkg_dir = _sp / _pkg
-                            if _pkg_dir.is_dir():
-                                _rmtree(_pkg_dir)
-                                log(f"[comfy-env] share_torch: rmtree leftover {_pkg_dir}")
-                    # Verify torch is actually gone
-                    check = subprocess.run(
-                        [str(_py), "-c", "import torch; print(torch.__file__)"],
-                        capture_output=True, text=True
-                    )
-                    if check.returncode == 0:
-                        log(f"[comfy-env] WARNING: torch still present after uninstall: {check.stdout.strip()}")
-                    else:
-                        log(f"[comfy-env] share_torch: confirmed torch removed from pixi env")
-                else:
-                    log(f"[comfy-env] share_torch: pixi python not found at {_py}")
 
         # Pixi env's python — needed for cuda-wheels install and post-install verify.
         pixi_default = build_dir / ".pixi" / "envs" / "default"

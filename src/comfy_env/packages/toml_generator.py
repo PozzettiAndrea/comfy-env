@@ -43,29 +43,9 @@ def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], No
     return pixi_toml
 
 
-def _should_skip_torch(cfg: ComfyEnvConfig, log: Callable[[str], None] = print) -> bool:
-    """Determine if torch packages should be skipped during install (inherited from host).
-
-    Skips when the host has torch and the worker's Python major.minor matches.
-    Torch is a C extension — it can only be shared when Python versions match.
-    """
-    try:
-        import torch as _torch
-    except ImportError:
-        return False
-
-    host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-    worker_version = cfg.python or host_version  # No python specified = defaults to host
-    if host_version == worker_version:
-        log(f"  share_torch: Python {worker_version} matches host, will use host torch at runtime")
-        return True
-
-    return False
-
-
 def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
                         cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
-                        force_install_torch: bool = False) -> Dict[str, Any]:
+                        force_install_torch: bool = True) -> Dict[str, Any]:
     pixi_data = copy.deepcopy(cfg.pixi_passthrough)
 
     # Detect CUDA/PyTorch versions and compute PyTorch index URL.
@@ -81,14 +61,9 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
             pytorch_index = "https://download.pytorch.org/whl/cpu"
             log("No GPU detected - using PyTorch CPU index")
 
-    # Determine if torch should be skipped (inherited from host at runtime).
-    # force_install_torch overrides this when the fallback combo is used —
-    # we need pixi to install its own torch matching the fallback versions.
-    skip_torch = False if force_install_torch else _should_skip_torch(cfg, log)
-
+    # Pixi always installs its own torch into each isolation env.
     # Add PyTorch packages to pypi-dependencies with per-package index.
-    # This lets pixi resolve torch alongside all other deps in a single pass,
-    # avoiding conflicts from a separate uv pip install step.
+    # This lets pixi resolve torch alongside all other deps in a single pass.
     torchvision_map = {
         "2.4": "0.19", "2.5": "0.20", "2.6": "0.21",
         "2.7": "0.22", "2.8": "0.23", "2.9": "0.24", "2.10": "0.25",
@@ -99,14 +74,12 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
         pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
         pin_version = torch_version or "2.8"
 
-        # When force_install_torch is set (fallback combo), explicitly add
-        # torch to pypi-deps with the CUDA index so pixi doesn't pull in
-        # CPU-only torch as a transitive dep (e.g. from timm).
-        if force_install_torch:
-            pypi_deps["torch"] = {"version": f"=={pin_version}.*", "index": pytorch_index}
-            tv_ver = torchvision_map.get(pin_version, "0.23")
-            pypi_deps["torchvision"] = {"version": f"=={tv_ver}.*", "index": pytorch_index}
-            log(f"  force_install_torch: torch=={pin_version}.* torchvision=={tv_ver}.* from {pytorch_index}")
+        # Explicit torch pin with the CUDA index so pixi doesn't pull in CPU-only torch
+        # as a transitive dep (e.g. from timm).
+        pypi_deps["torch"] = {"version": f"=={pin_version}.*", "index": pytorch_index}
+        tv_ver = torchvision_map.get(pin_version, "0.23")
+        pypi_deps["torchvision"] = {"version": f"=={tv_ver}.*", "index": pytorch_index}
+        log(f"  torch=={pin_version}.* torchvision=={tv_ver}.* from {pytorch_index}")
 
         for pkg in cfg.cuda_packages:
             if pkg in _TORCH_PACKAGES:
@@ -115,9 +88,6 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
                 else:
                     ver = pin_version
                 pypi_deps[pkg] = {"version": f"=={ver}.*", "index": pytorch_index}
-                if skip_torch:
-                    log(f"  Pinning {pkg}=={ver}.* (ABI compat; host torch used at runtime)")
-                    continue
 
     # Workspace
     workspace = pixi_data.setdefault("workspace", {})

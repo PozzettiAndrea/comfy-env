@@ -1265,53 +1265,6 @@ if sys.platform == "win32":
         except Exception as e:
             wlog(f"[worker] Failed to add pixi Library/bin: {e}")
 
-    # Host torch — for share_torch, ensure host site-packages is first on sys.path
-    # so host torch/torchvision win over any torch pixi installed transitively
-    _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
-    if _host_sp:
-        # Link torch family into pixi env instead of exposing entire host site-packages
-        _pixi_sp = None
-        for _p in sys.path:
-            if "site-packages" in _p and (".pixi" in _p or "_env_" in _p):
-                _pixi_sp = _p
-                break
-        if _pixi_sp:
-            _torch_pkgs = ("torch", "torchvision", "torchaudio", "torchgen", "functorch")
-            _linked = []
-            for _pkg in _torch_pkgs:
-                _src = os.path.join(_host_sp, _pkg)
-                _dst = os.path.join(_pixi_sp, _pkg)
-                if os.path.isdir(_src) and not os.path.exists(_dst):
-                    if sys.platform == "win32":
-                        import subprocess as _spr
-                        _spr.run(["cmd", "/c", "mklink", "/J", _dst, _src], capture_output=True)
-                    else:
-                        os.symlink(_src, _dst)
-                    _linked.append(_pkg)
-                # Also link dist-info
-                for _di in os.listdir(_host_sp):
-                    if _di.startswith(_pkg) and _di.endswith(".dist-info"):
-                        _di_dst = os.path.join(_pixi_sp, _di)
-                        if not os.path.exists(_di_dst):
-                            if sys.platform == "win32":
-                                _spr.run(["cmd", "/c", "mklink", "/J", _di_dst, os.path.join(_host_sp, _di)], capture_output=True)
-                            else:
-                                os.symlink(os.path.join(_host_sp, _di), _di_dst)
-            wlog(f"[worker] share_torch: linked {_linked} from {_host_sp} into {_pixi_sp}")
-        else:
-            # Fallback
-            if _host_sp not in sys.path:
-                sys.path.insert(0, _host_sp)
-            wlog(f"[worker] share_torch: fallback — prepended host site-packages: {_host_sp}")
-        # On Windows, also add DLL directory for torch C extensions
-        if hasattr(os, "add_dll_directory"):
-            _torch_lib = os.path.join(_host_sp, "torch", "lib")
-            if os.path.isdir(_torch_lib):
-                try:
-                    os.add_dll_directory(_torch_lib)
-                except Exception:
-                    pass
-
 # =============================================================================
 # Shared Memory Serialization
 # =============================================================================
@@ -3013,8 +2966,8 @@ class SubprocessWorker(Worker):
 
         # Launch subprocess with the venv/pixi Python, passing socket address.
         # For pixi environments, we set up the conda env vars manually instead of
-        # using "pixi run" — pixi run reinstalls packages from the lockfile which
-        # undoes the share_torch uninstall of transitive torch dependencies.
+        # using "pixi run" — "pixi run" re-resolves the lockfile every call, which
+        # adds noticeable latency for short-lived workers.
         is_pixi = '.pixi' in str(self.python)
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)

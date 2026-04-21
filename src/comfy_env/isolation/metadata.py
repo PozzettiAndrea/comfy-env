@@ -118,11 +118,6 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     _dlls_dir = os.path.join(_env_root, "DLLs")
     if os.path.isdir(_dlls_dir):
         os.add_dll_directory(_dlls_dir)
-    _host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
-    if _host_sp:
-        _torch_lib = os.path.join(_host_sp, "torch", "lib")
-        if os.path.isdir(_torch_lib):
-            os.add_dll_directory(_torch_lib)
 
 # Pre-import torch on Windows so its bundled libiomp5md.dll/fbgemm.dll claim the
 # DLL name slots before anything else loads them. The diagnostic probe below and
@@ -203,43 +198,6 @@ os.chdir(working_dir)
 _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
-
-# Add host torch to pixi env via symlink/junction (share_torch)
-# Only link torch family — don't expose entire host site-packages to avoid
-# C extension conflicts (e.g. pip numpy/scipy vs conda on macOS Accelerate)
-_host_sp = os.environ.get("_COMFY_ENV_HOST_SP")
-if _host_sp and os.path.isdir(_host_sp):
-    _pixi_sp = None
-    for p in sys.path:
-        if "site-packages" in p and (".pixi" in p or "_env_" in p):
-            _pixi_sp = p
-            break
-    if _pixi_sp:
-        _torch_pkgs = ("torch", "torchvision", "torchaudio", "torchgen", "functorch")
-        for _pkg in _torch_pkgs:
-            _src = os.path.join(_host_sp, _pkg)
-            _dst = os.path.join(_pixi_sp, _pkg)
-            if os.path.isdir(_src) and not os.path.exists(_dst):
-                if sys.platform == "win32":
-                    import subprocess as _sp
-                    _sp.run(["cmd", "/c", "mklink", "/J", _dst, _src],
-                            capture_output=True)
-                else:
-                    os.symlink(_src, _dst)
-            # Also link dist-info for importlib.metadata
-            for _di in os.listdir(_host_sp):
-                if _di.startswith(_pkg) and _di.endswith(".dist-info"):
-                    _di_dst = os.path.join(_pixi_sp, _di)
-                    if not os.path.exists(_di_dst):
-                        if sys.platform == "win32":
-                            _sp.run(["cmd", "/c", "mklink", "/J", _di_dst,
-                                     os.path.join(_host_sp, _di)],
-                                    capture_output=True)
-                        else:
-                            os.symlink(os.path.join(_host_sp, _di), _di_dst)
-    else:
-        # Fallback: no pixi site-packages found, use sys.path
-        sys.path.insert(0, _host_sp)
 
 
 # Redirect stdout to stderr during import so that any print() calls
@@ -326,7 +284,6 @@ def fetch_metadata(
     package_name: str,
     working_dir: Path,
     env_vars: Optional[Dict[str, str]] = None,
-    host_torch_sp: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Fetch node metadata by running a subprocess in the isolation env.
 
@@ -336,7 +293,6 @@ def fetch_metadata(
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         env_vars: Additional environment variables from comfy-env.toml
-        host_torch_sp: Host site-packages path for torch inheritance (share_torch)
 
     Returns:
         {"nodes": {name: meta_dict, ...}, "display": {name: display_name, ...}}
@@ -386,8 +342,6 @@ def fetch_metadata(
     # Build proper subprocess environment (DLL paths, library paths, etc.)
     from .wrap import build_isolation_env
     scan_env = build_isolation_env(python, env_vars)
-    if host_torch_sp:
-        scan_env["_COMFY_ENV_HOST_SP"] = str(host_torch_sp)
 
     # Write script to temp file
     script_file = None
@@ -401,9 +355,8 @@ def fetch_metadata(
 
         t0 = time.perf_counter()
 
-        # Launch pixi python directly instead of "pixi run" to avoid pixi
-        # reinstalling torch from the lockfile (undoes share_torch uninstall).
-        # Set up conda env vars manually for DLL search paths.
+        # Launch pixi python directly instead of "pixi run" to avoid the per-call overhead
+        # of pixi's lockfile resolve. Set up conda env vars manually for DLL search paths.
         is_pixi = ".pixi" in str(python)
         cmd = [str(python), script_file, str(working_dir), package_name]
         if sys.platform == "win32" and is_pixi:
