@@ -666,7 +666,15 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         # silently abandoned (e.g. pip exits non-zero from the summary bug, the
         # exception is swallowed by _install_isolated_subdirs, and the env is
         # marked .done with packages missing).
-        verify_pkgs = list(pypi_deps.keys()) + list(cuda_wheels_packages or [])
+        #
+        # `[cuda] packages = [...]` declares CUDA-only wheels (cc_torch, flash-attn, etc.).
+        # Those only have CUDA-variant wheels — no CPU variant exists. In CPU mode we skip
+        # installing them (block above gated on `cuda_version`), so we must also skip their
+        # presence in the verifier. Otherwise CPU-mode isolation envs always "fail verify"
+        # and comfy-env falls back to in-process node registration, which bypasses the pixi
+        # env's site-packages (timm, etc.) and breaks workflow execution.
+        cuda_wheels_to_verify = list(cuda_wheels_packages or []) if (cuda_version and sys.platform != "darwin") else []
+        verify_pkgs = list(pypi_deps.keys()) + cuda_wheels_to_verify
         if verify_pkgs and python_path.exists():
             missing = _verify_pixi_env_packages(python_path, verify_pkgs, log)
             if missing:
