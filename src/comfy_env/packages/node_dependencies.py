@@ -115,10 +115,13 @@ def install_requirements(node_dir: Path, log: Callable[[str], None] = print) -> 
     req_file = node_dir / "requirements.txt"
     if not req_file.exists(): return
     log(f"  Installing requirements for {node_dir.name}...")
+    # Surface the actual pins so mismatches are visible at a glance.
+    lines = req_file.read_text().splitlines()
+    for line in lines:
+        log(f"    {line}")
 
     # Filter out comfy-env and sister packages to prevent self-downgrade
     _PROTECTED = {"comfy-env", "comfy_env", "comfy-test", "comfy_test", "comfy-3d-viewers", "comfy_3d_viewers", "comfy-attn", "comfy_attn"}
-    lines = req_file.read_text().splitlines()
     filtered = [l for l in lines if not any(l.strip().lower().startswith(p) for p in _PROTECTED)]
     if len(filtered) < len(lines):
         # Write filtered requirements to temp file
