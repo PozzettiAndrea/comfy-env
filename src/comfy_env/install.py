@@ -557,27 +557,28 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
         # Pixi's cache dedupes physical bytes via reflinks/hardlinks across envs, so disk cost stays
         # at 2 copies total (host venv + pixi cache) regardless of how many isolation envs exist.
         force_install_torch = True
-        host_torch = None
         resolved_wheels = {}
         pytorch_packages = {"torch", "torchvision", "torchaudio"}
         cuda_wheels_packages = [p for p in cfg.cuda_packages if p not in pytorch_packages]
+
+        # Detect the main env's torch version once — used in both GPU and CPU branches so the
+        # pixi isolation env pins to the same torch as the main env (avoids ABI mismatch at
+        # IPC time). e.g. portable ships torch 2.11.0+cu130 — without this, CPU branch would
+        # fall back to the hardcoded "2.8" default in toml_generator and fbgemm.dll would
+        # fail to load at worker startup.
+        host_torch = None
+        host_cuda = None
+        try:
+            import torch as _torch
+            host_torch = ".".join(_torch.__version__.split(".")[:2])  # e.g. "2.11.0+cu130" → "2.11"
+            host_cuda = _torch.version.cuda  # e.g. "12.8" or None for CPU builds
+        except Exception:
+            pass
 
         if cfg.has_cuda and sys.platform != "darwin":
             log(f"[comfy-env] GPU: {get_gpu_summary()}")
             cuda_version = get_recommended_cuda_version()
             if cuda_version:
-                # Try the host's actual torch version first — if all cuda-wheels
-                # are available for it, we can inherit torch from the host (zero-copy).
-                host_torch = None
-                host_cuda = None
-                try:
-                    import torch as _torch
-                    # e.g. "2.8.0+cu128" → "2.8"
-                    host_torch = ".".join(_torch.__version__.split(".")[:2])
-                    host_cuda = _torch.version.cuda  # e.g. "12.8"
-                except Exception:
-                    pass
-
                 # When host torch exists, use its CUDA version for wheel
                 # resolution so cuda-wheels DLLs match the host runtime.
                 if host_cuda:
@@ -612,6 +613,9 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 log(f"[comfy-env] Selected: CUDA {cuda_version} + PyTorch {torch_version}")
             else:
                 log("[comfy-env] No GPU detected, using CPU")
+                if host_torch:
+                    torch_override = host_torch
+                    log(f"[comfy-env] CPU mode: matching main env torch {host_torch} from CPU index")
 
         write_pixi_toml(cfg, build_dir, log, cuda_override=cuda_override,
                         torch_override=torch_override, force_install_torch=force_install_torch)

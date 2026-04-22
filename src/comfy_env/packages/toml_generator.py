@@ -49,7 +49,8 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     pixi_data = copy.deepcopy(cfg.pixi_passthrough)
 
     # Detect CUDA/PyTorch versions and compute PyTorch index URL.
-    # Overrides allow the install logic to force a specific combo (e.g. fallback to cu128/2.8).
+    # Overrides allow the install logic to force a specific combo (e.g. fallback to cu128/2.8,
+    # or CPU mode matching the main env's torch version via `torch_override` with no cuda).
     cuda_version = torch_version = pytorch_index = None
     if cfg.has_cuda and sys.platform != "darwin":
         cuda_version = cuda_override or get_recommended_cuda_version()
@@ -58,8 +59,14 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
             pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
             log(f"CUDA {cuda_version} -> PyTorch {torch_version}")
         else:
+            # CPU mode: use torch_override if the caller detected a main-env torch version,
+            # otherwise let the downstream fallback kick in.
+            torch_version = torch_override
             pytorch_index = "https://download.pytorch.org/whl/cpu"
-            log("No GPU detected - using PyTorch CPU index")
+            if torch_version:
+                log(f"No GPU detected - using PyTorch CPU index, matching torch {torch_version}")
+            else:
+                log("No GPU detected - using PyTorch CPU index")
 
     # Pixi always installs its own torch into each isolation env.
     # Add PyTorch packages to pypi-dependencies with per-package index.
