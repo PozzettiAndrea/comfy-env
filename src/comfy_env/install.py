@@ -593,7 +593,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
                 if host_torch and cuda_wheels_packages:
                     log(f"[comfy-env] Target: cu{cuda_version}/torch{host_torch}/py{py_version}")
                     log(f"[comfy-env] Checking cuda-wheels for: {', '.join(cuda_wheels_packages)}")
-                    missing = check_all_wheels_available(cuda_wheels_packages, host_torch, cuda_version, py_version)
+                    missing = check_all_wheels_available(cuda_wheels_packages, host_torch, cuda_version, py_version, log=log)
                     if missing is None:
                         torch_version = host_torch
                         torch_override = host_torch
@@ -646,7 +646,7 @@ def _install_via_pixi(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], 
             log(f"[comfy-env] Installing cuda-wheels packages (uv={uv_path}, python={python_path})")
 
             for package in cuda_wheels_packages:
-                wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version)
+                wheel_url = get_wheel_url(package, torch_version, cuda_version, py_version, log=log)
                 if not wheel_url:
                     raise RuntimeError(f"No wheel for {package} (cu{cuda_version}/torch{torch_version}/py{py_version})")
                 resolved_wheels[package] = wheel_url

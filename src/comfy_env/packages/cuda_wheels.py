@@ -4,7 +4,7 @@ import logging
 import re
 import sys
 import urllib.request
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
@@ -27,13 +27,16 @@ def get_torch_version_for_cuda(cuda_version: str) -> Optional[str]:
 
 
 def check_all_wheels_available(packages: List[str], torch_version: str,
-                               cuda_version: str, python_version: str) -> Optional[str]:
+                               cuda_version: str, python_version: str,
+                               log: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Check if all required cuda-wheels are available for this CUDA+torch combo.
 
     Returns None if all packages have wheels, or the name of the first missing package.
+    If `log` is provided, lookup progress and failure reasons are surfaced to the caller's
+    log stream (the cuda_wheels logger is not wired to install logs by default).
     """
     for package in packages:
-        url = get_wheel_url(package, torch_version, cuda_version, python_version)
+        url = get_wheel_url(package, torch_version, cuda_version, python_version, log=log)
         if not url:
             return package
     return None
@@ -52,8 +55,18 @@ def _platform_tags() -> List[str]:
     return []
 
 
-def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str) -> Optional[str]:
-    """Get direct URL to matching wheel from cuda-wheels index."""
+def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str,
+                  log: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Get direct URL to matching wheel from cuda-wheels index.
+
+    If `log` is provided, every HTTP attempt, the matched wheel, or the per-URL failure
+    reason is emitted via that callback in addition to the module logger.
+    """
+    def _emit(msg: str) -> None:
+        logger.info(msg)
+        if log is not None:
+            log(msg)
+
     cuda_short = cuda_version.replace(".", "")[:3]
     torch_short = ".".join(torch_version.split(".")[:2])
     py_tag = f"cp{python_version.replace('.', '')}"
@@ -62,16 +75,20 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     link_pattern = re.compile(r'href="([^"]+\.whl)"[^>]*>([^<]+)</a>', re.IGNORECASE)
 
-    logger.info(f"Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {' '.join(platform_tags) or 'any'}")
+    _emit(f"[cuda-wheels] Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {' '.join(platform_tags) or 'any'}")
 
     candidates = []
+    attempted = []
     for pkg_dir in _pkg_variants(package):
         index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
+        if index_url in attempted:
+            continue
+        attempted.append(index_url)
         try:
             with urllib.request.urlopen(index_url, timeout=10) as resp:
                 html = resp.read().decode("utf-8")
         except Exception as e:
-            logger.debug(f"  {index_url}: {e}")
+            _emit(f"[cuda-wheels]   {index_url}: {type(e).__name__}: {e}")
             continue
 
         for match in link_pattern.finditer(html):
@@ -85,13 +102,13 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
         # Prefer manylinux wheels over plain linux
         for url, display in candidates:
             if "manylinux" in display:
-                logger.info(f"  Found: {display}")
+                _emit(f"[cuda-wheels]   Found: {display}")
                 return url
         url, display = candidates[0]
-        logger.info(f"  Found: {display}")
+        _emit(f"[cuda-wheels]   Found: {display}")
         return url
 
-    logger.info(f"  No matching wheel found")
+    _emit(f"[cuda-wheels]   No matching wheel found (tried {len(attempted)} index URL(s))")
     return None
 
 
