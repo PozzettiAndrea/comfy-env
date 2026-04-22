@@ -2,6 +2,7 @@
 
 import logging
 import re
+import ssl
 import sys
 import urllib.request
 from typing import Callable, List, Optional
@@ -9,6 +10,21 @@ from typing import Callable, List, Optional
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
 CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/v2/"
+
+
+def _ssl_context() -> Optional[ssl.SSLContext]:
+    """Build an SSL context using certifi's CA bundle when available.
+
+    Portable/embedded Python distributions (e.g. ComfyUI's python_embeded) often ship
+    without a complete CA store, which makes urllib fail with CERTIFICATE_VERIFY_FAILED
+    against hosts whose chain isn't in the stripped default store (notably GitHub Pages).
+    certifi is effectively always present (pip depends on it), so prefer it when we can.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
 
 # Fallback torch version for each CUDA version — used only when the host's
 # actual torch combo doesn't have all cuda-wheels available.
@@ -85,7 +101,7 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
             continue
         attempted.append(index_url)
         try:
-            with urllib.request.urlopen(index_url, timeout=10) as resp:
+            with urllib.request.urlopen(index_url, timeout=10, context=_ssl_context()) as resp:
                 html = resp.read().decode("utf-8")
         except Exception as e:
             _emit(f"[cuda-wheels]   {index_url}: {type(e).__name__}: {e}")
