@@ -132,6 +132,15 @@ def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str]
     #   - <82 satisfies torch (>=2.10) which requires setuptools<82
     dependencies.setdefault("setuptools", ">=75.0,<82")
 
+    # Windows only: force libblas to the OpenBLAS variant so conda-forge doesn't pull in
+    # mkl -> llvm-openmp -> Library\bin\libiomp5md.dll. That DLL shares the filename of
+    # PyTorch's bundled Intel-OpenMP libiomp5md.dll but exports a different (smaller) symbol
+    # set and causes fbgemm.dll to fail with WinError 127 on 'import torch' inside workers
+    # (the _vcomp_* symbols fbgemm imports only exist in the Intel build shipped with torch).
+    # Using setdefault so author overrides in comfy-env.toml still win.
+    if sys.platform == "win32":
+        dependencies.setdefault("libblas", {"version": "*", "build": "*openblas*"})
+
     # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
     if sys.platform == "darwin":
         pypi_deps = pixi_data.get("pypi-dependencies", {})
