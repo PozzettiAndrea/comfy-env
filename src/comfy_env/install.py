@@ -513,6 +513,36 @@ def _discover_node_configs(comfyui_dir: Path) -> List[Tuple[str, Path, Path, Com
     return out
 
 
+def _dedupe_envs_libomp(
+    workspace_dir: Path,
+    discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
+    log: Callable[[str], None],
+) -> None:
+    """Run `dedupe_libomp` against each env's site-packages (macOS only).
+
+    Pip wheels often bundle their own libomp.dylib (torch in `torch/lib/`,
+    sklearn in `.dylibs/`, pymeshlab in `Frameworks/`) and conda-forge installs
+    one at the env root `lib/`. Multiple libomps loaded into the same worker
+    process can cause OMP runtime corruption and segfaults; the dedupe symlinks
+    every redundant copy to torch's libomp so only one binary is in play.
+    """
+    if sys.platform != "darwin":
+        return
+    import glob as _glob
+    from .environment.libomp import dedupe_libomp
+
+    for env_name, _plugin, _cf, _cfg in discovered:
+        env_dir = workspace_dir / ".pixi" / "envs" / env_name
+        sp_matches = _glob.glob(str(env_dir / "lib" / "python*" / "site-packages"))
+        if not sp_matches:
+            continue
+        try:
+            dedupe_libomp(Path(sp_matches[0]))
+            log(f"[comfy-env] {env_name}: deduped libomp")
+        except Exception as e:
+            log(f"[comfy-env] {env_name}: libomp dedupe failed: {e}")
+
+
 def _install_cuda_wheels(
     workspace_dir: Path,
     discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
@@ -656,6 +686,12 @@ def install_workspace(
 
         # CUDA-only wheels (cumesh, flash-attn, etc.)
         _install_cuda_wheels(workspace_dir, discovered, cuda_version, log)
+
+        # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
+        # Multiple bundled libomps from pip wheels (torch, sklearn, pymeshlab,
+        # ...) coexisting in the same process can SIGSEGV inside native filters
+        # — KMP_DUPLICATE_LIB_OK only suppresses the abort, not the corruption.
+        _dedupe_envs_libomp(workspace_dir, discovered, log)
 
         log(f"[comfy-env] Install log: {log_path}")
         return workspace_dir
