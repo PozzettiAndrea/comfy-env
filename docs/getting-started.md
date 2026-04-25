@@ -20,7 +20,7 @@ packages = ["libgl1-mesa-glx"]
 ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 ```
 
-This handles system packages and ComfyUI node dependencies. Python package dependencies go in `requirements.txt` as usual — ComfyUI installs those itself.
+This handles system packages and ComfyUI node dependencies. Python package dependencies go in `requirements.txt` as usual -- ComfyUI installs those itself.
 
 ### 2. Create `install.py`
 
@@ -68,7 +68,7 @@ trimesh = { version = "*", extras = ["easy"] }
 
 **2.** Add your node's `__init__.py` in that subdirectory with standard ComfyUI node classes (`NODE_CLASS_MAPPINGS`, etc.).
 
-**3.** Run `comfy-env install` or let ComfyUI trigger `install.py` — this builds the isolated environment.
+**3.** Run `comfy-env install` or let ComfyUI trigger `install.py` -- this builds the isolated environment.
 
 You can also use `comfy-env init --isolated` to generate a starter `comfy-env.toml`.
 
@@ -76,22 +76,22 @@ You can also use `comfy-env init --isolated` to generate a starter `comfy-env.to
 
 ```
 ComfyUI-MyPack/
-├── comfy-env-root.toml       # System packages + node deps
-├── requirements.txt          # PyPI deps for main process (standard ComfyUI)
-├── install.py                # comfy_env.install()
-├── prestartup_script.py      # comfy_env.setup_env()
-├── __init__.py               # comfy_env.register_nodes()
-└── nodes/
-    ├── main/                 # No comfy-env.toml → runs in main process
-    │   └── __init__.py
-    ├── cgal/                 # Isolated → subprocess with Python 3.11 + CGAL
-    │   ├── comfy-env.toml
-    │   ├── _env_a1b2c3/     # Link to cached build
-    │   └── __init__.py
-    └── gpu/                  # Isolated → subprocess with CUDA packages
-        ├── comfy-env.toml
-        ├── _env_d4e5f6/
-        └── __init__.py
++-- comfy-env-root.toml       # System packages + node deps
++-- requirements.txt          # PyPI deps for main process (standard ComfyUI)
++-- install.py                # comfy_env.install()
++-- prestartup_script.py      # comfy_env.setup_env()
++-- __init__.py               # comfy_env.register_nodes()
+`-- nodes/
+    +-- main/                 # No comfy-env.toml -> runs in main process
+    |   `-- __init__.py
+    +-- cgal/                 # Isolated -> subprocess with Python 3.11 + CGAL
+    |   +-- comfy-env.toml
+    |   +-- _env_a1b2c3/     # Link to cached build
+    |   `-- __init__.py
+    `-- gpu/                  # Isolated -> subprocess with CUDA packages
+        +-- comfy-env.toml
+        +-- _env_d4e5f6/
+        `-- __init__.py
 ```
 
 See [Config Reference](config-reference.md) for all available config options.

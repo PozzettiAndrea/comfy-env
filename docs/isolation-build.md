@@ -4,13 +4,13 @@ This documents the internals of how comfy-env creates and manages isolated Pytho
 
 ## Overview
 
-Nodes that need conflicting dependencies (different Python versions, incompatible libraries) run in **isolated environments** — separate pixi (conda+pip) environments with their own Python interpreter. Each subdirectory with a `comfy-env.toml` gets its own environment.
+Nodes that need conflicting dependencies (different Python versions, incompatible libraries) run in **isolated environments** -- separate pixi (conda+pip) environments with their own Python interpreter. Each subdirectory with a `comfy-env.toml` gets its own environment.
 
 Environments are built once in a central cache and linked into node directories as `_env_<hash>`. On Windows this uses NTFS junctions (no admin/Developer Mode required); on Unix, symlinks. The cache location is `~/.ce` on Unix; on Windows it defaults to `<drive>/ce` where `<drive>` is the drive ComfyUI is installed on (e.g. `D:\ce`). Override with the `COMFY_ENV_BUILD_BASE` environment variable.
 
 ## Config Hash & Env Identity
 
-**File**: `environment/cache.py` — `compute_config_hash()`
+**File**: `environment/cache.py` -- `compute_config_hash()`
 
 Each environment is identified by a hash of:
 - The `comfy-env.toml` file contents
@@ -29,19 +29,19 @@ This means:
 
 ```
 <drive>/ce/                          # Central build cache (~/.ce on Unix)
-├── _env_a1b2c3/                    # One per unique config hash
-│   ├── .done                       # Present = build complete
-│   ├── .building/                  # Lock dir (atomic mkdir)
-│   ├── install.log                 # Full build output
-│   ├── .comfy-env-meta.json        # Source node name, config content
-│   ├── pixi.toml                   # Generated from comfy-env.toml
-│   └── .pixi/envs/default/        # The actual conda environment
-│       ├── bin/python              # (Unix)
-│       ├── python.exe              # (Windows)
-│       ├── lib/python3.11/site-packages/
-│       └── lib/                    # Shared libraries
-├── detect.sh                       # Lists all envs + status
-└── detect.bat
++-- _env_a1b2c3/                    # One per unique config hash
+|   +-- .done                       # Present = build complete
+|   +-- .building/                  # Lock dir (atomic mkdir)
+|   +-- install.log                 # Full build output
+|   +-- .comfy-env-meta.json        # Source node name, config content
+|   +-- pixi.toml                   # Generated from comfy-env.toml
+|   `-- .pixi/envs/default/        # The actual conda environment
+|       +-- bin/python              # (Unix)
+|       +-- python.exe              # (Windows)
+|       +-- lib/python3.11/site-packages/
+|       `-- lib/                    # Shared libraries
++-- detect.sh                       # Lists all envs + status
+`-- detect.bat
 ```
 
 In the node directory:
@@ -67,7 +67,7 @@ If `build_dir/.done` exists, the env is already built. Just create the link from
 
 Acquire lock via atomic `mkdir build_dir/.building/`:
 - If `mkdir` succeeds: we own the build, proceed
-- If `FileExistsError`: another process is building — poll for `.done` every 1s, up to 10 minutes
+- If `FileExistsError`: another process is building -- poll for `.done` every 1s, up to 10 minutes
 - If timeout: assume stale lock from a crashed build, nuke `build_dir` and rebuild
 
 ### 4. Bootstrap pixi
@@ -108,7 +108,7 @@ For **non-PyTorch** packages listed in `[cuda]` (nvdiffrast, pytorch3d, gsplat, 
 - Installed with `--no-deps --no-cache` to avoid conflicts
 - Falls back to PyPI if not in the index
 
-PyTorch packages (torch, torchvision, torchaudio) are **not** installed in this step — they are handled by pixi in step 6.
+PyTorch packages (torch, torchvision, torchaudio) are **not** installed in this step -- they are handled by pixi in step 6.
 
 ### 8. Link & finalize
 
@@ -123,10 +123,10 @@ PyTorch packages (torch, torchvision, torchaudio) are **not** installed in this 
 **Files**: `detection/cuda.py`, `detection/gpu.py`
 
 Detection order for GPU info:
-1. **NVML** (pynvml) — compute capability, VRAM, driver version
-2. **nvidia-smi** — subprocess, parse output
-3. **PyTorch** — `torch.cuda.get_device_properties()`
-4. **sysfs** — scan `/sys/bus/pci/devices` for NVIDIA vendor ID (Linux only)
+1. **NVML** (pynvml) -- compute capability, VRAM, driver version
+2. **nvidia-smi** -- subprocess, parse output
+3. **PyTorch** -- `torch.cuda.get_device_properties()`
+4. **sysfs** -- scan `/sys/bus/pci/devices` for NVIDIA vendor ID (Linux only)
 
 On Windows, nvidia-smi is tried first (avoids DLL loading issues with NVML).
 
@@ -152,7 +152,7 @@ Blackwell GPUs (compute capability 10.x) are forced to CUDA 12.8.
 `register_nodes()` discovers all `comfy-env.toml` files under the node package:
 1. Find `_env_*` directories next to each config
 2. For each isolation env: spawn a subprocess in the env's Python to import the node module and extract metadata (INPUT_TYPES, RETURN_TYPES, FUNCTION, etc.)
-3. Build proxy classes from the metadata — these have all the ComfyUI attributes but delegate execution to a subprocess worker
+3. Build proxy classes from the metadata -- these have all the ComfyUI attributes but delegate execution to a subprocess worker
 
 ### Worker pool
 

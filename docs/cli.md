@@ -94,4 +94,4 @@ Requires root or sudo. Reads `[apt]` packages from `comfy-env-root.toml` (or `co
 
 ### `cleanup`
 
-Deprecated. Environments are stored in the central build cache (`~/.ce` on Unix, `<drive>/ce` on Windows — same drive as ComfyUI). Override with `COMFY_ENV_BUILD_BASE`. To remove an environment, delete the corresponding `_env_*` directory in the node folder and optionally the matching directory in the cache.
+Deprecated. Environments are stored in the central build cache (`~/.ce` on Unix, `<drive>/ce` on Windows -- same drive as ComfyUI). Override with `COMFY_ENV_BUILD_BASE`. To remove an environment, delete the corresponding `_env_*` directory in the node folder and optionally the matching directory in the cache.

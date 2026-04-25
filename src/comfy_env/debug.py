@@ -14,7 +14,7 @@ from pathlib import Path
 
 SETTINGS_FILE = Path.home() / ".comfy-env" / "debug.env"
 
-# Load persistent settings (simple KEY=1 file) — env vars always override
+# Load persistent settings (simple KEY=1 file) -- env vars always override
 if SETTINGS_FILE.exists():
     try:
         for line in SETTINGS_FILE.read_text().splitlines():
@@ -33,7 +33,7 @@ def _is_on(var: str) -> bool:
 # Master switch
 DEBUG = _is_on("COMFY_ENV_DEBUG")
 
-# Granular categories — each is ON if its own var is set OR master is on
+# Granular categories -- each is ON if its own var is set OR master is on
 SERIALIZE = DEBUG or _is_on("COMFY_ENV_DEBUG_SERIALIZE")
 IPC = DEBUG or _is_on("COMFY_ENV_DEBUG_IPC")
 WORKER = DEBUG or _is_on("COMFY_ENV_DEBUG_WORKER")

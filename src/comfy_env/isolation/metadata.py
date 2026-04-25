@@ -21,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
-_DEBUG = _DBG_META  # backward compat — all metadata debug logging uses META category
+_DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
 _CACHE_VERSION = "8"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
@@ -84,7 +84,7 @@ def _log_vram(label: str) -> None:
                 parts.append(f"{n} ({gpu_mb} MB)")
             _log(f"[VRAM] Loaded: {', '.join(parts)}")
     except ImportError:
-        # No comfy — try raw torch
+        # No comfy -- try raw torch
         try:
             import torch
             if torch.cuda.is_available():
@@ -108,7 +108,7 @@ import base64
 import importlib
 
 # Windows: register DLL directories BEFORE any extension module imports.
-# Python 3.8+ doesn't search PATH for DLLs — os.add_dll_directory() required.
+# Python 3.8+ doesn't search PATH for DLLs -- os.add_dll_directory() required.
 if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
     _env_root = os.path.dirname(sys.executable)
     os.add_dll_directory(_env_root)

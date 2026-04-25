@@ -106,7 +106,7 @@ class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
             )
         except RuntimeError as e:
             if "not registered" in str(e):
-                # Worker was restarted — model no longer exists in subprocess.
+                # Worker was restarted -- model no longer exists in subprocess.
                 # For offload: model is already gone from VRAM, just update state.
                 log.warning("Model '%s' gone from worker (restarted?), treating as offloaded",
                             self._model_id)
@@ -123,7 +123,7 @@ class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
         """Load model to GPU in subprocess."""
         device_to = device_to or self.load_device
         size_mb = self.size // (1024 * 1024)
-        _log_vram(f"Before load '{self._model_id}' ({size_mb} MB) → {device_to}")
+        _log_vram(f"Before load '{self._model_id}' ({size_mb} MB) -> {device_to}")
         self._send_device_command(str(device_to))
         self.model.device = device_to
         self.model.model_loaded_weight_memory = self.size
@@ -134,7 +134,7 @@ class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
         """Offload model to CPU in subprocess."""
         device_to = device_to or self.offload_device
         size_mb = self.size // (1024 * 1024)
-        _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB) → {device_to}")
+        _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB) -> {device_to}")
         self._send_device_command(str(device_to))
         self.model.device = device_to
         self.model.model_loaded_weight_memory = 0

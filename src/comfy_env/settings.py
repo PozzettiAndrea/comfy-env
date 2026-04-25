@@ -13,7 +13,7 @@ from pathlib import Path
 
 SETTINGS_FILE = Path.home() / ".comfy-env" / "settings.env"
 
-# Load persistent settings (simple KEY=VALUE file) — env vars always override
+# Load persistent settings (simple KEY=VALUE file) -- env vars always override
 if SETTINGS_FILE.exists():
     try:
         for line in SETTINGS_FILE.read_text().splitlines():

@@ -2,7 +2,7 @@
 
 **File**: `isolation/workers/subprocess.py`
 
-JSON messages on the socket carry metadata only. Actual data (tensors, arrays, meshes) is transferred via **shared memory** — the JSON contains pointers that the receiving side uses to reconstruct the objects.
+JSON messages on the socket carry metadata only. Actual data (tensors, arrays, meshes) is transferred via **shared memory** -- the JSON contains pointers that the receiving side uses to reconstruct the objects.
 
 ## Serialization Strategies
 
@@ -12,15 +12,15 @@ Inputs and outputs are recursively walked by `_to_shm()` / `_from_shm()`. Each o
 |----------|------|----------|------------|
 | 1 | CUDA tensor | CUDA IPC handles | Yes (Linux only) |
 | 2 | CPU tensor | PyTorch file_system shared memory | Yes |
-| 3 | NumPy array | Convert to tensor → strategy 2 | Yes |
-| 4 | Trimesh mesh | pickle → shared memory | No (copy) |
+| 3 | NumPy array | Convert to tensor -> strategy 2 | Yes |
+| 4 | Trimesh mesh | pickle -> shared memory | No (copy) |
 | 5 | SparseTensor | Decompose to coords + feats tensors | Per-tensor |
-| 6 | Any pickleable | pickle → shared memory | No (copy) |
+| 6 | Any pickleable | pickle -> shared memory | No (copy) |
 | 7 | Primitives | Inline in JSON | N/A |
 
 ## CUDA IPC (GPU tensors, Linux)
 
-Uses `torch.multiprocessing.reductions.reduce_tensor()` to get an IPC handle — a file descriptor that lets another process map the same GPU memory.
+Uses `torch.multiprocessing.reductions.reduce_tensor()` to get an IPC handle -- a file descriptor that lets another process map the same GPU memory.
 
 ```python
 # Metadata in JSON
@@ -38,7 +38,7 @@ Uses `torch.multiprocessing.reductions.reduce_tensor()` to get an IPC handle —
 
 The receiving side calls `rebuild_cuda_tensor()` to map the same GPU memory. No data is copied.
 
-**IPC handle forwarding**: PyTorch's `reduce_tensor()` refuses to create a new IPC handle from a tensor received via IPC ("received from another process"). comfy-env solves this with **handle forwarding** — the original IPC metadata is cached on deserialization and forwarded directly when re-serializing to another worker. This enables true zero-copy for multi-hop chains (Worker A → Parent → Worker B) without cloning. Cloning only happens as a fallback when no cached metadata is available.
+**IPC handle forwarding**: PyTorch's `reduce_tensor()` refuses to create a new IPC handle from a tensor received via IPC ("received from another process"). comfy-env solves this with **handle forwarding** -- the original IPC metadata is cached on deserialization and forwarded directly when re-serializing to another worker. This enables true zero-copy for multi-hop chains (Worker A -> Parent -> Worker B) without cloning. Cloning only happens as a fallback when no cached metadata is available.
 
 ## PyTorch Shared Memory (CPU tensors)
 
@@ -98,7 +98,7 @@ When the parent passes this reference back in a later call, the worker resolves 
 
 ## Recursive Traversal
 
-`_to_shm()` recursively walks dicts, lists, and tuples. Cycle detection prevents infinite loops (via `id()` tracking). A `registry` list accumulates all `SharedMemory` blocks created during serialization — these are cleaned up after the response is processed.
+`_to_shm()` recursively walks dicts, lists, and tuples. Cycle detection prevents infinite loops (via `id()` tracking). A `registry` list accumulates all `SharedMemory` blocks created during serialization -- these are cleaned up after the response is processed.
 
 ## Tensor Lifecycle (GC Prevention)
 
@@ -118,6 +118,6 @@ class _TensorKeeper:
 ## Shared Memory Cleanup
 
 After each request-response cycle:
-1. Parent calls `_cleanup_shm(registry)` — closes and unlinks all blocks created for the request
+1. Parent calls `_cleanup_shm(registry)` -- closes and unlinks all blocks created for the request
 2. Worker cleans up input blocks before starting the next request
 3. `ShmKeeper` on the worker side delays unlinking by 30s to avoid races

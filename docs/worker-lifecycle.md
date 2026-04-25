@@ -29,15 +29,15 @@ stderr is inherited (not piped) to avoid deadlocks from tqdm/progress bars.
 
 ```
 Parent                          Worker
-  │                               │
-  │── accept() (60s timeout)      │── connect()
-  │                               │
-  │── {sys_paths: [...]} ────►    │── add sys_paths
-  │                               │── redirect print() to socket
-  │                               │── hook nn.Module.to() for model detection
-  │                               │── shim load_models_gpu()
-  │                               │── install progress bar hook
-  │   ◄── {status: ready}        │
+  |                               |
+  |-- accept() (60s timeout)      |-- connect()
+  |                               |
+  |-- {sys_paths: [...]} ---->    |-- add sys_paths
+  |                               |-- redirect print() to socket
+  |                               |-- hook nn.Module.to() for model detection
+  |                               |-- shim load_models_gpu()
+  |                               |-- install progress bar hook
+  |   <-- {status: ready}        |
 ```
 
 After the handshake, the worker enters its message loop and waits for requests.
@@ -67,9 +67,9 @@ For each node execution:
     "method_name": "...", "kwargs": {...}, "self_state": {...}}
    ```
 3. **Parent enters receive loop**, handling intermediate messages:
-   - `{type: log}` → print to stderr
-   - `{type: callback}` → dispatch (VRAM budget, progress), send response
-   - `{status: ok/error}` → break loop
+   - `{type: log}` -> print to stderr
+   - `{type: callback}` -> dispatch (VRAM budget, progress), send response
+   - `{status: ok/error}` -> break loop
 4. **Parent deserializes result** from shared memory (`_from_shm()`)
 5. **Parent cleans up** shared memory blocks
 
@@ -79,20 +79,20 @@ The worker hooks into `comfy.utils.set_progress_bar_global_hook()`:
 
 ```
 Worker                              Parent                    Frontend
-  │                                   │                         │
-  │── ProgressBar(total=10)           │                         │
-  │── step 1                          │                         │
-  │── callback: report_progress ──►   │                         │
-  │   value=1, total=10               │── PROGRESS_BAR_HOOK ──► │
-  │   ◄── callback_response           │                         │
-  │                                   │                         │
-  │── step 2                          │                         │
-  │── callback: report_progress ──►   │                         │
-  │   value=2, total=10               │── check interrupted?    │
-  │                                   │   (user clicked cancel) │
-  │   ◄── {status: error,             │                         │
-  │        error: "interrupted"}      │                         │
-  │── raise InterruptedError          │                         │
+  |                                   |                         |
+  |-- ProgressBar(total=10)           |                         |
+  |-- step 1                          |                         |
+  |-- callback: report_progress -->   |                         |
+  |   value=1, total=10               |-- PROGRESS_BAR_HOOK --> |
+  |   <-- callback_response           |                         |
+  |                                   |                         |
+  |-- step 2                          |                         |
+  |-- callback: report_progress -->   |                         |
+  |   value=2, total=10               |-- check interrupted?    |
+  |                                   |   (user clicked cancel) |
+  |   <-- {status: error,             |                         |
+  |        error: "interrupted"}      |                         |
+  |-- raise InterruptedError          |                         |
 ```
 
 The parent checks `comfy.model_management.throw_exception_if_processing_interrupted()` on each progress callback. If the user cancelled, the error propagates back to the worker which stops processing.
@@ -101,11 +101,11 @@ The parent checks `comfy.model_management.throw_exception_if_processing_interrup
 
 Workers auto-restart on crash. Detection happens before each request:
 
-1. Check `process.poll()` — is the process still alive?
-2. Check `_check_socket_health()` — does ping respond?
+1. Check `process.poll()` -- is the process still alive?
+2. Check `_check_socket_health()` -- does ping respond?
 3. If either fails:
    - Kill the process
-   - Fire `_on_restart()` → clean up stale model patchers
+   - Fire `_on_restart()` -> clean up stale model patchers
    - Respawn from socket creation step
 
 ### Crash Diagnostics
@@ -138,7 +138,7 @@ Triggered by `atexit` handler or explicit cleanup:
 1. Send `{"method": "shutdown"}` to worker
 2. Close socket and server socket
 3. Remove Unix socket file (if applicable)
-4. `process.wait(timeout=5)` — if timeout, `kill()`
+4. `process.wait(timeout=5)` -- if timeout, `kill()`
 5. Remove temp directory containing worker script
 
 ## Stale Worker Cleanup

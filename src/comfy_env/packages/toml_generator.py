@@ -81,7 +81,7 @@ def parse_requirement_line(line: str) -> Optional[Tuple[str, Any]]:
     if text.startswith("-"):
         return None  # options handled by caller (-r, --index-url, etc.)
     if "://" in text or text.startswith("git+"):
-        # URL/VCS entries: skip — pixi has a separate syntax for these. Caller
+        # URL/VCS entries: skip -- pixi has a separate syntax for these. Caller
         # can handle them out-of-band if needed.
         return None
     m = _REQ_LINE_RE.match(text)
@@ -122,7 +122,7 @@ def _parse_requirements_file(
     seen: set,
 ) -> Dict[str, Any]:
     if not req_file.exists():
-        log(f"[comfy-env] WARNING: {req_file} not found — comfyui feature will be empty")
+        log(f"[comfy-env] WARNING: {req_file} not found -- comfyui feature will be empty")
         return {}
     real = req_file.resolve()
     if real in seen:
@@ -187,7 +187,7 @@ def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
             f"[{name}] comfy-env.toml has {bad} under [cuda] packages. "
             "Plain torch/torchvision/torchaudio are now provided by the "
             "workspace's `comfyui` feature (parsed from <ComfyUI>/requirements.txt). "
-            "Remove them from [cuda] packages — keep only CUDA-only wheels there "
+            "Remove them from [cuda] packages -- keep only CUDA-only wheels there "
             "(cumesh, flash-attn, cc_torch, nvdiffrast, etc.)."
         )
 
@@ -215,7 +215,7 @@ def _build_node_feature(
     """Emit a pixi `[feature.<name>.*]` block from a node's ComfyEnvConfig.
 
     Only carries node-specific deps. Python pin lives in the pyXY feature; torch
-    lives in the comfyui feature. No platform gates — pypi index resolution
+    lives in the comfyui feature. No platform gates -- pypi index resolution
     handles wheel selection. Plain torch/torchvision/torchaudio entries are
     stripped (workspace-global from the `comfyui` feature).
     """
@@ -265,7 +265,7 @@ def build_workspace_toml(
         comfyui_dir: ComfyUI install root (used to find requirements.txt).
         torch_index: PyPI index URL for torch wheels (e.g. ".../whl/cpu" or ".../whl/cu124").
         cuda_major: Major CUDA version for `[system-requirements]` (e.g. "12"). None on CPU.
-        node_configs: List of (env_name, ComfyEnvConfig) — one entry per environment to create.
+        node_configs: List of (env_name, ComfyEnvConfig) -- one entry per environment to create.
     """
     host_py = f"{sys.version_info.major}.{sys.version_info.minor}"
     current_platform = get_pixi_platform()

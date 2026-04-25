@@ -2,7 +2,7 @@
 
 In the workspace model, comfy-env runs **one pixi workspace per ComfyUI install**
 at `<comfyui_dir>/.ce/`, with one environment per custom-node config. Env paths
-resolve to `<comfyui_dir>/.ce/.pixi/envs/<env_name>/` directly — no per-config
+resolve to `<comfyui_dir>/.ce/.pixi/envs/<env_name>/` directly -- no per-config
 hash directories, no `_env_*` symlinks.
 """
 

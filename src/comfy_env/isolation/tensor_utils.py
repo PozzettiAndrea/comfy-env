@@ -57,13 +57,13 @@ def prepare_tensor_for_ipc(t: Any) -> Any:
         import torch
         if not isinstance(t, torch.Tensor) or not t.is_cuda: return t
 
-        # Check if the IPC handle cache has this tensor — if so, no clone needed
+        # Check if the IPC handle cache has this tensor -- if so, no clone needed
         # because _serialize_cuda_ipc will forward the cached handle directly.
         try:
             from .workers.subprocess import _cuda_ipc_metadata_cache
             storage_id = id(t.untyped_storage())
             if storage_id in _cuda_ipc_metadata_cache:
-                return t  # Cache hit — forwarding will handle it
+                return t  # Cache hit -- forwarding will handle it
         except (ImportError, Exception):
             pass
 
@@ -76,7 +76,7 @@ def prepare_tensor_for_ipc(t: Any) -> Any:
             if "cudaMallocAsync" in err_str or "shareIpcHandle" in err_str:
                 return t  # Pool IPC will handle this
             if "received from another process" in err_str:
-                # No cache hit and can't reduce — must clone as fallback
+                # No cache hit and can't reduce -- must clone as fallback
                 size_mb = t.numel() * t.element_size() / (1024 * 1024)
                 if size_mb > 100:
                     logger.warning(f"Cloning large CUDA tensor ({size_mb:.1f}MB) for IPC")

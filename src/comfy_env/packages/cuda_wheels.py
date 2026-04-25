@@ -26,7 +26,7 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
     except Exception:
         return None
 
-# Fallback torch version for each CUDA version — used only when the host's
+# Fallback torch version for each CUDA version -- used only when the host's
 # actual torch combo doesn't have all cuda-wheels available.
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
 

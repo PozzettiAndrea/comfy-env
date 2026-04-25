@@ -47,7 +47,7 @@ from .base import Worker, WorkerError
 from ...packages.pixi import get_pixi_path
 from ...config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
-# Debug logging — granular categories from debug.py
+# Debug logging -- granular categories from debug.py
 from ...debug import (
     SERIALIZE as _DBG_SERIALIZE, IPC as _DBG_IPC,
     WORKER as _DBG_WORKER, MODELS as _DBG_MODELS,
@@ -203,7 +203,7 @@ import numpy as np
 # --- PyTorch native tensor sharing (parent side) ---
 # Uses share_memory_() to put tensors in /dev/shm via file_system strategy.
 # Zero-copy: no numpy intermediary, no memcpy, no Python SharedMemory objects.
-# This matches the worker→parent path (TensorRef format) for consistency.
+# This matches the worker->parent path (TensorRef format) for consistency.
 
 from collections import deque as _deque
 
@@ -321,7 +321,7 @@ def _probe_cuda_ipc() -> bool:
         torch.cuda.current_device()
         _ = torch.cuda.Event(interprocess=True)
         t = torch.empty(1, device="cuda")
-        # Critical: test reduce_tensor() — fails under cudaMallocAsync
+        # Critical: test reduce_tensor() -- fails under cudaMallocAsync
         import torch.multiprocessing.reductions as reductions
         reductions.reduce_tensor(t)
         _cuda_ipc_supported = True
@@ -335,23 +335,23 @@ def _serialize_cuda_ipc(t) -> dict:
 
     If the tensor was previously received via IPC (from another worker),
     forward the cached IPC handle instead of cloning. This enables true
-    zero-copy for multi-hop chains (Worker A → Parent → Worker B).
+    zero-copy for multi-hop chains (Worker A -> Parent -> Worker B).
     """
-    # Check IPC handle cache — forward original handle if available
+    # Check IPC handle cache -- forward original handle if available
     try:
         storage_id = id(t.untyped_storage())
         cached = _cuda_ipc_metadata_cache.get(storage_id)
         if cached is not None:
-            # Same tensor (not a view) — forward metadata directly
+            # Same tensor (not a view) -- forward metadata directly
             if (list(t.size()) == cached["tensor_size"]
                     and list(t.stride()) == cached["tensor_stride"]
                     and t.storage_offset() == cached.get("tensor_offset", 0)):
                 if _DBG_IPC:
-                    print(f"[comfy-env] CUDA IPC cache hit — forwarding handle (no clone)", file=sys.stderr, flush=True)
+                    print(f"[comfy-env] CUDA IPC cache hit -- forwarding handle (no clone)", file=sys.stderr, flush=True)
                 return cached
-            # View of the same storage — forward handle with adjusted shape
+            # View of the same storage -- forward handle with adjusted shape
             if _DBG_IPC:
-                print(f"[comfy-env] CUDA IPC cache hit (view) — forwarding handle with adjusted shape", file=sys.stderr, flush=True)
+                print(f"[comfy-env] CUDA IPC cache hit (view) -- forwarding handle with adjusted shape", file=sys.stderr, flush=True)
             return {**cached, "tensor_size": list(t.size()),
                     "tensor_stride": list(t.stride()),
                     "tensor_offset": t.storage_offset()}
@@ -734,7 +734,7 @@ def _to_shm(obj, registry, visited=None):
             result["__was_numpy__"] = True
             result["numpy_dtype"] = str(arr.dtype)
         except Exception:
-            # torch not available — fall back to Python SharedMemory copy
+            # torch not available -- fall back to Python SharedMemory copy
             block = shm.SharedMemory(create=True, size=arr.nbytes)
             np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
             registry.append(block)
@@ -1111,7 +1111,7 @@ try:
 except Exception:
     pass
 
-# Debug logging — granular categories (env vars propagate from parent)
+# Debug logging -- granular categories (env vars propagate from parent)
 def _dbg_on(var):
     return os.environ.get(var, "").lower() in ("1", "true", "yes")
 _DBG_ALL = _dbg_on("COMFY_ENV_DEBUG")
@@ -1184,7 +1184,7 @@ _vram_poll_transport = None  # set in main() after transport is available
 if _DBG_VRAM:
     def _vram_poller():
         import time as _vt
-        threshold = 200 * 1024 * 1024  # 200MB — ignore attention transients
+        threshold = 200 * 1024 * 1024  # 200MB -- ignore attention transients
         min_interval = 1.0              # max 1 log/sec
         last_alloc = 0
         last_log_time = 0.0
@@ -1248,7 +1248,7 @@ if sys.platform == "win32":
         except Exception:
             pass
 
-    # Pixi env root — python310.dll, vcruntime, etc.
+    # Pixi env root -- python310.dll, vcruntime, etc.
     _env_root = os.path.dirname(sys.executable)
     if hasattr(os, "add_dll_directory"):
         try:
@@ -1284,7 +1284,7 @@ if sys.platform == "linux":
         pass
 
 # Use default sharing strategy (file_descriptor on Linux).
-# Do NOT force file_system — its torch_shm_manager prematurely unlinks files in torch 2.8.
+# Do NOT force file_system -- its torch_shm_manager prematurely unlinks files in torch 2.8.
 try:
     import torch
     import torch.multiprocessing as mp
@@ -1338,7 +1338,7 @@ def _probe_cuda_ipc():
         torch.cuda.current_device()
         _ = torch.cuda.Event(interprocess=True)
         t = torch.empty(1, device="cuda")
-        # Critical: test reduce_tensor() — fails under cudaMallocAsync
+        # Critical: test reduce_tensor() -- fails under cudaMallocAsync
         import torch.multiprocessing.reductions as reductions
         reductions.reduce_tensor(t)
         _cuda_ipc_supported = True
@@ -1354,7 +1354,7 @@ _cuda_ipc_cache_tensors = {}
 
 def _serialize_cuda_ipc(t):
     import torch.multiprocessing.reductions as reductions
-    # Check IPC handle cache — forward original handle if available
+    # Check IPC handle cache -- forward original handle if available
     try:
         storage_id = id(t.untyped_storage())
         cached = _cuda_ipc_metadata_cache.get(storage_id)
@@ -1362,9 +1362,9 @@ def _serialize_cuda_ipc(t):
             if (list(t.size()) == cached["tensor_size"]
                     and list(t.stride()) == cached["tensor_stride"]
                     and t.storage_offset() == cached.get("tensor_offset", 0)):
-                wlog("[worker] CUDA IPC cache hit — forwarding handle (no clone)")
+                wlog("[worker] CUDA IPC cache hit -- forwarding handle (no clone)")
                 return cached
-            wlog("[worker] CUDA IPC cache hit (view) — forwarding with adjusted shape")
+            wlog("[worker] CUDA IPC cache hit (view) -- forwarding with adjusted shape")
             return {**cached, "tensor_size": list(t.size()),
                     "tensor_stride": list(t.stride()),
                     "tensor_offset": t.storage_offset()}
@@ -1815,12 +1815,12 @@ def _deserialize_tensor_native(data):
         parent_fd = data["fd"]
         storage_size = data["storage_size"]
 
-        # Open the parent's fd via /proc — zero-copy mmap
+        # Open the parent's fd via /proc -- zero-copy mmap
         fd = os.open(f"/proc/{parent_pid}/fd/{parent_fd}", os.O_RDWR)
         buf = _mmap.mmap(fd, storage_size, _mmap.MAP_SHARED, _mmap.PROT_READ | _mmap.PROT_WRITE)
         os.close(fd)  # mmap holds its own reference
 
-        # Wrap the mmap as a tensor — zero-copy
+        # Wrap the mmap as a tensor -- zero-copy
         flat = torch.frombuffer(buf, dtype=dtype)
         tensor = flat.view(tuple(data["tensor_size"]))
         # Keep mmap alive as long as tensor is in use
@@ -2260,7 +2260,7 @@ def main():
     wlog("[worker] Print and logging forwarding enabled")
 
     # ---------------------------------------------------------------
-    # Model registry — tracks nn.Module instances on CUDA so the main
+    # Model registry -- tracks nn.Module instances on CUDA so the main
     # process can command device moves via IPC for VRAM management.
     #
     # Auto-detection: hooks Module.to() and .cuda() to catch any
@@ -2283,7 +2283,7 @@ def main():
         return size
 
     def _register_model(model_id, model, kind="other"):
-        """Register a model explicitly (optional — auto-hook handles most cases)."""
+        """Register a model explicitly (optional -- auto-hook handles most cases)."""
         _model_registry[model_id] = model
         _model_id_by_obj[id(model)] = model_id
         size = _compute_model_size(model)
@@ -2315,7 +2315,7 @@ def main():
         wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
 
     # Install hooks on Module.to() and .cuda()
-    # Module.to() only fires for the outermost call — PyTorch recurses
+    # Module.to() only fires for the outermost call -- PyTorch recurses
     # through children via _apply(), not .to(), so we naturally catch
     # only top-level models.
     try:
@@ -2340,7 +2340,7 @@ def main():
         wlog("[worker] torch not available, skipping auto-registration hooks")
 
     # ---------------------------------------------------------------
-    # Bidirectional RPC — call parent methods during execution
+    # Bidirectional RPC -- call parent methods during execution
     # ---------------------------------------------------------------
     _current_call_id = None  # Tracks call_id of the request being processed
 
@@ -2402,7 +2402,7 @@ def main():
             pass
 
     # ---------------------------------------------------------------
-    # Shim comfy.model_management.load_models_gpu — tell parent to
+    # Shim comfy.model_management.load_models_gpu -- tell parent to
     # make room first, then let the real load_models_gpu handle the
     # actual loading (it already calculates lowvram_model_memory from
     # get_free_memory internally).
@@ -2444,7 +2444,7 @@ def main():
                         except (KeyError, AttributeError):
                             pass
 
-                # Now run the real load_models_gpu — it calls get_free_memory()
+                # Now run the real load_models_gpu -- it calls get_free_memory()
                 # which uses EXTRA_RESERVED_VRAM via minimum_inference_memory(),
                 # so it will calculate lowvram_model_memory correctly.
                 _original_load_models_gpu(models, *args, **kwargs)
@@ -2525,7 +2525,7 @@ def main():
             _pool_ipc_ok = False
             _our_pool = None
 
-    # --- Receive parent's shareable pool FD (for parent→worker zero-copy) ---
+    # --- Receive parent's shareable pool FD (for parent->worker zero-copy) ---
     _parent_pool = None
     try:
         msg = transport.recv(timeout=5)
@@ -2533,9 +2533,9 @@ def main():
             parent_fd = _recv_fd(sock, timeout=5)
             _parent_pool = _import_pool_from_fd(parent_fd)
             os.close(parent_fd)
-            wlog("[worker] Pool IPC: imported parent pool for parent→worker zero-copy")
+            wlog("[worker] Pool IPC: imported parent pool for parent->worker zero-copy")
         else:
-            wlog("[worker] No parent shareable pool (parent→worker uses CPU shm)")
+            wlog("[worker] No parent shareable pool (parent->worker uses CPU shm)")
     except Exception as e:
         wlog(f"[worker] Parent pool import skipped: {e}")
         _parent_pool = None
@@ -2579,7 +2579,7 @@ def main():
             try:
                 import torch as _torch
                 _target_dev = _torch.device(_target)
-                # Check if already on target device — idempotent
+                # Check if already on target device -- idempotent
                 _current_dev = None
                 try:
                     _first_param = next(_model.parameters(), None)
@@ -2852,7 +2852,7 @@ class SubprocessWorker(Worker):
                 pass
             self._server_socket = None
         self._worker_pool = None
-        # Clear stale pool IPC caches — pointer export data from dead worker's
+        # Clear stale pool IPC caches -- pointer export data from dead worker's
         # pool is invalid and would corrupt CUDA state if reused with new pool
         _pool_ipc_metadata_cache.clear()
         _pool_ipc_cache_tensors.clear()
@@ -2916,7 +2916,7 @@ class SubprocessWorker(Worker):
             self._last_new_models = []  # Clear stale model registry
             self._process = None  # Prevent second _on_restart fire below
 
-        # Process is dead or never started — fire restart callback if replacing
+        # Process is dead or never started -- fire restart callback if replacing
         if self._process is not None and self._on_restart:
             try:
                 self._on_restart()
@@ -2966,7 +2966,7 @@ class SubprocessWorker(Worker):
 
         # Launch subprocess with the venv/pixi Python, passing socket address.
         # For pixi environments, we set up the conda env vars manually instead of
-        # using "pixi run" — "pixi run" re-resolves the lockfile every call, which
+        # using "pixi run" -- "pixi run" re-resolves the lockfile every call, which
         # adds noticeable latency for short-lived workers.
         is_pixi = '.pixi' in str(self.python)
         if _DBG_WORKER:
@@ -3091,7 +3091,7 @@ class SubprocessWorker(Worker):
                     print(f"[{self.name}] Pool IPC handshake failed: {e}", file=sys.stderr, flush=True)
                 self._worker_pool = None
 
-        # --- Send parent's shareable pool FD to worker (for parent→worker zero-copy) ---
+        # --- Send parent's shareable pool FD to worker (for parent->worker zero-copy) ---
         if _parent_shareable_pool is not None and _has_af_unix():
             try:
                 parent_pool_fd = _export_pool_fd(_parent_shareable_pool)

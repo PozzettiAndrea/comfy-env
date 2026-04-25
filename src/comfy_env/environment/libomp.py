@@ -19,7 +19,7 @@ def dedupe_libomp(site_packages: Optional[Path] = None) -> None:
     With `site_packages` set: dedupes that directory's wheels and the
     enclosing env's `lib/libomp.dylib` (conda-forge libomp at env root).
 
-    The canonical libomp is `<sp>/torch/lib/libomp.dylib` — usually present
+    The canonical libomp is `<sp>/torch/lib/libomp.dylib` -- usually present
     because torch is installed in every env via the `comfyui` feature.
     """
     if sys.platform != "darwin":

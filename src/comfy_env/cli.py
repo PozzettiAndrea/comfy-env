@@ -476,7 +476,7 @@ def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=N
                 if cursor < bool_count:
                     cur_sel()[cursor] = not cur_sel()[cursor]
                 elif active_tab == 0 and cursor < bool_count + len(NUMERIC_SETTINGS):
-                    # Numeric setting — open inline editor
+                    # Numeric setting -- open inline editor
                     num_idx = cursor - bool_count
                     var, label, default, unit = NUMERIC_SETTINGS[num_idx]
                     new_val = _edit_numeric(stdscr, var, label, unit, h, w)

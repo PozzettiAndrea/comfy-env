@@ -18,7 +18,7 @@ from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, INSTALL as _DB
 _CLEANUP_DONE = False
 
 # ---------------------------------------------------------------------------
-# Persistent worker pool — one worker per isolation env, reused across calls.
+# Persistent worker pool -- one worker per isolation env, reused across calls.
 # Workers auto-restart on crash (native segfault, etc.).
 # ---------------------------------------------------------------------------
 _WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> (SubprocessWorker, generation)
@@ -307,7 +307,7 @@ def _share_torch_opt_in() -> bool:
 def _should_share_torch(env_dir: Path) -> bool:
     """Decide if host torch should be shared with this worker env.
 
-    Disabled by default in the workspace model — torch is provided by the
+    Disabled by default in the workspace model -- torch is provided by the
     `comfyui` feature in the workspace's pixi.toml. Set `COMFY_ENV_USE_SHARE_TORCH=1`
     to re-enable the legacy host-symlink path (e.g. for zero-copy CUDA IPC scenarios).
     """
@@ -363,7 +363,7 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 def _handle_progress(request: dict) -> dict:
     """Parent-side callback: forward subprocess progress to ComfyUI frontend.
 
-    Also checks if the user clicked cancel — if so, returns an error
+    Also checks if the user clicked cancel -- if so, returns an error
     so the subprocess can stop processing.
     """
     try:
@@ -414,7 +414,7 @@ def _handle_vram_budget(request: dict) -> dict:
     vram_state_name = mm.vram_state.name
     extra_reserved = mm.EXTRA_RESERVED_VRAM
 
-    from ..settings import get_numeric  # noqa: E402 — lazy to avoid circular
+    from ..settings import get_numeric  # noqa: E402 -- lazy to avoid circular
     worker_vram_budget = get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0)
     if worker_vram_budget > 0:
         import torch
@@ -445,13 +445,13 @@ def _cleanup_stale_patchers(env_dir):
 
     Called when a worker is replaced (crash/restart).  We clear the patcher
     registry so they won't be re-registered.  The patchers themselves stay in
-    ComfyUI's current_loaded_models — the safety net in _send_device_command
+    ComfyUI's current_loaded_models -- the safety net in _send_device_command
     handles "not registered" IPC errors gracefully, and free_memory will
     remove them during its normal unload loop.
 
     We must NOT modify current_loaded_models here because this callback can
-    fire inside free_memory's iteration (via model_unload → send_command →
-    _ensure_started → _on_restart), which would invalidate captured indices.
+    fire inside free_memory's iteration (via model_unload -> send_command ->
+    _ensure_started -> _on_restart), which would invalidate captured indices.
     """
     key = str(env_dir)
     old_patchers = _WORKER_PATCHERS.pop(key, None)
@@ -567,7 +567,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
             worker, gen = entry
             if worker.is_alive():
                 return worker, gen
-            # Dead — clean up stale patchers before replacing worker
+            # Dead -- clean up stale patchers before replacing worker
             _cleanup_stale_patchers(env_dir)
             try:
                 worker.shutdown()
@@ -843,7 +843,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
             package_root = env["package_root"]
             sys_path_list = [str(env["sp"]), str(package_root)]
-            # Don't add host site-packages to sys_path — torch is symlinked
+            # Don't add host site-packages to sys_path -- torch is symlinked
             # into pixi env by metadata.py/subprocess.py. Adding host sp leaks
             # pip C-extension packages (scipy, numpy) that crash on macOS.
             lib_path = str(env["lib"]) if env["lib"] else None
@@ -947,7 +947,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
                     package_root = env["package_root"]
                     sys_path_list = [str(env["sp"]), str(package_root)]
-                    # Don't add host site-packages — torch is symlinked into pixi env
+                    # Don't add host site-packages -- torch is symlinked into pixi env
                     lib_path = str(env["lib"]) if env["lib"] else None
 
                     for name, meta in nodes_meta.items():

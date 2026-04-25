@@ -47,22 +47,22 @@ Three source types:
 
 ```toml
 [node_reqs]
-# GitHub — default branch
+# GitHub -- default branch
 ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 
-# GitHub — pinned to tag
+# GitHub -- pinned to tag
 ComfyUI_essentials = { github = "cubiq/ComfyUI_essentials", tag = "v1.0.0" }
 
-# GitHub — pinned to branch
+# GitHub -- pinned to branch
 ComfyUI_dev = { github = "owner/repo", branch = "dev" }
 
-# GitHub — pinned to commit
+# GitHub -- pinned to commit
 ComfyUI_pinned = { github = "owner/repo", commit = "abc123def456" }
 
-# ComfyUI Registry — specific version
+# ComfyUI Registry -- specific version
 comfyui_essentials = { registry = "comfyui_essentials", version = "1.0.0" }
 
-# ComfyUI Registry — latest
+# ComfyUI Registry -- latest
 comfyui_essentials = { registry = "comfyui_essentials" }
 ```
 
@@ -141,7 +141,7 @@ Packages that need CUDA-aware resolution. comfy-env automatically detects the GP
 
 **PyTorch packages** (torch, torchvision, torchaudio) are added to pixi's `[pypi-dependencies]` with a per-package `index` URL pointing to the correct PyTorch wheel index (e.g., `https://download.pytorch.org/whl/cu128`). This means they're resolved alongside all other dependencies in a single pixi pass, avoiding version conflicts.
 
-**Custom CUDA packages** (nvdiffrast, pytorch3d, gsplat, etc.) are resolved from [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) — pre-built wheels matched by CUDA version, torch version, Python version, and platform. Installed via `uv pip install` after pixi. Falls back to PyPI if not in the index.
+**Custom CUDA packages** (nvdiffrast, pytorch3d, gsplat, etc.) are resolved from [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) -- pre-built wheels matched by CUDA version, torch version, Python version, and platform. Installed via `uv pip install` after pixi. Falls back to PyPI if not in the index.
 
 ### `[env_vars]`
 

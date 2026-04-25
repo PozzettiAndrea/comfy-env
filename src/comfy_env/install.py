@@ -268,7 +268,7 @@ def install(
     )
 
     if install_isolated:
-        # Workspace install — picks up every plugin's comfy-env.toml under custom_nodes/
+        # Workspace install -- picks up every plugin's comfy-env.toml under custom_nodes/
         from .environment.paths import get_comfyui_dir
         comfyui_dir = get_comfyui_dir(node_dir)
         if comfyui_dir is None:
@@ -280,7 +280,7 @@ def install(
         _install_to_main_env(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
 
     if not install_isolated and not install_main:
-        log("\n[comfy-env] Both install targets disabled — nothing to install")
+        log("\n[comfy-env] Both install targets disabled -- nothing to install")
 
     log("\nInstallation complete!")
     return True
@@ -402,7 +402,7 @@ def _install_to_main_env(
 
     if conda_warnings:
         for rel, pkgs in conda_warnings:
-            log(f"  WARNING: [{rel}] has conda deps ({', '.join(pkgs)}) — cannot install to main env")
+            log(f"  WARNING: [{rel}] has conda deps ({', '.join(pkgs)}) -- cannot install to main env")
 
     if not all_pypi and not cuda_packages:
         log("  No packages to install")
@@ -458,7 +458,7 @@ def _install_to_main_env(
 
 
 # ---------------------------------------------------------------------------
-# Workspace install — the heart of the new model
+# Workspace install -- the heart of the new model
 # ---------------------------------------------------------------------------
 
 def _resolve_workspace_torch(
@@ -481,13 +481,13 @@ def _resolve_workspace_torch(
     log(f"[comfy-env] GPU: {get_gpu_summary()}")
     cuda_version = get_recommended_cuda_version()
     if not cuda_version:
-        log("[comfy-env] No CUDA detected — using PyTorch CPU index")
+        log("[comfy-env] No CUDA detected -- using PyTorch CPU index")
         return cpu_index, None, None
 
     cu_tag = "cu" + cuda_version.replace(".", "")[:3]
     torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
     cuda_major = cuda_version.split(".")[0]
-    log(f"[comfy-env] CUDA {cuda_version} → torch index {torch_index}")
+    log(f"[comfy-env] CUDA {cuda_version} -> torch index {torch_index}")
     return torch_index, cuda_version, cuda_major
 
 
@@ -588,7 +588,7 @@ def _install_cuda_wheels(
                 log(f"[comfy-env]   WARNING: No wheel for {package} "
                     f"(cu{cuda_version}/torch{torch_ver}/py{py_version})")
                 continue
-            log(f"[comfy-env]   {package} ← {url}")
+            log(f"[comfy-env]   {package} <- {url}")
             cmd = [str(env_python), "-m", "pip", "install", "--no-deps", "--no-cache-dir", url]
             result = subprocess.run(cmd, capture_output=True, text=True)
             _log_subprocess(log, result, f"pip install {package} (env={env_name})")
@@ -615,7 +615,7 @@ def install_workspace(
     comfyui_dir = Path(comfyui_dir).resolve()
     discovered = _discover_node_configs(comfyui_dir)
     if not discovered:
-        log("[comfy-env] No custom-node comfy-env.toml files found — skipping workspace install")
+        log("[comfy-env] No custom-node comfy-env.toml files found -- skipping workspace install")
         return None
 
     workspace_dir = comfyui_dir / CE_WORKSPACE_DIR
@@ -634,7 +634,7 @@ def install_workspace(
                 rel = cf.relative_to(comfyui_dir)
             except ValueError:
                 rel = cf
-            log(f"  - {env_name} ← {rel} (python={cfg.python or 'host'})")
+            log(f"  - {env_name} <- {rel} (python={cfg.python or 'host'})")
 
         torch_index, cuda_version, cuda_major = _resolve_workspace_torch(log)
 
@@ -644,7 +644,7 @@ def install_workspace(
         )
 
         if dry_run:
-            log("[comfy-env] dry_run — skipping `pixi install`")
+            log("[comfy-env] dry_run -- skipping `pixi install`")
             return workspace_dir
 
         pixi_path = ensure_pixi(log=log)
@@ -690,7 +690,7 @@ def install_workspace(
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         # Multiple bundled libomps from pip wheels (torch, sklearn, pymeshlab,
         # ...) coexisting in the same process can SIGSEGV inside native filters
-        # — KMP_DUPLICATE_LIB_OK only suppresses the abort, not the corruption.
+        # -- KMP_DUPLICATE_LIB_OK only suppresses the abort, not the corruption.
         _dedupe_envs_libomp(workspace_dir, discovered, log)
 
         log(f"[comfy-env] Install log: {log_path}")
