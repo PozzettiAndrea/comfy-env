@@ -170,11 +170,18 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
 
 
 def _build_isolation_env_darwin(env: dict, python: Path) -> dict:
-    """macOS: add env's lib dir to DYLD_LIBRARY_PATH."""
+    """macOS: add env's lib dir to DYLD_FALLBACK_LIBRARY_PATH.
+
+    We use FALLBACK rather than DYLD_LIBRARY_PATH so absolute-path-linked
+    system libs (e.g. /usr/lib/libiconv.2.dylib used by bpy) keep resolving
+    to /usr/lib instead of being shadowed by conda-forge replicas inside the
+    pixi env. dyld only consults the fallback path when the explicit lookup
+    fails, which is the right behavior for a conda-style env on macOS.
+    """
     lib_dir = python.parent.parent / "lib"
     if lib_dir.is_dir():
-        existing = env.get("DYLD_LIBRARY_PATH", "")
-        env["DYLD_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+        existing = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
     return env
 
 
@@ -215,18 +222,119 @@ def _get_env_paths(env_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
     return (sp, lib) if sp and sp.exists() else (None, None)
 
 
-def _find_env_dir(node_dir: Path) -> Optional[Path]:
-    """Find _env_* directory in node_dir."""
+def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optional[Path]:
+    """Resolve the pixi env dir for a node config in the workspace model.
+
+    Looks up `<comfyui_dir>/.ce/.pixi/envs/<env_name>` based on the node's plugin
+    root and config path. Falls back to scanning for legacy `_env_*` symlinks if
+    the workspace dir doesn't exist (lets older installs keep working).
+    """
+    from ..environment.cache import get_env_name, get_workspace_env_dir
+
+    node_dir = Path(node_dir)
+
+    # Locate plugin root: walk up to the directory whose parent is `custom_nodes/`
+    plugin_dir = node_dir
+    for parent in node_dir.resolve().parents:
+        if parent.parent and parent.parent.name == "custom_nodes":
+            plugin_dir = parent
+            break
+
+    # Find ComfyUI base
     try:
-        for item in node_dir.iterdir():
-            if item.name.startswith("_env_") and item.is_dir():
-                # On Windows, resolve junctions to keep paths under MAX_PATH for LoadLibrary
-                if sys.platform == "win32":
-                    return item.resolve()
-                return item
-    except OSError:
-        pass
+        from ..environment.paths import get_comfyui_dir
+        comfyui_dir = get_comfyui_dir(node_dir)
+    except Exception:
+        comfyui_dir = None
+
+    if comfyui_dir is None:
+        # Legacy fallback: scan for _env_*
+        try:
+            for item in node_dir.iterdir():
+                if item.name.startswith("_env_") and item.is_dir():
+                    return item.resolve() if sys.platform == "win32" else item
+        except OSError:
+            pass
+        return None
+
+    if config_path is None:
+        for cand in ("comfy-env.toml", "comfy-env-root.toml"):
+            if (node_dir / cand).exists():
+                config_path = node_dir / cand
+                break
+        if config_path is None:
+            return None
+
+    env_name = get_env_name(plugin_dir, config_path)
+    env_dir = get_workspace_env_dir(comfyui_dir, env_name)
+    if env_dir.exists():
+        return env_dir.resolve() if sys.platform == "win32" else env_dir
     return None
+
+
+def _get_python_version(env_dir: Path) -> Optional[str]:
+    python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
+    if not python.exists(): return None
+    try:
+        import subprocess
+        r = subprocess.run([str(python), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+                          capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception: return None
+
+
+def _get_host_torch_sp() -> Optional[Path]:
+    """Get the host's site-packages directory containing torch, or None if torch isn't imported."""
+    try:
+        import torch
+        return Path(torch.__file__).parent.parent
+    except (ImportError, AttributeError):
+        return None
+
+
+def _share_torch_opt_in() -> bool:
+    """Whether the user has opted in to legacy share_torch via env var."""
+    return os.environ.get("COMFY_ENV_USE_SHARE_TORCH", "").lower() in ("1", "true", "yes")
+
+
+def _should_share_torch(env_dir: Path) -> bool:
+    """Decide if host torch should be shared with this worker env.
+
+    Disabled by default in the workspace model — torch is provided by the
+    `comfyui` feature in the workspace's pixi.toml. Set `COMFY_ENV_USE_SHARE_TORCH=1`
+    to re-enable the legacy host-symlink path (e.g. for zero-copy CUDA IPC scenarios).
+    """
+    if not _share_torch_opt_in():
+        return False
+
+    host_torch_sp = _get_host_torch_sp()
+    if host_torch_sp is None:
+        if _DBG_WORKER:
+            _log("[comfy-env] share_torch: host has no torch, not sharing")
+        return False
+
+    host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    worker_version = _get_python_version(env_dir)
+    if worker_version is None:
+        if _DBG_WORKER:
+            _log(f"[comfy-env] share_torch: could not detect worker python in {env_dir}, not sharing")
+        return False
+
+    if host_version != worker_version:
+        if _DBG_WORKER:
+            _log(f"[comfy-env] share_torch: host={host_version} != worker={worker_version}, not sharing")
+        return False
+
+    sp, _ = _get_env_paths(env_dir)
+    if sp:
+        env_torch = sp / "torch"
+        if env_torch.is_dir():
+            if _DBG_WORKER:
+                _log(f"[comfy-env] share_torch: env has own torch at {env_torch}, not sharing")
+            return False
+
+    _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, sharing")
+    return True
 
 
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
@@ -624,7 +732,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     for cf in config_files:
         if cf.name == "comfy-env-root.toml":
             continue
-        env_dir = _find_env_dir(cf.parent)
+        env_dir = _find_env_dir(cf.parent, config_path=cf)
         if not env_dir:
             continue
         sp, lib = _get_env_paths(env_dir)
@@ -644,6 +752,14 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
+        # Determine if this env should inherit host torch
+        share_torch_active = _should_share_torch(env_dir)
+        host_torch_sp = _get_host_torch_sp() if share_torch_active else None
+
+        if share_torch_active and host_torch_sp:
+            _log(f"[comfy-env] {cf.parent.name}: sharing host torch from {host_torch_sp}")
+            env_vars["_COMFY_ENV_HOST_SP"] = str(host_torch_sp)
+
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
             "dir": cf.parent,
@@ -653,6 +769,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             "env_vars": env_vars,
             "health_check_timeout": health_check_timeout,
             "package_root": package_root,
+            "share_torch": share_torch_active,
+            "host_torch_sp": host_torch_sp,
         }
 
     if _DBG_WORKER:
@@ -712,6 +830,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 package_name=nodes_package,
                 working_dir=pkg_dir,
                 env_vars=env["env_vars"],
+                host_torch_sp=env.get("host_torch_sp"),
             )
             root_nodes = root_meta.get("nodes", {})
             root_display = root_meta.get("display", {})
@@ -805,6 +924,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     package_name=package_name,
                     working_dir=pkg_dir,
                     env_vars=env["env_vars"],
+                    host_torch_sp=env.get("host_torch_sp"),
                 )
 
             with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:

@@ -1,17 +1,25 @@
-"""Generate pixi.toml from ComfyEnvConfig."""
+"""Generate the workspace pixi.toml from ComfyUI requirements + per-node configs.
+
+Workspace model:
+- One pixi workspace per ComfyUI install at `<comfyui_dir>/.ce/pixi.toml`.
+- `[feature.comfyui.pypi-dependencies]` is parsed from `<comfyui_dir>/requirements.txt`
+  with torch/torchvision/torchaudio pointed at the resolved CUDA/CPU index.
+- `[feature.py<XY>.dependencies]` per python version actually requested by any node.
+- `[feature.<env_name>.*]` per node config.
+- `[environments]` composes (pyXY + comfyui + node) per env, all `no-default-feature = true`.
+"""
 
 import copy
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..config import ComfyEnvConfig
-from ..detection import get_recommended_cuda_version, get_pixi_platform
-from .cuda_wheels import CUDA_TORCH_MAP
+from ..detection import get_pixi_platform
 
-# Torch bundle packages that can be inherited from the host
-_TORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
+
+_TORCH_PKGS = {"torch", "torchvision", "torchaudio"}
 
 
 def _require_tomli_w():
@@ -22,135 +30,331 @@ def _require_tomli_w():
         raise ImportError("tomli-w required: pip install tomli-w")
 
 
-def generate_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
-                       cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
-                       force_install_torch: bool = False) -> str:
-    return _require_tomli_w().dumps(config_to_pixi_dict(cfg, node_dir, log,
-                                                         cuda_override=cuda_override, torch_override=torch_override,
-                                                         force_install_torch=force_install_torch))
+# ---------------------------------------------------------------------------
+# requirements.txt parsing
+# ---------------------------------------------------------------------------
+
+_REQ_LINE_RE = re.compile(
+    r"""
+    ^
+    (?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)              # package name
+    (?: \[ (?P<extras>[^\]]+) \] )?                   # optional [extras]
+    (?P<spec>                                          # version spec(s)
+        (?:\s*(?:==|>=|<=|>|<|~=|!=)\s*[^,\s;#]+)*
+    )?
+    \s*$
+    """,
+    re.VERBOSE,
+)
 
 
-def write_pixi_toml(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
-                    cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
-                    force_install_torch: bool = False) -> Path:
+def _normalize_spec(spec: str) -> str:
+    """Compact a comma-joined version spec by stripping spaces. ' >= 1.2 ' -> '>=1.2'."""
+    return spec.strip().replace(" ", "")
+
+
+def parse_requirement_line(line: str) -> Optional[Tuple[str, Any]]:
+    """Parse one pip requirement line into a (name, pixi-spec) pair.
+
+    Returns None for blank lines, comments, options (`-r`, `--index-url`, etc.),
+    and lines that don't match the simple pattern (e.g. URL-only entries we don't
+    yet translate).
+
+    Examples:
+        "torch==2.8.0"             -> ("torch", "==2.8.0")
+        "numpy>=1.25.0"            -> ("numpy", ">=1.25.0")
+        "Pillow"                   -> ("Pillow", "*")
+        "trimesh[easy]>=4.0.0"     -> ("trimesh", {"version": ">=4.0.0", "extras": ["easy"]})
+        "pydantic~=2.0"            -> ("pydantic", "~=2.0")
+        "# comment"                -> None
+    """
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    # Strip trailing inline comment (# is only a comment if preceded by whitespace
+    # or at start; pip requirements use ; for env markers but those are also dropped here)
+    text = text.split(";", 1)[0].strip()
+    if not text:
+        return None
+    if " #" in text:
+        text = text.split(" #", 1)[0].strip()
+    if text.startswith("-"):
+        return None  # options handled by caller (-r, --index-url, etc.)
+    if "://" in text or text.startswith("git+"):
+        # URL/VCS entries: skip — pixi has a separate syntax for these. Caller
+        # can handle them out-of-band if needed.
+        return None
+    m = _REQ_LINE_RE.match(text)
+    if not m:
+        return None
+    name = m.group("name")
+    extras_str = m.group("extras") or ""
+    extras = [e.strip() for e in extras_str.split(",") if e.strip()]
+    spec = _normalize_spec(m.group("spec") or "")
+    if not spec:
+        spec = "*"
+    if extras:
+        return name, {"version": spec, "extras": extras}
+    return name, spec
+
+
+def parse_comfyui_requirements(
+    comfyui_dir: Path,
+    torch_index: Optional[str],
+    log: Callable[[str], None] = print,
+    _seen: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Read `<comfyui_dir>/requirements.txt` and produce a pixi pypi-dependencies dict.
+
+    torch/torchvision/torchaudio entries get `index = torch_index` attached so uv
+    fetches them from the pytorch wheel index (CPU or CUDA, decided once for the
+    workspace). `-r other.txt` lines are followed recursively.
+    """
+    _seen = _seen if _seen is not None else set()
+    req_file = Path(comfyui_dir) / "requirements.txt"
+    return _parse_requirements_file(req_file, torch_index, log, _seen)
+
+
+def _parse_requirements_file(
+    req_file: Path,
+    torch_index: Optional[str],
+    log: Callable[[str], None],
+    seen: set,
+) -> Dict[str, Any]:
+    if not req_file.exists():
+        log(f"[comfy-env] WARNING: {req_file} not found — comfyui feature will be empty")
+        return {}
+    real = req_file.resolve()
+    if real in seen:
+        return {}
+    seen.add(real)
+
+    out: Dict[str, Any] = {}
+    for raw in req_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-r ") or line.startswith("--requirement "):
+            sub = line.split(maxsplit=1)[1].strip()
+            sub_path = (req_file.parent / sub).resolve()
+            out.update(_parse_requirements_file(sub_path, torch_index, log, seen))
+            continue
+        if line.startswith("--index-url") or line.startswith("--extra-index-url") or line.startswith("-i "):
+            log(f"[comfy-env] Note: ignoring index directive in {req_file.name}: {line}")
+            continue
+        if line.startswith("-"):
+            continue
+        parsed = parse_requirement_line(line)
+        if parsed is None:
+            log(f"[comfy-env] WARNING: skipping unparseable requirement: {line!r}")
+            continue
+        name, spec = parsed
+        # Attach torch index for torch family
+        if name.lower() in _TORCH_PKGS and torch_index:
+            if isinstance(spec, dict):
+                spec = {**spec, "index": torch_index}
+            else:
+                spec = {"version": spec, "index": torch_index}
+        out[name] = spec
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Workspace builder
+# ---------------------------------------------------------------------------
+
+def _python_feature_name(version: str) -> str:
+    """3.11 -> py311, 3.13 -> py313."""
+    parts = version.split(".")
+    return "py" + parts[0] + parts[1]
+
+
+def _build_python_feature(version: str) -> Dict[str, Any]:
+    return {
+        "dependencies": {
+            "python": f"{version}.*",
+            "pip": "*",
+            "setuptools": ">=75.0,<82",
+        }
+    }
+
+
+def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
+    """Reject node configs that try to redefine workspace-global torch."""
+    bad = [p for p in cfg.cuda_packages if p in _TORCH_PKGS]
+    if bad:
+        raise ValueError(
+            f"[{name}] comfy-env.toml has {bad} under [cuda] packages. "
+            "Plain torch/torchvision/torchaudio are now provided by the "
+            "workspace's `comfyui` feature (parsed from <ComfyUI>/requirements.txt). "
+            "Remove them from [cuda] packages — keep only CUDA-only wheels there "
+            "(cumesh, flash-attn, cc_torch, nvdiffrast, etc.)."
+        )
+
+
+def _strip_torch_family(
+    table: Dict[str, Any],
+    name: str,
+    where: str,
+    log: Callable[[str], None],
+) -> None:
+    """Remove plain torch/torchvision/torchaudio entries from a deps table in place.
+
+    Torch family is workspace-global (provided by the `comfyui` feature). Per-node
+    declarations are silently stripped with a one-line note.
+    """
+    for k in list(table.keys()):
+        if k.lower() in _TORCH_PKGS:
+            del table[k]
+            log(f"[comfy-env] {name}: ignoring `{k}` in {where} (provided by workspace `comfyui` feature)")
+
+
+def _build_node_feature(
+    cfg: ComfyEnvConfig, name: str, log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Emit a pixi `[feature.<name>.*]` block from a node's ComfyEnvConfig.
+
+    Only carries node-specific deps. Python pin lives in the pyXY feature; torch
+    lives in the comfyui feature. No platform gates — pypi index resolution
+    handles wheel selection. Plain torch/torchvision/torchaudio entries are
+    stripped (workspace-global from the `comfyui` feature).
+    """
+    feat: Dict[str, Any] = {}
+
+    deps = copy.deepcopy(cfg.pixi_passthrough.get("dependencies", {}))
+    if deps:
+        _strip_torch_family(deps, name, "[dependencies]", log)
+        if deps:
+            feat["dependencies"] = deps
+
+    pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
+    if pypi:
+        _strip_torch_family(pypi, name, "[pypi-dependencies]", log)
+        if pypi:
+            feat["pypi-dependencies"] = pypi
+
+    # Per-target sections (only the current platform's), with torch family also stripped
+    targets = cfg.pixi_passthrough.get("target", {})
+    current = get_pixi_platform()
+    if current in targets:
+        cur_target = copy.deepcopy(targets[current])
+        for tbl in ("dependencies", "pypi-dependencies"):
+            if tbl in cur_target:
+                _strip_torch_family(
+                    cur_target[tbl], name,
+                    f"[target.{current}.{tbl}]", log,
+                )
+                if not cur_target[tbl]:
+                    del cur_target[tbl]
+        if cur_target:
+            feat.setdefault("target", {})[current] = cur_target
+
+    return feat
+
+
+def build_workspace_toml(
+    comfyui_dir: Path,
+    torch_index: Optional[str],
+    cuda_major: Optional[str],
+    node_configs: List[Tuple[str, ComfyEnvConfig]],  # (env_name, cfg) pairs
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Assemble the full workspace pixi.toml as a dict.
+
+    Args:
+        comfyui_dir: ComfyUI install root (used to find requirements.txt).
+        torch_index: PyPI index URL for torch wheels (e.g. ".../whl/cpu" or ".../whl/cu124").
+        cuda_major: Major CUDA version for `[system-requirements]` (e.g. "12"). None on CPU.
+        node_configs: List of (env_name, ComfyEnvConfig) — one entry per environment to create.
+    """
+    host_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    current_platform = get_pixi_platform()
+
+    # Validate first so we fail fast on bad node configs
+    for name, cfg in node_configs:
+        _validate_node_config(name, cfg)
+
+    out: Dict[str, Any] = {
+        "workspace": {
+            "name": "comfy-env",
+            "version": "0.1.0",
+            "channels": ["conda-forge"],
+            "platforms": [current_platform],
+        }
+    }
+
+    # comfyui baseline feature
+    comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
+    feature_comfyui: Dict[str, Any] = {}
+    if comfyui_pypi:
+        feature_comfyui["pypi-dependencies"] = comfyui_pypi
+    if cuda_major:
+        feature_comfyui["system-requirements"] = {"cuda": cuda_major}
+    if sys.platform.startswith("linux"):
+        feature_comfyui.setdefault("system-requirements", {}).setdefault(
+            "libc", {"family": "glibc", "version": "2.35"}
+        )
+    out["feature"] = {"comfyui": feature_comfyui}
+
+    # Per-python features
+    py_versions: Dict[str, str] = {}  # version -> feature_name
+    for _, cfg in node_configs:
+        v = cfg.python or host_py
+        py_versions.setdefault(v, _python_feature_name(v))
+    for v, fname in py_versions.items():
+        out["feature"][fname] = _build_python_feature(v)
+
+    # Per-node features
+    for env_name, cfg in node_configs:
+        feat = _build_node_feature(cfg, env_name, log)
+        if feat:
+            out["feature"][env_name] = feat
+        # if a node has zero pixi-passthrough deps, still create an (empty) feature
+        # so the env composes correctly.
+        else:
+            out["feature"][env_name] = {}
+
+    # Environments table
+    environments: Dict[str, Any] = {}
+    for env_name, cfg in node_configs:
+        v = cfg.python or host_py
+        py_feature = py_versions[v]
+        environments[env_name] = {
+            "features": [py_feature, "comfyui", env_name],
+            "no-default-feature": True,
+            "solve-group": py_feature,
+        }
+    out["environments"] = environments
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Top-level write entry point
+# ---------------------------------------------------------------------------
+
+def write_workspace_pixi_toml(
+    workspace_dir: Path,
+    comfyui_dir: Path,
+    torch_index: Optional[str],
+    cuda_major: Optional[str],
+    node_configs: List[Tuple[str, ComfyEnvConfig]],
+    log: Callable[[str], None] = print,
+) -> Path:
+    """Generate `<workspace_dir>/pixi.toml` from the parts above. Returns the file path."""
     tomli_w = _require_tomli_w()
-    pixi_toml = node_dir / "pixi.toml"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    pixi_toml = workspace_dir / "pixi.toml"
+    data = build_workspace_toml(comfyui_dir, torch_index, cuda_major, node_configs, log)
     with open(pixi_toml, "wb") as f:
-        tomli_w.dump(config_to_pixi_dict(cfg, node_dir, log,
-                                          cuda_override=cuda_override, torch_override=torch_override,
-                                          force_install_torch=force_install_torch), f)
+        tomli_w.dump(data, f)
     log(f"Generated {pixi_toml}")
     return pixi_toml
 
 
-def config_to_pixi_dict(cfg: ComfyEnvConfig, node_dir: Path, log: Callable[[str], None] = print,
-                        cuda_override: Optional[str] = None, torch_override: Optional[str] = None,
-                        force_install_torch: bool = True) -> Dict[str, Any]:
-    pixi_data = copy.deepcopy(cfg.pixi_passthrough)
-
-    # Detect CUDA/PyTorch versions and compute PyTorch index URL.
-    # Overrides allow the install logic to force a specific combo (e.g. fallback to cu128/2.8,
-    # or CPU mode matching the main env's torch version via `torch_override` with no cuda).
-    cuda_version = torch_version = pytorch_index = None
-    if cfg.has_cuda and sys.platform != "darwin":
-        cuda_version = cuda_override or get_recommended_cuda_version()
-        if cuda_version:
-            torch_version = torch_override or CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]), "2.8")
-            pytorch_index = f"https://download.pytorch.org/whl/cu{cuda_version.replace('.', '')[:3]}"
-            log(f"CUDA {cuda_version} -> PyTorch {torch_version}")
-        else:
-            # CPU mode: use torch_override if the caller detected a main-env torch version,
-            # otherwise let the downstream fallback kick in.
-            torch_version = torch_override
-            pytorch_index = "https://download.pytorch.org/whl/cpu"
-            if torch_version:
-                log(f"No GPU detected - using PyTorch CPU index, matching torch {torch_version}")
-            else:
-                log("No GPU detected - using PyTorch CPU index")
-
-    # Pixi always installs its own torch into each isolation env.
-    # Add PyTorch packages to pypi-dependencies with per-package index.
-    # This lets pixi resolve torch alongside all other deps in a single pass.
-    torchvision_map = {
-        "2.4": "0.19", "2.5": "0.20", "2.6": "0.21",
-        "2.7": "0.22", "2.8": "0.23", "2.9": "0.24", "2.10": "0.25",
-        "2.11": "0.26",
-    }
-
-    if cfg.cuda_packages and sys.platform != "darwin" and pytorch_index:
-        pypi_deps = pixi_data.setdefault("pypi-dependencies", {})
-        pin_version = torch_version or "2.8"
-
-        # Explicit torch pin with the CUDA index so pixi doesn't pull in CPU-only torch
-        # as a transitive dep (e.g. from timm).
-        pypi_deps["torch"] = {"version": f"=={pin_version}.*", "index": pytorch_index}
-        tv_ver = torchvision_map.get(pin_version, "0.23")
-        pypi_deps["torchvision"] = {"version": f"=={tv_ver}.*", "index": pytorch_index}
-        log(f"  torch=={pin_version}.* torchvision=={tv_ver}.* from {pytorch_index}")
-
-        for pkg in cfg.cuda_packages:
-            if pkg in _TORCH_PACKAGES:
-                if pkg == "torchvision":
-                    ver = torchvision_map.get(pin_version, "0.23")
-                else:
-                    ver = pin_version
-                pypi_deps[pkg] = {"version": f"=={ver}.*", "index": pytorch_index}
-
-    # Workspace
-    workspace = pixi_data.setdefault("workspace", {})
-    workspace.setdefault("name", node_dir.name)
-    workspace.setdefault("version", "0.1.0")
-    workspace.setdefault("channels", ["conda-forge"])
-    current_platform = get_pixi_platform()
-    workspace.setdefault("platforms", [current_platform])
-
-    # Strip target sections for other platforms (pixi errors on unmatched targets)
-    if "target" in pixi_data:
-        non_matching = [k for k in pixi_data["target"] if k != current_platform]
-        for k in non_matching:
-            del pixi_data["target"][k]
-        if not pixi_data["target"]:
-            del pixi_data["target"]
-
-    # System requirements
-    if sys.platform.startswith("linux") or cuda_version:
-        system_reqs = pixi_data.setdefault("system-requirements", {})
-        if sys.platform.startswith("linux"):
-            system_reqs.setdefault("libc", {"family": "glibc", "version": "2.35"})
-        if cuda_version:
-            system_reqs["cuda"] = cuda_version.split(".")[0]
-
-    # Dependencies
-    dependencies = pixi_data.setdefault("dependencies", {})
-    py_version = cfg.python or f"{sys.version_info.major}.{sys.version_info.minor}"
-    dependencies.setdefault("python", f"{py_version}.*")
-    dependencies.setdefault("pip", "*")
-
-    # Pin setuptools in conda deps (not pypi) to avoid pypi/conda version conflicts.
-    # Range >=75.0,<82 satisfies both:
-    #   - >=75.0 fixes conda-forge Python version string parsing
-    #   - <82 satisfies torch (>=2.10) which requires setuptools<82
-    dependencies.setdefault("setuptools", ">=75.0,<82")
-
-    # Windows only: force libblas to the OpenBLAS variant so conda-forge doesn't pull in
-    # mkl -> llvm-openmp -> Library\bin\libiomp5md.dll. That DLL shares the filename of
-    # PyTorch's bundled Intel-OpenMP libiomp5md.dll but exports a different (smaller) symbol
-    # set and causes fbgemm.dll to fail with WinError 127 on 'import torch' inside workers
-    # (the _vcomp_* symbols fbgemm imports only exist in the Intel build shipped with torch).
-    # Using setdefault so author overrides in comfy-env.toml still win.
-    if sys.platform == "win32":
-        dependencies.setdefault("libblas", {"version": "*", "build": "*openblas*"})
-
-    # On macOS, strip CUDA-specific pypi deps (e.g. cumm-cu121, spconv-cu121)
-    if sys.platform == "darwin":
-        pypi_deps = pixi_data.get("pypi-dependencies", {})
-        cuda_pkgs = [k for k in pypi_deps if re.search(r"-cu\d+", k)]
-        for k in cuda_pkgs:
-            del pypi_deps[k]
-            log(f"  Skipping {k} (CUDA-only, no macOS wheels)")
-
-    return pixi_data
-
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result = copy.deepcopy(base)

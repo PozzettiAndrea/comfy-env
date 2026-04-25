@@ -19,8 +19,9 @@ from .cuda_wheels import (
     get_cuda_torch_mapping,
 )
 from .toml_generator import (
-    generate_pixi_toml,
-    config_to_pixi_dict,
+    build_workspace_toml,
+    write_workspace_pixi_toml,
+    parse_comfyui_requirements,
 )
 from .apt import (
     apt_install,
@@ -46,8 +47,9 @@ __all__ = [
     "find_available_wheels",
     "get_cuda_torch_mapping",
     # TOML generation
-    "generate_pixi_toml",
-    "config_to_pixi_dict",
+    "build_workspace_toml",
+    "write_workspace_pixi_toml",
+    "parse_comfyui_requirements",
     # APT packages
     "apt_install",
     "check_apt_packages",
