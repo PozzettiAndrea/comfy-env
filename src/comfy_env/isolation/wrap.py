@@ -177,11 +177,18 @@ def _build_isolation_env_darwin(env: dict, python: Path) -> dict:
     to /usr/lib instead of being shadowed by conda-forge replicas inside the
     pixi env. dyld only consults the fallback path when the explicit lookup
     fails, which is the right behavior for a conda-style env on macOS.
+
+    KMP_DUPLICATE_LIB_OK=TRUE: the parent venv often ships pip-built libs
+    with their own bundled libomp.dylib (cv2, scipy, etc.), and the pixi env
+    has conda-forge's libomp. When meta-scan or worker imports pull in both,
+    libomp aborts (OMP: Error #15). KMP_DUPLICATE_LIB_OK is the official
+    Intel-OpenMP escape hatch and is already set on win32 (line 161).
     """
     lib_dir = python.parent.parent / "lib"
     if lib_dir.is_dir():
         existing = env.get("DYLD_FALLBACK_LIBRARY_PATH", "")
         env["DYLD_FALLBACK_LIBRARY_PATH"] = f"{lib_dir}:{existing}" if existing else str(lib_dir)
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     return env
 
 
