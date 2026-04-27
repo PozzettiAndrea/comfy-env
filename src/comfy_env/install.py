@@ -493,6 +493,19 @@ def _resolve_workspace_torch(
     torch_version = get_bootstrap_torch_version()
     bootstrap_cuda = get_bootstrap_torch_cuda()
 
+    # Portable ComfyUI ships torch+cu128 inside python_embeded, so bootstrap_cuda
+    # is "12.8" even on a hosted runner with no NVIDIA driver. Treat it as
+    # CPU-only when no GPU is actually present -- otherwise pixi installs cu*
+    # wheels into every env and `import torch` later dies with WinError 127
+    # (or its Linux equivalent) trying to load shm.dll / libtorch_cuda.so.
+    from .detection.cuda import has_nvidia_gpu
+    if bootstrap_cuda and not has_nvidia_gpu():
+        log(
+            f"[comfy-env] Bootstrap torch is cu{bootstrap_cuda.replace('.', '')[:3]} "
+            f"but no NVIDIA GPU detected -- ignoring cuda tag, using CPU index"
+        )
+        bootstrap_cuda = None
+
     if torch_version:
         log(
             f"[comfy-env] Bootstrap python={python_version} torch={torch_version}"
