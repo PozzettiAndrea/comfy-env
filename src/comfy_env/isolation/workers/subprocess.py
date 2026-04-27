@@ -2195,6 +2195,23 @@ def main():
         return
     wlog("[worker] Got config, setting up paths...")
 
+    # When COMFY_ENV_DEBUG_WORKER is on, dump every env var the worker process
+    # sees at startup. This is the only reliable way to diff the failing
+    # ComfyUI-spawned worker against a known-passing standalone `pixi run` and
+    # find which inherited env var is poisoning torch's DLL graph.
+    if os.environ.get("COMFY_ENV_DEBUG_WORKER", "").lower() in ("1", "true", "yes"):
+        wlog(f"[worker] os.environ has {len(os.environ)} entries:")
+        for _k in sorted(os.environ.keys()):
+            _v = os.environ[_k]
+            if len(_v) > 200:
+                _v = _v[:200] + "...(truncated)"
+            wlog(f"[worker]   {_k}={_v}")
+        wlog(f"[worker] sys.executable={sys.executable}")
+        wlog(f"[worker] sys.prefix={sys.prefix}")
+        wlog(f"[worker] sys.path entries: {len(sys.path)}")
+        for _i, _p in enumerate(sys.path):
+            wlog(f"[worker]   sys.path[{_i}]={_p}")
+
     # Setup sys.path
     for p in config.get("sys_paths", []):
         if p not in sys.path:
@@ -2953,47 +2970,41 @@ class SubprocessWorker(Worker):
         print(f"[{self.name}] sys_path sent to worker: {all_sys_path}", flush=True)
 
         # Launch subprocess with the venv/pixi Python, passing socket address.
-        # For pixi environments, we set up the conda env vars manually instead of
-        # using "pixi run" -- "pixi run" re-resolves the lockfile every call, which
-        # adds noticeable latency for short-lived workers.
+        # For pixi environments, route through `pixi run -e <env> --frozen` so
+        # pixi handles activation (PATH, CONDA_PREFIX, [activation.env] vars
+        # like KMP_DUPLICATE_LIB_OK, libomp/MKL setup). Hand-rolling the
+        # activation worked for PATH but missed the [activation.env] block,
+        # which is what set KMP_DUPLICATE_LIB_OK=TRUE — without it, torch's
+        # OMP guard or delay-loaded DLLs failed at `import torch` with
+        # WinError 127 / OMP Error #15. `--frozen` avoids re-resolving the
+        # lockfile per worker (the original perf concern).
         is_pixi = '.pixi' in str(self.python)
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
-            # The interpreter sits at <workspace>/.pixi/envs/<env_name>/python.exe
-            # (Windows) or .../bin/python (POSIX). Use the actual env that owns
-            # self.python — never hardcode "default", or a cp313 worker ends up
-            # with a cp310 env's site-packages on PATH (cross-ABI DLL crashes).
+            # <workspace>/.pixi/envs/<env_name>/python.exe (Windows) or
+            # <workspace>/.pixi/envs/<env_name>/bin/python (POSIX). Walk up to
+            # find the workspace dir (parent of `.pixi/`) and the env name.
             if sys.platform == "win32":
                 pixi_env_root = self.python.parent
             else:
                 pixi_env_root = self.python.parent.parent
+            env_name = pixi_env_root.name
+            # pixi_env_root is <workspace>/.pixi/envs/<env_name>; walk up 3 levels.
+            workspace_dir = pixi_env_root.parent.parent.parent
 
-            cmd = [str(self.python), str(self._worker_script), self._socket_addr]
+            try:
+                from ...packages.pixi import ensure_pixi
+                pixi_path = ensure_pixi(log=lambda m: None)
+            except Exception:
+                pixi_path = "pixi"  # fall back to PATH lookup
 
-            # Set up conda-like env vars that pixi run would normally provide
-            env["CONDA_PREFIX"] = str(pixi_env_root)
-
-            # Build PATH: pixi env paths first, then cleaned system PATH
-            path_sep = ";" if sys.platform == "win32" else ":"
-            current_path = env.get("PATH", "")
-            clean_path_parts = [
-                p for p in current_path.split(path_sep)
-                if not any(x in p.lower() for x in (".ct-envs", "conda", "mamba", "miniforge", "miniconda", "anaconda"))
+            cmd = [
+                str(pixi_path), "run", "--frozen",
+                "--manifest-path", str(workspace_dir / "pixi.toml"),
+                "-e", env_name,
+                "python", str(self._worker_script), self._socket_addr,
             ]
-            if sys.platform == "win32":
-                pixi_paths = [
-                    str(pixi_env_root),
-                    str(pixi_env_root / "Library" / "mingw-w64" / "bin"),
-                    str(pixi_env_root / "Library" / "usr" / "bin"),
-                    str(pixi_env_root / "Library" / "bin"),
-                    str(pixi_env_root / "Scripts"),
-                ]
-            else:
-                pixi_paths = [
-                    str(pixi_env_root / "bin"),
-                ]
-            env["PATH"] = path_sep.join(pixi_paths + clean_path_parts)
             launch_env = env
         else:
             cmd = [str(self.python), str(self._worker_script), self._socket_addr]
@@ -3009,6 +3020,16 @@ class SubprocessWorker(Worker):
                     print(f"[SubprocessWorker]   [{i}] {p}", flush=True)
                 if len(path_parts) > 10:
                     print(f"[SubprocessWorker]   ... and {len(path_parts) - 10} more", flush=True)
+                # Full env dump so we can diff what was passed in vs what the
+                # worker actually sees post-pixi-activation. The diff identifies
+                # leaky inherited env vars from python_embeded.
+                _keys = sorted(launch_env.keys())
+                print(f"[SubprocessWorker] launch_env has {len(_keys)} entries:", flush=True)
+                for _k in _keys:
+                    _v = launch_env[_k]
+                    if len(_v) > 200:
+                        _v = _v[:200] + "...(truncated)"
+                    print(f"[SubprocessWorker]   {_k}={_v}", flush=True)
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,

@@ -211,13 +211,26 @@ def _strip_torch_family(
 
 def _build_node_feature(
     cfg: ComfyEnvConfig, name: str, log: Callable[[str], None] = print,
+    auto_overrides: Optional[Dict[str, Dict[str, str]]] = None,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Emit a pixi `[feature.<name>.*]` block from a node's ComfyEnvConfig.
 
     Only carries node-specific deps. Python pin lives in the pyXY feature; torch
     lives in the comfyui feature. No platform gates -- pypi index resolution
     handles wheel selection. Plain torch/torchvision/torchaudio entries are
-    stripped (workspace-global from the `comfyui` feature).
+    stripped from `[dependencies]`/`[pypi-dependencies]` (workspace-global from
+    the `comfyui` feature).
+
+    `pypi-options` from the node's `comfy-env.toml` is passed through verbatim.
+    A node author can express `[pypi-options.dependency-overrides]` to redirect
+    torch (or any package) resolution within their per-node env independently
+    of the comfyui workspace pin.
+
+    `auto_overrides`, when given, is a `{pkg: {version, index}}` map populated
+    by `build_workspace_toml` when the resolved cuda-wheel combo diverges from
+    bootstrap. It's merged into `pypi-options.dependency-overrides`, with any
+    manual override from the node's `comfy-env.toml` winning on conflict.
     """
     feat: Dict[str, Any] = {}
 
@@ -249,30 +262,50 @@ def _build_node_feature(
         if cur_target:
             feat.setdefault("target", {})[current] = cur_target
 
+    if cuda_wheel_urls:
+        pypi = feat.setdefault("pypi-dependencies", {})
+        for pkg, url in cuda_wheel_urls.items():
+            pypi[pkg] = {"url": url}
+        log(
+            f"[comfy-env] {name}: cuda-wheels inlined as pypi-dependencies "
+            f"({', '.join(cuda_wheel_urls.keys())})"
+        )
+
+    pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+    if auto_overrides:
+        manual = pypi_options.get("dependency-overrides", {}) or {}
+        merged = {**auto_overrides, **manual}  # manual entries shadow auto-emitted
+        if merged:
+            pypi_options["dependency-overrides"] = merged
+        # one-line summary instead of three per node
+        any_spec = next(iter(auto_overrides.values()), None)
+        idx = (any_spec or {}).get("index", "")
+        ver_summary = ", ".join(
+            f"{p}{(s or {}).get('version', '')}" for p, s in auto_overrides.items()
+        )
+        shadowed = sorted(set(auto_overrides) & set(manual))
+        shadow_note = f" (overridden by comfy-env.toml: {', '.join(shadowed)})" if shadowed else ""
+        log(
+            f"[comfy-env] {name}: torch override -> {ver_summary} from {idx}"
+            f"{shadow_note}"
+        )
+    if pypi_options:
+        feat["pypi-options"] = pypi_options
+
     return feat
 
 
-def _pin_torch_family(
-    pypi: Dict[str, Any],
+def _torch_family_pins(
     torch_pin: Optional[str],
     log: Callable[[str], None],
-) -> None:
-    """Pin torch and derive matching torchvision/torchaudio pins from TORCH_FAMILY_COMPAT.
+) -> Optional[Dict[str, str]]:
+    """Return {torch: <pin>, torchvision: <pin>, torchaudio: <pin>} from TORCH_FAMILY_COMPAT.
 
-    `torch_pin` is a PEP 440 spec like `"==2.11.0"` (tier-1) or `"==2.8.*"` (tier-2
-    fallback). The torch INDEX (cu{NN} / cpu) was attached upstream by
-    parse_comfyui_requirements; here we just clamp versions so per-node envs
-    hardlink-share an identical torch family with the comfyui template env.
-
-    torchvision and torchaudio have their own version numbering (torch 2.11 pairs
-    with torchvision 0.26 and torchaudio 2.11), so the siblings come from the
-    compat table rather than reusing torch's literal version string. If torch's
-    minor isn't in the table, only torch is pinned and a warning is logged.
-
-    No-op when `torch_pin` is None.
+    Returns None when `torch_pin` is None. Returns a partial map (`{"torch": pin}` only)
+    when torch's minor isn't in the compat table, with a warning logged.
     """
     if not torch_pin:
-        return
+        return None
     from .cuda_wheels import derive_family_pins
     family = derive_family_pins(torch_pin)
     if family is None:
@@ -280,11 +313,30 @@ def _pin_torch_family(
             f"[comfy-env] WARNING: torch_pin {torch_pin} not in TORCH_FAMILY_COMPAT; "
             f"pinning torch only, leaving torchvision/torchaudio unpinned"
         )
-        pin_map = {"torch": torch_pin}
-    else:
-        vision_pin, audio_pin = family
-        pin_map = {"torch": torch_pin, "torchvision": vision_pin, "torchaudio": audio_pin}
+        return {"torch": torch_pin}
+    vision_pin, audio_pin = family
+    return {"torch": torch_pin, "torchvision": vision_pin, "torchaudio": audio_pin}
 
+
+def _pin_torch_family(
+    pypi: Dict[str, Any],
+    torch_pin: Optional[str],
+    log: Callable[[str], None],
+) -> None:
+    """Pin torch and derive matching torchvision/torchaudio pins in a pypi dict.
+
+    `torch_pin` is a PEP 440 spec like `"==2.11.0"` (tier-1) or `"==2.8.*"` (tier-2
+    fallback). The torch INDEX (cu{NN} / cpu) was attached upstream by
+    parse_comfyui_requirements; here we just clamp versions so per-node envs
+    hardlink-share an identical torch family with the comfyui template env.
+
+    No-op when `torch_pin` is None.
+    """
+    pin_map = _torch_family_pins(torch_pin, log)
+    if not pin_map:
+        return
+
+    pinned: list[str] = []
     for k in list(pypi.keys()):
         new_spec = pin_map.get(k.lower())
         if new_spec is None:
@@ -294,7 +346,12 @@ def _pin_torch_family(
             pypi[k] = {**spec, "version": new_spec}
         else:
             pypi[k] = new_spec
-        log(f"[comfy-env] comfyui: pinning {k} {new_spec}")
+        pinned.append(f"{k} {new_spec}")
+    if pinned:
+        log(f"[comfy-env] Comfyui feature pin: {', '.join(pinned)}")
+
+
+_PYTORCH_PACKAGES = frozenset({"torch", "torchvision", "torchaudio"})
 
 
 def build_workspace_toml(
@@ -305,19 +362,32 @@ def build_workspace_toml(
     bootstrap_python: Optional[str] = None,
     torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
+    chosen_torch_index: Optional[str] = None,
+    chosen_torch_pin: Optional[str] = None,
+    chosen_cuda: Optional[str] = None,
+    chosen_torch_short: Optional[str] = None,
+    chosen_python: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the full workspace pixi.toml as a dict.
 
     Args:
         comfyui_dir: ComfyUI install root (used to find requirements.txt).
-        torch_index: PyPI index URL for torch wheels (e.g. ".../whl/cpu" or ".../whl/cu124").
+        torch_index: PyPI index URL for the comfyui feature's torch (bootstrap-derived,
+            i.e. what python_embeded already has). The comfyui template env is meant
+            to mirror python_embeded; per-node envs that need a different cuda combo
+            override below.
         cuda_major: Major CUDA version for `[system-requirements]` (e.g. "12"). None on CPU.
         node_configs: List of (env_name, ComfyEnvConfig) -- one entry per environment to create.
         bootstrap_python: Major.minor of the install bootstrap interpreter (e.g. "3.10").
             Defaults to `sys.version_info` on the running interpreter.
-        torch_pin: PEP 440 version spec to pin torch/torchvision/torchaudio
-            (e.g. `"==2.11.0"` for tier-1 bootstrap match, `"==2.8.*"` for tier-2
-            fallback). When None, torch stays as `*` from ComfyUI's requirements.txt.
+        torch_pin: PEP 440 version spec to pin torch/torchvision/torchaudio in the
+            comfyui feature (bootstrap-derived). When None, torch stays as `*`.
+        chosen_torch_index, chosen_torch_pin: the cuda-wheel combo selected by
+            `_resolve_wheel_combo` -- may equal the bootstrap (no real divergence)
+            or differ (fallback combo). When set, per-node features that declare
+            cuda-only packages get a `[pypi-options.dependency-overrides]` block
+            targeting this combo so their env resolves to a torch matching the
+            cuda-only wheels, independent of the comfyui pin.
     """
     host_py = bootstrap_python or f"{sys.version_info.major}.{sys.version_info.minor}"
     current_platform = get_pixi_platform()
@@ -341,12 +411,6 @@ def build_workspace_toml(
     feature_comfyui: Dict[str, Any] = {}
     if comfyui_pypi:
         feature_comfyui["pypi-dependencies"] = comfyui_pypi
-    if cuda_major:
-        feature_comfyui["system-requirements"] = {"cuda": cuda_major}
-    if sys.platform.startswith("linux"):
-        feature_comfyui.setdefault("system-requirements", {}).setdefault(
-            "libc", {"family": "glibc", "version": "2.35"}
-        )
     # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
     # LLVM libomp.dll. With both loaded in the same process, torch's OMP
     # guard aborts ("OMP: Error #15 ... already initialized"). Set on the
@@ -364,9 +428,55 @@ def build_workspace_toml(
     for v, fname in py_versions.items():
         out["feature"][fname] = _build_python_feature(v)
 
-    # Per-node features
+    # Per-node features.
+    # Build the override map once from the chosen cuda-wheel combo (same combo
+    # workspace-wide today; one entry per torch-family package). `_build_node_feature`
+    # only attaches it to features whose node declares cuda-only packages — no-cuda
+    # nodes get no auto-emit. When chosen == bootstrap the override is redundant but
+    # explicit; when they diverge it's the wire that lets the per-node env resolve a
+    # different torch than the comfyui template env.
+    override_map: Optional[Dict[str, Dict[str, str]]] = None
+    if chosen_torch_pin and chosen_torch_index:
+        family = _torch_family_pins(chosen_torch_pin, log)
+        if family:
+            override_map = {
+                pkg: {"version": pin, "index": chosen_torch_index}
+                for pkg, pin in family.items()
+            }
+            log(
+                f"[comfy-env] cuda-wheels combo: per-node cuda features will pin "
+                f"{sorted(family.keys())} via pypi-options.dependency-overrides "
+                f"({chosen_torch_index})"
+            )
+
+    # Resolve cuda-wheel URLs for each per-node feature so pixi installs them
+    # as part of `pixi install --all` (rather than a slow post-step pip pass).
+    from .cuda_wheels import get_wheel_url as _get_wheel_url
+    can_resolve_urls = bool(chosen_cuda and chosen_torch_short and chosen_python)
+
     for env_name, cfg in node_configs:
-        feat = _build_node_feature(cfg, env_name, log)
+        cuda_only = [p for p in cfg.cuda_packages if p not in _PYTORCH_PACKAGES]
+        feat_urls: Optional[Dict[str, str]] = None
+        if cuda_only and can_resolve_urls:
+            urls: Dict[str, str] = {}
+            for pkg in cuda_only:
+                url = _get_wheel_url(
+                    pkg, chosen_torch_short, chosen_cuda, chosen_python, log=log,
+                )
+                if not url:
+                    raise RuntimeError(
+                        f"cuda-wheel {pkg!r} unavailable for "
+                        f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{chosen_python}; "
+                        f"_resolve_wheel_combo should have caught this earlier."
+                    )
+                urls[pkg] = url
+            feat_urls = urls
+
+        feat = _build_node_feature(
+            cfg, env_name, log,
+            auto_overrides=override_map if cuda_only else None,
+            cuda_wheel_urls=feat_urls,
+        )
         if feat:
             out["feature"][env_name] = feat
         # if a node has zero pixi-passthrough deps, still create an (empty) feature
@@ -413,6 +523,11 @@ def write_workspace_pixi_toml(
     bootstrap_python: Optional[str] = None,
     torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
+    chosen_torch_index: Optional[str] = None,
+    chosen_torch_pin: Optional[str] = None,
+    chosen_cuda: Optional[str] = None,
+    chosen_torch_short: Optional[str] = None,
+    chosen_python: Optional[str] = None,
 ) -> Path:
     """Generate `<workspace_dir>/pixi.toml` from the parts above. Returns the file path."""
     tomli_w = _require_tomli_w()
@@ -423,6 +538,11 @@ def write_workspace_pixi_toml(
         bootstrap_python=bootstrap_python,
         torch_pin=torch_pin,
         log=log,
+        chosen_torch_index=chosen_torch_index,
+        chosen_torch_pin=chosen_torch_pin,
+        chosen_cuda=chosen_cuda,
+        chosen_torch_short=chosen_torch_short,
+        chosen_python=chosen_python,
     )
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)

@@ -159,6 +159,16 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
+    # Scrub Python-pathing env vars inherited from the parent (python_embeded
+    # on portable). PYTHONPATH would let the env's python pick up modules from
+    # python_embeded's site-packages -- cp313 ABI but a *different* torch wheel
+    # (cu130 from the portable archive vs. the env's cu128/cu130 install). The
+    # DLL graph loaded straddles two torches, ERROR_PROC_NOT_FOUND on shm.dll.
+    # PYTHONNOUSERSITE keeps the env hermetic from %APPDATA%\Python user
+    # site-packages too. PYTHONSTARTUP can side-load arbitrary code; drop it.
+    for var in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
+        env.pop(var, None)
+    env["PYTHONNOUSERSITE"] = "1"
     # Pixi/conda envs on Windows: the Python binary resolves sys.prefix to the
     # base UV/conda Python instead of the env, causing both stdlib version
     # mismatches (SRE module mismatch) and missing site-packages (CGAL).
@@ -232,8 +242,9 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
     """Resolve the pixi env dir for a node config in the workspace model.
 
     Looks up `<comfyui_dir>/.ce/.pixi/envs/<env_name>` based on the node's plugin
-    root and config path. Falls back to scanning for legacy `_env_*` symlinks if
-    the workspace dir doesn't exist (lets older installs keep working).
+    root and config path. Returns None (with a log line) when the env hasn't been
+    materialized — that signals to register_nodes() that this node should fall
+    back to plain in-process import.
     """
     from ..environment.cache import get_env_name, get_workspace_env_dir
 
@@ -254,13 +265,10 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         comfyui_dir = None
 
     if comfyui_dir is None:
-        # Legacy fallback: scan for _env_*
-        try:
-            for item in node_dir.iterdir():
-                if item.name.startswith("_env_") and item.is_dir():
-                    return item.resolve() if sys.platform == "win32" else item
-        except OSError:
-            pass
+        _log(
+            f"[comfy-env] isolation env not found: ComfyUI base could not be located "
+            f"from {node_dir}; using in-process import"
+        )
         return None
 
     if config_path is None:
@@ -269,12 +277,21 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
                 config_path = node_dir / cand
                 break
         if config_path is None:
+            _log(
+                f"[comfy-env] isolation env not found: no comfy-env.toml in {node_dir}; "
+                f"using in-process import"
+            )
             return None
 
     env_name = get_env_name(plugin_dir, config_path)
     env_dir = get_workspace_env_dir(comfyui_dir, env_name)
     if env_dir.exists():
         return env_dir.resolve() if sys.platform == "win32" else env_dir
+    _log(
+        f"[comfy-env] isolation env not found at {env_dir}: pixi has not "
+        f"materialized `{env_name}`; using in-process import. Run "
+        f"`comfy-env install` (or your node's `install.py`) to create it."
+    )
     return None
 
 

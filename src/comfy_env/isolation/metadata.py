@@ -355,27 +355,35 @@ def fetch_metadata(
 
         t0 = time.perf_counter()
 
-        # Launch pixi python directly instead of "pixi run" to avoid the per-call overhead
-        # of pixi's lockfile resolve. Set up conda env vars manually for DLL search paths.
+        # Route the metadata scan through `pixi run -e <env> --frozen` so pixi
+        # handles activation (PATH for delay-loaded DLLs, CONDA_PREFIX,
+        # [activation.env] vars like KMP_DUPLICATE_LIB_OK). Hand-rolling the
+        # PATH activation worked for delay-load resolution but missed the
+        # [activation.env] block — without KMP_DUPLICATE_LIB_OK, torch's OMP
+        # guard or MKL init failed mid-scan. The previous attempt also
+        # hard-coded the env name as "default", silently scanning under the
+        # wrong env's site-packages. `--frozen` avoids re-resolving the
+        # lockfile per scan.
         is_pixi = ".pixi" in str(python)
-        cmd = [str(python), script_file, str(working_dir), package_name]
-        if sys.platform == "win32" and is_pixi:
-            # Find pixi env root for PATH setup
-            pixi_env_root = python
-            while pixi_env_root.name != ".pixi" and pixi_env_root.parent != pixi_env_root:
-                pixi_env_root = pixi_env_root.parent
-            pixi_env_root = pixi_env_root / "envs" / "default"
-            scan_env["CONDA_PREFIX"] = str(pixi_env_root)
-            path_sep = ";"
-            pixi_paths = [
-                str(pixi_env_root),
-                str(pixi_env_root / "Library" / "mingw-w64" / "bin"),
-                str(pixi_env_root / "Library" / "usr" / "bin"),
-                str(pixi_env_root / "Library" / "bin"),
-                str(pixi_env_root / "Scripts"),
+        if is_pixi:
+            # python is at <workspace>/.pixi/envs/<env_name>/python.exe (Win)
+            # or <workspace>/.pixi/envs/<env_name>/bin/python (POSIX).
+            env_root = python.parent if sys.platform == "win32" else python.parent.parent
+            env_name = env_root.name
+            workspace_dir = env_root.parent.parent.parent  # strip envs/<name> and .pixi
+            try:
+                from ..packages.pixi import ensure_pixi
+                pixi_path = ensure_pixi(log=lambda m: None)
+            except Exception:
+                pixi_path = "pixi"
+            cmd = [
+                str(pixi_path), "run", "--frozen",
+                "--manifest-path", str(workspace_dir / "pixi.toml"),
+                "-e", env_name,
+                "python", script_file, str(working_dir), package_name,
             ]
-            current_path = scan_env.get("PATH", "")
-            scan_env["PATH"] = path_sep.join(pixi_paths + [current_path])
+        else:
+            cmd = [str(python), script_file, str(working_dir), package_name]
 
         if _DEBUG:
             print(f"[comfy-env] Metadata scan: {' '.join(cmd)}", file=sys.stderr, flush=True)
