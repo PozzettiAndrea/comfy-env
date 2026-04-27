@@ -1235,20 +1235,8 @@ if _DEBUG:
     if len(_path_parts) > 15:
         print(f"[worker]   ... and {len(_path_parts) - 15} more", file=sys.stderr, flush=True)
 
-# On Windows, add host Python's DLL directories so packages like opencv can find VC++ runtime
 if sys.platform == "win32":
-    _host_python_dir = os.environ.get("COMFYUI_HOST_PYTHON_DIR")
-    if _host_python_dir and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(_host_python_dir)
-            # Also add DLLs subdirectory if it exists
-            _dlls_dir = os.path.join(_host_python_dir, "DLLs")
-            if os.path.isdir(_dlls_dir):
-                os.add_dll_directory(_dlls_dir)
-        except Exception:
-            pass
-
-    # Pixi env root -- python310.dll, vcruntime, etc.
+    # Pixi env root -- pythonXY.dll, vcruntime, etc.
     _env_root = os.path.dirname(sys.executable)
     if hasattr(os, "add_dll_directory"):
         try:
@@ -2972,11 +2960,14 @@ class SubprocessWorker(Worker):
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
-            # Find pixi env root (the .pixi/envs/default directory)
-            pixi_env_root = self.python
-            while pixi_env_root.name != '.pixi' and pixi_env_root.parent != pixi_env_root:
-                pixi_env_root = pixi_env_root.parent
-            pixi_env_root = pixi_env_root / "envs" / "default"
+            # The interpreter sits at <workspace>/.pixi/envs/<env_name>/python.exe
+            # (Windows) or .../bin/python (POSIX). Use the actual env that owns
+            # self.python — never hardcode "default", or a cp313 worker ends up
+            # with a cp310 env's site-packages on PATH (cross-ABI DLL crashes).
+            if sys.platform == "win32":
+                pixi_env_root = self.python.parent
+            else:
+                pixi_env_root = self.python.parent.parent
 
             cmd = [str(self.python), str(self._worker_script), self._socket_addr]
 
@@ -2997,7 +2988,6 @@ class SubprocessWorker(Worker):
                     str(pixi_env_root / "Library" / "usr" / "bin"),
                     str(pixi_env_root / "Library" / "bin"),
                     str(pixi_env_root / "Scripts"),
-                    str(pixi_env_root / "Library" / "bin" / "Lib" / "site-packages" / "bpy"),
                 ]
             else:
                 pixi_paths = [

@@ -136,7 +136,6 @@ def _is_enabled() -> bool:
 
 def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     """Windows: minimal PATH with env + Library/bin + system dirs."""
-    env["COMFYUI_HOST_PYTHON_DIR"] = str(Path(sys.executable).parent)
     env_root = python.parent
     library_bin = env_root / "Library" / "bin"
     windir = os.environ.get("WINDIR", r"C:\Windows")
