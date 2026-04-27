@@ -639,6 +639,16 @@ def _resolve_wheel_combo(
     if not bootstrap_cuda or sys.platform == "darwin":
         return None
 
+    # Portable ComfyUI bundles a torch+cu128 build, so `bootstrap_cuda` is
+    # truthy on hosted runners with no NVIDIA hardware. Without this guard,
+    # cuda-wheel resolution proceeds, pixi pins cu128 in the comfyui env,
+    # and the post-step `import torch` validation fails because the cu128
+    # wheel can't load on a no-driver host.
+    from .detection.cuda import has_nvidia_gpu
+    if not has_nvidia_gpu():
+        log("[comfy-env] cuda-wheels: skipping (no NVIDIA GPU detected)")
+        return None
+
     packages = _aggregate_cuda_packages(discovered)
     if not packages:
         return None
