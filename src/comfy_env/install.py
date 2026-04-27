@@ -184,6 +184,9 @@ def _run_streaming(cmd, log: Callable, cwd=None, env=None):
         assert proc.stderr is not None
         for line in proc.stderr:
             stderr_lines.append(line)
+            line_text = line.rstrip("\n")
+            if line_text.strip():
+                log(f"  {line_text}")
 
     t = threading.Thread(target=_read_stderr, daemon=True)
     t.start()
@@ -483,13 +486,18 @@ def _resolve_workspace_torch(
         get_gpu_summary,
         get_bootstrap_python_version,
         get_bootstrap_torch_version,
+        get_bootstrap_torch_cuda,
     )
     cpu_index = "https://download.pytorch.org/whl/cpu"
     python_version = get_bootstrap_python_version()
     torch_version = get_bootstrap_torch_version()
+    bootstrap_cuda = get_bootstrap_torch_cuda()
 
     if torch_version:
-        log(f"[comfy-env] Bootstrap python={python_version} torch={torch_version}")
+        log(
+            f"[comfy-env] Bootstrap python={python_version} torch={torch_version}"
+            + (f" (cu{bootstrap_cuda.replace('.', '')})" if bootstrap_cuda else " (cpu)")
+        )
     else:
         log(f"[comfy-env] Bootstrap python={python_version} (no torch importable)")
 
@@ -497,7 +505,10 @@ def _resolve_workspace_torch(
         return cpu_index, None, None, python_version, torch_version
 
     log(f"[comfy-env] GPU: {get_gpu_summary()}")
-    cuda_version = get_recommended_cuda_version()
+    # Bootstrap torch's CUDA tag is authoritative when present -- it's what the
+    # ABI actually targets. Fall back to GPU/driver-driven recommendation only
+    # when bootstrap is CPU-only or torch isn't importable.
+    cuda_version = bootstrap_cuda or get_recommended_cuda_version()
     if not cuda_version:
         log("[comfy-env] No CUDA detected -- using PyTorch CPU index")
         return cpu_index, None, None, python_version, torch_version
@@ -505,7 +516,8 @@ def _resolve_workspace_torch(
     cu_tag = "cu" + cuda_version.replace(".", "")[:3]
     torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
     cuda_major = cuda_version.split(".")[0]
-    log(f"[comfy-env] CUDA {cuda_version} -> torch index {torch_index}")
+    src = "bootstrap torch" if bootstrap_cuda else "GPU"
+    log(f"[comfy-env] CUDA {cuda_version} ({src}) -> torch index {torch_index}")
     return torch_index, cuda_version, cuda_major, python_version, torch_version
 
 

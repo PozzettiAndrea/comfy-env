@@ -33,6 +33,40 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
 FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
 
+# torch.minor -> (torchvision_minor, torchaudio_minor). torchaudio mirrors
+# torch's major.minor exactly; torchvision is `0.(torch_minor + 15)` for the
+# torch-2.x line. Verified against pytorch.org/get-started/previous-versions
+# and torchvision's PyPI release history. Update whenever a new torch lands.
+TORCH_FAMILY_COMPAT: dict = {
+    "2.4":  ("0.19", "2.4"),
+    "2.5":  ("0.20", "2.5"),
+    "2.6":  ("0.21", "2.6"),
+    "2.7":  ("0.22", "2.7"),
+    "2.8":  ("0.23", "2.8"),
+    "2.9":  ("0.24", "2.9"),
+    "2.10": ("0.25", "2.10"),
+    "2.11": ("0.26", "2.11"),
+}
+
+
+def derive_family_pins(torch_pin: str) -> Optional[tuple]:
+    """Given a torch pin like '==2.11.0' or '==2.8.*', return
+    `(torchvision_pin, torchaudio_pin)` derived from `TORCH_FAMILY_COMPAT`,
+    or `None` if torch's minor isn't in the table.
+
+    Returned pins are major.minor `.*` specs (e.g. `'==0.26.*'`, `'==2.11.*'`),
+    so the resolver picks the latest matching patch from the cu-tagged index.
+    """
+    m = re.match(r"==\s*(\d+)\.(\d+)", torch_pin)
+    if not m:
+        return None
+    minor_key = f"{m.group(1)}.{m.group(2)}"
+    pair = TORCH_FAMILY_COMPAT.get(minor_key)
+    if not pair:
+        return None
+    vision_minor, audio_minor = pair
+    return (f"=={vision_minor}.*", f"=={audio_minor}.*")
+
 
 def get_cuda_torch_mapping() -> dict:
     return CUDA_TORCH_MAP.copy()

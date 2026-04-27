@@ -112,3 +112,19 @@ def get_bootstrap_torch_version() -> str | None:
         return str(v).split("+", 1)[0]
     except Exception:
         return None
+
+
+def get_bootstrap_torch_cuda() -> str | None:
+    """CUDA version the bootstrap torch was built against (e.g. '12.8').
+
+    Read from `torch.version.cuda`. Returns None if torch isn't importable from
+    the bootstrap or it's a CPU-only build. This is the authoritative answer
+    when present -- it's what the bootstrap torch's binary ABI actually targets,
+    independent of what nvidia-smi reports.
+    """
+    try:
+        import torch
+        cu = getattr(torch.version, "cuda", None)
+        return str(cu) if cu else None
+    except Exception:
+        return None

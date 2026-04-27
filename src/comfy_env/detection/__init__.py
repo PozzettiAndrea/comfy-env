@@ -14,6 +14,7 @@ from .cuda import (
     get_cuda_from_env,
     get_bootstrap_python_version,
     get_bootstrap_torch_version,
+    get_bootstrap_torch_cuda,
 )
 from .gpu import (
     GPUInfo,
@@ -55,6 +56,7 @@ __all__ = [
     "get_cuda_from_env",
     "get_bootstrap_python_version",
     "get_bootstrap_torch_version",
+    "get_bootstrap_torch_cuda",
     # GPU detection
     "GPUInfo",
     "CUDAEnvironment",

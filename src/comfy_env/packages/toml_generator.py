@@ -257,27 +257,44 @@ def _pin_torch_family(
     torch_pin: Optional[str],
     log: Callable[[str], None],
 ) -> None:
-    """Override torch/torchvision/torchaudio version pins with the given spec.
+    """Pin torch and derive matching torchvision/torchaudio pins from TORCH_FAMILY_COMPAT.
 
     `torch_pin` is a PEP 440 spec like `"==2.11.0"` (tier-1) or `"==2.8.*"` (tier-2
     fallback). The torch INDEX (cu{NN} / cpu) was attached upstream by
-    parse_comfyui_requirements; here we just clamp the version so per-node envs
-    hardlink-share an identical torch with the comfyui template env (and the
-    cuda-wheels fetched later are guaranteed to match this ABI).
+    parse_comfyui_requirements; here we just clamp versions so per-node envs
+    hardlink-share an identical torch family with the comfyui template env.
+
+    torchvision and torchaudio have their own version numbering (torch 2.11 pairs
+    with torchvision 0.26 and torchaudio 2.11), so the siblings come from the
+    compat table rather than reusing torch's literal version string. If torch's
+    minor isn't in the table, only torch is pinned and a warning is logged.
 
     No-op when `torch_pin` is None.
     """
     if not torch_pin:
         return
+    from .cuda_wheels import derive_family_pins
+    family = derive_family_pins(torch_pin)
+    if family is None:
+        log(
+            f"[comfy-env] WARNING: torch_pin {torch_pin} not in TORCH_FAMILY_COMPAT; "
+            f"pinning torch only, leaving torchvision/torchaudio unpinned"
+        )
+        pin_map = {"torch": torch_pin}
+    else:
+        vision_pin, audio_pin = family
+        pin_map = {"torch": torch_pin, "torchvision": vision_pin, "torchaudio": audio_pin}
+
     for k in list(pypi.keys()):
-        if k.lower() not in _TORCH_PKGS:
+        new_spec = pin_map.get(k.lower())
+        if new_spec is None:
             continue
         spec = pypi[k]
         if isinstance(spec, dict):
-            pypi[k] = {**spec, "version": torch_pin}
+            pypi[k] = {**spec, "version": new_spec}
         else:
-            pypi[k] = torch_pin
-        log(f"[comfy-env] comfyui: pinning {k} {torch_pin}")
+            pypi[k] = new_spec
+        log(f"[comfy-env] comfyui: pinning {k} {new_spec}")
 
 
 def build_workspace_toml(
