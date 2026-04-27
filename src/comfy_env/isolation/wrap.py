@@ -156,7 +156,6 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
         if _DBG_INSTALL:
             _log(f"[comfy-env] {env_root.name}: Library/bin NOT FOUND at {library_bin}")
     env["PATH"] = ";".join(minimal_path_parts)
-    env["COMFYUI_PIXI_LIBRARY_BIN"] = str(library_bin) if library_bin.is_dir() else ""
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
     # Scrub Python-pathing env vars inherited from the parent (python_embeded

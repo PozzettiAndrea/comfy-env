@@ -131,62 +131,7 @@ if sys.platform == "win32":
     except ImportError:
         pass
 
-# Print environment diagnostics to stderr (survives crashes)
 _debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
-if _debug:
-    _sep = ";" if sys.platform == "win32" else ":"
-    print(f"[meta-scan] python: {sys.executable}", file=sys.stderr, flush=True)
-    print(f"[meta-scan] PATH:", file=sys.stderr, flush=True)
-    for _i, _p in enumerate(os.environ.get("PATH", "").split(_sep)):
-        print(f"[meta-scan]   [{_i}] {_p}", file=sys.stderr, flush=True)
-    # List shared libraries in the env's library directory
-    _env_root = os.path.dirname(sys.executable)
-    if sys.platform == "win32":
-        import ctypes
-        _lib_dir = os.path.join(_env_root, "Library", "bin")
-        _ext = ".dll"
-    elif sys.platform == "darwin":
-        _lib_dir = os.path.join(_env_root, "..", "lib")
-        _ext = ".dylib"
-    else:
-        _lib_dir = os.path.join(_env_root, "..", "lib")
-        _ext = ".so"
-    _lib_dir = os.path.normpath(_lib_dir)
-    if os.path.isdir(_lib_dir):
-        _libs = sorted(f for f in os.listdir(_lib_dir) if _ext in f.lower())
-        print(f"[meta-scan] {_lib_dir}: {len(_libs)} shared libs", file=sys.stderr, flush=True)
-        # On Windows, probe each DLL with ctypes to detect missing dependencies
-        if sys.platform == "win32":
-            if hasattr(os, "add_dll_directory"):
-                os.add_dll_directory(_lib_dir)
-            for _d in _libs:
-                _path = os.path.join(_lib_dir, _d)
-                try:
-                    ctypes.WinDLL(_path)
-                    print(f"[meta-scan]   OK   {_d}", file=sys.stderr, flush=True)
-                except OSError as _e:
-                    print(f"[meta-scan]   FAIL {_d}: {_e}", file=sys.stderr, flush=True)
-        else:
-            # Deduplicate versioned symlinks: libfoo.so.1.2.0 -> libfoo.so
-            import re
-            _seen = set()
-            _deduped = []
-            for _d in _libs:
-                _base = re.sub(r'\.so[\d.]*$', '.so', _d) if '.so' in _d else re.sub(r'\.(\d+\.)*dylib$', '.dylib', _d)
-                if _base not in _seen:
-                    _seen.add(_base)
-                    _deduped.append(_base)
-            for _d in _deduped[:40]:
-                print(f"[meta-scan]   {_d}", file=sys.stderr, flush=True)
-            if len(_deduped) > 40:
-                print(f"[meta-scan]   ... and {len(_deduped) - 40} more", file=sys.stderr, flush=True)
-    else:
-        print(f"[meta-scan] lib dir NOT FOUND: {_lib_dir}", file=sys.stderr, flush=True)
-    # Also print LD/DYLD paths on non-Windows
-    if sys.platform != "win32":
-        _ld = os.environ.get("LD_LIBRARY_PATH") or os.environ.get("DYLD_LIBRARY_PATH")
-        if _ld:
-            print(f"[meta-scan] LD/DYLD_LIBRARY_PATH: {_ld}", file=sys.stderr, flush=True)
 
 working_dir = sys.argv[1]
 package_name = sys.argv[2]

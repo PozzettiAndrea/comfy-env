@@ -1225,40 +1225,9 @@ if _DBG_VRAM:
     _vram_thread.start()
     wlog("[worker] VRAM poller started (200MB threshold, 100ms poll, 1s cooldown)")
 
-# Debug: print PATH at startup (only if debug enabled)
-if _DEBUG:
-    _path_sep = ";" if sys.platform == "win32" else ":"
-    _path_parts = os.environ.get("PATH", "").split(_path_sep)
-    print(f"[worker] PATH has {len(_path_parts)} entries:", file=sys.stderr, flush=True)
-    for _i, _p in enumerate(_path_parts[:15]):
-        print(f"[worker]   [{_i}] {_p}", file=sys.stderr, flush=True)
-    if len(_path_parts) > 15:
-        print(f"[worker]   ... and {len(_path_parts) - 15} more", file=sys.stderr, flush=True)
-
-if sys.platform == "win32":
-    # Pixi env root -- pythonXY.dll, vcruntime, etc.
-    _env_root = os.path.dirname(sys.executable)
-    if hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(_env_root)
-        except Exception:
-            pass
-
-    # For pixi environments with MKL, add Library/bin for MKL DLLs
-    _pixi_library_bin = os.environ.get("COMFYUI_PIXI_LIBRARY_BIN")
-    if _pixi_library_bin and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(_pixi_library_bin)
-            wlog(f"[worker] Added pixi Library/bin to DLL search: {_pixi_library_bin}")
-        except Exception as e:
-            wlog(f"[worker] Failed to add pixi Library/bin: {e}")
-
 # =============================================================================
 # Shared Memory Serialization
 # =============================================================================
-
-from multiprocessing import shared_memory as shm
-import numpy as np
 
 # Pin to single CPU core before importing torch to prevent TSC non-monotonicity
 # during libc10_cuda.so static initialization (WSL has imprecise per-core TSC sync).
@@ -1271,6 +1240,11 @@ if sys.platform == "linux":
     except OSError:
         pass
 
+# Import torch BEFORE numpy on Windows. conda-forge's numpy is MKL-linked, and
+# loading numpy first pulls in libiomp5md.dll from <env>/Library/bin -- once that
+# OMP runtime is in the process, torch's bundled libiomp5md (in torch/lib/) can't
+# load alongside it and fbgemm.dll's delay-loaded deps fail with WinError 127.
+# Order matters: torch first ensures torch/lib's DLLs win the address-space race.
 # Use default sharing strategy (file_descriptor on Linux).
 # Do NOT force file_system -- its torch_shm_manager prematurely unlinks files in torch 2.8.
 try:
@@ -1279,6 +1253,9 @@ try:
     wlog(f"[worker] PyTorch sharing strategy: {mp.get_sharing_strategy()}")
 except Exception as e:
     wlog(f"[worker] PyTorch not available: {e}")
+
+from multiprocessing import shared_memory as shm
+import numpy as np
 
 # Release CPU affinity back to all cores for actual GPU work
 if _affinity_pinned:
@@ -2195,23 +2172,6 @@ def main():
         return
     wlog("[worker] Got config, setting up paths...")
 
-    # When COMFY_ENV_DEBUG_WORKER is on, dump every env var the worker process
-    # sees at startup. This is the only reliable way to diff the failing
-    # ComfyUI-spawned worker against a known-passing standalone `pixi run` and
-    # find which inherited env var is poisoning torch's DLL graph.
-    if os.environ.get("COMFY_ENV_DEBUG_WORKER", "").lower() in ("1", "true", "yes"):
-        wlog(f"[worker] os.environ has {len(os.environ)} entries:")
-        for _k in sorted(os.environ.keys()):
-            _v = os.environ[_k]
-            if len(_v) > 200:
-                _v = _v[:200] + "...(truncated)"
-            wlog(f"[worker]   {_k}={_v}")
-        wlog(f"[worker] sys.executable={sys.executable}")
-        wlog(f"[worker] sys.prefix={sys.prefix}")
-        wlog(f"[worker] sys.path entries: {len(sys.path)}")
-        for _i, _p in enumerate(sys.path):
-            wlog(f"[worker]   sys.path[{_i}]={_p}")
-
     # Setup sys.path
     for p in config.get("sys_paths", []):
         if p not in sys.path:
@@ -3012,24 +2972,6 @@ class SubprocessWorker(Worker):
 
         if _DBG_WORKER:
             print(f"[SubprocessWorker] launching cmd={cmd[:3]}...", flush=True)
-            if launch_env:
-                path_sep = ";" if sys.platform == "win32" else ":"
-                path_parts = launch_env.get("PATH", "").split(path_sep)
-                print(f"[SubprocessWorker] PATH has {len(path_parts)} entries:", flush=True)
-                for i, p in enumerate(path_parts[:10]):  # Show first 10
-                    print(f"[SubprocessWorker]   [{i}] {p}", flush=True)
-                if len(path_parts) > 10:
-                    print(f"[SubprocessWorker]   ... and {len(path_parts) - 10} more", flush=True)
-                # Full env dump so we can diff what was passed in vs what the
-                # worker actually sees post-pixi-activation. The diff identifies
-                # leaky inherited env vars from python_embeded.
-                _keys = sorted(launch_env.keys())
-                print(f"[SubprocessWorker] launch_env has {len(_keys)} entries:", flush=True)
-                for _k in _keys:
-                    _v = launch_env[_k]
-                    if len(_v) > 200:
-                        _v = _v[:200] + "...(truncated)"
-                    print(f"[SubprocessWorker]   {_k}={_v}", flush=True)
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
