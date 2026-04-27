@@ -347,6 +347,13 @@ def build_workspace_toml(
         feature_comfyui.setdefault("system-requirements", {}).setdefault(
             "libc", {"family": "glibc", "version": "2.35"}
         )
+    # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
+    # LLVM libomp.dll. With both loaded in the same process, torch's OMP
+    # guard aborts ("OMP: Error #15 ... already initialized"). Set on the
+    # comfyui feature so every env (template + per-node) inherits it; OMP
+    # documents this var as the safe escape when full libomp dedupe across
+    # mixed conda/pip wheels isn't feasible.
+    feature_comfyui["activation"] = {"env": {"KMP_DUPLICATE_LIB_OK": "TRUE"}}
     out["feature"] = {"comfyui": feature_comfyui}
 
     # Per-python features

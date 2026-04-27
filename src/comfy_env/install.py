@@ -586,24 +586,57 @@ def _dedupe_envs_libomp(
             log(f"[comfy-env] {env_name}: libomp dedupe failed: {e}")
 
 
-def _read_env_torch_version(env_python: Path) -> Optional[str]:
-    """Run `python -c 'import torch; print(torch.__version__)'` in a pixi env.
+def _read_env_torch_version(
+    pixi_path: Path,
+    workspace_dir: Path,
+    env_name: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """Run `pixi run -e <env_name> python -c 'import torch; print(...)'`.
 
     Returns the public torch version (e.g. "2.11.0", local label stripped), or
-    None if torch isn't importable from that env.
+    None if torch isn't importable from that env. If `log` is given, the
+    failure reason (subprocess returncode/stderr/stdout) is written to it.
+
+    Goes through `pixi run` rather than invoking the env's `python.exe`
+    directly so pixi's own activation runs first — that's what puts
+    `<env>/Library/bin` on PATH, sets KMP/MKL env vars correctly for the
+    conda-forge libs, and matches what an end-user would get if they ran
+    `pixi run -e <env> python` themselves. Hand-rolling activation here was
+    the source of the 0xC06D007F (delay-load DLL not found) and OMP Error #15
+    (duplicate libomp) failures observed earlier.
     """
     import subprocess
-    if not env_python.exists():
-        return None
+    import os
+    env = os.environ.copy()
+    # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
+    # LLVM libomp.dll. Both can't coexist in one process without OMP Error #15
+    # aborting on torch import. For a read-only `__version__` probe, the
+    # standard workaround is fine. The env's pixi.toml should also set this
+    # in [activation.env] for runtime use.
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     r = subprocess.run(
-        [str(env_python), "-c",
+        [str(pixi_path), "run", "-e", env_name,
+         "python", "-c",
          "import torch, sys; sys.stdout.write(torch.__version__)"],
-        capture_output=True, text=True,
+        cwd=str(workspace_dir),
+        capture_output=True, text=True, env=env,
     )
     if r.returncode != 0:
+        if log:
+            log(
+                f"[comfy-env] _read_env_torch_version: pixi run -e {env_name} "
+                f"exit={r.returncode}; stderr={(r.stderr or '').strip()!r}; "
+                f"stdout={(r.stdout or '').strip()!r}"
+            )
         return None
     out = r.stdout.strip()
     if not out:
+        if log:
+            log(
+                f"[comfy-env] _read_env_torch_version: pixi run -e {env_name} "
+                f"exit=0 but empty stdout; stderr={(r.stderr or '').strip()!r}"
+            )
         return None
     return out.split("+", 1)[0]
 
@@ -738,6 +771,7 @@ def _install_cuda_wheels(
     chosen_cuda: str,
     chosen_torch_short: str,
     log: Callable[[str], None],
+    pixi_path: Optional[Path] = None,
 ) -> None:
     """Install CUDA-only wheel packages (cumesh, flash-attn, etc.) into per-env site-packages.
 
@@ -752,14 +786,19 @@ def _install_cuda_wheels(
 
     import subprocess
     from .packages.cuda_wheels import get_wheel_url, CUDA_WHEELS_INDEX
+    from .packages.pixi import ensure_pixi
 
-    py_exe = "python.exe" if sys.platform == "win32" else "bin/python"
-    template_python = workspace_dir / ".pixi" / "envs" / "comfyui" / py_exe
-    template_torch = _read_env_torch_version(template_python)
+    if pixi_path is None:
+        pixi_path = ensure_pixi(log=log)
+
+    template_torch = _read_env_torch_version(
+        pixi_path, workspace_dir, "comfyui", log=log,
+    )
     if not template_torch:
         raise RuntimeError(
-            f"Cannot read torch version from comfyui template env at "
-            f"{template_python}. Either pixi install --all didn't materialize "
+            f"Cannot read torch version from comfyui template env via "
+            f"`pixi run -e comfyui python -c 'import torch'` in "
+            f"{workspace_dir}. Either pixi install --all didn't materialize "
             f"the env, or torch isn't in the comfyui feature."
         )
     template_short = ".".join(template_torch.split(".")[:2])
@@ -916,13 +955,27 @@ def install_workspace(
 
         # CUDA-only wheels (cumesh, flash-attn, etc.)
         if combo is not None:
-            _install_cuda_wheels(
-                workspace_dir, discovered,
-                chosen_python=chosen_python,
-                chosen_cuda=chosen_cuda,
-                chosen_torch_short=chosen_torch_short,
-                log=log,
-            )
+            try:
+                _install_cuda_wheels(
+                    workspace_dir, discovered,
+                    chosen_python=chosen_python,
+                    chosen_cuda=chosen_cuda,
+                    chosen_torch_short=chosen_torch_short,
+                    log=log,
+                    pixi_path=pixi_path,
+                )
+            except BaseException as e:
+                # _install_cuda_wheels was crashing silently because its
+                # exception trace went to a stderr that wasn't being captured
+                # to install.log. Log the full traceback so future failures
+                # are debuggable without re-running, then re-raise so the
+                # caller still treats it as a hard failure.
+                import traceback
+                log("[comfy-env] _install_cuda_wheels raised; traceback follows:")
+                for line in traceback.format_exc().rstrip().split("\n"):
+                    log(f"[comfy-env]   {line}")
+                log(f"[comfy-env] _install_cuda_wheels exception: {type(e).__name__}: {e}")
+                raise
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         # Multiple bundled libomps from pip wheels (torch, sklearn, pymeshlab,
