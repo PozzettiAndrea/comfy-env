@@ -307,9 +307,13 @@ def _share_torch_opt_in() -> bool:
 def _should_share_torch(env_dir: Path) -> bool:
     """Decide if host torch should be shared with this worker env.
 
-    Disabled by default in the workspace model -- torch is provided by the
-    `comfyui` feature in the workspace's pixi.toml. Set `COMFY_ENV_USE_SHARE_TORCH=1`
-    to re-enable the legacy host-symlink path (e.g. for zero-copy CUDA IPC scenarios).
+    DEPRECATED. The workspace model now pins torch in the `comfyui` feature and
+    relies on pixi multi-env hardlinks for inter-env sharing -- per-node envs
+    already see a single torch installation on disk that matches the comfyui
+    template env's pin. This legacy sys.path-redirect path is only consulted when
+    `COMFY_ENV_USE_SHARE_TORCH=1` is set explicitly, and is fragile on Windows
+    (uv pip uninstall leaves stranded torch DLLs that cause WinError 127). It
+    will be removed in a future release.
     """
     if not _share_torch_opt_in():
         return False

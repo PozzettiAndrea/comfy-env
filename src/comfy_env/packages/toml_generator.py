@@ -252,11 +252,41 @@ def _build_node_feature(
     return feat
 
 
+def _pin_torch_family(
+    pypi: Dict[str, Any],
+    torch_pin: Optional[str],
+    log: Callable[[str], None],
+) -> None:
+    """Override torch/torchvision/torchaudio version pins with the given spec.
+
+    `torch_pin` is a PEP 440 spec like `"==2.11.0"` (tier-1) or `"==2.8.*"` (tier-2
+    fallback). The torch INDEX (cu{NN} / cpu) was attached upstream by
+    parse_comfyui_requirements; here we just clamp the version so per-node envs
+    hardlink-share an identical torch with the comfyui template env (and the
+    cuda-wheels fetched later are guaranteed to match this ABI).
+
+    No-op when `torch_pin` is None.
+    """
+    if not torch_pin:
+        return
+    for k in list(pypi.keys()):
+        if k.lower() not in _TORCH_PKGS:
+            continue
+        spec = pypi[k]
+        if isinstance(spec, dict):
+            pypi[k] = {**spec, "version": torch_pin}
+        else:
+            pypi[k] = torch_pin
+        log(f"[comfy-env] comfyui: pinning {k} {torch_pin}")
+
+
 def build_workspace_toml(
     comfyui_dir: Path,
     torch_index: Optional[str],
     cuda_major: Optional[str],
     node_configs: List[Tuple[str, ComfyEnvConfig]],  # (env_name, cfg) pairs
+    bootstrap_python: Optional[str] = None,
+    torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """Assemble the full workspace pixi.toml as a dict.
@@ -266,8 +296,13 @@ def build_workspace_toml(
         torch_index: PyPI index URL for torch wheels (e.g. ".../whl/cpu" or ".../whl/cu124").
         cuda_major: Major CUDA version for `[system-requirements]` (e.g. "12"). None on CPU.
         node_configs: List of (env_name, ComfyEnvConfig) -- one entry per environment to create.
+        bootstrap_python: Major.minor of the install bootstrap interpreter (e.g. "3.10").
+            Defaults to `sys.version_info` on the running interpreter.
+        torch_pin: PEP 440 version spec to pin torch/torchvision/torchaudio
+            (e.g. `"==2.11.0"` for tier-1 bootstrap match, `"==2.8.*"` for tier-2
+            fallback). When None, torch stays as `*` from ComfyUI's requirements.txt.
     """
-    host_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    host_py = bootstrap_python or f"{sys.version_info.major}.{sys.version_info.minor}"
     current_platform = get_pixi_platform()
 
     # Validate first so we fail fast on bad node configs
@@ -285,6 +320,7 @@ def build_workspace_toml(
 
     # comfyui baseline feature
     comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
+    _pin_torch_family(comfyui_pypi, torch_pin, log)
     feature_comfyui: Dict[str, Any] = {}
     if comfyui_pypi:
         feature_comfyui["pypi-dependencies"] = comfyui_pypi
@@ -297,7 +333,7 @@ def build_workspace_toml(
     out["feature"] = {"comfyui": feature_comfyui}
 
     # Per-python features
-    py_versions: Dict[str, str] = {}  # version -> feature_name
+    py_versions: Dict[str, str] = {host_py: _python_feature_name(host_py)}
     for _, cfg in node_configs:
         v = cfg.python or host_py
         py_versions.setdefault(v, _python_feature_name(v))
@@ -314,8 +350,19 @@ def build_workspace_toml(
         else:
             out["feature"][env_name] = {}
 
-    # Environments table
-    environments: Dict[str, Any] = {}
+    # Environments table.
+    # The `comfyui` template env exists for every workspace -- it pins what the
+    # main ComfyUI process is running and gives the cuda-wheel picker a canonical
+    # place to read torch's resolved version from. Per-node envs share the same
+    # solve-group so torch is hardlinked across envs from a single content cache.
+    host_py_feature = py_versions[host_py]
+    environments: Dict[str, Any] = {
+        "comfyui": {
+            "features": [host_py_feature, "comfyui"],
+            "no-default-feature": True,
+            "solve-group": host_py_feature,
+        }
+    }
     for env_name, cfg in node_configs:
         v = cfg.python or host_py
         py_feature = py_versions[v]
@@ -339,13 +386,20 @@ def write_workspace_pixi_toml(
     torch_index: Optional[str],
     cuda_major: Optional[str],
     node_configs: List[Tuple[str, ComfyEnvConfig]],
+    bootstrap_python: Optional[str] = None,
+    torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Path:
     """Generate `<workspace_dir>/pixi.toml` from the parts above. Returns the file path."""
     tomli_w = _require_tomli_w()
     workspace_dir.mkdir(parents=True, exist_ok=True)
     pixi_toml = workspace_dir / "pixi.toml"
-    data = build_workspace_toml(comfyui_dir, torch_index, cuda_major, node_configs, log)
+    data = build_workspace_toml(
+        comfyui_dir, torch_index, cuda_major, node_configs,
+        bootstrap_python=bootstrap_python,
+        torch_pin=torch_pin,
+        log=log,
+    )
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)
     log(f"Generated {pixi_toml}")

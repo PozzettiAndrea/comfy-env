@@ -6,11 +6,14 @@ No side effects. These functions gather information about the runtime environmen
 
 from .cuda import (
     CUDA_VERSION_ENV_VAR,
+    TORCH_VERSION_ENV_VAR,
     detect_cuda_version,
     get_cuda_from_torch,
     get_cuda_from_nvml,
     get_cuda_from_nvcc,
     get_cuda_from_env,
+    get_bootstrap_python_version,
+    get_bootstrap_torch_version,
 )
 from .gpu import (
     GPUInfo,
@@ -44,11 +47,14 @@ from .runtime import (
 __all__ = [
     # CUDA detection
     "CUDA_VERSION_ENV_VAR",
+    "TORCH_VERSION_ENV_VAR",
     "detect_cuda_version",
     "get_cuda_from_torch",
     "get_cuda_from_nvml",
     "get_cuda_from_nvcc",
     "get_cuda_from_env",
+    "get_bootstrap_python_version",
+    "get_bootstrap_torch_version",
     # GPU detection
     "GPUInfo",
     "CUDAEnvironment",

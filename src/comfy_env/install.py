@@ -463,32 +463,50 @@ def _install_to_main_env(
 
 def _resolve_workspace_torch(
     log: Callable[[str], None],
-) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Decide (torch_index, cuda_version, cuda_major) once for the whole workspace.
+) -> Tuple[Optional[str], Optional[str], Optional[str], str, Optional[str]]:
+    """Decide (torch_index, cuda_version, cuda_major, python_version, torch_version)
+    once for the whole workspace.
 
     `cuda_version` is the full string (e.g. "12.4"), used by `get_wheel_url`.
     `cuda_major` is just the leading digit (e.g. "12"), used in `[system-requirements]`.
+    `python_version` is the bootstrap interpreter's MAJOR.MINOR (e.g. "3.10").
+    `torch_version` is the bootstrap's torch.__version__ (public part), or None
+    if torch isn't importable from bootstrap (then the comfyui feature stays
+    `torch = "*"` and the cuda-wheel picker reads the actual version from the
+    materialized template env post-install).
 
-    macOS: (cpu_index, None, None). Linux/Windows + NVIDIA: cuXYZ index + version.
-    Linux/Windows without GPU: (cpu_index, None, None).
+    macOS: (cpu_index, None, None, py, torch). Linux/Windows + NVIDIA: cu* index +
+    version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
     """
-    from .detection import get_recommended_cuda_version, get_gpu_summary
+    from .detection import (
+        get_recommended_cuda_version,
+        get_gpu_summary,
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+    )
     cpu_index = "https://download.pytorch.org/whl/cpu"
+    python_version = get_bootstrap_python_version()
+    torch_version = get_bootstrap_torch_version()
+
+    if torch_version:
+        log(f"[comfy-env] Bootstrap python={python_version} torch={torch_version}")
+    else:
+        log(f"[comfy-env] Bootstrap python={python_version} (no torch importable)")
 
     if sys.platform == "darwin":
-        return cpu_index, None, None
+        return cpu_index, None, None, python_version, torch_version
 
     log(f"[comfy-env] GPU: {get_gpu_summary()}")
     cuda_version = get_recommended_cuda_version()
     if not cuda_version:
         log("[comfy-env] No CUDA detected -- using PyTorch CPU index")
-        return cpu_index, None, None
+        return cpu_index, None, None, python_version, torch_version
 
     cu_tag = "cu" + cuda_version.replace(".", "")[:3]
     torch_index = f"https://download.pytorch.org/whl/{cu_tag}"
     cuda_major = cuda_version.split(".")[0]
     log(f"[comfy-env] CUDA {cuda_version} -> torch index {torch_index}")
-    return torch_index, cuda_version, cuda_major
+    return torch_index, cuda_version, cuda_major, python_version, torch_version
 
 
 def _discover_node_configs(comfyui_dir: Path) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
@@ -543,51 +561,201 @@ def _dedupe_envs_libomp(
             log(f"[comfy-env] {env_name}: libomp dedupe failed: {e}")
 
 
+def _read_env_torch_version(env_python: Path) -> Optional[str]:
+    """Run `python -c 'import torch; print(torch.__version__)'` in a pixi env.
+
+    Returns the public torch version (e.g. "2.11.0", local label stripped), or
+    None if torch isn't importable from that env.
+    """
+    import subprocess
+    if not env_python.exists():
+        return None
+    r = subprocess.run(
+        [str(env_python), "-c",
+         "import torch, sys; sys.stdout.write(torch.__version__)"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    out = r.stdout.strip()
+    if not out:
+        return None
+    return out.split("+", 1)[0]
+
+
+_PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
+
+
+def _aggregate_cuda_packages(
+    discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
+) -> List[str]:
+    """Union of `cuda_packages` across all discovered node configs, minus the
+    workspace-global torch family (those come from the comfyui feature, not
+    cuda-wheels)."""
+    seen: List[str] = []
+    for _en, _pl, _cf, cfg in discovered:
+        for p in cfg.cuda_packages:
+            if p in _PYTORCH_PACKAGES:
+                continue
+            if p not in seen:
+                seen.append(p)
+    return seen
+
+
+def _resolve_wheel_combo(
+    discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
+    bootstrap_python: str,
+    bootstrap_cuda: Optional[str],
+    bootstrap_torch: Optional[str],
+    log: Callable[[str], None],
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
+
+    Strategy:
+      1. Try the bootstrap combo (`bootstrap_python` / `bootstrap_cuda` / `bootstrap_torch`).
+         If every required cuda-wheel is published for it, use it. Pin torch to
+         `==<bootstrap_torch>`.
+      2. Else try the known-good fallback `(bootstrap_python, FALLBACK_COMBO)` =
+         `(py, "12.8", "2.8")`. Pin torch to `==2.8.*` (a major.minor pin -- pixi
+         resolves the latest 2.8.x on the cu128 index).
+      3. Else raise.
+
+    Returns None when there's nothing to resolve (no cuda-only packages required,
+    or running on macOS/CPU). In that case the caller skips wheel-combo logic and
+    leaves torch as `*` in the comfyui feature.
+    """
+    if not bootstrap_cuda or sys.platform == "darwin":
+        return None
+
+    packages = _aggregate_cuda_packages(discovered)
+    if not packages:
+        return None
+
+    from .packages.cuda_wheels import (
+        check_all_wheels_available,
+        FALLBACK_COMBO,
+        CUDA_WHEELS_INDEX,
+    )
+
+    log(f"[comfy-env] cuda-wheels: probing {len(packages)} package(s) {packages}")
+
+    # Tier 1: bootstrap combo
+    if bootstrap_torch:
+        torch_short = ".".join(bootstrap_torch.split(".")[:2])
+        miss = check_all_wheels_available(
+            packages, torch_short, bootstrap_cuda, bootstrap_python, log=log,
+        )
+        if miss is None:
+            log(
+                f"[comfy-env] cuda-wheels combo: cu{bootstrap_cuda}/torch{torch_short}"
+                f"/cp{bootstrap_python.replace('.', '')} (bootstrap)"
+            )
+            return (
+                bootstrap_python,
+                bootstrap_cuda,
+                torch_short,
+                f"=={bootstrap_torch}",
+                "bootstrap",
+            )
+        log(
+            f"[comfy-env] cuda-wheels: {miss} not built for "
+            f"cu{bootstrap_cuda}+torch{torch_short}+cp{bootstrap_python.replace('.', '')}; "
+            f"trying fallback"
+        )
+    else:
+        log(
+            "[comfy-env] cuda-wheels: bootstrap torch unknown; trying fallback combo"
+        )
+
+    # Tier 2: known-good fallback (same python, cu128, torch 2.8)
+    fb_cuda, fb_torch = FALLBACK_COMBO
+    miss = check_all_wheels_available(
+        packages, fb_torch, fb_cuda, bootstrap_python, log=log,
+    )
+    if miss is None:
+        log(
+            f"[comfy-env] cuda-wheels combo: cu{fb_cuda}/torch{fb_torch}"
+            f"/cp{bootstrap_python.replace('.', '')} (fallback)"
+        )
+        return (
+            bootstrap_python,
+            fb_cuda,
+            fb_torch,
+            f"=={fb_torch}.*",
+            "fallback",
+        )
+
+    raise RuntimeError(
+        f"No cuda-wheels combo covers all required packages.\n"
+        f"  packages: {packages}\n"
+        f"  tier 1 (bootstrap): cu{bootstrap_cuda}/torch{bootstrap_torch}"
+        f"/cp{bootstrap_python} -- missing or untried\n"
+        f"  tier 2 (fallback):  cu{fb_cuda}/torch{fb_torch}.*"
+        f"/cp{bootstrap_python} -- {miss} missing\n"
+        f"Check {CUDA_WHEELS_INDEX}{miss}/ and update the cuda-wheels build matrix."
+    )
+
+
 def _install_cuda_wheels(
     workspace_dir: Path,
     discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
-    cuda_version: Optional[str],
+    chosen_python: str,
+    chosen_cuda: str,
+    chosen_torch_short: str,
     log: Callable[[str], None],
 ) -> None:
     """Install CUDA-only wheel packages (cumesh, flash-attn, etc.) into per-env site-packages.
 
-    Skipped on macOS or without a CUDA host.
+    The combo `(chosen_python, chosen_cuda, chosen_torch_short)` was pre-validated
+    by `_resolve_wheel_combo` against the v2 index and matches what the comfyui
+    template env actually has on disk after `pixi install --all`. As a sanity
+    check, this function reads the template env's torch version and fails loudly
+    if it diverges from `chosen_torch_short`.
     """
-    if not cuda_version or sys.platform == "darwin":
+    if sys.platform == "darwin":
         return
 
     import subprocess
-    from .packages.cuda_wheels import get_wheel_url, CUDA_TORCH_MAP
+    from .packages.cuda_wheels import get_wheel_url, CUDA_WHEELS_INDEX
 
-    pytorch_packages = {"torch", "torchvision", "torchaudio"}
-    cu_short = ".".join(cuda_version.split(".")[:2])
-    torch_ver = CUDA_TORCH_MAP.get(cu_short, "2.8")
+    py_exe = "python.exe" if sys.platform == "win32" else "bin/python"
+    template_python = workspace_dir / ".pixi" / "envs" / "comfyui" / py_exe
+    template_torch = _read_env_torch_version(template_python)
+    if not template_torch:
+        raise RuntimeError(
+            f"Cannot read torch version from comfyui template env at "
+            f"{template_python}. Either pixi install --all didn't materialize "
+            f"the env, or torch isn't in the comfyui feature."
+        )
+    template_short = ".".join(template_torch.split(".")[:2])
+    if template_short != chosen_torch_short:
+        raise RuntimeError(
+            f"Workspace torch drift: pinned cu{chosen_cuda}/torch{chosen_torch_short} "
+            f"but comfyui env materialized torch {template_torch} "
+            f"(short {template_short}). Regenerate pixi.toml or check resolver."
+        )
+    log(f"[comfy-env] cuda-wheels: torch={template_torch} cuda={chosen_cuda}")
 
     for env_name, _plugin, _cf, cfg in discovered:
-        cuda_only = [p for p in cfg.cuda_packages if p not in pytorch_packages]
+        cuda_only = [p for p in cfg.cuda_packages if p not in _PYTORCH_PACKAGES]
         if not cuda_only:
             continue
-        env_python = workspace_dir / ".pixi" / "envs" / env_name / (
-            "python.exe" if sys.platform == "win32" else "bin/python"
-        )
+        env_python = workspace_dir / ".pixi" / "envs" / env_name / py_exe
         if not env_python.exists():
             log(f"[comfy-env] {env_name}: python not found at {env_python}, skipping cuda-wheels")
             continue
 
-        pyv = subprocess.run(
-            [str(env_python), "-c",
-             "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-            capture_output=True, text=True,
-        )
-        py_version = pyv.stdout.strip() or f"{sys.version_info.major}.{sys.version_info.minor}"
-
         log(f"[comfy-env] {env_name}: installing cuda-wheels {cuda_only}")
         for package in cuda_only:
-            url = get_wheel_url(package, torch_ver, cuda_version, py_version)
+            url = get_wheel_url(
+                package, chosen_torch_short, chosen_cuda, chosen_python, log=log,
+            )
             if not url:
-                log(f"[comfy-env]   WARNING: No wheel for {package} "
-                    f"(cu{cuda_version}/torch{torch_ver}/py{py_version})")
-                continue
+                raise RuntimeError(
+                    f"cuda-wheel disappeared between probe and install: {package} "
+                    f"for cu{chosen_cuda}/torch{chosen_torch_short}/cp{chosen_python}. "
+                    f"Check {CUDA_WHEELS_INDEX}{package}/."
+                )
             log(f"[comfy-env]   {package} <- {url}")
             cmd = [str(env_python), "-m", "pip", "install", "--no-deps", "--no-cache-dir", url]
             result = subprocess.run(cmd, capture_output=True, text=True)
@@ -636,11 +804,37 @@ def install_workspace(
                 rel = cf
             log(f"  - {env_name} <- {rel} (python={cfg.python or 'host'})")
 
-        torch_index, cuda_version, cuda_major = _resolve_workspace_torch(log)
+        (
+            torch_index, cuda_version, cuda_major,
+            bootstrap_python, bootstrap_torch,
+        ) = _resolve_workspace_torch(log)
+
+        # Pre-validate cuda-wheel availability against the v2 index. May downgrade
+        # the workspace's torch/cuda to a known-good combo if the bootstrap one
+        # has unpublished wheels. Returns None on macOS / CPU / no cuda-only deps.
+        combo = _resolve_wheel_combo(
+            discovered, bootstrap_python, cuda_version, bootstrap_torch, log,
+        )
+        if combo is not None:
+            chosen_python, chosen_cuda, chosen_torch_short, chosen_torch_pin, _src = combo
+            cuda_version = chosen_cuda
+            cuda_major = chosen_cuda.split(".")[0]
+            torch_index = f"https://download.pytorch.org/whl/cu{chosen_cuda.replace('.', '')[:3]}"
+            torch_pin: Optional[str] = chosen_torch_pin
+        else:
+            chosen_python = bootstrap_python
+            chosen_cuda = cuda_version
+            chosen_torch_short = (
+                ".".join(bootstrap_torch.split(".")[:2]) if bootstrap_torch else None
+            )
+            torch_pin = f"=={bootstrap_torch}" if bootstrap_torch else None
 
         node_configs = [(env_name, cfg) for env_name, _, _, cfg in discovered]
         write_workspace_pixi_toml(
-            workspace_dir, comfyui_dir, torch_index, cuda_major, node_configs, log=log,
+            workspace_dir, comfyui_dir, torch_index, cuda_major, node_configs,
+            bootstrap_python=bootstrap_python,
+            torch_pin=torch_pin,
+            log=log,
         )
 
         if dry_run:
@@ -671,6 +865,7 @@ def install_workspace(
         envs_dir = workspace_dir / ".pixi" / "envs"
         if envs_dir.is_dir():
             current_names = {env_name for env_name, _, _, _ in discovered}
+            current_names.add("comfyui")  # template env always present
             for d in envs_dir.iterdir():
                 if not d.is_dir():
                     continue
@@ -685,7 +880,14 @@ def install_workspace(
                 )
 
         # CUDA-only wheels (cumesh, flash-attn, etc.)
-        _install_cuda_wheels(workspace_dir, discovered, cuda_version, log)
+        if combo is not None:
+            _install_cuda_wheels(
+                workspace_dir, discovered,
+                chosen_python=chosen_python,
+                chosen_cuda=chosen_cuda,
+                chosen_torch_short=chosen_torch_short,
+                log=log,
+            )
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         # Multiple bundled libomps from pip wheels (torch, sklearn, pymeshlab,

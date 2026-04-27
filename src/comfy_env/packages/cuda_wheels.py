@@ -26,12 +26,12 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
     except Exception:
         return None
 
-# Fallback torch version for each CUDA version -- used only when the host's
-# actual torch combo doesn't have all cuda-wheels available.
+# Tier-2 fallback combo. Only consulted by the install pipeline (see
+# install._resolve_wheel_combo) when the host's bootstrap (python, cuda, torch)
+# combo doesn't have every required cuda-wheel published. Keep this aligned with
+# the cuda-wheels build matrix's known-good baseline.
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
-
-# Known-good baseline where all cuda-wheels packages have wheels built.
-FALLBACK_COMBO = ("12.8", "2.8")
+FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
 
 
 def get_cuda_torch_mapping() -> dict:

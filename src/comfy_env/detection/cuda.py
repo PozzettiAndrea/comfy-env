@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 CUDA_VERSION_ENV_VAR = "COMFY_ENV_CUDA_VERSION"
+TORCH_VERSION_ENV_VAR = "COMFY_ENV_TORCH_VERSION"
 
 
 def has_nvidia_gpu() -> bool:
@@ -86,3 +87,28 @@ def get_cuda_from_nvcc() -> str | None:
     except Exception:
         pass
     return None
+
+
+def get_bootstrap_python_version() -> str:
+    """Python version of the interpreter running comfy-env install (e.g. '3.10')."""
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def get_bootstrap_torch_version() -> str | None:
+    """Public torch version available in the bootstrap interpreter (e.g. '2.11.0').
+
+    Priority: COMFY_ENV_TORCH_VERSION env var -> `import torch; torch.__version__`.
+    Returns None if torch isn't importable from the bootstrap.
+    """
+    override = os.environ.get(TORCH_VERSION_ENV_VAR, "").strip()
+    if override:
+        return override
+    try:
+        import torch
+        v = getattr(torch, "__version__", None)
+        if not v:
+            return None
+        # Strip local label (e.g. "2.11.0+cu128" -> "2.11.0")
+        return str(v).split("+", 1)[0]
+    except Exception:
+        return None
