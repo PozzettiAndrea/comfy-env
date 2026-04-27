@@ -322,7 +322,7 @@ def fetch_metadata(
             except Exception:
                 pixi_path = "pixi"
             cmd = [
-                str(pixi_path), "run", "--frozen",
+                str(pixi_path), "run", "--as-is",
                 "--manifest-path", str(workspace_dir / "pixi.toml"),
                 "-e", env_name,
                 "python", script_file, str(working_dir), package_name,

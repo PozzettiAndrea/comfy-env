@@ -2960,7 +2960,7 @@ class SubprocessWorker(Worker):
                 pixi_path = "pixi"  # fall back to PATH lookup
 
             cmd = [
-                str(pixi_path), "run", "--frozen",
+                str(pixi_path), "run", "--as-is",
                 "--manifest-path", str(workspace_dir / "pixi.toml"),
                 "-e", env_name,
                 "python", str(self._worker_script), self._socket_addr,
