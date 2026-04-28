@@ -286,7 +286,8 @@ def _build_node_feature(
         shadowed = sorted(set(auto_overrides) & set(manual))
         shadow_note = f" (overridden by comfy-env.toml: {', '.join(shadowed)})" if shadowed else ""
         log(
-            f"[comfy-env] {name}: torch override -> {ver_summary} from {idx}"
+            f"[comfy-env] {name}: dependency overrides -> {ver_summary}"
+            f"{f' from {idx}' if idx else ''}"
             f"{shadow_note}"
         )
     if pypi_options:
@@ -472,9 +473,15 @@ def build_workspace_toml(
                 urls[pkg] = url
             feat_urls = urls
 
+        # Merge torch-family overrides with cuda-wheel overrides that relax
+        # inter-package version constraints (e.g. spconv -> cumm).
+        node_overrides = dict(override_map) if (override_map and cuda_only) else {}
+        if feat_urls:
+            for pkg in feat_urls:
+                node_overrides[pkg] = {"version": ">=0"}
         feat = _build_node_feature(
             cfg, env_name, log,
-            auto_overrides=override_map if cuda_only else None,
+            auto_overrides=node_overrides or None,
             cuda_wheel_urls=feat_urls,
         )
         if feat:
