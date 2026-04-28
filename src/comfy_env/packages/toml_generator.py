@@ -417,20 +417,22 @@ def build_workspace_toml(
 
     out: Dict[str, Any] = {"workspace": workspace}
 
-    # Auto-detect host glibc so pixi accepts wheels matching the real system
-    # (pixi defaults to glibc 2.28 which rejects e.g. manylinux_2_31 wheels).
-    import platform as _platform
-    libc_family, libc_version = _platform.libc_ver()
-    if libc_family == "glibc" and libc_version:
-        out["system-requirements"] = {
-            "libc": {"family": "glibc", "version": libc_version},
-        }
-        log(f"[comfy-env] Host glibc {libc_version} -> system-requirements.libc")
-
     # comfyui baseline feature
     comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
     _pin_torch_family(comfyui_pypi, torch_pin, log)
     feature_comfyui: Dict[str, Any] = {}
+
+    # Auto-detect host glibc so pixi accepts wheels matching the real system.
+    # Put on the comfyui feature (not top-level) because all envs use
+    # no-default-feature and include comfyui — top-level system-requirements
+    # would be ignored.
+    import platform as _platform
+    libc_family, libc_version = _platform.libc_ver()
+    if libc_family == "glibc" and libc_version:
+        feature_comfyui["system-requirements"] = {
+            "libc": {"family": "glibc", "version": libc_version},
+        }
+        log(f"[comfy-env] Host glibc {libc_version} -> comfyui feature system-requirements")
     if comfyui_pypi:
         feature_comfyui["pypi-dependencies"] = comfyui_pypi
     # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
