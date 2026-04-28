@@ -272,6 +272,18 @@ def _build_node_feature(
         )
 
     pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
+
+    # Prevent pixi from building cuda-wheels from source (sdist) — we only
+    # want the pre-built wheel URLs we already provided.
+    if cuda_wheel_urls:
+        no_build = pypi_options.get("no-build", None)
+        if no_build is None:
+            no_build = list(cuda_wheel_urls.keys())
+        elif isinstance(no_build, list):
+            no_build = list(no_build) + [p for p in cuda_wheel_urls if p not in no_build]
+        # if no_build == "all" or similar, leave it alone
+        if isinstance(no_build, list):
+            pypi_options["no-build"] = no_build
     if auto_overrides:
         manual = pypi_options.get("dependency-overrides", {}) or {}
         merged = {**auto_overrides, **manual}  # manual entries shadow auto-emitted
