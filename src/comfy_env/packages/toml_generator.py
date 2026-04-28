@@ -272,18 +272,6 @@ def _build_node_feature(
         )
 
     pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
-
-    # Prevent pixi from building cuda-wheels from source (sdist) — we only
-    # want the pre-built wheel URLs we already provided.
-    if cuda_wheel_urls:
-        no_build = pypi_options.get("no-build", None)
-        if no_build is None:
-            no_build = list(cuda_wheel_urls.keys())
-        elif isinstance(no_build, list):
-            no_build = list(no_build) + [p for p in cuda_wheel_urls if p not in no_build]
-        # if no_build == "all" or similar, leave it alone
-        if isinstance(no_build, list):
-            pypi_options["no-build"] = no_build
     if auto_overrides:
         manual = pypi_options.get("dependency-overrides", {}) or {}
         merged = {**auto_overrides, **manual}  # manual entries shadow auto-emitted
@@ -298,8 +286,7 @@ def _build_node_feature(
         shadowed = sorted(set(auto_overrides) & set(manual))
         shadow_note = f" (overridden by comfy-env.toml: {', '.join(shadowed)})" if shadowed else ""
         log(
-            f"[comfy-env] {name}: dependency overrides -> {ver_summary}"
-            f"{f' from {idx}' if idx else ''}"
+            f"[comfy-env] {name}: torch override -> {ver_summary} from {idx}"
             f"{shadow_note}"
         )
     if pypi_options:
@@ -467,9 +454,13 @@ def build_workspace_toml(
     from .cuda_wheels import get_wheel_url as _get_wheel_url
     can_resolve_urls = bool(chosen_cuda and chosen_torch_short and chosen_python)
 
+    # Collect cuda-wheel URLs per env for post-pixi `uv pip install --no-deps`.
+    # These are NOT inlined into pixi.toml because pixi's resolver cannot handle
+    # --no-deps semantics and will try to resolve/build their declared dependencies.
+    cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
+
     for env_name, cfg in node_configs:
         cuda_only = [p for p in cfg.cuda_packages if p not in _PYTORCH_PACKAGES]
-        feat_urls: Optional[Dict[str, str]] = None
         if cuda_only and can_resolve_urls:
             urls: Dict[str, str] = {}
             for pkg in cuda_only:
@@ -483,18 +474,16 @@ def build_workspace_toml(
                         f"_resolve_wheel_combo should have caught this earlier."
                     )
                 urls[pkg] = url
-            feat_urls = urls
+            if urls:
+                cuda_urls_by_env[env_name] = urls
+                log(
+                    f"[comfy-env] {env_name}: cuda-wheels deferred for post-pixi install "
+                    f"({', '.join(urls.keys())})"
+                )
 
-        # Merge torch-family overrides with cuda-wheel overrides that relax
-        # inter-package version constraints (e.g. spconv -> cumm).
-        node_overrides = dict(override_map) if (override_map and cuda_only) else {}
-        if feat_urls:
-            for pkg in feat_urls:
-                node_overrides[pkg] = {"version": ">=0"}
         feat = _build_node_feature(
             cfg, env_name, log,
-            auto_overrides=node_overrides or None,
-            cuda_wheel_urls=feat_urls,
+            auto_overrides=override_map if cuda_only else None,
         )
         if feat:
             out["feature"][env_name] = feat
@@ -526,7 +515,7 @@ def build_workspace_toml(
         }
     out["environments"] = environments
 
-    return out
+    return out, cuda_urls_by_env
 
 
 # ---------------------------------------------------------------------------
@@ -548,11 +537,15 @@ def write_workspace_pixi_toml(
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
 ) -> Path:
-    """Generate `<workspace_dir>/pixi.toml` from the parts above. Returns the file path."""
+    """Generate `<workspace_dir>/pixi.toml` from the parts above.
+
+    Returns (pixi_toml_path, cuda_urls_by_env) where cuda_urls_by_env is
+    ``{env_name: {pkg: wheel_url}}`` for post-pixi ``uv pip install --no-deps``.
+    """
     tomli_w = _require_tomli_w()
     workspace_dir.mkdir(parents=True, exist_ok=True)
     pixi_toml = workspace_dir / "pixi.toml"
-    data = build_workspace_toml(
+    data, cuda_urls_by_env = build_workspace_toml(
         comfyui_dir, torch_index, cuda_major, node_configs,
         bootstrap_python=bootstrap_python,
         torch_pin=torch_pin,
@@ -566,7 +559,7 @@ def write_workspace_pixi_toml(
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)
     log(f"Generated {pixi_toml}")
-    return pixi_toml
+    return pixi_toml, cuda_urls_by_env
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ from ..config import (
     ROOT_CONFIG_FILE_NAME,
 )
 from ..environment.cache import get_env_name
-from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py
+from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py, _find_uv
 
 
 _PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
@@ -419,7 +419,7 @@ def install_workspace(
             )
 
         node_configs = [(env_name, cfg) for env_name, _, _, cfg in discovered]
-        write_workspace_pixi_toml(
+        _, cuda_urls_by_env = write_workspace_pixi_toml(
             workspace_dir, comfyui_dir, torch_index, cuda_major, node_configs,
             bootstrap_python=bootstrap_python,
             torch_pin=torch_pin,
@@ -472,10 +472,32 @@ def install_workspace(
                     f"Remove via `pixi clean --environment {d.name}` if intended."
                 )
 
-        # CUDA-only wheels (cumesh, flash-attn, etc.) are inlined as
-        # `pypi-dependencies` URL entries in the per-node features (see
-        # `toml_generator.build_workspace_toml`). Pixi installs them as part of
-        # `pixi install --all`, no post-step pip pass needed.
+        # CUDA-only wheels (cumesh, flash-attn, etc.) are installed with
+        # --no-deps after pixi, because pixi's resolver cannot suppress their
+        # declared dependencies (which are often wrong for custom-built wheels).
+        if cuda_urls_by_env:
+            uv_path = _find_uv()
+            for env_name, pkg_urls in cuda_urls_by_env.items():
+                env_dir = envs_dir / env_name
+                if not env_dir.is_dir():
+                    log(f"[comfy-env] Warning: env dir {env_dir} not found, skipping cuda-wheels")
+                    continue
+                wheel_urls = list(pkg_urls.values())
+                log(
+                    f"[comfy-env] {env_name}: installing cuda-wheels with --no-deps "
+                    f"({', '.join(pkg_urls.keys())})"
+                )
+                uv_result = _run_streaming(
+                    [uv_path, "pip", "install", "--no-deps", "--no-cache",
+                     "--prefix", str(env_dir)] + wheel_urls,
+                    log=log, cwd=workspace_dir, env=pixi_env,
+                )
+                _log_subprocess(log, uv_result, f"uv pip install --no-deps ({env_name})")
+                if uv_result.returncode != 0:
+                    raise RuntimeError(
+                        f"uv pip install --no-deps failed for {env_name}:\n"
+                        f"stderr: {uv_result.stderr}\nstdout: {uv_result.stdout}"
+                    )
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         _dedupe_envs_libomp(workspace_dir, discovered, log)
