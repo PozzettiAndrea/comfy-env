@@ -16,14 +16,9 @@ def is_comfy_env_enabled() -> bool:
 
 
 def _find_env_dirs(node_dir: str) -> list:
-    """Recursively find all _env_* directories under node_dir (for debug info only)."""
-    envs = []
-    for root, dirs, _ in os.walk(node_dir):
-        for d in dirs:
-            if d.startswith("_env_"):
-                envs.append(os.path.join(root, d))
-        dirs[:] = [d for d in dirs if not d.startswith("_env_")]
-    return envs
+    """Recursively find comfy-env.toml files under node_dir (for debug info only)."""
+    from pathlib import Path
+    return sorted(str(p.parent) for p in Path(node_dir).rglob("comfy-env.toml"))
 
 
 def _ensure_base_directory():
