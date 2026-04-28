@@ -452,7 +452,7 @@ def build_workspace_toml(
     # Resolve cuda-wheel URLs for each per-node feature so pixi installs them
     # as part of `pixi install --all` (rather than a slow post-step pip pass).
     from .cuda_wheels import get_wheel_url as _get_wheel_url
-    can_resolve_urls = bool(chosen_cuda and chosen_torch_short and chosen_python)
+    can_resolve_urls = bool(chosen_cuda and chosen_torch_short)
 
     # Collect cuda-wheel URLs per env for post-pixi `uv pip install --no-deps`.
     # These are NOT inlined into pixi.toml because pixi's resolver cannot handle
@@ -461,16 +461,17 @@ def build_workspace_toml(
 
     for env_name, cfg in node_configs:
         cuda_only = [p for p in cfg.cuda_packages if p not in _PYTORCH_PACKAGES]
-        if cuda_only and can_resolve_urls:
+        env_python = cfg.python or host_py
+        if cuda_only and can_resolve_urls and env_python:
             urls: Dict[str, str] = {}
             for pkg in cuda_only:
                 url = _get_wheel_url(
-                    pkg, chosen_torch_short, chosen_cuda, chosen_python, log=log,
+                    pkg, chosen_torch_short, chosen_cuda, env_python, log=log,
                 )
                 if not url:
                     raise RuntimeError(
                         f"cuda-wheel {pkg!r} unavailable for "
-                        f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{chosen_python}; "
+                        f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{env_python}; "
                         f"_resolve_wheel_combo should have caught this earlier."
                     )
                 urls[pkg] = url
