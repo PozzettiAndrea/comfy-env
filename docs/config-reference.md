@@ -9,24 +9,25 @@ comfy-env uses two config files with distinct roles:
 
 ## comfy-env-root.toml
 
-Root-level config. Handles system packages and ComfyUI node dependencies. **Does not install any Python packages**.
+Root-level config. Handles conda dependencies for the main ComfyUI environment and custom node dependencies.
 
 ```toml
-[brew]
-packages = ["libomp"]
+[dependencies]
+ffmpeg = "*"  # conda packages for the main ComfyUI env
 
 [node_reqs]
 ComfyUI_essentials = { github = "cubiq/ComfyUI_essentials", tag = "v1.0.0" }
 comfyui_controlnet_aux = "Fannovel16/comfyui_controlnet_aux"
 ```
 
-### `[brew]`
+### `[dependencies]`
 
-macOS packages installed via Homebrew.
+Conda packages injected into the main ComfyUI pixi environment. Use this for system libraries that ComfyUI or its core deps need (e.g. `ffmpeg` for `av` on macOS).
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `packages` | list of strings | Package names to install |
+```toml
+[dependencies]
+ffmpeg = "*"
+```
 
 ### `[node_reqs]`
 
@@ -158,7 +159,7 @@ Runtime options.
 
 | Section | Root | Isolated |
 |---------|:----:|:--------:|
-| `[brew]` | x | |
+| `[dependencies]` | x | x |
 | `[node_reqs]` | x | |
 | `python` | | x |
 | `[dependencies]` | | x |

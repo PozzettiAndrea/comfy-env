@@ -12,7 +12,6 @@ from ..config import (
 )
 from .helpers import USE_COMFY_ENV_VAR, _enable_windows_long_paths
 from .plugin import (
-    _install_brew_packages,
     _install_node_dependencies,
     _reinstall_main_requirements,
     _collect_node_req_dirs,
@@ -38,7 +37,7 @@ def install(
     """Install dependencies for the calling plugin and (re)build the workspace.
 
     Called from a plugin's `install.py` as `from comfy_env import install; install()`.
-    Performs per-plugin work (brew/node_reqs/main-env pip), then triggers a
+    Performs per-plugin work (node_reqs/main-env pip), then triggers a
     workspace-wide `pixi install --all` covering every plugin in this ComfyUI install.
     """
     if node_dir is None:
@@ -58,9 +57,6 @@ def install(
     if cfg is None:
         raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
-    if cfg.brew_packages:
-        _install_brew_packages(cfg.brew_packages, log, dry_run)
-
     node_req_dirs: List[Path] = []
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
@@ -69,8 +65,7 @@ def install(
         for nr_dir in node_req_dirs:
             nr_cfg = discover_config(nr_dir, root=True)
             if nr_cfg:
-                if nr_cfg.brew_packages:
-                    _install_brew_packages(nr_cfg.brew_packages, log, dry_run)
+                pass  # Future: could process nr_cfg here
 
     from ..settings import resolve_bool, GENERAL_DEFAULTS
     node_settings = cfg.settings if cfg.settings else None

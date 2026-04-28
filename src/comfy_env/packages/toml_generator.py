@@ -371,6 +371,7 @@ def build_workspace_toml(
     chosen_cuda: Optional[str] = None,
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
+    root_conda_deps: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the full workspace pixi.toml as a dict.
 
@@ -433,6 +434,9 @@ def build_workspace_toml(
             "libc": {"family": "glibc", "version": libc_version},
         }
         log(f"[comfy-env] Host glibc {libc_version} -> comfyui feature system-requirements")
+    if root_conda_deps:
+        feature_comfyui["dependencies"] = copy.deepcopy(root_conda_deps)
+        log(f"[comfy-env] Root conda deps injected into comfyui feature: {list(root_conda_deps.keys())}")
     if comfyui_pypi:
         feature_comfyui["pypi-dependencies"] = comfyui_pypi
     # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
@@ -561,6 +565,7 @@ def write_workspace_pixi_toml(
     chosen_cuda: Optional[str] = None,
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
+    root_conda_deps: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Generate `<workspace_dir>/pixi.toml` from the parts above.
 
@@ -580,6 +585,7 @@ def write_workspace_pixi_toml(
         chosen_cuda=chosen_cuda,
         chosen_torch_short=chosen_torch_short,
         chosen_python=chosen_python,
+        root_conda_deps=root_conda_deps,
     )
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)
