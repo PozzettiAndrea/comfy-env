@@ -565,6 +565,8 @@ def install_workspace(
                 # correct site-packages and validates wheel compatibility.
                 env_python = env_dir / "bin" / "python"
                 if not env_python.exists():
+                    env_python = env_dir / "python.exe"  # pixi on Windows
+                if not env_python.exists():
                     env_python = env_dir / "Scripts" / "python.exe"
                 uv_result = _run_streaming(
                     [uv_path, "pip", "install", "--no-deps", "--no-cache",
