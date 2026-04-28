@@ -12,9 +12,6 @@ comfy-env uses two config files with distinct roles:
 Root-level config. Handles system packages and ComfyUI node dependencies. **Does not install any Python packages**.
 
 ```toml
-[apt]
-packages = ["libgl1-mesa-glx", "libglib2.0-0"]
-
 [brew]
 packages = ["libomp"]
 
@@ -22,14 +19,6 @@ packages = ["libomp"]
 ComfyUI_essentials = { github = "cubiq/ComfyUI_essentials", tag = "v1.0.0" }
 comfyui_controlnet_aux = "Fannovel16/comfyui_controlnet_aux"
 ```
-
-### `[apt]`
-
-Linux system packages installed via `apt-get`.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `packages` | list of strings | Package names to install |
 
 ### `[brew]`
 
@@ -169,7 +158,6 @@ Runtime options.
 
 | Section | Root | Isolated |
 |---------|:----:|:--------:|
-| `[apt]` | x | |
 | `[brew]` | x | |
 | `[node_reqs]` | x | |
 | `python` | | x |

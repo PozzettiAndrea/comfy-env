@@ -40,11 +40,6 @@ def main(args: Optional[List[str]] = None) -> int:
     p.add_argument("--package", "-p", type=str, help="Check specific package")
     p.add_argument("--config", "-c", type=str, help="Config path")
 
-    # apt-install
-    p = sub.add_parser("apt-install", help="Install apt packages (Linux)")
-    p.add_argument("--config", "-c", type=str, help="Config path")
-    p.add_argument("--dry-run", action="store_true", help="Preview only")
-
     # settings
     sub.add_parser("settings", help="Configure comfy-env settings")
 
@@ -61,7 +56,7 @@ def main(args: Optional[List[str]] = None) -> int:
 
     commands = {
         "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
-        "info": cmd_info, "doctor": cmd_doctor, "apt-install": cmd_apt_install,
+        "info": cmd_info, "doctor": cmd_doctor,
         "settings": cmd_settings, "debug": cmd_debug, "cleanup": cmd_cleanup,
     }
 
@@ -79,9 +74,6 @@ ROOT_DEFAULT_CONFIG = """\
 # comfy-env-root.toml - Main node config
 # PyPI deps go in requirements.txt
 # CUDA/conda/pypi packages go in comfy-env.toml (isolated subfolders only)
-
-[apt]
-packages = []
 
 [node_reqs]
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"
@@ -198,46 +190,6 @@ def cmd_doctor(args) -> int:
         return 0 if verify_installation(packages) else 1
     print("  No packages to verify")
     return 0
-
-
-def cmd_apt_install(args) -> int:
-    import os, shutil, subprocess, platform
-    if platform.system() != "Linux":
-        print("apt-install: Linux only", file=sys.stderr)
-        return 1
-
-    # Check root config first, then regular
-    if args.config:
-        config_path = Path(args.config).resolve()
-    else:
-        root_path = Path.cwd() / ROOT_CONFIG_FILE_NAME
-        config_path = root_path if root_path.exists() else Path.cwd() / CONFIG_FILE_NAME
-
-    if not config_path.exists():
-        print(f"Not found: {config_path}", file=sys.stderr)
-        return 1
-
-    from .config.parser import load_config
-    packages = load_config(config_path).apt_packages
-    if not packages:
-        print("No apt packages in config")
-        return 0
-
-    print(f"Packages: {', '.join(packages)}")
-    use_sudo = os.geteuid() != 0 and shutil.which("sudo")
-    prefix = ["sudo"] if use_sudo else []
-
-    if args.dry_run:
-        print(f"Would run: {'sudo ' if use_sudo else ''}apt-get install -y {' '.join(packages)}")
-        return 0
-
-    if os.geteuid() != 0 and not shutil.which("sudo"):
-        print("Need root. Run: sudo apt-get install -y " + " ".join(packages), file=sys.stderr)
-        return 1
-
-    subprocess.run(prefix + ["apt-get", "update"], capture_output=False)
-    result = subprocess.run(prefix + ["apt-get", "install", "-y"] + packages, capture_output=False)
-    return result.returncode
 
 
 def _read_env_file(path):

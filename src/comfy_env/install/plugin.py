@@ -1,4 +1,4 @@
-"""Per-plugin install: apt/brew/node_reqs and main-env pip install.
+"""Per-plugin install: brew/node_reqs and main-env pip install.
 
 Called from `install()` in __init__.py for the plugin whose `install.py` invoked
 `from comfy_env import install; install()`. Workspace-level (`pixi install --all`)
@@ -18,18 +18,6 @@ from ..config import (
     discover_config,
     CONFIG_FILE_NAME,
 )
-
-
-def _install_apt_packages(packages: List[str], log: Callable[[str], None], dry_run: bool) -> None:
-    from ..packages.apt import apt_install
-    import platform
-    if platform.system() != "Linux":
-        return
-    log(f"\n[apt] Installing: {', '.join(packages)}")
-    if not dry_run:
-        success = apt_install(packages, log)
-        if not success:
-            log("[apt] WARNING: Some apt packages failed to install. This may cause issues.")
 
 
 def _install_brew_packages(packages: List[str], log: Callable[[str], None], dry_run: bool) -> None:

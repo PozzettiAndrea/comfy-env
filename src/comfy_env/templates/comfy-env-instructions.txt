@@ -16,9 +16,6 @@ CONFIG FORMAT
 [cuda]
 packages = ["nvdiffrast", "pytorch3d"]
 
-[apt]
-packages = ["libgl1-mesa-glx"]
-
 [dependencies]
 cgal = "*"
 

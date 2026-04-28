@@ -60,7 +60,7 @@ packages = []
 # CONDA PACKAGES (pixi-native)
 # =============================================================================
 # Conda packages from conda-forge (includes system libraries).
-# Use this instead of apt/brew - works cross-platform.
+# Use this for system libraries - works cross-platform.
 
 [dependencies]
 # mesalib = "*"           # OpenGL (replaces libgl1)
