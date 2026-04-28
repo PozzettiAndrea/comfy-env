@@ -292,6 +292,10 @@ def _build_node_feature(
     if pypi_options:
         feat["pypi-options"] = pypi_options
 
+    sys_reqs = cfg.pixi_passthrough.get("system-requirements")
+    if sys_reqs:
+        feat["system-requirements"] = copy.deepcopy(sys_reqs)
+
     return feat
 
 
@@ -404,14 +408,24 @@ def build_workspace_toml(
             if ch not in channels:
                 channels.append(ch)
 
-    out: Dict[str, Any] = {
-        "workspace": {
-            "name": "comfy-env",
-            "version": "0.1.0",
-            "channels": channels,
-            "platforms": [current_platform],
-        }
+    workspace: Dict[str, Any] = {
+        "name": "comfy-env",
+        "version": "0.1.0",
+        "channels": channels,
+        "platforms": [current_platform],
     }
+
+    # Auto-detect host glibc so pixi accepts wheels matching the real system
+    # (pixi defaults to glibc 2.28 which rejects e.g. manylinux_2_31 wheels).
+    import platform as _platform
+    libc_family, libc_version = _platform.libc_ver()
+    if libc_family == "glibc" and libc_version:
+        workspace["system-requirements"] = {
+            "libc": {"family": "glibc", "version": libc_version},
+        }
+        log(f"[comfy-env] Host glibc {libc_version} -> system-requirements.libc")
+
+    out: Dict[str, Any] = {"workspace": workspace}
 
     # comfyui baseline feature
     comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
