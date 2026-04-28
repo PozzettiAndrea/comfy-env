@@ -396,11 +396,19 @@ def build_workspace_toml(
     for name, cfg in node_configs:
         _validate_node_config(name, cfg)
 
+    # Collect channels: start with conda-forge, then merge any extra channels
+    # declared by node configs in [workspace].channels.
+    channels: List[str] = ["conda-forge"]
+    for _, cfg in node_configs:
+        for ch in cfg.pixi_passthrough.get("workspace", {}).get("channels", []):
+            if ch not in channels:
+                channels.append(ch)
+
     out: Dict[str, Any] = {
         "workspace": {
             "name": "comfy-env",
             "version": "0.1.0",
-            "channels": ["conda-forge"],
+            "channels": channels,
             "platforms": [current_platform],
         }
     }
