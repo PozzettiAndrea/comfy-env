@@ -415,17 +415,17 @@ def build_workspace_toml(
         "platforms": [current_platform],
     }
 
+    out: Dict[str, Any] = {"workspace": workspace}
+
     # Auto-detect host glibc so pixi accepts wheels matching the real system
     # (pixi defaults to glibc 2.28 which rejects e.g. manylinux_2_31 wheels).
     import platform as _platform
     libc_family, libc_version = _platform.libc_ver()
     if libc_family == "glibc" and libc_version:
-        workspace["system-requirements"] = {
+        out["system-requirements"] = {
             "libc": {"family": "glibc", "version": libc_version},
         }
         log(f"[comfy-env] Host glibc {libc_version} -> system-requirements.libc")
-
-    out: Dict[str, Any] = {"workspace": workspace}
 
     # comfyui baseline feature
     comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
