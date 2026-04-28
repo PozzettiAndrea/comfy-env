@@ -1757,7 +1757,31 @@ def _to_shm(obj, registry, visited=None):
     if isinstance(obj, (np.floating, np.integer, np.bool_)):
         return obj.item()
 
-    return obj
+    # Path -> string
+    from pathlib import PurePath
+    if isinstance(obj, PurePath):
+        return str(obj)
+
+    # primitives pass through
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    # Fallback: pickle any remaining object to shared memory
+    import pickle
+    try:
+        obj_bytes = pickle.dumps(obj)
+        block = shm.SharedMemory(create=True, size=len(obj_bytes))
+        block.buf[:len(obj_bytes)] = obj_bytes
+        registry.append(block)
+        result = {
+            "__shm_pickle__": True,
+            "name": block.name,
+            "size": len(obj_bytes),
+        }
+        visited[obj_id] = result
+        return result
+    except Exception:
+        return obj
 
 
 def _deserialize_tensor_native(data):
