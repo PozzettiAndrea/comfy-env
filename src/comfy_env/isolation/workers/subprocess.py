@@ -79,22 +79,30 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
 
     Returns:
         Tuple of (socket, address_string).
-        Address string is "unix://path" or "tcp://host:port".
+        Address string is "abstract://name", "unix://path", or "tcp://host:port".
     """
     if _has_af_unix():
-        # Unix domain socket (fast, no port conflicts)
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock_path = _get_socket_dir() / f"comfy_worker_{uuid.uuid4().hex[:12]}.sock"
-        # Remove stale socket file if exists
-        try:
-            sock_path.unlink()
-        except FileNotFoundError:
-            pass
-        sock.bind(str(sock_path))
-        sock.listen(1)
-        return sock, f"unix://{sock_path}"
+        if sys.platform == 'linux':
+            # Abstract namespace: kernel-only, no filesystem path that can disappear.
+            # Fixes intermittent FileNotFoundError when pixi env activation or
+            # container-level cleanup deletes /dev/shm/*.sock between bind and connect.
+            abstract_name = f"\0comfy_worker_{uuid.uuid4().hex[:12]}"
+            sock.bind(abstract_name)
+            sock.listen(1)
+            return sock, f"abstract://{abstract_name[1:]}"
+        else:
+            # macOS/other: filesystem sockets (no abstract namespace support)
+            sock_path = _get_socket_dir() / f"comfy_worker_{uuid.uuid4().hex[:12]}.sock"
+            try:
+                sock_path.unlink()
+            except FileNotFoundError:
+                pass
+            sock.bind(str(sock_path))
+            sock.listen(1)
+            return sock, f"unix://{sock_path}"
     else:
-        # TCP localhost fallback (works everywhere)
+        # TCP localhost fallback (Windows)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('127.0.0.1', 0))  # OS picks free port
@@ -108,12 +116,16 @@ def _connect_to_socket(addr: str) -> socket.socket:
     Connect to a server socket.
 
     Args:
-        addr: Address string ("unix://path" or "tcp://host:port").
+        addr: Address string ("abstract://name", "unix://path", or "tcp://host:port").
 
     Returns:
         Connected socket.
     """
-    if addr.startswith("unix://"):
+    if addr.startswith("abstract://"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(f"\0{addr[11:]}")  # Prepend \0 for abstract namespace
+        return sock
+    elif addr.startswith("unix://"):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(addr[7:])  # Strip "unix://"
         return sock
@@ -2138,10 +2150,30 @@ class SocketTransport:
 
 
 def _connect(addr):
-    """Connect to server socket (unix:// or tcp://)."""
-    if addr.startswith("unix://"):
+    """Connect to server socket (abstract://, unix://, or tcp://)."""
+    if addr.startswith("abstract://"):
+        # Abstract Unix socket (Linux) — kernel namespace, no filesystem path
+        name = f"\\0{addr[11:]}"
+        if _DBG_WORKER:
+            wlog(f"[worker] abstract socket name={addr[11:]}")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(addr[7:])
+        sock.connect(name)
+        return sock
+    elif addr.startswith("unix://"):
+        path = addr[7:]
+        if _DBG_WORKER:
+            wlog(f"[worker] socket path={path} exists={os.path.exists(path)} dir_exists={os.path.isdir(os.path.dirname(path))}")
+            wlog(f"[worker] pid={os.getpid()} ppid={os.getppid()} cwd={os.getcwd()}")
+            wlog(f"[worker] sys.argv={sys.argv}")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(path)
+        except FileNotFoundError:
+            # Always log this to stderr — worker is about to crash and wlog file may be lost
+            print(f"[worker] FATAL: socket not found: path={path} exists={os.path.exists(path)} "
+                  f"dir={os.path.dirname(path)} dir_exists={os.path.isdir(os.path.dirname(path))} "
+                  f"argv={sys.argv}", file=sys.stderr, flush=True)
+            raise
         return sock
     elif addr.startswith("tcp://"):
         host_port = addr[6:]
@@ -2995,7 +3027,20 @@ class SubprocessWorker(Worker):
             launch_env = env
 
         if _DBG_WORKER:
-            print(f"[SubprocessWorker] launching cmd={cmd[:3]}...", flush=True)
+            print(f"[SubprocessWorker] launching cmd={cmd}...", flush=True)
+        # Verify socket before spawning worker
+        if self._socket_addr.startswith("abstract://"):
+            if _DBG_WORKER:
+                print(f"[SubprocessWorker] socket_addr={self._socket_addr} (abstract, no filesystem path)", flush=True)
+        elif self._socket_addr.startswith("unix://"):
+            _sock_path = self._socket_addr[7:]
+            _sock_exists = os.path.exists(_sock_path)
+            if _DBG_WORKER:
+                print(f"[SubprocessWorker] socket_addr={self._socket_addr} exists={_sock_exists}", flush=True)
+            if not _sock_exists:
+                print(f"[SubprocessWorker] WARNING: socket file missing before worker spawn!", flush=True)
+                if _DBG_WORKER:
+                    print(f"[SubprocessWorker] socket dir={os.path.dirname(_sock_path)} dir_exists={os.path.isdir(os.path.dirname(_sock_path))}", flush=True)
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
