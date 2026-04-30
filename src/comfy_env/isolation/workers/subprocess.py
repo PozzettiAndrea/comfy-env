@@ -2625,7 +2625,12 @@ def main():
             continue
 
         if request.get("method") == "model_to_device":
-            # Move a registered model to a device (cuda/cpu)
+            # Move a registered model to a device (cuda/cpu).
+            # We go through ComfyUI's ModelPatcher when possible so that
+            # weight-casting patches (comfy_cast_weights) are properly
+            # applied/removed.  A raw .to() bypasses the patching lifecycle
+            # and leaves tensors in an inconsistent state ("Inference tensors
+            # do not track version counter").
             _mid = request.get("model_id")
             _target = request.get("device", "cpu")
             _model = _model_registry.get(_mid)
@@ -2650,7 +2655,27 @@ def main():
                     continue
                 _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
                 wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
-                _model.to(_target_dev)
+
+                # Try to find the ModelPatcher in the subprocess's
+                # current_loaded_models so we use patch_model/unpatch_model
+                # instead of raw .to().
+                _used_patcher = False
+                try:
+                    import comfy.model_management as _cmm_move
+                    for _lm in _cmm_move.current_loaded_models:
+                        if _lm.model is not None and _lm.model.model is _model:
+                            if _target_dev.type == "cpu":
+                                _lm.model_unload()
+                            else:
+                                _lm.model_load()
+                            _used_patcher = True
+                            break
+                except Exception as _pe:
+                    wlog(f"[worker] model_to_device: patcher path failed ({_pe}), falling back to .to()")
+
+                if not _used_patcher:
+                    _model.to(_target_dev)
+
                 # Only empty cache if we actually freed CUDA tensors
                 if _was_cuda and _target_dev.type == "cpu":
                     _torch.cuda.empty_cache()
