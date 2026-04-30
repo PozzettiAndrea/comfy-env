@@ -486,7 +486,7 @@ def build_proxy_class(
     def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn, hsk):
         def proxy(self, **kwargs):
             from .wrap import (_get_or_create_worker, _remove_worker,
-                               _load_worker_models, _register_new_patchers)
+                               _register_new_patchers)
 
             # Strip hidden kwargs that V3 execute() doesn't expect
             if hsk:
@@ -519,9 +519,6 @@ def build_proxy_class(
             worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
             _t0 = time.perf_counter()
             try:
-                # Ensure any previously-registered subprocess models are on GPU
-                _load_worker_models(ed)
-
                 try:
                     from .tensor_utils import prepare_for_ipc_recursive
                     kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}

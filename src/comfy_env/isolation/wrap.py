@@ -685,35 +685,37 @@ def _register_new_patchers(env_dir, worker, generation):
             offload_device=offload_device,
             kind=ref.get("kind", "other"),
         )
-        # Mark as already loaded (the model is on GPU right now)
-        patcher.model.device = load_device
-        patcher.model.model_loaded_weight_memory = ref["size"]
+        # Set device based on where the model actually is in the subprocess.
+        # Models are auto-detected when they land on CUDA, but may have been
+        # offloaded back to CPU by the time the call finishes.
+        reported_device = ref.get("device", "cpu")
+        if reported_device.startswith("cuda"):
+            patcher.model.device = load_device
+            patcher.model.model_loaded_weight_memory = ref["size"]
+        else:
+            patcher.model.device = offload_device
+            patcher.model.model_loaded_weight_memory = 0
         patchers[model_id] = patcher
         created.append(model_id)
 
     if created:
         if _DBG_MODELS:
             _log(f"[comfy-env] Created {len(created)} model patchers: {created}")
-        # Register with ComfyUI memory manager (models are already on GPU)
-        comfy.model_management.load_models_gpu(list(patchers.values()))
+        # Register with ComfyUI memory manager.  We insert LoadedModel
+        # wrappers directly instead of calling load_models_gpu (which
+        # would try to load all models simultaneously and OOM).
+        import weakref
+        for model_id in created:
+            p = patchers[model_id]
+            lm = comfy.model_management.LoadedModel(p)
+            lm.currently_used = (p.model.device == load_device)
+            # Set real_model and model_finalizer (needed by model_unload)
+            lm.real_model = weakref.ref(p.model)
+            lm.model_finalizer = weakref.finalize(
+                p.model, comfy.model_management.cleanup_models)
+            lm.model_finalizer.atexit = False
+            comfy.model_management.current_loaded_models.insert(0, lm)
 
-
-def _load_worker_models(env_dir):
-    """Ensure all tracked models for this worker are on GPU before a call.
-
-    Called before each call_method.  If ComfyUI evicted models between calls,
-    load_models_gpu will send IPC commands to move them back.
-    """
-    key = str(env_dir)
-    patchers = _WORKER_PATCHERS.get(key)
-    if not patchers:
-        return
-
-    try:
-        import comfy.model_management
-        comfy.model_management.load_models_gpu(list(patchers.values()))
-    except Exception:
-        pass
 
 
 def register_nodes(nodes_package: str = "nodes") -> tuple:

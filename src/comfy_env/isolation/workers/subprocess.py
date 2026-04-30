@@ -210,7 +210,40 @@ class SocketTransport:
 
 from multiprocessing import shared_memory as shm
 import base64
+import mmap as _mmap_mod
 import numpy as np
+
+# --- Anonymous shared memory via memfd_create (Linux) ---
+# Replaces named POSIX shared memory to avoid resource_tracker cleanup races.
+# Falls back to named SharedMemory on non-Linux platforms.
+_USE_MEMFD = sys.platform == "linux"
+_libc = None
+
+def _memfd_write(data):
+    """Create anonymous shared memory, write data. Returns (fd, size)."""
+    global _libc
+    if _libc is None:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    fd = _libc.memfd_create(b"comfy_ipc", 0)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "memfd_create failed")
+    size = len(data)
+    os.ftruncate(fd, size)
+    buf = _mmap_mod.mmap(fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_WRITE)
+    buf[:size] = data
+    buf.close()
+    return fd, size
+
+def _memfd_read(pid, fd, size):
+    """Read data from another process's memfd via procfs."""
+    local_fd = os.open(f"/proc/{pid}/fd/{fd}", os.O_RDONLY)
+    try:
+        buf = _mmap_mod.mmap(local_fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_READ)
+        data = bytes(buf[:size])
+        buf.close()
+        return data
+    finally:
+        os.close(local_fd)
 
 # --- PyTorch native tensor sharing (parent side) ---
 # Uses share_memory_() to put tensors in /dev/shm via file_system strategy.
@@ -746,11 +779,18 @@ def _to_shm(obj, registry, visited=None):
             result["__was_numpy__"] = True
             result["numpy_dtype"] = str(arr.dtype)
         except Exception:
-            # torch not available -- fall back to Python SharedMemory copy
-            block = shm.SharedMemory(create=True, size=arr.nbytes)
-            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-            registry.append(block)
-            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+            # torch not available -- fall back to shared memory copy
+            arr_bytes = arr.tobytes()
+            if _USE_MEMFD:
+                fd, size = _memfd_write(arr_bytes)
+                registry.append(fd)
+                result = {"__shm_np__": True, "fd": fd, "pid": os.getpid(),
+                          "shape": list(arr.shape), "dtype": str(arr.dtype), "size": size}
+            else:
+                block = shm.SharedMemory(create=True, size=arr.nbytes)
+                np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+                registry.append(block)
+                result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
         visited[obj_id] = result
         return result
 
@@ -777,15 +817,16 @@ def _to_shm(obj, registry, visited=None):
         obj = _prepare_trimesh_for_pickle(obj)
         mesh_bytes = pickle.dumps(obj)
 
-        block = shm.SharedMemory(create=True, size=len(mesh_bytes))
-        block.buf[:len(mesh_bytes)] = mesh_bytes
-        registry.append(block)
+        if _USE_MEMFD:
+            fd, size = _memfd_write(mesh_bytes)
+            registry.append(fd)
+            result = {"__shm_trimesh__": True, "fd": fd, "pid": os.getpid(), "size": size}
+        else:
+            block = shm.SharedMemory(create=True, size=len(mesh_bytes))
+            block.buf[:len(mesh_bytes)] = mesh_bytes
+            registry.append(block)
+            result = {"__shm_trimesh__": True, "name": block.name, "size": len(mesh_bytes)}
 
-        result = {
-            "__shm_trimesh__": True,
-            "name": block.name,
-            "size": len(mesh_bytes),
-        }
         visited[obj_id] = result
         return result
 
@@ -831,14 +872,15 @@ def _to_shm(obj, registry, visited=None):
     import pickle
     try:
         obj_bytes = pickle.dumps(obj)
-        block = shm.SharedMemory(create=True, size=len(obj_bytes))
-        block.buf[:len(obj_bytes)] = obj_bytes
-        registry.append(block)
-        result = {
-            "__shm_pickle__": True,
-            "name": block.name,
-            "size": len(obj_bytes),
-        }
+        if _USE_MEMFD:
+            fd, size = _memfd_write(obj_bytes)
+            registry.append(fd)
+            result = {"__shm_pickle__": True, "fd": fd, "pid": os.getpid(), "size": size}
+        else:
+            block = shm.SharedMemory(create=True, size=len(obj_bytes))
+            block.buf[:len(obj_bytes)] = obj_bytes
+            registry.append(block)
+            result = {"__shm_pickle__": True, "name": block.name, "size": len(obj_bytes)}
         visited[obj_id] = result
         return result
     except Exception:
@@ -924,23 +966,32 @@ def _from_shm(obj, unlink=True):
             return tensor.numpy()
         return tensor
 
-    # numpy array via Python SharedMemory (fallback when torch unavailable)
+    # numpy array via shared memory (fallback when torch unavailable)
     if "__shm_np__" in obj:
-        block = shm.SharedMemory(name=obj["__shm_np__"])
-        arr = np.ndarray(tuple(obj["shape"]), dtype=np.dtype(obj["dtype"]), buffer=block.buf).copy()
-        block.close()
-        if unlink:
-            block.unlink()
-        return arr
+        shape = tuple(obj["shape"])
+        dtype = np.dtype(obj["dtype"])
+        if "fd" in obj:
+            data = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+            return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+        else:
+            block = shm.SharedMemory(name=obj["__shm_np__"])
+            arr = np.ndarray(shape, dtype=dtype, buffer=block.buf).copy()
+            block.close()
+            if unlink:
+                block.unlink()
+            return arr
 
     # trimesh (pickled to preserve visual, metadata, normals)
     if "__shm_trimesh__" in obj:
         import pickle
-        block = shm.SharedMemory(name=obj["name"])
-        mesh_bytes = bytes(block.buf[:obj["size"]])
-        block.close()
-        if unlink:
-            block.unlink()
+        if "fd" in obj:
+            mesh_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+        else:
+            block = shm.SharedMemory(name=obj["name"])
+            mesh_bytes = bytes(block.buf[:obj["size"]])
+            block.close()
+            if unlink:
+                block.unlink()
         return pickle.loads(mesh_bytes)
 
     # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
@@ -962,11 +1013,14 @@ def _from_shm(obj, unlink=True):
     # generic pickled object (VideoFromFile, etc.)
     if "__shm_pickle__" in obj:
         import pickle
-        block = shm.SharedMemory(name=obj["name"])
-        obj_bytes = bytes(block.buf[:obj["size"]])
-        block.close()
-        if unlink:
-            block.unlink()
+        if "fd" in obj:
+            obj_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+        else:
+            block = shm.SharedMemory(name=obj["name"])
+            obj_bytes = bytes(block.buf[:obj["size"]])
+            block.close()
+            if unlink:
+                block.unlink()
         return pickle.loads(obj_bytes)
 
     # V3 NodeOutput -> reconstruct
@@ -982,11 +1036,14 @@ def _from_shm(obj, unlink=True):
 
 
 def _cleanup_shm(registry):
-    """Unlink all shared memory blocks in registry."""
-    for block in registry:
+    """Close all shared memory in registry (memfd fds or SharedMemory blocks)."""
+    for item in registry:
         try:
-            block.close()
-            block.unlink()
+            if isinstance(item, int):
+                os.close(item)  # memfd fd
+            else:
+                item.close()
+                item.unlink()
         except Exception:
             pass
     registry.clear()
@@ -1267,7 +1324,40 @@ except Exception as e:
     wlog(f"[worker] PyTorch not available: {e}")
 
 from multiprocessing import shared_memory as shm
+import mmap as _mmap_mod
 import numpy as np
+
+# --- Anonymous shared memory via memfd_create (Linux) ---
+_USE_MEMFD = sys.platform == "linux"
+_libc = None
+
+def _memfd_write(data):
+    """Create anonymous shared memory, write data. Returns (fd, size)."""
+    global _libc
+    if _libc is None:
+        import ctypes, ctypes.util
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    fd = _libc.memfd_create(b"comfy_ipc", 0)
+    if fd < 0:
+        import ctypes
+        raise OSError(ctypes.get_errno(), "memfd_create failed")
+    size = len(data)
+    os.ftruncate(fd, size)
+    buf = _mmap_mod.mmap(fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_WRITE)
+    buf[:size] = data
+    buf.close()
+    return fd, size
+
+def _memfd_read(pid, fd, size):
+    """Read data from another process's memfd via procfs."""
+    local_fd = os.open(f"/proc/{pid}/fd/{fd}", os.O_RDONLY)
+    try:
+        buf = _mmap_mod.mmap(local_fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_READ)
+        data = bytes(buf[:size])
+        buf.close()
+        return data
+    finally:
+        os.close(local_fd)
 
 # Release CPU affinity back to all cores for actual GPU work
 if _affinity_pinned:
@@ -1706,10 +1796,17 @@ def _to_shm(obj, registry, visited=None):
             result["__was_numpy__"] = True
             result["numpy_dtype"] = str(arr.dtype)
         except Exception:
-            block = shm.SharedMemory(create=True, size=arr.nbytes)
-            np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-            registry.append(block)
-            result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+            arr_bytes = arr.tobytes()
+            if _USE_MEMFD:
+                fd, size = _memfd_write(arr_bytes)
+                registry.append(fd)
+                result = {"__shm_np__": True, "fd": fd, "pid": os.getpid(),
+                          "shape": list(arr.shape), "dtype": str(arr.dtype), "size": size}
+            else:
+                block = shm.SharedMemory(create=True, size=arr.nbytes)
+                np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
+                registry.append(block)
+                result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
         visited[obj_id] = result
         return result
 
@@ -1719,15 +1816,16 @@ def _to_shm(obj, registry, visited=None):
         obj = _prepare_trimesh_for_pickle(obj)
         mesh_bytes = pickle.dumps(obj)
 
-        block = shm.SharedMemory(create=True, size=len(mesh_bytes))
-        block.buf[:len(mesh_bytes)] = mesh_bytes
-        registry.append(block)
+        if _USE_MEMFD:
+            fd, size = _memfd_write(mesh_bytes)
+            registry.append(fd)
+            result = {"__shm_trimesh__": True, "fd": fd, "pid": os.getpid(), "size": size}
+        else:
+            block = shm.SharedMemory(create=True, size=len(mesh_bytes))
+            block.buf[:len(mesh_bytes)] = mesh_bytes
+            registry.append(block)
+            result = {"__shm_trimesh__": True, "name": block.name, "size": len(mesh_bytes)}
 
-        result = {
-            "__shm_trimesh__": True,
-            "name": block.name,
-            "size": len(mesh_bytes),
-        }
         visited[obj_id] = result
         return result
 
@@ -1782,14 +1880,15 @@ def _to_shm(obj, registry, visited=None):
     import pickle
     try:
         obj_bytes = pickle.dumps(obj)
-        block = shm.SharedMemory(create=True, size=len(obj_bytes))
-        block.buf[:len(obj_bytes)] = obj_bytes
-        registry.append(block)
-        result = {
-            "__shm_pickle__": True,
-            "name": block.name,
-            "size": len(obj_bytes),
-        }
+        if _USE_MEMFD:
+            fd, size = _memfd_write(obj_bytes)
+            registry.append(fd)
+            result = {"__shm_pickle__": True, "fd": fd, "pid": os.getpid(), "size": size}
+        else:
+            block = shm.SharedMemory(create=True, size=len(obj_bytes))
+            block.buf[:len(obj_bytes)] = obj_bytes
+            registry.append(block)
+            result = {"__shm_pickle__": True, "name": block.name, "size": len(obj_bytes)}
         visited[obj_id] = result
         return result
     except Exception:
@@ -1897,38 +1996,44 @@ def _from_shm(obj, _depth=0, _key="root"):
             return tensor.numpy()
         return tensor
 
-    # __shm_np__ -> numpy array via Python SharedMemory (fallback when torch unavailable)
+    # __shm_np__ -> numpy array via shared memory (fallback when torch unavailable)
     if "__shm_np__" in obj:
-        shm_name = obj["__shm_np__"]
         shape = tuple(obj["shape"])
-        dtype = obj["dtype"]
-        nbytes = np.prod(shape) * np.dtype(dtype).itemsize
-        wlog(f"[_from_shm] {_key}: opening shm '{shm_name}' shape={shape} dtype={dtype} ({nbytes/1e6:.1f} MB)")
-        block = shm.SharedMemory(name=shm_name)
-        try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(block._name, "shared_memory")
-        except Exception:
-            pass
-        arr = np.ndarray(shape, dtype=np.dtype(dtype), buffer=block.buf)
-        _input_shm_blocks.append(block)
+        dtype = np.dtype(obj["dtype"])
+        if "fd" in obj:
+            wlog(f"[_from_shm] {_key}: numpy memfd pid={obj['pid']} fd={obj['fd']} shape={shape}")
+            data = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+            arr = np.frombuffer(data, dtype=dtype).reshape(shape).copy()
+        else:
+            shm_name = obj["__shm_np__"]
+            wlog(f"[_from_shm] {_key}: opening shm '{shm_name}' shape={shape} dtype={dtype}")
+            block = shm.SharedMemory(name=shm_name)
+            try:
+                from multiprocessing.resource_tracker import unregister
+                unregister(block._name, "shared_memory")
+            except Exception:
+                pass
+            arr = np.ndarray(shape, dtype=dtype, buffer=block.buf)
+            _input_shm_blocks.append(block)
         wlog(f"[_from_shm] {_key}: mapped arr shape={arr.shape}")
         return arr
 
     # trimesh (pickled)
     if "__shm_trimesh__" in obj:
         import pickle
-        wlog(f"[_from_shm] {_key}: trimesh shm '{obj['name']}' size={obj['size']}")
-        block = shm.SharedMemory(name=obj["name"])
-        # Unregister from resource_tracker - parent owns these blocks
-        try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(block._name, "shared_memory")
-        except Exception:
-            pass
-        mesh_bytes = bytes(block.buf[:obj["size"]])
-        block.close()
-        # Don't unlink - parent will clean up
+        if "fd" in obj:
+            wlog(f"[_from_shm] {_key}: trimesh memfd pid={obj['pid']} fd={obj['fd']} size={obj['size']}")
+            mesh_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+        else:
+            wlog(f"[_from_shm] {_key}: trimesh shm '{obj['name']}' size={obj['size']}")
+            block = shm.SharedMemory(name=obj["name"])
+            try:
+                from multiprocessing.resource_tracker import unregister
+                unregister(block._name, "shared_memory")
+            except Exception:
+                pass
+            mesh_bytes = bytes(block.buf[:obj["size"]])
+            block.close()
         return pickle.loads(mesh_bytes)
 
     # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
@@ -1952,15 +2057,19 @@ def _from_shm(obj, _depth=0, _key="root"):
     # generic pickled object (VideoFromFile, etc.)
     if "__shm_pickle__" in obj:
         import pickle
-        wlog(f"[_from_shm] {_key}: pickled obj shm '{obj['name']}' size={obj['size']}")
-        block = shm.SharedMemory(name=obj["name"])
-        try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(block._name, "shared_memory")
-        except Exception:
-            pass
-        obj_bytes = bytes(block.buf[:obj["size"]])
-        block.close()
+        if "fd" in obj:
+            wlog(f"[_from_shm] {_key}: pickled memfd pid={obj['pid']} fd={obj['fd']} size={obj['size']}")
+            obj_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
+        else:
+            wlog(f"[_from_shm] {_key}: pickled obj shm '{obj['name']}' size={obj['size']}")
+            block = shm.SharedMemory(name=obj["name"])
+            try:
+                from multiprocessing.resource_tracker import unregister
+                unregister(block._name, "shared_memory")
+            except Exception:
+                pass
+            obj_bytes = bytes(block.buf[:obj["size"]])
+            block.close()
         return pickle.loads(obj_bytes)
 
     # Dict - recurse with key names for debugging
@@ -1969,10 +2078,13 @@ def _from_shm(obj, _depth=0, _key="root"):
     return {k: _from_shm(v, _depth+1, k) for k, v in obj.items()}
 
 def _cleanup_shm(registry):
-    for block in registry:
+    for item in registry:
         try:
-            block.close()
-            block.unlink()
+            if isinstance(item, int):
+                os.close(item)  # memfd fd
+            else:
+                item.close()
+                item.unlink()
         except Exception:
             pass
     registry.clear()
@@ -2662,7 +2774,7 @@ def main():
                 _used_patcher = False
                 try:
                     import comfy.model_management as _cmm_move
-                    for _lm in _cmm_move.current_loaded_models:
+                    for _lm in list(_cmm_move.current_loaded_models):
                         if _lm.model is not None and _lm.model.model is _model:
                             if _target_dev.type == "cpu":
                                 _lm.model_unload()
@@ -2780,6 +2892,19 @@ def main():
 
             response = {"status": "ok", "call_id": _current_call_id, "result": result_meta}
             if _new_models_this_call:
+                # Resolve actual device at response time.  Models are
+                # auto-detected when they land on CUDA, but the subprocess
+                # may have moved them back to CPU before the call finished.
+                for _nme in _new_models_this_call:
+                    _nm_model = _model_registry.get(_nme["id"])
+                    if _nm_model is not None:
+                        try:
+                            _nm_p = next(_nm_model.parameters(), None)
+                            _nme["device"] = str(_nm_p.device) if _nm_p is not None else "cpu"
+                        except Exception:
+                            _nme["device"] = "cpu"
+                    else:
+                        _nme["device"] = "cpu"
                 response["_new_models"] = list(_new_models_this_call)
             transport.send(response)
             _shm_keeper.keep(shm_registry)  # Keep alive for 30s until host reads
