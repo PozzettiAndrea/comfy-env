@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, INSTALL as _DBG_INSTALL
@@ -23,6 +23,7 @@ _CLEANUP_DONE = False
 # ---------------------------------------------------------------------------
 _WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> (SubprocessWorker, generation)
 _WORKER_PATCHERS: Dict[str, Dict[str, Any]] = {}  # str(env_dir) -> {model_id: SubprocessModelPatcher}
+_STALE_PATCHERS: List[Any] = []  # Keeps stale patchers alive until free_memory finishes
 _POOL_LOCK = threading.Lock()
 _WORKER_GENERATION = 0  # Monotonically increasing; incremented on each new worker
 
@@ -471,11 +472,19 @@ def _cleanup_stale_patchers(env_dir):
     We must NOT modify current_loaded_models here because this callback can
     fire inside free_memory's iteration (via model_unload -> send_command ->
     _ensure_started -> _on_restart), which would invalidate captured indices.
+
+    We also must keep the old patchers alive (in _STALE_PATCHERS) because
+    LoadedModel._model is a weakref -- if the patcher is GC'd, the
+    SubprocessModel finalizer fires cleanup_models() which pops items from
+    current_loaded_models, corrupting free_memory's index-based iteration.
+    The stale references are cleared on the next _register_new_patchers call.
     """
     key = str(env_dir)
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
+    # Keep strong references to prevent GC during free_memory iteration
+    _STALE_PATCHERS.extend(old_patchers.values())
     _log(f"[comfy-env] Invalidated {len(old_patchers)} stale model patchers "
          f"(will be cleaned up during next unload)")
 
@@ -628,6 +637,7 @@ def _shutdown_all_workers():
                 pass
         _WORKER_POOL.clear()
         _WORKER_PATCHERS.clear()
+        _STALE_PATCHERS.clear()
 
 
 atexit.register(_shutdown_all_workers)
@@ -641,6 +651,10 @@ def _register_new_patchers(env_dir, worker, generation):
     metadata in response['_new_models'].  We create patchers here and register
     them with ComfyUI's memory manager so they participate in VRAM eviction.
     """
+    # Release stale patchers from previous worker restarts.  Safe to do here
+    # because we're outside free_memory's iteration loop.
+    _STALE_PATCHERS.clear()
+
     new_models = getattr(worker, '_last_new_models', [])
     if not new_models:
         return

@@ -2335,6 +2335,31 @@ def main():
         _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
         wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
 
+    def _register_if_cuda(module):
+        """Register an nn.Module with parent if it's on CUDA.
+
+        Like _auto_register_if_cuda but bypasses the _loading_via_shim guard.
+        Called after shimmed load_models_gpu to ensure the parent can evict
+        models that were loaded inside the shim.
+        """
+        obj_id = id(module)
+        if obj_id in _model_id_by_obj:
+            return  # Already registered
+        try:
+            first_param = next(module.parameters(), None)
+            if first_param is None or first_param.device.type != "cuda":
+                return
+        except Exception:
+            return
+        _model_counter[0] += 1
+        model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
+        size = _compute_model_size(module)
+        _model_registry[model_id] = module
+        _model_registry_meta[model_id] = {"size": size, "kind": "other"}
+        _model_id_by_obj[obj_id] = model_id
+        _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
+        wlog(f"[worker] Post-shim registered '{model_id}': {size / 1e9:.2f} GB")
+
     # Install hooks on Module.to() and .cuda()
     # Module.to() only fires for the outermost call -- PyTorch recurses
     # through children via _apply(), not .to(), so we naturally catch
@@ -2470,6 +2495,17 @@ def main():
                 # so it will calculate lowvram_model_memory correctly.
                 _original_load_models_gpu(models, *args, **kwargs)
                 wlog(f"[worker] Models loaded via real load_models_gpu")
+
+                # Register loaded models with parent so they participate in
+                # cross-process VRAM eviction.  The auto-hook was suppressed
+                # during the shim (_loading_via_shim=True), so the parent
+                # doesn't know about these models yet.  Without this, the
+                # parent's free_memory() can't evict them when another
+                # subprocess needs VRAM.
+                for m in models:
+                    model_obj = getattr(m, 'model', None)
+                    if model_obj is not None and hasattr(model_obj, 'parameters'):
+                        _register_if_cuda(model_obj)
             finally:
                 _loading_via_shim[0] = False
 
