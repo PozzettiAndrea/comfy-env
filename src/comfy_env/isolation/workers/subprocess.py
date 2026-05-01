@@ -2502,21 +2502,96 @@ def main():
     # ---------------------------------------------------------------
     _current_call_id = None  # Tracks call_id of the request being processed
 
+    def _handle_model_to_device(request):
+        """Handle a model_to_device command. Can be called from main loop or _call_parent."""
+        _mid = request.get("model_id")
+        _target = request.get("device", "cpu")
+        _req_call_id = request.get("call_id", _current_call_id)
+        _model = _model_registry.get(_mid)
+        if _model is None:
+            transport.send({"status": "error", "call_id": _req_call_id,
+                            "error": f"Model '{_mid}' not registered"})
+            return
+        try:
+            import torch as _torch
+            _target_dev = _torch.device(_target)
+            _current_dev = None
+            try:
+                _first_param = next(_model.parameters(), None)
+                if _first_param is not None:
+                    _current_dev = _first_param.device
+            except Exception:
+                pass
+            if _current_dev is not None and _current_dev == _target_dev:
+                wlog(f"[worker] model_to_device: '{_mid}' already on {_target}")
+                transport.send({"status": "ok", "call_id": _req_call_id, "device": _target, "moved": False})
+                return
+            _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
+            wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
+            _used_patcher = False
+            try:
+                import comfy.model_management as _cmm_move
+                for _lm in list(_cmm_move.current_loaded_models):
+                    if _lm.model is not None and _lm.model.model is _model:
+                        if _target_dev.type == "cpu":
+                            _lm.model_unload()
+                            # Remove from current_loaded_models to avoid
+                            # zombie entries.  model_unload() sets
+                            # real_model = None which makes is_dead() crash
+                            # (TypeError: 'NoneType' is not callable)
+                            # because cleanup_models_gc() expects real_model
+                            # to be either a live weakref or absent.
+                            try:
+                                _cmm_move.current_loaded_models.remove(_lm)
+                            except ValueError:
+                                pass
+                        else:
+                            _lm.model_load()
+                        _used_patcher = True
+                        break
+            except Exception as _pe:
+                wlog(f"[worker] model_to_device: patcher path failed ({_pe}), falling back to .to()")
+            if not _used_patcher:
+                _model.to(_target_dev)
+            if _was_cuda and _target_dev.type == "cpu":
+                _torch.cuda.empty_cache()
+            transport.send({"status": "ok", "call_id": _req_call_id, "device": _target, "moved": True})
+        except Exception as _e:
+            wlog(f"[worker] model_to_device error: {_e}")
+            transport.send({"status": "error", "call_id": _req_call_id, "error": str(_e)})
+
     def _call_parent(method, **params):
         """Call a method on the parent process and wait for result.
 
         Can only be called during method execution (while transport is active).
         The parent handles the callback and sends back a response.
+        Handles interleaved management commands (model_to_device, ping, etc.)
+        that may arrive while waiting for the callback_response.
         """
         transport.send({"type": "callback", "method": method, "call_id": _current_call_id, **params})
-        response = transport.recv()
-        if response is None:
-            raise RuntimeError("Parent disconnected during callback")
-        if response.get("type") != "callback_response":
-            raise RuntimeError(f"Expected callback_response, got {response.get('type')}")
-        if response.get("status") == "error":
-            raise RuntimeError(response.get("error", "Callback failed"))
-        return response.get("result")
+        while True:
+            response = transport.recv()
+            if response is None:
+                raise RuntimeError("Parent disconnected during callback")
+            # Handle interleaved management commands
+            if response.get("method") == "model_to_device":
+                _handle_model_to_device(response)
+                continue
+            if response.get("method") == "ping":
+                transport.send({"status": "pong", "call_id": response.get("call_id")})
+                continue
+            if response.get("method") == "list_models":
+                transport.send({"status": "ok", "call_id": response.get("call_id"), "models": _model_registry_meta})
+                continue
+            if response.get("method") == "shutdown":
+                raise RuntimeError("Shutdown requested during callback")
+            # Check for actual callback_response
+            if response.get("type") == "callback_response":
+                if response.get("status") == "error":
+                    raise RuntimeError(response.get("error", "Callback failed"))
+                return response.get("result")
+            # Unknown message — log and skip
+            wlog(f"[worker] _call_parent: unexpected message type={response.get('type')}, keys={list(response.keys())}")
 
     # ---------------------------------------------------------------
     # Auto-enable fastest attention backend before comfy modules are
@@ -2737,64 +2812,7 @@ def main():
             continue
 
         if request.get("method") == "model_to_device":
-            # Move a registered model to a device (cuda/cpu).
-            # We go through ComfyUI's ModelPatcher when possible so that
-            # weight-casting patches (comfy_cast_weights) are properly
-            # applied/removed.  A raw .to() bypasses the patching lifecycle
-            # and leaves tensors in an inconsistent state ("Inference tensors
-            # do not track version counter").
-            _mid = request.get("model_id")
-            _target = request.get("device", "cpu")
-            _model = _model_registry.get(_mid)
-            if _model is None:
-                transport.send({"status": "error", "call_id": _current_call_id,
-                                "error": f"Model '{_mid}' not registered"})
-                continue
-            try:
-                import torch as _torch
-                _target_dev = _torch.device(_target)
-                # Check if already on target device -- idempotent
-                _current_dev = None
-                try:
-                    _first_param = next(_model.parameters(), None)
-                    if _first_param is not None:
-                        _current_dev = _first_param.device
-                except Exception:
-                    pass
-                if _current_dev is not None and _current_dev == _target_dev:
-                    wlog(f"[worker] model_to_device: '{_mid}' already on {_target}")
-                    transport.send({"status": "ok", "call_id": _current_call_id, "device": _target, "moved": False})
-                    continue
-                _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
-                wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
-
-                # Try to find the ModelPatcher in the subprocess's
-                # current_loaded_models so we use patch_model/unpatch_model
-                # instead of raw .to().
-                _used_patcher = False
-                try:
-                    import comfy.model_management as _cmm_move
-                    for _lm in list(_cmm_move.current_loaded_models):
-                        if _lm.model is not None and _lm.model.model is _model:
-                            if _target_dev.type == "cpu":
-                                _lm.model_unload()
-                            else:
-                                _lm.model_load()
-                            _used_patcher = True
-                            break
-                except Exception as _pe:
-                    wlog(f"[worker] model_to_device: patcher path failed ({_pe}), falling back to .to()")
-
-                if not _used_patcher:
-                    _model.to(_target_dev)
-
-                # Only empty cache if we actually freed CUDA tensors
-                if _was_cuda and _target_dev.type == "cpu":
-                    _torch.cuda.empty_cache()
-                transport.send({"status": "ok", "call_id": _current_call_id, "device": _target, "moved": True})
-            except Exception as _e:
-                wlog(f"[worker] model_to_device error: {_e}")
-                transport.send({"status": "error", "call_id": _current_call_id, "error": str(_e)})
+            _handle_model_to_device(request)
             continue
 
         if request.get("method") == "list_models":
@@ -2828,6 +2846,14 @@ def main():
 
         # Clear new-models tracker for this call
         _new_models_this_call.clear()
+
+        # Defensive: skip stale callback_responses or unknown messages
+        if request.get("type") == "callback_response":
+            wlog(f"[worker] Ignoring stale callback_response in main loop")
+            continue
+        if "module" not in request:
+            wlog(f"[worker] Ignoring unknown request format: {list(request.keys())}")
+            continue
 
         shm_registry = []
         try:
@@ -2978,7 +3004,7 @@ class SubprocessWorker(Worker):
         self._shm_dir = _get_shm_dir()
         self._process: Optional[subprocess.Popen] = None
         self._shutdown = False
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # Reentrant: VRAM eviction callbacks re-enter via send_command
         self._last_new_models = []  # Auto-detected models from last call
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
