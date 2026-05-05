@@ -435,17 +435,8 @@ def build_workspace_toml(
         }
         log(f"[comfy-env] Host glibc {libc_version} -> comfyui feature system-requirements")
     if root_conda_deps:
-        # Separate plain deps from target-specific deps
-        plain_deps = {k: v for k, v in root_conda_deps.items() if k != "__targets__"}
-        target_deps = root_conda_deps.get("__targets__", {})
-        if plain_deps:
-            feature_comfyui["dependencies"] = copy.deepcopy(plain_deps)
-            log(f"[comfy-env] Root conda deps injected into comfyui feature: {list(plain_deps.keys())}")
-        if target_deps:
-            target_block = feature_comfyui.setdefault("target", {})
-            for target_key, deps in target_deps.items():
-                target_block.setdefault(target_key, {})["dependencies"] = copy.deepcopy(deps)
-            log(f"[comfy-env] Root conda target deps injected: {list(target_deps.keys())}")
+        feature_comfyui["dependencies"] = copy.deepcopy(root_conda_deps)
+        log(f"[comfy-env] Root conda deps injected into comfyui feature: {list(root_conda_deps.keys())}")
     if comfyui_pypi:
         feature_comfyui["pypi-dependencies"] = comfyui_pypi
     # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
