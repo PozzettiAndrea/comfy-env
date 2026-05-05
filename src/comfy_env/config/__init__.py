@@ -1,13 +1,12 @@
-"""comfy-env configuration. One file, no bullshit."""
-
 from pathlib import Path
-
 import tomli
 
+#Two config types:
+# one that sits at root (ComfyUI-Geometrypack/comfy-env-root.toml)
 ROOT_CONFIG_FILE_NAME = "comfy-env-root.toml"
+# one that sits at node folder (ComfyUI-Sharp/nodes/comfy-env.toml)
 CONFIG_FILE_NAME = "comfy-env.toml"
 DEFAULT_HEALTH_CHECK_TIMEOUT = 5.0
-
 
 class ComfyEnvConfig(dict):
     """Config is just a dict you can also access with dot notation."""
@@ -25,11 +24,6 @@ class ComfyEnvConfig(dict):
             or self.get("pixi_passthrough", {}).get("dependencies")
             or self.get("pixi_passthrough", {}).get("pypi-dependencies")
         )
-
-
-# Backwards compat alias
-NodeDependency = dict
-
 
 def load_config(path):
     """Load a comfy-env TOML file. Returns a ComfyEnvConfig."""

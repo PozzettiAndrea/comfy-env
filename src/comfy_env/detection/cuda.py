@@ -1,9 +1,3 @@
-"""CUDA and torch version detection.
-
-Delegates system CUDA detection to pixi (which uses NVML/libcuda internally).
-Torch/Python versions read from importlib.metadata to avoid importing torch.
-"""
-
 from __future__ import annotations
 
 import os
@@ -26,22 +20,14 @@ def detect_cuda_version() -> str | None:
 def _get_cuda_from_pixi() -> str | None:
     """Get CUDA version from pixi's virtual package detection."""
     try:
-        from ..packages.pixi import get_pixi_path
-        pixi = get_pixi_path()
-        if not pixi:
-            return None
-        result = subprocess.run(
-            [str(pixi), "info", "--json"],
-            capture_output=True, text=True, timeout=10
-        )
+        from ..packages.pixi import PIXI
+        import json
+        result = subprocess.run([PIXI, "info", "--json"], capture_output=True, text=True, timeout=10)
         if result.returncode != 0:
             return None
-        import json
         info = json.loads(result.stdout)
-        # virtual_packages is a list like ['__cuda=13.0=0', '__linux=6.8.0=0', ...]
         for vp in info.get("virtual_packages", []):
             if vp.startswith("__cuda="):
-                # Parse "__cuda=12.8=0" -> "12.8"
                 return vp.split("=")[1]
     except Exception:
         pass

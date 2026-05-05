@@ -197,11 +197,11 @@ def _dedupe_envs_libomp(
 # ---------------------------------------------------------------------------
 
 def _read_env_torch_version(
-    pixi_path: Path,
     workspace_dir: Path,
     env_name: str,
     log: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
+    from ..packages.pixi import PIXI
     """Run `pixi run -e <env_name> python -c 'import torch; print(...)'`.
 
     Returns the public torch version (e.g. "2.11.0", local label stripped), or
@@ -218,7 +218,7 @@ def _read_env_torch_version(
     env = os.environ.copy()
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     r = subprocess.run(
-        [str(pixi_path), "run", "-e", env_name,
+        [PIXI, "run", "-e", env_name,
          "python", "-c",
          "import torch, sys; sys.stdout.write(torch.__version__)"],
         cwd=str(workspace_dir),
@@ -423,12 +423,12 @@ def install_workspace(
     log: Callable[[str], None] = print,
     dry_run: bool = False,
 ) -> Optional[Path]:
+    from ..packages.pixi import PIXI
     """Generate `<comfyui_dir>/.ce/pixi.toml` and run `pixi install --all`.
 
     Returns the workspace directory on success, None if nothing to install.
     """
     from ..environment.cache import CE_WORKSPACE_DIR
-    from ..packages.pixi import ensure_pixi
     from ..packages.toml_generator import write_workspace_pixi_toml
 
     comfyui_dir = Path(comfyui_dir).resolve()
@@ -509,9 +509,6 @@ def install_workspace(
             log("[comfy-env] dry_run -- skipping `pixi install`")
             return workspace_dir
 
-        pixi_path = ensure_pixi(log=log)
-        log(f"[comfy-env] pixi: {pixi_path}")
-
         _patch_uv_platform_py(log)
 
         pixi_env = dict(os.environ)
@@ -520,7 +517,7 @@ def install_workspace(
 
         log("[comfy-env] Running `pixi install --all`...")
         result = _run_streaming(
-            [str(pixi_path), "install", "--all"],
+            [PIXI, "install", "--all"],
             log=log, cwd=workspace_dir, env=pixi_env,
         )
         _log_subprocess(log, result, "pixi install --all")

@@ -1,17 +1,6 @@
-"""
-Packages layer - Package installation with side effects.
+"""Packages layer - CUDA wheels, toml generation, node dependencies."""
 
-Handles pixi, CUDA wheels, and node dependencies.
-"""
-
-from .pixi import (
-    ensure_pixi,
-    get_pixi_path,
-    get_pixi_python,
-    pixi_install,
-    pixi_run,
-    pixi_clean,
-)
+from .pixi import PIXI
 from .cuda_wheels import (
     CUDA_WHEELS_INDEX,
     get_wheel_url,
@@ -30,13 +19,7 @@ from .node_dependencies import (
 )
 
 __all__ = [
-    # Pixi package manager
-    "ensure_pixi",
-    "get_pixi_path",
-    "get_pixi_python",
-    "pixi_install",
-    "pixi_run",
-    "pixi_clean",
+    "PIXI",
     # CUDA wheels
     "CUDA_WHEELS_INDEX",
     "get_wheel_url",

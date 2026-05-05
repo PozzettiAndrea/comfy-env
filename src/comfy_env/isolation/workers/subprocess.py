@@ -38,7 +38,6 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import Worker, WorkerError
-from ...packages.pixi import get_pixi_path
 from ...config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 # Debug logging -- granular categories from debug.py
@@ -383,14 +382,10 @@ class SubprocessWorker(Worker):
             # pixi_env_root is <workspace>/.pixi/envs/<env_name>; walk up 3 levels.
             workspace_dir = pixi_env_root.parent.parent.parent
 
-            try:
-                from ...packages.pixi import ensure_pixi
-                pixi_path = ensure_pixi(log=lambda m: None)
-            except Exception:
-                pixi_path = "pixi"  # fall back to PATH lookup
+            from ...packages.pixi import PIXI
 
             cmd = [
-                str(pixi_path), "run", "--as-is",
+                PIXI, "run", "--as-is",
                 "--manifest-path", str(workspace_dir / "pixi.toml"),
                 "-e", env_name,
                 "python", str(self._worker_script), self._socket_addr,
