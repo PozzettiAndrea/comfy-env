@@ -24,7 +24,7 @@ from .install import install, verify_installation, USE_COMFY_ENV_VAR
 
 # Prestartup helpers
 from .environment.setup import setup_env
-from .environment.paths import copy_files, get_comfyui_dir
+from .environment.cache import copy_files, find_comfyui_dir_from_node as get_comfyui_dir
 
 # Isolation
 from .isolation import register_nodes
@@ -36,7 +36,6 @@ from .isolation import register_nodes
 
 from .config import (
     ComfyEnvConfig,
-    NodeDependency,
     load_config,
     discover_config,
     CONFIG_FILE_NAME,
@@ -76,11 +75,9 @@ from .detection import (
 
 from .packages import (
     # Pixi
+    PIXI,
     ensure_pixi,
     get_pixi_path,
-    get_pixi_python,
-    pixi_run,
-    pixi_clean,
     # CUDA wheels
     CUDA_WHEELS_INDEX,
     get_wheel_url,
@@ -93,9 +90,9 @@ from .packages import (
 # =============================================================================
 
 from .environment import (
-    get_cache_dir,
-    resolve_env_path,
-    CACHE_DIR,
+    get_env_name,
+    get_workspace_dir,
+    find_comfyui_dir_from_node,
 )
 
 
@@ -132,36 +129,28 @@ __all__ = [
     "register_nodes",
     # Config
     "ComfyEnvConfig",
-    "NodeDependency",
     "load_config",
     "discover_config",
     "CONFIG_FILE_NAME",
     "ROOT_CONFIG_FILE_NAME",
     # Detection
     "detect_cuda_version",
+    "has_nvidia_gpu",
     "detect_cuda_environment",
     "get_recommended_cuda_version",
     "GPUInfo",
     "CUDAEnvironment",
     "detect_gpu",
     "get_gpu_summary",
-    "detect_platform",
-    "get_platform_tag",
-    "RuntimeEnv",
-    "detect_runtime",
     # Packages
-    "ensure_pixi",
-    "get_pixi_path",
-    "get_pixi_python",
-    "pixi_run",
-    "pixi_clean",
+    "PIXI",
     "CUDA_WHEELS_INDEX",
     "get_wheel_url",
     "get_cuda_torch_mapping",
     # Environment
-    "get_cache_dir",
-    "resolve_env_path",
-    "CACHE_DIR",
+    "get_env_name",
+    "get_workspace_dir",
+    "find_comfyui_dir_from_node",
     # Workers
     "Worker",
     "WorkerError",

@@ -13,7 +13,6 @@ from typing import Callable, List, Optional, Set, Tuple
 
 from ..config import (
     ComfyEnvConfig,
-    NodeDependency,
     load_config,
     discover_config,
     CONFIG_FILE_NAME,
@@ -21,7 +20,7 @@ from ..config import (
 
 
 def _install_node_dependencies(
-    node_reqs: List[NodeDependency], node_dir: Path,
+    node_reqs: List[dict], node_dir: Path,
     log: Callable[[str], None], dry_run: bool,
 ) -> None:
     from ..packages.node_dependencies import install_node_dependencies
@@ -48,7 +47,7 @@ def _reinstall_main_requirements(
 
 
 def _collect_node_req_dirs(
-    node_reqs: List[NodeDependency],
+    node_reqs: List[dict],
     custom_nodes_dir: Path,
     visited: Optional[Set[str]] = None,
 ) -> List[Path]:

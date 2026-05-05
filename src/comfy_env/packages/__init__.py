@@ -1,6 +1,14 @@
 """Packages layer - CUDA wheels, toml generation, node dependencies."""
 
 from .pixi import PIXI
+
+
+# Legacy aliases — external code (prestartup scripts) may import these
+def ensure_pixi(install_dir=None, log=None):
+    return PIXI
+
+def get_pixi_path():
+    return PIXI
 from .cuda_wheels import (
     CUDA_WHEELS_INDEX,
     get_wheel_url,

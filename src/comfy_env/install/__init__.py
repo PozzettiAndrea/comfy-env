@@ -80,7 +80,7 @@ def install(
 
     if install_isolated:
         # Workspace install -- picks up every plugin's comfy-env.toml under custom_nodes/
-        from ..environment.paths import get_comfyui_dir
+        from ..environment.cache import find_comfyui_dir_from_node as get_comfyui_dir
         comfyui_dir = get_comfyui_dir(node_dir)
         if comfyui_dir is None:
             log("[comfy-env] WARNING: Could not locate ComfyUI base; skipping workspace install")

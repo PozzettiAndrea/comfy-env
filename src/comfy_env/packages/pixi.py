@@ -1,7 +1,6 @@
-"""Pixi interface. Pixi is a pip dependency — binary lives next to sys.executable."""
+"""Pixi binary location. Installed to ~/.pixi/bin by the official installer."""
 
-import subprocess
 import sys
 from pathlib import Path
 
-PIXI = str(Path(sys.executable).parent / ("pixi.exe" if sys.platform == "win32" else "pixi"))
+PIXI = str(Path.home() / ".pixi" / "bin" / ("pixi.exe" if sys.platform == "win32" else "pixi"))

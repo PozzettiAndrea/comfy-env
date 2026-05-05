@@ -10,8 +10,6 @@ import zipfile
 from pathlib import Path
 from typing import Callable, List, Optional, Set, TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from ..config import NodeDependency
 
 COMFY_REGISTRY_API = "https://api.comfy.org"
 
@@ -149,7 +147,7 @@ def run_install_script(node_dir: Path, log: Callable[[str], None] = print) -> No
 
 
 def install_node_dependencies(
-    node_deps: "List[NodeDependency]",
+    node_deps: "List[dict]",
     custom_nodes_dir: Path,
     log: Callable[[str], None] = print,
     visited: Set[str] = None,

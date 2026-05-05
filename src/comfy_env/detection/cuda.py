@@ -6,7 +6,7 @@ import sys
 
 
 def has_nvidia_gpu() -> bool:
-    """Check if NVIDIA GPU is present (via pixi virtual packages or CUDA detection)."""
+    """Check if NVIDIA GPU is present."""
     return detect_cuda_version() is not None
 
 

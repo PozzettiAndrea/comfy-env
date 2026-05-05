@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import Worker, WorkerError
-from ...config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
+from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 # Debug logging -- granular categories from debug.py
 from ...debug import (

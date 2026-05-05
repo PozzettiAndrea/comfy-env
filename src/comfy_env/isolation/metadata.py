@@ -18,7 +18,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
+from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category

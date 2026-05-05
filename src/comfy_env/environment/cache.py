@@ -42,6 +42,11 @@ def get_workspace_dir(comfyui_dir):
     return Path(comfyui_dir) / CE_WORKSPACE_DIR
 
 
+def get_workspace_env_dir(comfyui_dir, env_name):
+    """Path to one environment inside the workspace."""
+    return get_workspace_dir(comfyui_dir) / ".pixi" / "envs" / env_name
+
+
 def find_comfyui_dir_from_node(node_dir):
     """Walk up from a node dir to find the ComfyUI base (has main.py + comfy/)."""
     current = Path(node_dir).resolve()

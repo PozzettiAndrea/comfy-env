@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from ..config.types import DEFAULT_HEALTH_CHECK_TIMEOUT
+from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, INSTALL as _DBG_INSTALL
 _CLEANUP_DONE = False
 
@@ -259,7 +259,7 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
 
     # Find ComfyUI base
     try:
-        from ..environment.paths import get_comfyui_dir
+        from ..environment.cache import find_comfyui_dir_from_node as get_comfyui_dir
         comfyui_dir = get_comfyui_dir(node_dir)
     except Exception:
         comfyui_dir = None
@@ -824,7 +824,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # Load per-node settings from comfy-env-root.toml (if present)
     node_settings = None
     try:
-        from ..config.parser import discover_config
+        from ..config import discover_config
         root_cfg = discover_config(pkg_dir, root=True)
         if root_cfg and root_cfg.settings:
             node_settings = root_cfg.settings
