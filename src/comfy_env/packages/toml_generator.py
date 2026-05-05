@@ -522,16 +522,14 @@ def build_workspace_toml(
             out["feature"][env_name] = {}
 
     # Environments table.
-    # The `comfyui` template env exists for every workspace -- it pins what the
-    # main ComfyUI process is running and gives the cuda-wheel picker a canonical
-    # place to read torch's resolved version from. Per-node envs share the same
-    # solve-group so torch is hardlinked across envs from a single content cache.
+    # Each env gets its own solve-group so deps resolve independently per node.
+    # Pixi still hardlinks identical packages from its central cache regardless.
     host_py_feature = py_versions[host_py]
     environments: Dict[str, Any] = {
         "comfyui": {
             "features": [host_py_feature, "comfyui"],
             "no-default-feature": True,
-            "solve-group": host_py_feature,
+            "solve-group": "comfyui",
         }
     }
     for env_name, cfg in node_configs:
@@ -540,7 +538,7 @@ def build_workspace_toml(
         environments[env_name] = {
             "features": [py_feature, "comfyui", env_name],
             "no-default-feature": True,
-            "solve-group": py_feature,
+            "solve-group": env_name,
         }
     out["environments"] = environments
 

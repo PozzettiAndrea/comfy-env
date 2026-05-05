@@ -157,24 +157,25 @@ def install_node_dependencies(
 
     visited = visited or set()
     for dep in node_deps:
-        if dep.name in visited:
-            log(f"  {dep.name}: cycle, skipping")
+        name = dep["name"]
+        if name in visited:
+            log(f"  {name}: cycle, skipping")
             continue
-        visited.add(dep.name)
+        visited.add(name)
 
-        node_path = custom_nodes_dir / dep.name
+        node_path = custom_nodes_dir / name
         if node_path.exists():
-            log(f"  {dep.name}: exists")
+            log(f"  {name}: exists")
             continue
 
         try:
-            if dep.registry:
-                install_from_registry(dep.registry, dep.name, custom_nodes_dir, log, version=dep.version)
-            elif dep.github:
-                clone_node(dep.github, dep.name, custom_nodes_dir, log,
-                           tag=dep.tag, branch=dep.branch, commit=dep.commit)
+            if dep.get("registry"):
+                install_from_registry(dep["registry"], name, custom_nodes_dir, log, version=dep.get("version"))
+            elif dep.get("github"):
+                clone_node(dep["github"], name, custom_nodes_dir, log,
+                           tag=dep.get("tag"), branch=dep.get("branch"), commit=dep.get("commit"))
             else:
-                log(f"  Warning: {dep.name} has no github or registry source, skipping")
+                log(f"  Warning: {name} has no github or registry source, skipping")
                 continue
 
             install_requirements(node_path, log)
@@ -184,4 +185,4 @@ def install_node_dependencies(
             if nested_config and nested_config.node_reqs:
                 install_node_dependencies(nested_config.node_reqs, custom_nodes_dir, log, visited)
         except Exception as e:
-            log(f"  Warning: {dep.name} failed: {e}")
+            log(f"  Warning: {name} failed: {e}")

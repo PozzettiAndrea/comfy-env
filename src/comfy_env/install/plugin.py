@@ -28,7 +28,7 @@ def _install_node_dependencies(
     log(f"\nInstalling {len(node_reqs)} node dependencies...")
     if dry_run:
         for req in node_reqs:
-            log(f"  {req.name}: {'exists' if (custom_nodes_dir / req.name).exists() else 'would clone'}")
+            log(f"  {req['name']}: {'exists' if (custom_nodes_dir / req['name']).exists() else 'would clone'}")
         return
     install_node_dependencies(node_reqs, custom_nodes_dir, log, {node_dir.name})
 
@@ -55,10 +55,11 @@ def _collect_node_req_dirs(
     visited = visited or set()
     result = []
     for dep in node_reqs:
-        if dep.name in visited:
+        name = dep["name"]
+        if name in visited:
             continue
-        visited.add(dep.name)
-        node_path = custom_nodes_dir / dep.name
+        visited.add(name)
+        node_path = custom_nodes_dir / name
         if not node_path.exists():
             continue
         result.append(node_path)
