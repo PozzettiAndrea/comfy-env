@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .cuda import CUDA_VERSION_ENV_VAR
+from .cuda import detect_cuda_version
 
 COMPUTE_TO_ARCH = {
     (5, 0): "Maxwell", (5, 2): "Maxwell", (5, 3): "Maxwell",
@@ -70,8 +70,8 @@ def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
     if os.environ.get("COMFY_TEST_GPU") == "0":
         return ""
 
-    if override := os.environ.get(CUDA_VERSION_ENV_VAR, "").strip():
-        return f"{override[:-1]}.{override[-1]}" if "." not in override and len(override) >= 2 else override
+    if cuda := detect_cuda_version():
+        return cuda
 
     gpus = gpus if gpus is not None else detect_cuda_environment().gpus
     if not gpus: return ""
@@ -124,8 +124,7 @@ def detect_cuda_environment(force_refresh: bool = False) -> CUDAEnvironment:
 def get_gpu_summary() -> str:
     env = detect_cuda_environment()
     if not env.gpus:
-        override = os.environ.get(CUDA_VERSION_ENV_VAR)
-        return f"No GPU detected (using {CUDA_VERSION_ENV_VAR}={override})" if override else f"No GPU (set {CUDA_VERSION_ENV_VAR} to override)"
+        return "No GPU detected"
 
     lines = [f"Detection: {env.detection_method}"]
     if env.driver_version: lines.append(f"Driver: {env.driver_version}")

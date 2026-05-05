@@ -5,14 +5,8 @@ No side effects. These functions gather information about the runtime environmen
 """
 
 from .cuda import (
-    CUDA_VERSION_ENV_VAR,
-    TORCH_VERSION_ENV_VAR,
+    has_nvidia_gpu,
     detect_cuda_version,
-    get_cuda_from_torch,
-    get_cuda_from_nvml,
-    get_cuda_from_libcuda,
-    get_cuda_from_nvcc,
-    get_cuda_from_env,
     get_bootstrap_python_version,
     get_bootstrap_torch_version,
     get_bootstrap_torch_cuda,
@@ -29,33 +23,53 @@ from .gpu import (
     get_recommended_cuda_version,
     get_gpu_summary,
 )
-from .platform import (
-    PlatformInfo,
-    detect_platform,
-    get_platform_tag,
-    get_pixi_platform,
-    get_library_extension,
-    get_executable_suffix,
-    is_linux,
-    is_windows,
-    is_macos,
-)
-from .runtime import (
-    RuntimeEnv,
-    detect_runtime,
-    parse_wheel_requirement,
-)
+
+# Platform helpers (minimal, inlined from former platform.py)
+import platform as _platform_module
+import sys as _sys
+
+_PIXI_PLATFORMS = {
+    ("linux", "x86_64"): "linux-64",
+    ("linux", "aarch64"): "linux-aarch64",
+    ("darwin", "x86_64"): "osx-64",
+    ("darwin", "arm64"): "osx-arm64",
+    ("windows", "amd64"): "win-64",
+    ("windows", "x86_64"): "win-64",
+}
+
+
+def _get_os_name() -> str:
+    if _sys.platform.startswith("linux"):
+        return "linux"
+    elif _sys.platform == "darwin":
+        return "darwin"
+    elif _sys.platform == "win32":
+        return "windows"
+    return _sys.platform
+
+
+def get_pixi_platform() -> str:
+    """Get pixi platform string (e.g. 'linux-64', 'osx-arm64')."""
+    key = (_get_os_name(), _platform_module.machine().lower())
+    return _PIXI_PLATFORMS.get(key, f"{key[0]}-{key[1]}")
+
+
+def is_linux() -> bool:
+    return _sys.platform.startswith("linux")
+
+
+def is_windows() -> bool:
+    return _sys.platform == "win32"
+
+
+def is_macos() -> bool:
+    return _sys.platform == "darwin"
+
 
 __all__ = [
     # CUDA detection
-    "CUDA_VERSION_ENV_VAR",
-    "TORCH_VERSION_ENV_VAR",
+    "has_nvidia_gpu",
     "detect_cuda_version",
-    "get_cuda_from_torch",
-    "get_cuda_from_nvml",
-    "get_cuda_from_libcuda",
-    "get_cuda_from_nvcc",
-    "get_cuda_from_env",
     "get_bootstrap_python_version",
     "get_bootstrap_torch_version",
     "get_bootstrap_torch_cuda",
@@ -70,18 +84,9 @@ __all__ = [
     "compute_capability_to_architecture",
     "get_recommended_cuda_version",
     "get_gpu_summary",
-    # Platform detection
-    "PlatformInfo",
-    "detect_platform",
-    "get_platform_tag",
+    # Platform helpers
     "get_pixi_platform",
-    "get_library_extension",
-    "get_executable_suffix",
     "is_linux",
     "is_windows",
     "is_macos",
-    # Runtime detection
-    "RuntimeEnv",
-    "detect_runtime",
-    "parse_wheel_requirement",
 ]

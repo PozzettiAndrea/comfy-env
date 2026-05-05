@@ -1,41 +1,29 @@
-"""
-Environment layer - Environment management with side effects.
-
-Handles environment caching, path resolution, and runtime setup.
-"""
+"""Environment layer - path resolution, setup, and platform workarounds."""
 
 from .cache import (
-    CACHE_DIR,
-    get_cache_dir,
+    CE_WORKSPACE_DIR,
     get_env_name,
-    get_local_env_path,
-    resolve_env_path,
-)
-from .paths import (
-    get_site_packages_path,
-    get_lib_path,
+    get_workspace_dir,
+    find_comfyui_dir_from_node,
     copy_files,
 )
 from .setup import (
     setup_env,
+    is_comfy_env_enabled,
+    USE_COMFY_ENV_VAR,
 )
 from .libomp import (
     dedupe_libomp,
 )
 
 __all__ = [
-    # Cache management
-    "CACHE_DIR",
-    "get_cache_dir",
+    "CE_WORKSPACE_DIR",
     "get_env_name",
-    "get_local_env_path",
-    "resolve_env_path",
-    # Path resolution
-    "get_site_packages_path",
-    "get_lib_path",
+    "get_workspace_dir",
+    "find_comfyui_dir_from_node",
     "copy_files",
-    # Setup helpers
     "setup_env",
-    # macOS workaround
+    "is_comfy_env_enabled",
+    "USE_COMFY_ENV_VAR",
     "dedupe_libomp",
 ]

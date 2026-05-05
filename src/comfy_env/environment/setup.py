@@ -3,30 +3,27 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from .libomp import dedupe_libomp
 
-USE_COMFY_ENV_VAR = "USE_COMFY_ENV"  # kept for backwards compat
+USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
 
-def is_comfy_env_enabled() -> bool:
+def is_comfy_env_enabled():
     from ..settings import ISOLATE
     return ISOLATE
 
 
-def _find_env_dirs(node_dir: str) -> list:
+def _find_env_dirs(node_dir):
     """Recursively find comfy-env.toml files under node_dir (for debug info only)."""
-    from pathlib import Path
     return sorted(str(p.parent) for p in Path(node_dir).rglob("comfy-env.toml"))
 
 
 def _ensure_base_directory():
     """Ensure comfy.cli_args.args.base_directory is set.
 
-    Some nodes (e.g. KJNodes) resolve relative paths via args.base_directory.
-    If the user didn't pass --base-directory, it defaults to None and relative
-    paths break when cwd != ComfyUI root (common on CI / portable builds).
+    Some nodes resolve relative paths via args.base_directory.
+    If the user didn't pass --base-directory, it defaults to None.
     """
     try:
         from comfy.cli_args import args
@@ -39,35 +36,6 @@ def _ensure_base_directory():
 
 
 _shareable_pool_applied = False
-
-
-def _activate_attention(flash=False, sage=False):
-    """Set attention flags on comfy.cli_args.args (already imported at prestartup time)."""
-    try:
-        from comfy.cli_args import args
-        patches = []
-        if sage and not getattr(args, 'use_sage_attention', False):
-            try:
-                from sageattention import sageattn  # noqa: F401
-                args.use_sage_attention = True
-                patches.append("sage")
-            except Exception:
-                print("[comfy-env] sage attention requested but sageattention not importable",
-                      file=sys.stderr, flush=True)
-        if flash and not getattr(args, 'use_flash_attention', False):
-            try:
-                from flash_attn import flash_attn_func  # noqa: F401
-                args.use_flash_attention = True
-                patches.append("flash")
-            except Exception:
-                print("[comfy-env] flash attention requested but flash_attn not importable",
-                      file=sys.stderr, flush=True)
-        if patches:
-            print(f"[comfy-env] auto-activated {' + '.join(patches)} attention",
-                  file=sys.stderr, flush=True)
-    except Exception as e:
-        print(f"[comfy-env] attention patch FAILED: {e}",
-              file=sys.stderr, flush=True)
 
 
 def _register_shareable_pool_hook():
@@ -111,9 +79,8 @@ def _register_shareable_pool_hook():
 
                 pool = _create_shareable_pool(device=0)
                 _set_device_pool(0, pool)
-                sp._parent_shareable_pool = pool
+                sp._ipc_parent._parent_shareable_pool = pool
 
-                # Patch get_free_memory
                 _orig_get_free = mm.get_free_memory
 
                 def _patched_get_free(dev=None, torch_free_too=False):
@@ -131,7 +98,6 @@ def _register_shareable_pool_hook():
 
                 mm.get_free_memory = _patched_get_free
 
-                # Patch get_total_memory
                 _orig_get_total = mm.get_total_memory
 
                 def _patched_get_total(dev=None, torch_total_too=False):
@@ -147,7 +113,6 @@ def _register_shareable_pool_hook():
 
                 mm.get_total_memory = _patched_get_total
 
-                # Patch empty_cache to also trim our pool
                 _orig_empty = torch.cuda.empty_cache
 
                 def _patched_empty():
@@ -167,7 +132,7 @@ def _register_shareable_pool_hook():
     sys.meta_path.insert(0, _ShareablePoolHook())
 
 
-def setup_env(node_dir: Optional[str] = None) -> None:
+def setup_env(node_dir=None):
     """Set up comfy-env runtime. Call in prestartup_script.py."""
     if node_dir is None:
         import inspect
@@ -178,7 +143,6 @@ def setup_env(node_dir: Optional[str] = None) -> None:
 
     node_name = os.path.basename(node_dir)
 
-    # Log isolation envs
     sub_envs = _find_env_dirs(node_dir)
     if sub_envs:
         print(f"[comfy-env] {node_name}: {len(sub_envs)} isolation env(s):", file=sys.stderr)
@@ -187,23 +151,16 @@ def setup_env(node_dir: Optional[str] = None) -> None:
     else:
         print(f"[comfy-env] {node_name}: no isolation envs", file=sys.stderr)
 
-    # Patches (apply regardless of isolation setting)
-    from ..settings import _is_on, PATCH_DEFAULTS
-    use_flash = _is_on("COMFY_ENV_PATCH_FLASH_ATTENTION",
-                        PATCH_DEFAULTS["COMFY_ENV_PATCH_FLASH_ATTENTION"])
-    use_sage = _is_on("COMFY_ENV_PATCH_SAGE_ATTENTION",
-                       PATCH_DEFAULTS["COMFY_ENV_PATCH_SAGE_ATTENTION"])
-    if use_flash or use_sage:
-        _activate_attention(flash=use_flash, sage=use_sage)
-
     if not is_comfy_env_enabled():
         print("[comfy-env] prestartup complete (isolation disabled)",
               file=sys.stderr, flush=True)
         return
+
     dedupe_libomp()
 
+    from ..settings import _is_on, PATCH_DEFAULTS
     if _is_on("COMFY_ENV_PATCH_SHAREABLE_POOL",
-              PATCH_DEFAULTS["COMFY_ENV_PATCH_SHAREABLE_POOL"]):
+              PATCH_DEFAULTS.get("COMFY_ENV_PATCH_SHAREABLE_POOL", False)):
         _register_shareable_pool_hook()
         print("[comfy-env] shareable pool hook registered",
               file=sys.stderr, flush=True)

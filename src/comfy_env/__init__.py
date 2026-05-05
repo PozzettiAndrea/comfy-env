@@ -51,19 +51,22 @@ from .config import (
 from .detection import (
     # CUDA detection
     detect_cuda_version,
-    detect_cuda_environment,
-    get_recommended_cuda_version,
+    has_nvidia_gpu,
+    get_bootstrap_torch_version,
+    get_bootstrap_torch_cuda,
+    get_bootstrap_python_version,
     # GPU detection
     GPUInfo,
     CUDAEnvironment,
+    detect_cuda_environment,
     detect_gpu,
     get_gpu_summary,
-    # Platform detection
-    detect_platform,
-    get_platform_tag,
-    # Runtime detection
-    RuntimeEnv,
-    detect_runtime,
+    get_recommended_cuda_version,
+    # Platform helpers
+    get_pixi_platform,
+    is_linux,
+    is_windows,
+    is_macos,
 )
 
 
