@@ -201,7 +201,6 @@ def _read_env_torch_version(
     env_name: str,
     log: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
-    from ..packages.pixi import PIXI
     """Run `pixi run -e <env_name> python -c 'import torch; print(...)'`.
 
     Returns the public torch version (e.g. "2.11.0", local label stripped), or
@@ -215,6 +214,7 @@ def _read_env_torch_version(
     `pixi run -e <env> python` themselves.
     """
     import subprocess
+    from ..packages.pixi import PIXI
     env = os.environ.copy()
     env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     r = subprocess.run(
@@ -423,11 +423,12 @@ def install_workspace(
     log: Callable[[str], None] = print,
     dry_run: bool = False,
 ) -> Optional[Path]:
-    from ..packages.pixi import PIXI
     """Generate `<comfyui_dir>/.ce/pixi.toml` and run `pixi install --all`.
 
     Returns the workspace directory on success, None if nothing to install.
     """
+    from ..packages.pixi import ensure_pixi, PIXI
+    ensure_pixi()
     from ..environment.cache import CE_WORKSPACE_DIR
     from ..packages.toml_generator import write_workspace_pixi_toml
 
