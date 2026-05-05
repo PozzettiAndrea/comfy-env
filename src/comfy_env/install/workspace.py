@@ -158,6 +158,15 @@ def _collect_root_conda_deps(
         if deps:
             log(f"[comfy-env] Root conda deps from {plugin_dir.name}: {list(deps.keys())}")
             merged.update(deps)
+        # Also collect target-specific deps (e.g. [target.osx-arm64.dependencies])
+        targets = cfg.pixi_passthrough.get("target", {})
+        for target_key, target_val in targets.items():
+            target_deps = target_val.get("dependencies", {}) if isinstance(target_val, dict) else {}
+            if target_deps:
+                log(f"[comfy-env] Root conda deps from {plugin_dir.name} [{target_key}]: {list(target_deps.keys())}")
+                merged.setdefault("__targets__", {})\
+                      .setdefault(target_key, {})\
+                      .update(target_deps)
     return merged
 
 
