@@ -1,6 +1,9 @@
-"""Pixi binary location. Installed to ~/.pixi/bin by the official installer."""
+"""Pixi binary location."""
 
+import shutil
 import sys
 from pathlib import Path
 
-PIXI = str(Path.home() / ".pixi" / "bin" / ("pixi.exe" if sys.platform == "win32" else "pixi"))
+_name = "pixi.exe" if sys.platform == "win32" else "pixi"
+_default = Path.home() / ".pixi" / "bin" / _name
+PIXI = str(_default) if _default.exists() else shutil.which("pixi")
