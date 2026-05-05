@@ -77,7 +77,6 @@ from .packages import (
     # Pixi
     PIXI,
     ensure_pixi,
-    get_pixi_path,
     # CUDA wheels
     CUDA_WHEELS_INDEX,
     get_wheel_url,
