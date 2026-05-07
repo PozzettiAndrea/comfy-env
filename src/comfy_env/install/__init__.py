@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import os
 from pathlib import Path
+
+import sys
+os.environ["PYTHONUNBUFFERED"] = "1"
+# Unbuffer current process too (takes effect even when stdout is piped)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 from typing import Callable, List, Optional, Union
 
 from ..config import (
