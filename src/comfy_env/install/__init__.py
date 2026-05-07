@@ -24,7 +24,6 @@ from .plugin import (
     _install_node_dependencies,
     _reinstall_main_requirements,
     _collect_node_req_dirs,
-    _install_to_main_env,
 )
 from .workspace import install_workspace
 from .verify import verify_installation
@@ -82,25 +81,16 @@ def install(
         "COMFY_ENV_INSTALL_ISOLATED", node_settings,
         GENERAL_DEFAULTS["COMFY_ENV_INSTALL_ISOLATED"],
     )
-    install_main = resolve_bool(
-        "COMFY_ENV_INSTALL_MAIN", node_settings,
-        GENERAL_DEFAULTS["COMFY_ENV_INSTALL_MAIN"],
-    )
 
     if install_isolated:
-        # Workspace install -- picks up every plugin's comfy-env.toml under custom_nodes/
         from ..environment.cache import find_comfyui_dir_from_node as get_comfyui_dir
         comfyui_dir = get_comfyui_dir(node_dir)
         if comfyui_dir is None:
             log("[comfy-env] WARNING: Could not locate ComfyUI base; skipping workspace install")
         else:
             install_workspace(comfyui_dir, log=log, dry_run=dry_run)
-
-    if install_main:
-        _install_to_main_env(node_dir, log, dry_run, node_req_dirs=node_req_dirs)
-
-    if not install_isolated and not install_main:
-        log("\n[comfy-env] Both install targets disabled -- nothing to install")
+    else:
+        log("\n[comfy-env] Isolated install disabled -- nothing to install")
 
     log("\nInstallation complete!")
     return True

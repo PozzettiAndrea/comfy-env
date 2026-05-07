@@ -295,75 +295,6 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
     return None
 
 
-def _get_python_version(env_dir: Path) -> Optional[str]:
-    python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
-    if not python.exists(): return None
-    try:
-        import subprocess
-        r = subprocess.run([str(python), "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                          capture_output=True, text=True, timeout=5)
-        return r.stdout.strip() if r.returncode == 0 else None
-    except Exception: return None
-
-
-def _get_host_torch_sp() -> Optional[Path]:
-    """Get the host's site-packages directory containing torch, or None if torch isn't imported."""
-    try:
-        import torch
-        return Path(torch.__file__).parent.parent
-    except (ImportError, AttributeError):
-        return None
-
-
-def _share_torch_opt_in() -> bool:
-    """Whether the user has opted in to legacy share_torch via env var."""
-    return os.environ.get("COMFY_ENV_USE_SHARE_TORCH", "").lower() in ("1", "true", "yes")
-
-
-def _should_share_torch(env_dir: Path) -> bool:
-    """Decide if host torch should be shared with this worker env.
-
-    DEPRECATED. The workspace model now pins torch in the `comfyui` feature and
-    relies on pixi multi-env hardlinks for inter-env sharing -- per-node envs
-    already see a single torch installation on disk that matches the comfyui
-    template env's pin. This legacy sys.path-redirect path is only consulted when
-    `COMFY_ENV_USE_SHARE_TORCH=1` is set explicitly, and is fragile on Windows
-    (uv pip uninstall leaves stranded torch DLLs that cause WinError 127). It
-    will be removed in a future release.
-    """
-    if not _share_torch_opt_in():
-        return False
-
-    host_torch_sp = _get_host_torch_sp()
-    if host_torch_sp is None:
-        if _DBG_WORKER:
-            _log("[comfy-env] share_torch: host has no torch, not sharing")
-        return False
-
-    host_version = f"{sys.version_info.major}.{sys.version_info.minor}"
-    worker_version = _get_python_version(env_dir)
-    if worker_version is None:
-        if _DBG_WORKER:
-            _log(f"[comfy-env] share_torch: could not detect worker python in {env_dir}, not sharing")
-        return False
-
-    if host_version != worker_version:
-        if _DBG_WORKER:
-            _log(f"[comfy-env] share_torch: host={host_version} != worker={worker_version}, not sharing")
-        return False
-
-    sp, _ = _get_env_paths(env_dir)
-    if sp:
-        env_torch = sp / "torch"
-        if env_torch.is_dir():
-            if _DBG_WORKER:
-                _log(f"[comfy-env] share_torch: env has own torch at {env_torch}, not sharing")
-            return False
-
-    _log(f"[comfy-env] share_torch: host={host_version}, worker={worker_version}, sharing")
-    return True
-
-
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                    lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
                    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -793,14 +724,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
 
-        # Determine if this env should inherit host torch
-        share_torch_active = _should_share_torch(env_dir)
-        host_torch_sp = _get_host_torch_sp() if share_torch_active else None
-
-        if share_torch_active and host_torch_sp:
-            _log(f"[comfy-env] {cf.parent.name}: sharing host torch from {host_torch_sp}")
-            env_vars["_COMFY_ENV_HOST_SP"] = str(host_torch_sp)
-
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
             "dir": cf.parent,
@@ -810,8 +733,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             "env_vars": env_vars,
             "health_check_timeout": health_check_timeout,
             "package_root": package_root,
-            "share_torch": share_torch_active,
-            "host_torch_sp": host_torch_sp,
         }
 
     if _DBG_WORKER:
