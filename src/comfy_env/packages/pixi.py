@@ -2,6 +2,7 @@
 
 import os
 import platform
+import ssl
 import stat
 import sys
 import urllib.request
@@ -33,7 +34,15 @@ def ensure_pixi():
     print(f"[comfy-env] pixi not found, downloading...", file=sys.stderr, flush=True)
     dest = Path(PIXI)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, dest)
+
+    # Portable/embedded Python often lacks CA certs; use certifi if available
+    try:
+        import certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        ctx = ssl.create_default_context()
+    with urllib.request.urlopen(url, context=ctx) as resp:
+        dest.write_bytes(resp.read())
 
     if sys.platform != "win32":
         dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
