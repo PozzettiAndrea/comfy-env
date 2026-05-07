@@ -50,8 +50,8 @@ def get_workspace_env_dir(comfyui_dir, env_name):
 def find_comfyui_dir_from_node(node_dir=None):
     """Find the ComfyUI base directory.
 
-    Tries folder_paths.base_path first (works in desktop app where custom_nodes
-    are outside the ComfyUI tree), then walks up from node_dir.
+    Tries folder_paths.base_path first (works when ComfyUI is running),
+    then walks up from node_dir looking for ComfyUI markers.
     """
     try:
         import folder_paths
@@ -61,7 +61,11 @@ def find_comfyui_dir_from_node(node_dir=None):
     if node_dir is not None:
         current = Path(node_dir).resolve()
         for _ in range(10):
+            # Standard layout: has main.py + comfy/
             if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            # Desktop app layout: base_path has custom_nodes/ but no main.py
+            if (current / "custom_nodes").is_dir() and (current / "user").is_dir():
                 return current
             if current.parent == current:
                 break
