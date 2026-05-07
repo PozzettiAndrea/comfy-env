@@ -753,8 +753,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     pkg_dir = Path(frame.filename).resolve().parent
     caller_pkg_name = caller_module.__name__ if caller_module else None
 
-    if _DBG_WORKER:
-        _log(f"[comfy-env] register_nodes: pkg_dir={pkg_dir}, caller={caller_pkg_name}")
+    _log(f"[comfy-env] register_nodes: {pkg_dir.name}")
 
     nodes_dir = pkg_dir / nodes_package
     if not nodes_dir.is_dir():
@@ -864,7 +863,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     if root_resolved in isolation_envs and enabled:
         # Isolation env at root -- subprocess scan
         env = isolation_envs[root_resolved]
-        _log(f"[comfy-env] Importing {nodes_package} (isolation root)...")
+        _log(f"[comfy-env] Scanning {nodes_package} metadata (isolation root)...")
         try:
             root_meta = fetch_metadata(
                 env_dir=env["env_dir"],
@@ -959,6 +958,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             def _scan_isolation(subdir):
                 env = isolation_envs[subdir.resolve()]
                 package_name = f"{nodes_package}.{subdir.name}"
+                _log(f"[comfy-env] Scanning {subdir.name} metadata...")
                 return subdir, env, fetch_metadata(
                     env_dir=env["env_dir"],
                     node_dir=subdir,
