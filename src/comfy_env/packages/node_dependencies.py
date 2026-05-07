@@ -141,9 +141,9 @@ def run_install_script(node_dir: Path, log: Callable[[str], None] = print) -> No
     install_script = node_dir / "install.py"
     if install_script.exists():
         log(f"  Running install.py for {node_dir.name}...")
-        result = subprocess.run([sys.executable, str(install_script)], cwd=node_dir, capture_output=True, text=True)
+        result = subprocess.run([sys.executable, str(install_script)], cwd=node_dir)
         if result.returncode != 0:
-            log(f"  Warning: install.py failed: {result.stderr.strip()[:200]}")
+            log(f"  Warning: {node_dir.name} install.py failed (exit code {result.returncode})")
 
 
 def install_node_dependencies(
