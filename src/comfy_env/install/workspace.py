@@ -515,7 +515,19 @@ def install_workspace(
         pixi_env = dict(os.environ)
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(workspace_dir / "_no_python")
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
+        pixi_env["PIXI_NO_PROGRESS"] = "1"  # plain text output instead of progress bars
 
+        log(f"[comfy-env] Installing {len(node_configs)} environment(s):")
+        for env_name, cfg in node_configs:
+            py = cfg.python or "host"
+            deps = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys())
+            cuda = cfg.cuda_packages
+            parts = [f"python={py}"]
+            if deps:
+                parts.append(f"{len(deps)} pypi deps")
+            if cuda:
+                parts.append(f"{len(cuda)} cuda wheels")
+            log(f"  - {env_name} ({', '.join(parts)})")
         log("[comfy-env] Running `pixi install --all`...")
         result = _run_streaming(
             [PIXI, "install", "--all"],

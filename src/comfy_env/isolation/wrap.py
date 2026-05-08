@@ -786,6 +786,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         env = isolation_envs[root_resolved]
         _log(f"[comfy-env] Scanning {nodes_package} metadata (isolation root)...")
         try:
+            import time as _time
+            _t0 = _time.perf_counter()
             root_meta = fetch_metadata(
                 env_dir=env["env_dir"],
                 node_dir=nodes_dir,
@@ -794,6 +796,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 env_vars=env["env_vars"],
             )
             root_nodes = root_meta.get("nodes", {})
+            _log(f"[comfy-env] Scanned {nodes_package} root: {len(root_nodes)} nodes ({_time.perf_counter()-_t0:.1f}s)")
             root_display = root_meta.get("display", {})
 
             package_root = env["package_root"]
@@ -880,13 +883,18 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 env = isolation_envs[subdir.resolve()]
                 package_name = f"{nodes_package}.{subdir.name}"
                 _log(f"[comfy-env] Scanning {subdir.name} metadata...")
-                return subdir, env, fetch_metadata(
+                import time
+                t0 = time.perf_counter()
+                meta = fetch_metadata(
                     env_dir=env["env_dir"],
                     node_dir=subdir,
                     package_name=package_name,
                     working_dir=pkg_dir,
                     env_vars=env["env_vars"],
                 )
+                n = len(meta.get("nodes", {}))
+                _log(f"[comfy-env] Scanned {subdir.name}: {n} nodes ({time.perf_counter()-t0:.1f}s)")
+                return subdir, env, meta
 
             with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:
                 futures = {executor.submit(_scan_isolation, d): d for d in isolation_dirs}
