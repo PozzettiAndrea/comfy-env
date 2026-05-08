@@ -697,9 +697,13 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     try:
         import folder_paths
-        comfyui_base = folder_paths.base_path
+        # Use module location, not base_path — on Desktop app, base_path is
+        # the user data dir, not the source dir with comfy_api/comfy/etc.
+        comfyui_base = str(Path(folder_paths.__file__).parent)
+        _log(f"[comfy-env] ComfyUI source dir: {comfyui_base}")
     except ImportError:
         comfyui_base = None
+        _log("[comfy-env] folder_paths not available, ComfyUI base unknown")
 
     for cf in config_files:
         if cf.name == "comfy-env-root.toml":
@@ -723,6 +727,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _log(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
+            if _DBG_WORKER:
+                _log(f"[comfy-env] {cf.parent.name}: COMFYUI_BASE={comfyui_base}")
 
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {
