@@ -725,8 +725,14 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _log(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
-            if _DBG_WORKER:
-                _log(f"[comfy-env] {cf.parent.name}: COMFYUI_BASE={comfyui_base}")
+        # On Desktop app, folder_paths needs the user data dir for input/output/models
+        try:
+            import folder_paths
+            user_data = folder_paths.base_path
+            if user_data and str(user_data) != str(comfyui_base):
+                env_vars["COMFYUI_USER_DIR"] = str(user_data)
+        except ImportError:
+            pass
 
         package_root = pkg_dir
         isolation_envs[cf.parent.resolve()] = {

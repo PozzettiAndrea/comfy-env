@@ -139,10 +139,22 @@ package_name = sys.argv[2]
 sys.path.insert(0, working_dir)
 os.chdir(working_dir)
 
-# Add ComfyUI base to sys.path so nodes can import folder_paths etc.
+# Add ComfyUI source dir to sys.path so nodes can import folder_paths, comfy_api etc.
 _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
+
+# On Desktop app, redirect folder_paths to the user data dir (for input/output/models)
+_comfyui_user_dir = os.environ.get("COMFYUI_USER_DIR")
+if _comfyui_user_dir:
+    try:
+        import folder_paths
+        folder_paths.base_path = _comfyui_user_dir
+        folder_paths.output_directory = os.path.join(_comfyui_user_dir, "output")
+        folder_paths.input_directory = os.path.join(_comfyui_user_dir, "input")
+        folder_paths.user_directory = os.path.join(_comfyui_user_dir, "user")
+    except ImportError:
+        pass
 
 
 # Redirect stdout to stderr during import so that any print() calls
