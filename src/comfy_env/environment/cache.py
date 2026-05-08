@@ -1,6 +1,8 @@
 """Environment path resolution for comfy-env."""
 
+import os
 import shutil
+import sys
 from pathlib import Path
 
 CE_WORKSPACE_DIR = ".ce"
@@ -47,30 +49,90 @@ def get_workspace_env_dir(comfyui_dir, env_name):
     return get_workspace_dir(comfyui_dir) / ".pixi" / "envs" / env_name
 
 
-def find_comfyui_dir_from_node(node_dir=None):
-    """Find the ComfyUI base directory.
+def _find_desktop_source_dir():
+    """Find ComfyUI source dir from the Desktop app's extra_models_config.yaml.
 
-    Tries folder_paths.base_path first (works when ComfyUI is running),
-    then walks up from node_dir looking for ComfyUI markers.
+    The Electron desktop app stores config in its userData dir:
+      macOS:   ~/Library/Application Support/ComfyUI/
+      Windows: %APPDATA%/ComfyUI/
+      Linux:   ~/.config/ComfyUI/
+
+    The file extra_models_config.yaml contains a desktop_extensions section
+    with a custom_nodes path pointing into the app bundle. The parent of
+    that path is the ComfyUI source dir (where main.py, comfy/, requirements.txt live).
     """
+    if sys.platform == "darwin":
+        config_dir = Path.home() / "Library" / "Application Support" / "ComfyUI"
+    elif sys.platform == "win32":
+        config_dir = Path(os.environ.get("APPDATA", "")) / "ComfyUI"
+    else:
+        config_dir = Path.home() / ".config" / "ComfyUI"
+
+    yaml_path = config_dir / "extra_models_config.yaml"
+    if not yaml_path.exists():
+        return None
+    try:
+        content = yaml_path.read_text(encoding="utf-8")
+        # Look for desktop_extensions.custom_nodes line
+        in_desktop = False
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("desktop_extensions"):
+                in_desktop = True
+                continue
+            if in_desktop and stripped.startswith("custom_nodes:"):
+                path_str = stripped.split(":", 1)[1].strip()
+                candidate = Path(path_str).parent
+                if (candidate / "main.py").exists():
+                    return candidate
+            if not line.startswith(" ") and not line.startswith("\t") and ":" in line:
+                in_desktop = False
+    except Exception:
+        pass
+    return None
+
+
+def find_comfyui_dir_from_node(node_dir=None):
+    """Find the ComfyUI source directory.
+
+    Priority:
+    1. folder_paths module location (when running inside ComfyUI server)
+    2. Walk up from node_dir looking for main.py + comfy/ (standard layout)
+    3. Walk up looking for custom_nodes/ + user/ (Desktop app user data dir)
+       → then resolve actual source dir from Desktop app config
+    4. Desktop app config directly (no node_dir needed)
+    """
+    # 1. Running inside ComfyUI server
     try:
         import folder_paths
-        return Path(folder_paths.base_path)
+        return Path(folder_paths.__file__).parent
     except ImportError:
         pass
+
+    # 2+3. Walk up from node_dir
     if node_dir is not None:
         current = Path(node_dir).resolve()
         for _ in range(10):
             # Standard layout: has main.py + comfy/
             if (current / "main.py").exists() and (current / "comfy").exists():
                 return current
-            # Desktop app layout: base_path has custom_nodes/ but no main.py
+            # Desktop app user data dir: has custom_nodes/ but no main.py
             if (current / "custom_nodes").is_dir() and (current / "user").is_dir():
+                if not (current / "main.py").exists():
+                    # This is the user data dir, not the source dir.
+                    # Try to find the real source dir from Desktop app config.
+                    source = _find_desktop_source_dir()
+                    if source:
+                        return source
+                # If we can't find the source dir, return the user data dir
+                # as fallback (better than None)
                 return current
             if current.parent == current:
                 break
             current = current.parent
-    return None
+
+    # 4. Last resort: check Desktop app config directly
+    return _find_desktop_source_dir()
 
 
 def copy_files(src, dst, pattern="*", overwrite=False):
