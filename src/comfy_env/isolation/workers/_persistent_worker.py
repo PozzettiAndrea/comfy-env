@@ -1188,6 +1188,19 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
+    # On Desktop app, folder_paths needs user data dir for input/output/models
+    _user_dir = os.environ.get("COMFYUI_USER_DIR")
+    if _user_dir:
+        try:
+            import folder_paths
+            folder_paths.base_path = _user_dir
+            folder_paths.output_directory = os.path.join(_user_dir, "output")
+            folder_paths.input_directory = os.path.join(_user_dir, "input")
+            folder_paths.user_directory = os.path.join(_user_dir, "user")
+            wlog(f"[worker] folder_paths redirected to {_user_dir}")
+        except ImportError:
+            pass
+
     # Try to import torch (optional - not all isolated envs need it)
     _HAS_TORCH = False
     try:
