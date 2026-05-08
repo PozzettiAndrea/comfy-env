@@ -93,45 +93,59 @@ def _find_desktop_source_dir():
 
 
 def find_comfyui_dir_from_node(node_dir=None):
-    """Find the ComfyUI source directory.
+    """Find the ComfyUI user data directory (where .ce/, custom_nodes/, user/ live).
 
-    Priority:
-    1. folder_paths module location (when running inside ComfyUI server)
-    2. Walk up from node_dir looking for main.py + comfy/ (standard layout)
-    3. Walk up looking for custom_nodes/ + user/ (Desktop app user data dir)
-       → then resolve actual source dir from Desktop app config
-    4. Desktop app config directly (no node_dir needed)
+    This is where the workspace and pixi envs are created.
+    On standard installs this is the same as the source dir.
+    On Desktop app this is ~/Documents/ComfyUI/ (NOT the app bundle).
     """
-    # 1. Running inside ComfyUI server
+    # Running inside ComfyUI server — base_path is the user data dir
+    try:
+        import folder_paths
+        return Path(folder_paths.base_path)
+    except ImportError:
+        pass
+
+    # Walk up from node_dir
+    if node_dir is not None:
+        current = Path(node_dir).resolve()
+        for _ in range(10):
+            # Standard: has main.py + comfy/ (source dir IS the data dir)
+            if (current / "main.py").exists() and (current / "comfy").exists():
+                return current
+            # Desktop app: has custom_nodes/ + user/ but no main.py
+            if (current / "custom_nodes").is_dir() and (current / "user").is_dir():
+                return current
+            if current.parent == current:
+                break
+            current = current.parent
+    return None
+
+
+def find_comfyui_source_dir(node_dir=None):
+    """Find the ComfyUI source directory (where main.py, comfy/, requirements.txt live).
+
+    On standard installs this is the same as the data dir.
+    On Desktop app this is inside the app bundle (e.g. ComfyUI.app/.../ComfyUI/).
+    """
+    # Running inside ComfyUI server — folder_paths module is in the source dir
     try:
         import folder_paths
         return Path(folder_paths.__file__).parent
     except ImportError:
         pass
 
-    # 2+3. Walk up from node_dir
+    # Walk up from node_dir — if we find main.py + comfy/, that's it
     if node_dir is not None:
         current = Path(node_dir).resolve()
         for _ in range(10):
-            # Standard layout: has main.py + comfy/
             if (current / "main.py").exists() and (current / "comfy").exists():
-                return current
-            # Desktop app user data dir: has custom_nodes/ but no main.py
-            if (current / "custom_nodes").is_dir() and (current / "user").is_dir():
-                if not (current / "main.py").exists():
-                    # This is the user data dir, not the source dir.
-                    # Try to find the real source dir from Desktop app config.
-                    source = _find_desktop_source_dir()
-                    if source:
-                        return source
-                # If we can't find the source dir, return the user data dir
-                # as fallback (better than None)
                 return current
             if current.parent == current:
                 break
             current = current.parent
 
-    # 4. Last resort: check Desktop app config directly
+    # Desktop app: source dir is in the app bundle, read from config
     return _find_desktop_source_dir()
 
 

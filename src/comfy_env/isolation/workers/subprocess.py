@@ -186,15 +186,12 @@ class SubprocessWorker(Worker):
     def _find_comfyui_base(self) -> Optional[Path]:
         """Find ComfyUI source directory (where main.py, comfy/, folder_paths.py live).
 
-        On Desktop app, folder_paths.base_path is the user data dir (~/Documents/ComfyUI),
-        NOT the source dir. Use folder_paths.__file__ location instead — it's always
-        in the actual source tree.
+        Uses find_comfyui_source_dir which handles both standard and Desktop app layouts.
         """
-        try:
-            import folder_paths
-            return Path(folder_paths.__file__).parent
-        except ImportError:
-            pass
+        from ...environment.cache import find_comfyui_source_dir
+        result = find_comfyui_source_dir(self.working_dir)
+        if result:
+            return result
 
         # Fallback: Check common child directories (for test environments)
         for base in [self.working_dir, self.working_dir.parent]:

@@ -492,6 +492,13 @@ def install_workspace(
         # Collect conda deps from root configs for the comfyui feature
         root_conda_deps = _collect_root_conda_deps(comfyui_dir, log)
 
+        # On Desktop app, requirements.txt is in the app bundle (source dir),
+        # not the user data dir. Resolve source dir separately.
+        from ..environment.cache import find_comfyui_source_dir
+        source_dir = find_comfyui_source_dir(comfyui_dir / "custom_nodes")
+        if source_dir and source_dir != comfyui_dir:
+            log(f"[comfy-env] Desktop app detected: source={source_dir}, data={comfyui_dir}")
+
         node_configs = [(env_name, cfg) for env_name, _, _, cfg in discovered]
         _, cuda_urls_by_env = write_workspace_pixi_toml(
             workspace_dir, comfyui_dir, torch_index, cuda_major, node_configs,
@@ -504,6 +511,7 @@ def install_workspace(
             chosen_torch_short=chosen_torch_short if combo is not None else None,
             chosen_python=chosen_python if combo is not None else None,
             root_conda_deps=root_conda_deps or None,
+            comfyui_source_dir=source_dir,
         )
 
         if dry_run:

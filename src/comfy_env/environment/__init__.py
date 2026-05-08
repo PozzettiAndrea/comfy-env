@@ -5,6 +5,7 @@ from .cache import (
     get_env_name,
     get_workspace_dir,
     find_comfyui_dir_from_node,
+    find_comfyui_source_dir,
     copy_files,
 )
 from .setup import (

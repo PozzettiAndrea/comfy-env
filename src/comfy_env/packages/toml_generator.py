@@ -365,6 +365,7 @@ def build_workspace_toml(
     node_configs: List[Tuple[str, ComfyEnvConfig]],  # (env_name, cfg) pairs
     bootstrap_python: Optional[str] = None,
     torch_pin: Optional[str] = None,
+    comfyui_source_dir: Optional[Path] = None,
     log: Callable[[str], None] = print,
     chosen_torch_index: Optional[str] = None,
     chosen_torch_pin: Optional[str] = None,
@@ -419,7 +420,9 @@ def build_workspace_toml(
     out: Dict[str, Any] = {"workspace": workspace}
 
     # comfyui baseline feature
-    comfyui_pypi = parse_comfyui_requirements(comfyui_dir, torch_index, log)
+    # requirements.txt lives in the source dir (app bundle on Desktop)
+    req_dir = comfyui_source_dir or comfyui_dir
+    comfyui_pypi = parse_comfyui_requirements(req_dir, torch_index, log)
     _pin_torch_family(comfyui_pypi, torch_pin, log)
     feature_comfyui: Dict[str, Any] = {}
 
@@ -564,6 +567,7 @@ def write_workspace_pixi_toml(
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
     root_conda_deps: Optional[Dict[str, Any]] = None,
+    comfyui_source_dir: Optional[Path] = None,
 ) -> Path:
     """Generate `<workspace_dir>/pixi.toml` from the parts above.
 
@@ -577,6 +581,7 @@ def write_workspace_pixi_toml(
         comfyui_dir, torch_index, cuda_major, node_configs,
         bootstrap_python=bootstrap_python,
         torch_pin=torch_pin,
+        comfyui_source_dir=comfyui_source_dir,
         log=log,
         chosen_torch_index=chosen_torch_index,
         chosen_torch_pin=chosen_torch_pin,

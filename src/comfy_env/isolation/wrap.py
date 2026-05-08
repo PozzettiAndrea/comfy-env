@@ -695,15 +695,13 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     isolation_envs = {}  # {resolved_dir: env_config}
     config_files = list(pkg_dir.rglob("comfy-env.toml"))
 
-    try:
-        import folder_paths
-        # Use module location, not base_path — on Desktop app, base_path is
-        # the user data dir, not the source dir with comfy_api/comfy/etc.
-        comfyui_base = str(Path(folder_paths.__file__).parent)
+    from ..environment.cache import find_comfyui_source_dir
+    comfyui_base = find_comfyui_source_dir(pkg_dir)
+    if comfyui_base:
+        comfyui_base = str(comfyui_base)
         _log(f"[comfy-env] ComfyUI source dir: {comfyui_base}")
-    except ImportError:
-        comfyui_base = None
-        _log("[comfy-env] folder_paths not available, ComfyUI base unknown")
+    else:
+        _log("[comfy-env] ComfyUI source dir not found")
 
     for cf in config_files:
         if cf.name == "comfy-env-root.toml":
