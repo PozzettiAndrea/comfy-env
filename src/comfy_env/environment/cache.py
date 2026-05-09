@@ -49,6 +49,48 @@ def get_workspace_env_dir(comfyui_dir, env_name):
     return get_workspace_dir(comfyui_dir) / ".pixi" / "envs" / env_name
 
 
+def _candidate_config_dirs():
+    """Yield candidate ComfyUI Desktop config dirs, ordered most-specific
+    first. On Windows, robust against SYSTEM-context APPDATA inherited from
+    agent harnesses, scheduled tasks, or service-spawned shells: when
+    APPDATA points at the systemprofile subtree (where ComfyUI never
+    writes), we fall through to USERPROFILE-, USERNAME-, then a glob across
+    C:\\Users\\* picking any user that has the userData dir."""
+    if sys.platform == "darwin":
+        return [Path.home() / "Library" / "Application Support" / "ComfyUI"]
+    if sys.platform != "win32":
+        return [Path.home() / ".config" / "ComfyUI"]
+
+    seen = set()
+    out = []
+    def add(p):
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    appdata = os.environ.get("APPDATA", "")
+    if appdata and "systemprofile" not in appdata.lower():
+        add(Path(appdata) / "ComfyUI")
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile and "systemprofile" not in userprofile.lower():
+        add(Path(userprofile) / "AppData" / "Roaming" / "ComfyUI")
+    username = os.environ.get("USERNAME", "")
+    if username and username.upper() != "SYSTEM":
+        add(Path("C:/Users") / username / "AppData" / "Roaming" / "ComfyUI")
+    try:
+        from glob import glob as _glob
+        skip = ("default", "default user", "public", "all users")
+        for p in _glob(r"C:\Users\*\AppData\Roaming\ComfyUI"):
+            parts = Path(p).parts
+            user_seg = parts[2].lower() if len(parts) > 2 else ""
+            if user_seg in skip:
+                continue
+            add(Path(p))
+    except Exception:
+        pass
+    return out
+
+
 def _find_desktop_source_dir():
     """Find ComfyUI source dir from the Desktop app's extra_models_config.yaml.
 
@@ -61,34 +103,30 @@ def _find_desktop_source_dir():
     with a custom_nodes path pointing into the app bundle. The parent of
     that path is the ComfyUI source dir (where main.py, comfy/, requirements.txt live).
     """
-    if sys.platform == "darwin":
-        config_dir = Path.home() / "Library" / "Application Support" / "ComfyUI"
-    elif sys.platform == "win32":
-        config_dir = Path(os.environ.get("APPDATA", "")) / "ComfyUI"
-    else:
-        config_dir = Path.home() / ".config" / "ComfyUI"
-
-    yaml_path = config_dir / "extra_models_config.yaml"
-    if not yaml_path.exists():
-        return None
-    try:
-        content = yaml_path.read_text(encoding="utf-8")
-        # Look for desktop_extensions.custom_nodes line
-        in_desktop = False
-        for line in content.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("desktop_extensions"):
-                in_desktop = True
-                continue
-            if in_desktop and stripped.startswith("custom_nodes:"):
-                path_str = stripped.split(":", 1)[1].strip()
-                candidate = Path(path_str).parent
-                if (candidate / "main.py").exists():
-                    return candidate
-            if not line.startswith(" ") and not line.startswith("\t") and ":" in line:
-                in_desktop = False
-    except Exception:
-        pass
+    for config_dir in _candidate_config_dirs():
+        yaml_path = config_dir / "extra_models_config.yaml"
+        if not yaml_path.exists():
+            continue
+        try:
+            content = yaml_path.read_text(encoding="utf-8")
+            # Look for desktop_extensions.custom_nodes line
+            in_desktop = False
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("desktop_extensions"):
+                    in_desktop = True
+                    continue
+                if in_desktop and stripped.startswith("custom_nodes:"):
+                    path_str = stripped.split(":", 1)[1].strip()
+                    candidate = Path(path_str).parent
+                    if (candidate / "main.py").exists():
+                        return candidate
+                if (not line.startswith(" ")
+                        and not line.startswith("\t")
+                        and ":" in line):
+                    in_desktop = False
+        except Exception:
+            continue
     return None
 
 
