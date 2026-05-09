@@ -2,11 +2,11 @@
 
 Workspace model:
 - One pixi workspace per ComfyUI install at `<comfyui_dir>/.ce/pixi.toml`.
-- `[feature.comfyui.pypi-dependencies]` is parsed from `<comfyui_dir>/requirements.txt`
-  with torch/torchvision/torchaudio pointed at the resolved CUDA/CPU index.
-- `[feature.py<XY>.dependencies]` per python version actually requested by any node.
-- `[feature.<env_name>.*]` per node config.
-- `[environments]` composes (pyXY + comfyui + node) per env, all `no-default-feature = true`.
+- One `[feature.comfyui<XY>]` per python version encountered: python pin + torch
+  family + ComfyUI requirements.txt pypi deps + root conda deps + env vars.
+- `[feature.<env_name>.*]` per node config (node-specific deps only).
+- `[environments]` composes (comfyui<XY> + node) per env, `no-default-feature = true`.
+  Envs sharing a python version share a solve-group so the base is solved once.
 """
 
 import copy
