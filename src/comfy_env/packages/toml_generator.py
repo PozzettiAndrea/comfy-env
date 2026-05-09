@@ -163,20 +163,49 @@ def _parse_requirements_file(
 # Workspace builder
 # ---------------------------------------------------------------------------
 
-def _python_feature_name(version: str) -> str:
-    """3.11 -> py311, 3.13 -> py313."""
+def _comfyui_feature_name(version: str) -> str:
+    """3.11 -> comfyui311, 3.13 -> comfyui313."""
     parts = version.split(".")
-    return "py" + parts[0] + parts[1]
+    return "comfyui" + parts[0] + parts[1]
 
 
-def _build_python_feature(version: str) -> Dict[str, Any]:
-    return {
-        "dependencies": {
-            "python": f"{version}.*",
-            "pip": "*",
-            "setuptools": ">=75.0,<82",
-        }
+def _build_comfyui_feature(
+    version: str,
+    comfyui_pypi: Dict[str, Any],
+    root_conda_deps: Optional[Dict[str, Any]],
+    glibc_version: Optional[str],
+) -> Dict[str, Any]:
+    """Build a per-python-version comfyui base feature.
+
+    Contains python + pip + setuptools pin, torch family (from comfyui_pypi),
+    ComfyUI requirements.txt pypi deps, root conda deps, glibc, and KMP env var.
+    """
+    feat: Dict[str, Any] = {}
+
+    # Conda dependencies: python pin + root conda deps
+    deps: Dict[str, Any] = {
+        "python": f"{version}.*",
+        "pip": "*",
+        "setuptools": ">=75.0,<82",
     }
+    if root_conda_deps:
+        deps.update(copy.deepcopy(root_conda_deps))
+    feat["dependencies"] = deps
+
+    # PyPI dependencies: everything from ComfyUI requirements.txt (incl. torch)
+    if comfyui_pypi:
+        feat["pypi-dependencies"] = copy.deepcopy(comfyui_pypi)
+
+    # System requirements
+    if glibc_version:
+        feat["system-requirements"] = {
+            "libc": {"family": "glibc", "version": glibc_version},
+        }
+
+    # KMP env var to prevent OMP conflicts between conda MKL and pip torch
+    feat["activation"] = {"env": {"KMP_DUPLICATE_LIB_OK": "TRUE"}}
+
+    return feat
 
 
 def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
@@ -185,8 +214,8 @@ def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
     if bad:
         raise ValueError(
             f"[{name}] comfy-env.toml has {bad} under [cuda] packages. "
-            "Plain torch/torchvision/torchaudio are now provided by the "
-            "workspace's `comfyui` feature (parsed from <ComfyUI>/requirements.txt). "
+            "Plain torch/torchvision/torchaudio are provided by the "
+            "comfyui base feature (parsed from <ComfyUI>/requirements.txt). "
             "Remove them from [cuda] packages -- keep only CUDA-only wheels there "
             "(cumesh, flash-attn, cc_torch, nvdiffrast, etc.)."
         )
@@ -200,13 +229,13 @@ def _strip_torch_family(
 ) -> None:
     """Remove plain torch/torchvision/torchaudio entries from a deps table in place.
 
-    Torch family is workspace-global (provided by the `comfyui` feature). Per-node
+    Torch family is provided by the per-python comfyui base feature. Per-node
     declarations are silently stripped with a one-line note.
     """
     for k in list(table.keys()):
         if k.lower() in _TORCH_PKGS:
             del table[k]
-            log(f"[comfy-env] {name}: ignoring `{k}` in {where} (provided by workspace `comfyui` feature)")
+            log(f"[comfy-env] {name}: ignoring `{k}` in {where} (provided by comfyui base feature)")
 
 
 def _build_node_feature(
@@ -216,11 +245,9 @@ def _build_node_feature(
 ) -> Dict[str, Any]:
     """Emit a pixi `[feature.<name>.*]` block from a node's ComfyEnvConfig.
 
-    Only carries node-specific deps. Python pin lives in the pyXY feature; torch
-    lives in the comfyui feature. No platform gates -- pypi index resolution
-    handles wheel selection. Plain torch/torchvision/torchaudio entries are
-    stripped from `[dependencies]`/`[pypi-dependencies]` (workspace-global from
-    the `comfyui` feature).
+    Only carries node-specific deps. Python pin and torch family live in the
+    per-python comfyui base feature. Plain torch/torchvision/torchaudio entries
+    are stripped from `[dependencies]`/`[pypi-dependencies]`.
 
     `pypi-options` from the node's `comfy-env.toml` is passed through verbatim.
     A node author can express `[pypi-options.dependency-overrides]` to redirect
@@ -376,24 +403,12 @@ def build_workspace_toml(
 ) -> Dict[str, Any]:
     """Assemble the full workspace pixi.toml as a dict.
 
-    Args:
-        comfyui_dir: ComfyUI install root (used to find requirements.txt).
-        torch_index: PyPI index URL for the comfyui feature's torch (bootstrap-derived,
-            i.e. what python_embeded already has). The comfyui template env is meant
-            to mirror python_embeded; per-node envs that need a different cuda combo
-            override below.
-        cuda_major: Major CUDA version for `[system-requirements]` (e.g. "12"). None on CPU.
-        node_configs: List of (env_name, ComfyEnvConfig) -- one entry per environment to create.
-        bootstrap_python: Major.minor of the install bootstrap interpreter (e.g. "3.10").
-            Defaults to `sys.version_info` on the running interpreter.
-        torch_pin: PEP 440 version spec to pin torch/torchvision/torchaudio in the
-            comfyui feature (bootstrap-derived). When None, torch stays as `*`.
-        chosen_torch_index, chosen_torch_pin: the cuda-wheel combo selected by
-            `_resolve_wheel_combo` -- may equal the bootstrap (no real divergence)
-            or differ (fallback combo). When set, per-node features that declare
-            cuda-only packages get a `[pypi-options.dependency-overrides]` block
-            targeting this combo so their env resolves to a torch matching the
-            cuda-only wheels, independent of the comfyui pin.
+    One ``comfyui<XY>`` base feature is stamped out per python version encountered
+    (host + any explicit ``python = "X.Y"`` in node configs).  Each base feature
+    carries the python pin, torch family, ComfyUI requirements.txt pypi deps,
+    root conda deps, and env vars.  Envs sharing a python version share a
+    solve-group so the base is solved once; different python versions get
+    separate solve-groups and never cross-contaminate.
     """
     host_py = bootstrap_python or f"{sys.version_info.major}.{sys.version_info.minor}"
     current_platform = get_pixi_platform()
@@ -419,45 +434,38 @@ def build_workspace_toml(
 
     out: Dict[str, Any] = {"workspace": workspace}
 
-    # comfyui baseline feature
-    # requirements.txt lives in the source dir (app bundle on Desktop)
+    # Parse ComfyUI requirements.txt (torch gets index + pin applied)
     req_dir = comfyui_source_dir or comfyui_dir
     comfyui_pypi = parse_comfyui_requirements(req_dir, torch_index, log)
     _pin_torch_family(comfyui_pypi, torch_pin, log)
-    feature_comfyui: Dict[str, Any] = {}
 
-    # Auto-detect host glibc so pixi accepts wheels matching the real system.
-    # Put on the comfyui feature (not top-level) because all envs use
-    # no-default-feature and include comfyui — top-level system-requirements
-    # would be ignored.
+    # Auto-detect host glibc
     import platform as _platform
     libc_family, libc_version = _platform.libc_ver()
+    glibc_version: Optional[str] = None
     if libc_family == "glibc" and libc_version:
-        feature_comfyui["system-requirements"] = {
-            "libc": {"family": "glibc", "version": libc_version},
-        }
+        glibc_version = libc_version
         log(f"[comfy-env] Host glibc {libc_version} -> comfyui feature system-requirements")
-    if root_conda_deps:
-        feature_comfyui["dependencies"] = copy.deepcopy(root_conda_deps)
-        log(f"[comfy-env] Root conda deps injected into comfyui feature: {list(root_conda_deps.keys())}")
-    if comfyui_pypi:
-        feature_comfyui["pypi-dependencies"] = comfyui_pypi
-    # Conda-forge MKL pulls Intel libiomp5md.dll; pip-installed torch ships
-    # LLVM libomp.dll. With both loaded in the same process, torch's OMP
-    # guard aborts ("OMP: Error #15 ... already initialized"). Set on the
-    # comfyui feature so every env (template + per-node) inherits it; OMP
-    # documents this var as the safe escape when full libomp dedupe across
-    # mixed conda/pip wheels isn't feasible.
-    feature_comfyui["activation"] = {"env": {"KMP_DUPLICATE_LIB_OK": "TRUE"}}
-    out["feature"] = {"comfyui": feature_comfyui}
 
-    # Per-python features
-    py_versions: Dict[str, str] = {host_py: _python_feature_name(host_py)}
+    if root_conda_deps:
+        log(f"[comfy-env] Root conda deps: {list(root_conda_deps.keys())}")
+
+    # Per-python comfyui base features.
+    # One feature per python version encountered (comfyui313, comfyui311, etc.).
+    # Each contains: python pin, torch, ComfyUI reqs, root conda deps, env vars.
+    # Envs sharing a python version share the same base feature AND solve-group,
+    # so pixi solves the base once and layers node-specific deps on top.
+    py_versions: Dict[str, str] = {host_py: _comfyui_feature_name(host_py)}
     for _, cfg in node_configs:
         v = cfg.python or host_py
-        py_versions.setdefault(v, _python_feature_name(v))
+        py_versions.setdefault(v, _comfyui_feature_name(v))
+
+    out["feature"] = {}
     for v, fname in py_versions.items():
-        out["feature"][fname] = _build_python_feature(v)
+        out["feature"][fname] = _build_comfyui_feature(
+            v, comfyui_pypi, root_conda_deps, glibc_version,
+        )
+        log(f"[comfy-env] {fname}: python {v}, torch from {torch_index or 'default'}")
 
     # Per-node features.
     # Build the override map once from the chosen cuda-wheel combo (same combo
@@ -525,23 +533,25 @@ def build_workspace_toml(
             out["feature"][env_name] = {}
 
     # Environments table.
-    # Each env gets its own solve-group so deps resolve independently per node.
-    # Pixi still hardlinks identical packages from its central cache regardless.
-    host_py_feature = py_versions[host_py]
+    # Each env composes its per-python comfyui base + node-specific feature.
+    # Envs sharing a python version share a solve-group: pixi solves the base
+    # once and layers node deps on top.  Different python versions get separate
+    # solve-groups so their constraints never cross-contaminate.
+    host_comfyui = py_versions[host_py]
     environments: Dict[str, Any] = {
         "comfyui": {
-            "features": [host_py_feature, "comfyui"],
+            "features": [host_comfyui],
             "no-default-feature": True,
-            "solve-group": "comfyui",
+            "solve-group": host_comfyui,
         }
     }
     for env_name, cfg in node_configs:
         v = cfg.python or host_py
-        py_feature = py_versions[v]
+        comfyui_feat = py_versions[v]
         environments[env_name] = {
-            "features": [py_feature, "comfyui", env_name],
+            "features": [comfyui_feat, env_name],
             "no-default-feature": True,
-            "solve-group": env_name,
+            "solve-group": comfyui_feat,
         }
     out["environments"] = environments
 
