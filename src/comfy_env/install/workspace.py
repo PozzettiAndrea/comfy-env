@@ -109,24 +109,43 @@ def _resolve_workspace_torch(
     return torch_index, cuda_version, cuda_major, python_version, torch_version
 
 
-def _discover_node_configs(comfyui_dir: Path) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
-    """Find every comfy-env.toml under custom_nodes/ and pair with (env_name, plugin_dir, config_path, cfg)."""
+def _discover_node_configs(
+    comfyui_dir: Path,
+    log: Callable[[str], None] = print,
+) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
+    """Find every comfy-env.toml under custom_nodes/ and pair with (env_name, plugin_dir, config_path, cfg).
+
+    Logs the scan loudly so failed parses don't silently produce an empty result.
+    """
     custom_nodes = comfyui_dir / "custom_nodes"
     if not custom_nodes.is_dir():
+        log(f"[comfy-env] _discover: {custom_nodes} is not a directory")
         return []
 
+    log(f"[comfy-env] _discover: scanning {custom_nodes}")
     out: List[Tuple[str, Path, Path, ComfyEnvConfig]] = []
     for plugin_dir in sorted(custom_nodes.iterdir()):
-        if not plugin_dir.is_dir() or plugin_dir.name.startswith((".", "_")):
+        if not plugin_dir.is_dir():
             continue
-        for cf in sorted(plugin_dir.rglob(CONFIG_FILE_NAME)):
-            if cf.name == ROOT_CONFIG_FILE_NAME:
-                continue
+        if plugin_dir.name.startswith((".", "_")):
+            log(f"[comfy-env] _discover: skip {plugin_dir.name} (dot/underscore prefix)")
+            continue
+        toml_files = [cf for cf in sorted(plugin_dir.rglob(CONFIG_FILE_NAME))
+                      if cf.name != ROOT_CONFIG_FILE_NAME]
+        if not toml_files:
+            log(f"[comfy-env] _discover: {plugin_dir.name}: no {CONFIG_FILE_NAME} found")
+            continue
+        for cf in toml_files:
             try:
                 cfg = load_config(cf)
-            except Exception:
+            except Exception as e:
+                log(
+                    f"[comfy-env] _discover: FAILED to load {cf}: "
+                    f"{type(e).__name__}: {e}"
+                )
                 continue
             env_name = get_env_name(plugin_dir, cf)
+            log(f"[comfy-env] _discover: {plugin_dir.name} -> {env_name} ({cf.relative_to(comfyui_dir)})")
             out.append((env_name, plugin_dir, cf, cfg))
     return out
 
@@ -433,7 +452,7 @@ def install_workspace(
     from ..packages.toml_generator import write_workspace_pixi_toml
 
     comfyui_dir = Path(comfyui_dir).resolve()
-    discovered = _discover_node_configs(comfyui_dir)
+    discovered = _discover_node_configs(comfyui_dir, log=log)
     if not discovered:
         log("[comfy-env] No custom-node comfy-env.toml files found -- skipping workspace install")
         return None
