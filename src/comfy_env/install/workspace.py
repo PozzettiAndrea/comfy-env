@@ -573,7 +573,6 @@ def install_workspace(
         envs_dir = workspace_dir / ".pixi" / "envs"
         if envs_dir.is_dir():
             current_names = {env_name for env_name, _, _, _ in discovered}
-            current_names.add("comfyui")  # template env always present
             for d in envs_dir.iterdir():
                 if not d.is_dir() or d.name in current_names:
                     continue

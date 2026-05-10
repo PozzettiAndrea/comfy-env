@@ -216,43 +216,13 @@ def _strip_torch_family(
     """Remove plain torch/torchvision/torchaudio entries from a deps table in place.
 
     Torch family is pinned workspace-wide and added directly to each feature by
-    `_build_node_feature` / `_build_comfyui_feature`. Node-level declarations
-    are stripped so they can't shadow the pin.
+    `_build_node_feature`. Node-level declarations are stripped so they can't
+    shadow the pin.
     """
     for k in list(table.keys()):
         if k.lower() in _TORCH_PKGS:
             del table[k]
             log(f"[comfy-env] {name}: ignoring `{k}` in {where} (pinned workspace-wide)")
-
-
-def _build_comfyui_feature(
-    version: str,
-    comfyui_pypi: Dict[str, Any],
-    root_conda_deps: Optional[Dict[str, Any]],
-    glibc_version: Optional[str],
-) -> Dict[str, Any]:
-    """Self-contained feature for the env that runs the ComfyUI process itself.
-
-    Carries the full ComfyUI requirements.txt deps + root_conda_deps. Torch
-    family is already in `comfyui_pypi` (parse_comfyui_requirements attaches
-    the index, _pin_torch_family clamps versions).
-    """
-    feat: Dict[str, Any] = {}
-    deps = _common_base_dependencies(version)
-    if root_conda_deps:
-        deps.update(copy.deepcopy(root_conda_deps))
-    feat["dependencies"] = deps
-
-    if comfyui_pypi:
-        feat["pypi-dependencies"] = copy.deepcopy(comfyui_pypi)
-
-    if glibc_version:
-        feat["system-requirements"] = {
-            "libc": {"family": "glibc", "version": glibc_version},
-        }
-
-    feat["activation"] = {"env": {"KMP_DUPLICATE_LIB_OK": "TRUE"}}
-    return feat
 
 
 def _build_node_feature(
@@ -455,12 +425,6 @@ def build_workspace_toml(
 
     out: Dict[str, Any] = {"workspace": workspace}
 
-    # Parse ComfyUI requirements.txt (torch gets index + pin applied) — used
-    # ONLY by the "comfyui" env that runs the ComfyUI process itself.
-    req_dir = comfyui_source_dir or comfyui_dir
-    comfyui_pypi = parse_comfyui_requirements(req_dir, torch_index, log)
-    _pin_torch_family(comfyui_pypi, torch_pin, log)
-
     # Auto-detect host glibc
     import platform as _platform
     libc_family, libc_version = _platform.libc_ver()
@@ -469,16 +433,7 @@ def build_workspace_toml(
         glibc_version = libc_version
         log(f"[comfy-env] Host glibc {libc_version} -> system-requirements")
 
-    if root_conda_deps:
-        log(f"[comfy-env] Root conda deps (comfyui env only): {list(root_conda_deps.keys())}")
-
     out["feature"] = {}
-
-    # comfyui env: runs ComfyUI itself. Carries the full requirements.txt deps.
-    out["feature"]["comfyui"] = _build_comfyui_feature(
-        host_py, comfyui_pypi, root_conda_deps, glibc_version,
-    )
-    log(f"[comfy-env] comfyui env: python {host_py}, torch from {torch_index or 'default'}")
 
     # Resolve cuda-wheel URLs for each cuda node so pixi installs them as part
     # of `pixi install --all` (rather than a slow post-step pip pass).
@@ -534,12 +489,7 @@ def build_workspace_toml(
     # Environments table. One env -> one self-contained feature, no solve-group.
     # Every env solves independently; the only cross-env coupling is the torch
     # pin replicated into each feature.
-    environments: Dict[str, Any] = {
-        "comfyui": {
-            "features": ["comfyui"],
-            "no-default-feature": True,
-        }
-    }
+    environments: Dict[str, Any] = {}
     for env_name, _ in node_configs:
         environments[env_name] = {
             "features": [env_name],
