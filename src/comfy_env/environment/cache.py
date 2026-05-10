@@ -5,7 +5,29 @@ import shutil
 import sys
 from pathlib import Path
 
+# Legacy workspace dir name, kept for orphan-detection only. Live workspaces
+# now live under a short global root (see `get_workspace_dir`).
 CE_WORKSPACE_DIR = ".ce"
+
+
+def _short_global_root():
+    """Short global root for the single shared comfy-env workspace.
+
+    Per-platform default keeps the workspace path short so Windows
+    `LoadLibrary` (260-char limit) doesn't choke on deeply-nested ComfyUI
+    installs. Override via COMFY_ENV_ROOT.
+    """
+    override = os.environ.get("COMFY_ENV_ROOT")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        root = Path(r"C:\ce")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            return root
+        except OSError:
+            return Path(os.environ["LOCALAPPDATA"]) / "ce"
+    return Path.home() / ".ce"
 
 
 def get_env_name(plugin_dir, config_path):
@@ -39,9 +61,16 @@ def get_env_name(plugin_dir, config_path):
     return f"{name}-{suffix}" if suffix else name
 
 
-def get_workspace_dir(comfyui_dir):
-    """Return the comfy-env pixi workspace dir: <comfyui>/.ce/"""
-    return Path(comfyui_dir) / CE_WORKSPACE_DIR
+def get_workspace_dir(comfyui_dir=None):
+    """Return the single global comfy-env pixi workspace.
+
+    Shared across every ComfyUI install on this machine — env names act as
+    the global identifier (conda-style). `comfyui_dir` is accepted for
+    signature compatibility but ignored.
+    """
+    ws = _short_global_root()
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
 
 
 def get_workspace_env_dir(comfyui_dir, env_name):

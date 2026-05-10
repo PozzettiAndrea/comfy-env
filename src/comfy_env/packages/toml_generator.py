@@ -542,10 +542,55 @@ def write_workspace_pixi_toml(
         chosen_python=chosen_python,
         root_conda_deps=root_conda_deps,
     )
+
+    # The workspace is shared across every ComfyUI install on this machine
+    # (conda-style global env pool). Merge this install's features and
+    # environments on top of whatever was there from prior runs so we don't
+    # delete envs that belong to other installs.
+    if pixi_toml.exists():
+        import tomli
+        try:
+            with open(pixi_toml, "rb") as f:
+                existing = tomli.load(f)
+        except Exception as e:
+            log(f"[comfy-env] Warning: couldn't read existing {pixi_toml} ({e}); overwriting.")
+            existing = None
+        if existing:
+            data = _merge_into_existing(existing, data)
+
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)
     log(f"Generated {pixi_toml}")
     return pixi_toml, cuda_urls_by_env
+
+
+def _merge_into_existing(existing: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge `fresh` (this install's envs) on top of `existing` (prior installs).
+
+    - `feature.<name>` and `environments.<name>` entries from `fresh` overwrite
+      same-named entries in `existing`; entries only in `existing` are kept.
+    - `workspace.channels` is unioned (fresh-preferred order).
+    - Everything else under `workspace.*` comes from `fresh` (name/platforms/version
+      are identical across installs on the same machine).
+    """
+    merged = copy.deepcopy(existing)
+    fresh_ws = fresh.get("workspace", {})
+    old_ws = existing.get("workspace", {})
+    new_channels = list(fresh_ws.get("channels", []))
+    old_channels = list(old_ws.get("channels", []))
+    seen: set = set()
+    union: List[str] = []
+    for c in new_channels + old_channels:
+        if c not in seen:
+            seen.add(c)
+            union.append(c)
+    merged_ws = dict(fresh_ws)
+    if union:
+        merged_ws["channels"] = union
+    merged["workspace"] = merged_ws
+    merged.setdefault("feature", {}).update(fresh.get("feature", {}))
+    merged.setdefault("environments", {}).update(fresh.get("environments", {}))
+    return merged
 
 
 # ---------------------------------------------------------------------------

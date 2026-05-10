@@ -47,6 +47,8 @@ ComfyUI-MyPack/
 
 **Build time** (`install.py`): For each subdirectory with a `comfy-env.toml`, comfy-env hashes the config contents + its own package version, checks the central build cache (`<drive>/ce` on Windows, `~/.ce` on Unix; override with `COMFY_ENV_BUILD_BASE`), and builds a pixi environment if needed. The result is linked into the node directory as `_env_<hash>` -- symlink on Unix, NTFS junction on Windows (no admin required). Identical configs across different node packs share the same cached build.
 
+**Workspace location**: a single global pixi workspace at `C:\ce` (Windows) / `~/.ce` (Unix) is shared by every ComfyUI install on the machine. Env names (`sam3-nodes`, `motioncapture-nodes`, …) act as the global identifier — installs that need the same node pack share the same env. Override the root with `COMFY_ENV_ROOT`. The short path is what keeps Windows `LoadLibrary` (260-char limit) happy on deeply-nested CI checkouts.
+
 **Runtime** (`register_nodes()`): Discovers all node subdirectories. Those with a built `_env_*` run in persistent subprocess workers using the isolated Python interpreter. Those without a config are imported normally. Workers communicate via Unix domain sockets (TCP on Windows) and support bidirectional callbacks for VRAM budget negotiation and progress reporting.
 
 **CUDA packages**: Listed in `[cuda]`, installed from the PyTorch wheel index or [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) -- pre-built wheels for nvdiffrast, pytorch3d, gsplat, etc. No CUDA toolkit or C++ compiler needed.

@@ -448,7 +448,7 @@ def install_workspace(
     """
     from ..packages.pixi import ensure_pixi, PIXI
     ensure_pixi()
-    from ..environment.cache import CE_WORKSPACE_DIR
+    from ..environment.cache import CE_WORKSPACE_DIR, get_workspace_dir
     from ..packages.toml_generator import write_workspace_pixi_toml
 
     comfyui_dir = Path(comfyui_dir).resolve()
@@ -457,8 +457,14 @@ def install_workspace(
         log("[comfy-env] No custom-node comfy-env.toml files found -- skipping workspace install")
         return None
 
-    workspace_dir = comfyui_dir / CE_WORKSPACE_DIR
-    workspace_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir = get_workspace_dir(comfyui_dir)
+
+    legacy_workspace = comfyui_dir / CE_WORKSPACE_DIR
+    if (legacy_workspace / ".pixi").is_dir():
+        log(
+            f"[comfy-env] Old workspace at {legacy_workspace} -- safe to delete, "
+            f"no longer used"
+        )
 
     log_path = workspace_dir / "install.log"
     tee_log = _make_tee_log(log, log_path)
@@ -555,15 +561,21 @@ def install_workspace(
             if cuda:
                 parts.append(f"{len(cuda)} cuda wheels")
             log(f"  - {env_name} ({', '.join(parts)})")
-        log("[comfy-env] Running `pixi install --all`...")
+        # Install only this run's envs. Envs from other ComfyUI installs that
+        # share this global workspace stay materialized; we don't touch them.
+        install_envs: List[str] = [env_name for env_name, _, _, _ in discovered]
+        env_flags: List[str] = []
+        for n in install_envs:
+            env_flags += ["-e", n]
+        log(f"[comfy-env] Running `pixi install {' '.join(env_flags)}`...")
         result = _run_streaming(
-            [PIXI, "install", "--all"],
+            [PIXI, "install", *env_flags],
             log=log, cwd=workspace_dir, env=pixi_env,
         )
-        _log_subprocess(log, result, "pixi install --all")
+        _log_subprocess(log, result, f"pixi install {' '.join(env_flags)}")
         if result.returncode != 0:
             raise RuntimeError(
-                f"pixi install --all failed:\nstderr: {result.stderr}\nstdout: {result.stdout}"
+                f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}"
             )
 
         # Report envs that aren't in the current manifest, but DO NOT prune.
