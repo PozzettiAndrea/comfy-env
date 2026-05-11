@@ -5,7 +5,6 @@ and extract class metadata (INPUT_TYPES, RETURN_TYPES, etc.). The main process n
 imports isolation code -- it builds proxy classes from the serialized metadata.
 """
 
-import base64
 import glob
 import hashlib
 import os
@@ -22,7 +21,7 @@ from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "8"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "10"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -104,7 +103,6 @@ _METADATA_SCRIPT = r'''
 import sys
 import os
 import pickle
-import base64
 import importlib
 
 # Windows: register DLL directories BEFORE any extension module imports.
@@ -135,6 +133,7 @@ _debug = os.environ.get("COMFY_ENV_DEBUG", "").lower() in ("1", "true", "yes")
 
 working_dir = sys.argv[1]
 package_name = sys.argv[2]
+output_path = sys.argv[3]
 
 sys.path.insert(0, working_dir)
 os.chdir(working_dir)
@@ -157,9 +156,9 @@ if _comfyui_user_dir:
         pass
 
 
-# Redirect stdout to stderr during import so that any print() calls
-# from imported code don't corrupt our base64 payload on stdout.
-_real_stdout = sys.stdout
+# Redirect stdout to stderr so any prints from imported code (or pixi/torch
+# DLL loaders) are captured for debugging but never mix with our protocol --
+# the payload is written to a dedicated file, not stdout.
 sys.stdout = sys.stderr
 
 if _debug:
@@ -225,9 +224,11 @@ def _sanitize(obj):
 
 payload = _sanitize(payload)
 
-# Restore real stdout for the payload write
-sys.stdout = _real_stdout
-sys.stdout.buffer.write(base64.b64encode(pickle.dumps(payload)))
+# Write the payload to the parent-allocated file. Anything pixi, torch DLL
+# loaders, or imported code printed during this run went to stderr and never
+# touched the protocol.
+with open(output_path, "wb") as _f:
+    pickle.dump(payload, _f)
 '''
 
 
@@ -300,8 +301,12 @@ def fetch_metadata(
     from .wrap import build_isolation_env
     scan_env = build_isolation_env(python, env_vars)
 
-    # Write script to temp file
+    # Write script and allocate a dedicated payload file. The worker dumps the
+    # pickle payload into `output_file` so the protocol is decoupled from
+    # stdout/stderr (which pixi, torch DLL loaders, and other noise can
+    # contaminate, especially on Windows).
     script_file = None
+    output_file = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", prefix="comfy_meta_", delete=False,
@@ -309,6 +314,11 @@ def fetch_metadata(
         ) as f:
             f.write(_METADATA_SCRIPT)
             script_file = f.name
+
+        out_fd, output_file = tempfile.mkstemp(
+            suffix=".pkl", prefix="comfy_meta_out_",
+        )
+        os.close(out_fd)
 
         t0 = time.perf_counter()
 
@@ -333,10 +343,10 @@ def fetch_metadata(
                 PIXI, "run", "--as-is",
                 "--manifest-path", str(workspace_dir / "pixi.toml"),
                 "-e", env_name,
-                "python", script_file, str(working_dir), package_name,
+                "python", script_file, str(working_dir), package_name, output_file,
             ]
         else:
-            cmd = [str(python), script_file, str(working_dir), package_name]
+            cmd = [str(python), script_file, str(working_dir), package_name, output_file]
 
         if _DEBUG:
             print(f"[comfy-env] Metadata scan: {' '.join(cmd)}", file=sys.stderr, flush=True)
@@ -373,12 +383,21 @@ def fetch_metadata(
                 print(f"[comfy-env]   {line}", file=sys.stderr, flush=True)
             return {"nodes": {}, "display": {}}
 
-        raw = result.stdout.strip()
-        if not raw:
-            print(f"[comfy-env] Metadata scan returned empty for {package_name}", file=sys.stderr, flush=True)
+        # Read the payload from the dedicated file -- never touches stdout,
+        # so pixi/torch/DLL-loader noise can't corrupt the protocol.
+        try:
+            with open(output_file, "rb") as _f:
+                payload = pickle.load(_f)
+        except (OSError, EOFError, pickle.UnpicklingError) as e:
+            stderr_tail = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-5:]
+            print(
+                f"[comfy-env] Metadata scan: payload unreadable for {package_name}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr, flush=True,
+            )
+            for line in stderr_tail:
+                print(f"[comfy-env]   {line}", file=sys.stderr, flush=True)
             return {"nodes": {}, "display": {}}
-
-        payload = pickle.loads(base64.b64decode(raw))
 
         node_count = len(payload.get("nodes", {}))
         if _DEBUG or node_count > 0:
@@ -396,11 +415,12 @@ def fetch_metadata(
         print(f"[comfy-env] Metadata scan error for {package_name}: {e}", file=sys.stderr, flush=True)
         return {"nodes": {}, "display": {}}
     finally:
-        if script_file and os.path.exists(script_file):
-            try:
-                os.unlink(script_file)
-            except OSError:
-                pass
+        for path in (script_file, output_file):
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
