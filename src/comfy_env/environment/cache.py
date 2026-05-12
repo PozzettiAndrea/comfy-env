@@ -14,9 +14,11 @@ _ANNOUNCED_WS = False
 
 
 def _short_global_root():
-    """Resolve workspace root. Defaults to %LOCALAPPDATA%\\ce on Windows so
-    fresh installs never need admin (old default `C:\\ce` required admin to
-    create at drive root). Override via COMFY_ENV_ROOT.
+    """Resolve workspace root. Defaults to %LOCALAPPDATA%\\Programs\\comfy-env
+    on Windows (sits next to the ComfyUI Desktop install at
+    %LOCALAPPDATA%\\Programs\\ComfyUI) so fresh installs never need admin --
+    the old default `C:\\ce` required admin to create at drive root.
+    Override via COMFY_ENV_ROOT.
     """
     global _ANNOUNCED_WS
 
@@ -24,7 +26,8 @@ def _short_global_root():
     if override:
         root = Path(override)
     elif sys.platform == "win32":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ce"
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        root = base / "Programs" / "comfy-env"
     else:
         root = Path.home() / ".ce"
 
@@ -36,8 +39,9 @@ def _short_global_root():
         if sys.platform == "win32" and root != Path(r"C:\ce") and legacy.is_dir() and any(legacy.iterdir()):
             print(
                 "[comfy-env] Legacy workspace detected at C:\\ce. "
-                "Workspace has moved to %LOCALAPPDATA%\\ce -- please reinstall "
-                "the node ('python install.py') and then delete C:\\ce.",
+                "Workspace has moved to %LOCALAPPDATA%\\Programs\\comfy-env -- "
+                "please reinstall the node ('python install.py') and then "
+                "delete C:\\ce.",
                 file=sys.stderr, flush=True,
             )
         _ANNOUNCED_WS = True
