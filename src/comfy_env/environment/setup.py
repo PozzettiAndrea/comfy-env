@@ -145,9 +145,18 @@ def setup_env(node_dir=None):
 
     sub_envs = _find_env_dirs(node_dir)
     if sub_envs:
+        from .cache import get_env_name, get_workspace_env_dir
         print(f"[comfy-env] {node_name}: {len(sub_envs)} isolation env(s):", file=sys.stderr)
         for env_path in sub_envs:
             print(f"[comfy-env]   {os.path.basename(env_path)} -> {env_path}", file=sys.stderr)
+            try:
+                config_path = Path(env_path) / "comfy-env.toml"
+                env_name = get_env_name(node_dir, config_path)
+                target = get_workspace_env_dir(None, env_name)
+                status = "OK" if target.is_dir() else "MISSING -- run install.py"
+                print(f"[comfy-env]     env: {target}  [{status}]", file=sys.stderr)
+            except Exception as e:
+                print(f"[comfy-env]     env: <resolution failed: {e}>", file=sys.stderr)
     else:
         print(f"[comfy-env] {node_name}: no isolation envs", file=sys.stderr)
 

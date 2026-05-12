@@ -10,24 +10,39 @@ from pathlib import Path
 CE_WORKSPACE_DIR = ".ce"
 
 
-def _short_global_root():
-    """Short global root for the single shared comfy-env workspace.
+_ANNOUNCED_WS = False
 
-    Per-platform default keeps the workspace path short so Windows
-    `LoadLibrary` (260-char limit) doesn't choke on deeply-nested ComfyUI
-    installs. Override via COMFY_ENV_ROOT.
+
+def _short_global_root():
+    """Resolve workspace root. Defaults to %LOCALAPPDATA%\\ce on Windows so
+    fresh installs never need admin (old default `C:\\ce` required admin to
+    create at drive root). Override via COMFY_ENV_ROOT.
     """
+    global _ANNOUNCED_WS
+
     override = os.environ.get("COMFY_ENV_ROOT")
     if override:
-        return Path(override)
-    if sys.platform == "win32":
-        root = Path(r"C:\ce")
-        try:
-            root.mkdir(parents=True, exist_ok=True)
-            return root
-        except OSError:
-            return Path(os.environ["LOCALAPPDATA"]) / "ce"
-    return Path.home() / ".ce"
+        root = Path(override)
+    elif sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "ce"
+    else:
+        root = Path.home() / ".ce"
+
+    root.mkdir(parents=True, exist_ok=True)
+
+    if not _ANNOUNCED_WS:
+        print(f"[comfy-env] Workspace: {root}", file=sys.stderr, flush=True)
+        legacy = Path(r"C:\ce\.pixi\envs")
+        if sys.platform == "win32" and root != Path(r"C:\ce") and legacy.is_dir() and any(legacy.iterdir()):
+            print(
+                "[comfy-env] Legacy workspace detected at C:\\ce. "
+                "Workspace has moved to %LOCALAPPDATA%\\ce -- please reinstall "
+                "the node ('python install.py') and then delete C:\\ce.",
+                file=sys.stderr, flush=True,
+            )
+        _ANNOUNCED_WS = True
+
+    return root
 
 
 def get_env_name(plugin_dir, config_path):
@@ -68,9 +83,7 @@ def get_workspace_dir(comfyui_dir=None):
     the global identifier (conda-style). `comfyui_dir` is accepted for
     signature compatibility but ignored.
     """
-    ws = _short_global_root()
-    ws.mkdir(parents=True, exist_ok=True)
-    return ws
+    return _short_global_root()
 
 
 def get_workspace_env_dir(comfyui_dir, env_name):
