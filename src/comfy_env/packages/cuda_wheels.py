@@ -1,11 +1,21 @@
 """CUDA wheels index integration. See: https://pozzettiandrea.github.io/cuda-wheels/"""
 
+import json
 import logging
 import re
+import socket
 import ssl
 import sys
+import time
+import urllib.error
 import urllib.request
 from typing import Callable, List, Optional
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _UA = f"comfy-env/{_pkg_version('comfy-env')}"
+except Exception:
+    _UA = "comfy-env/unknown"
 
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
@@ -105,6 +115,90 @@ def _platform_tags() -> List[str]:
     return []
 
 
+_TRANSIENT_NET_ERRORS = (ConnectionResetError, socket.timeout, TimeoutError)
+
+
+def _fetch_with_retries(url: str, timeout: int = 10, max_retries: int = 3,
+                        log: Optional[Callable[[str], None]] = None) -> str:
+    """Fetch `url` with a real User-Agent and exponential-backoff retries on
+    transient transport errors. Non-transient HTTP errors (4xx/5xx) are raised
+    immediately. Default Python urllib UA gets RST by some corporate proxies
+    and AV middleboxes, so we always send `comfy-env/<version>`.
+    """
+    backoff = (1, 2, 4)
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": _UA})
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
+                return resp.read().decode("utf-8")
+        except urllib.error.HTTPError:
+            raise
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason, _TRANSIENT_NET_ERRORS):
+                raise
+            last_err = e
+        except _TRANSIENT_NET_ERRORS as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            sleep_s = backoff[attempt]
+            if log is not None:
+                log(f"[cuda-wheels]   retry {attempt+1}/{max_retries} after {sleep_s}s ({type(last_err).__name__})")
+            time.sleep(sleep_s)
+    raise last_err
+
+
+def _fetch_from_github_api(package: str, torch_version: str, cuda_version: str,
+                           python_version: str,
+                           log: Optional[Callable[[str], None]] = None) -> Optional[tuple]:
+    """Fallback when the GH Pages index is unreachable: list release assets
+    via `api.github.com/repos/PozzettiAndrea/cuda-wheels/releases` and match
+    by the same filename pattern. Different routing edge than Pages, so often
+    works when Fastly is RST-ing the Pages host. Returns `(url, name)` or None.
+    """
+    cuda_short = cuda_version.replace(".", "")[:3]
+    torch_short = ".".join(torch_version.split(".")[:2])
+    py_tag = f"cp{python_version.replace('.', '')}"
+    platform_tags = _platform_tags()
+    local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
+    pkg_variants_set = set(_pkg_variants(package))
+
+    api_url = "https://api.github.com/repos/PozzettiAndrea/cuda-wheels/releases?per_page=100"
+    try:
+        body = _fetch_with_retries(api_url, timeout=15, log=log)
+    except Exception as e:
+        if log is not None:
+            log(f"[cuda-wheels]   GitHub Releases API: {type(e).__name__}: {e}")
+        return None
+    try:
+        releases = json.loads(body)
+    except Exception:
+        return None
+
+    candidates = []
+    for release in releases:
+        for asset in release.get("assets", ()):
+            name = asset.get("name", "")
+            wheel_pkg = name.split("-", 1)[0] if "-" in name else ""
+            if wheel_pkg not in pkg_variants_set:
+                continue
+            if not any(p in name for p in local_patterns):
+                continue
+            if py_tag not in name:
+                continue
+            if platform_tags and not any(t in name for t in platform_tags):
+                continue
+            url = asset.get("browser_download_url")
+            if url:
+                candidates.append((url, name))
+    if not candidates:
+        return None
+    for url, name in candidates:
+        if "manylinux" in name:
+            return (url, name)
+    return candidates[0]
+
+
 def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_version: str,
                   log: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Get direct URL to matching wheel from cuda-wheels index.
@@ -129,16 +223,19 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
 
     candidates = []
     attempted = []
+    deferred_errors = []
     for pkg_dir in _pkg_variants(package):
         index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
         if index_url in attempted:
             continue
         attempted.append(index_url)
         try:
-            with urllib.request.urlopen(index_url, timeout=10, context=_ssl_context()) as resp:
-                html = resp.read().decode("utf-8")
+            html = _fetch_with_retries(index_url, timeout=10, log=_emit)
+        except urllib.error.HTTPError as e:
+            deferred_errors.append(f"[cuda-wheels]   {index_url}: HTTPError: {e}")
+            continue
         except Exception as e:
-            _emit(f"[cuda-wheels]   {index_url}: {type(e).__name__}: {e}")
+            deferred_errors.append(f"[cuda-wheels]   {index_url}: {type(e).__name__}: {e}")
             continue
 
         for match in link_pattern.finditer(html):
@@ -158,7 +255,19 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
         _emit(f"[cuda-wheels]   Found: {display}")
         return url
 
-    _emit(f"[cuda-wheels]   No matching wheel found (tried {len(attempted)} index URL(s))")
+    # Index path failed for every variant -- try the different-transport fallback.
+    _emit(f"[cuda-wheels]   GH Pages index unreachable, falling back to GitHub Releases API...")
+    api_result = _fetch_from_github_api(package, torch_version, cuda_version, python_version, log=_emit)
+    if api_result is not None:
+        url, display = api_result
+        _emit(f"[cuda-wheels]   Found via API: {display}")
+        return url
+
+    # Both paths failed: surface buffered per-URL errors and an actionable hint.
+    for line in deferred_errors:
+        _emit(line)
+    _emit(f"[cuda-wheels]   No wheel found via index or API. If your network blocks")
+    _emit(f"[cuda-wheels]   *.github.io / fastly, set HTTPS_PROXY to a working proxy.")
     return None
 
 
