@@ -1,22 +1,36 @@
 # comfy-env
 
-Environment management for ComfyUI custom nodes.
+Environment management and automatic CUDA wheel resolution/installation for ComfyUI custom nodes.
 
-## The Problem
+## The Problem(s) and Solution(s)
 
+Problem 1:
 ComfyUI custom nodes share a single Python environment. This breaks when:
 - Node A needs torch 2.4, Node B needs torch 2.8
-- Two packages bundle conflicting native libraries (libomp, CUDA runtimes)
-- A node requires a specific Python version (e.g., Blender API needs 3.11)
+- Two packages bundle conflicting native libraries (libomp, CUDA runtimes, cv2)
+- A node requires a specific Python version (e.g., Blender needs 3.11, pymesh2 needs 3.9)
 
-## The Solution
-
+Solution 1:
 comfy-env provides **process isolation** -- nodes that need conflicting dependencies run in their own Python environments as persistent subprocesses, transparent to ComfyUI.
 
 Two config files, two roles:
 
 - **`comfy-env-root.toml`** (root level): System packages (apt/brew) and ComfyUI node dependency management. Never touches the Python environment -- PyPI deps stay in `requirements.txt`.
 - **`comfy-env.toml`** (subdirectories): Each subdirectory with this file gets its own isolated Python environment via [pixi](https://pixi.sh), with a separate interpreter, conda packages, pip packages, and pre-built CUDA wheels.
+
+Using conda CANNOT be avoided. We need to be able to use ComfyUI functions and return types within isolated nodes, which means they will need things like `av` or `ffmpeg`, and those cannot be installed through PyPI. [Pixi](https://pixi.sh) is a convenient, fast, Rust-based package manager that speaks both conda-forge AND PyPI in the same `pixi.toml`, ships a real lockfile (so envs are reproducible across machines), installs entirely per-user with no admin / no system Python pollution, and uses [uv](https://github.com/astral-sh/uv) under the hood for the PyPI side -- so it's as fast as the fastest thing in the ecosystem.
+
+Problem 2:
+With the advent of ever more complex and useful Computer Vision ML models, code relies on CUDA packages like flash-attn, nvdiffrast, nunchaku, pytorch3d to work.
+Every single CUDA compiled wheel is compiled for:
+- Python ABI (3.10, 3.11, 3.12 etc)
+- Pytorch version when linking against pytorch, can be from 2.4 to 2.11
+- CUDA version (12.8, 13.0)
+- OS (Windows vs Linux)
+- GPU architectures (8.0 and above)
+
+Solution 2:
+In order to ensure a smooth use and installation for ComfyUI users, we offer automatic wheel resolution through a cuda index: https://github.com/PozzettiAndrea/cuda-wheels.
 
 ## Architecture
 
@@ -31,41 +45,57 @@ ComfyUI-MyPack/
     |   `-- __init__.py
     `-- cgal/                      # Has config -> isolated subprocess
         +-- comfy-env.toml
-        +-- _env_a1b2c3 ---------> <drive>/ce/_env_a1b2c3/.pixi/envs/default
         `-- __init__.py
 
-<drive>/ce/                        # Central build cache (same drive as ComfyUI)
-`-- _env_a1b2c3/                   # SHA256(config + comfy-env version)[:8]
-    +-- .pixi/envs/default/        # Complete Python environment
-    |   +-- bin/python
-    |   `-- lib/python3.11/site-packages/
-    +-- pixi.toml                  # Generated from comfy-env.toml
-    `-- .done                      # Build complete marker
+<workspace>/                       # %LOCALAPPDATA%\Programs\comfy-env  (Windows)
+                                   # ~/.ce                              (Unix)
++-- pixi.toml                      # Generated from every discovered comfy-env.toml
+`-- .pixi/envs/
+    +-- mypack-cgal/               # Env for ComfyUI-MyPack/nodes/cgal/
+    |   +-- python                 #   Complete Python interpreter
+    |   `-- lib/.../site-packages/ #   + isolated packages
+    `-- <plugin>-<subdir>/         # Each isolation config gets its own named env
+        `-- ...
 ```
+
+Env names are derived as `<plugin>-<subdir>` (or just `<plugin>` for root-level configs), with the `ComfyUI-` prefix stripped and the result lowercased: `comfyui-sam3/nodes` -> `sam3-nodes`, `comfyui-motioncapture/nodes` -> `motioncapture-nodes`, etc. See [`get_env_name`](src/comfy_env/environment/cache.py).
+
+### Examples in the wild
+
+- **[ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2)** -- root-only config (`comfy-env-root.toml`). No isolation env; uses comfy-env purely for CUDA wheel resolution (`flash-attn`, `sageattention`) and to declare `ComfyUI-GeometryPack` as a node dependency. Runs inside the host ComfyUI process.
+- **[ComfyUI-Hunyuan3D-Part](https://github.com/PozzettiAndrea/ComfyUI-Hunyuan3D-Part)** -- same pattern; lightest possible use of comfy-env.
+- **[ComfyUI-GeometryPack](https://github.com/PozzettiAndrea/ComfyUI-GeometryPack)** -- full isolation env. `nodes/comfy-env.toml` declares conda deps from `conda-forge` + a custom `pozzettiandrea` channel (CGAL, igl, `bpy`, pyvista), one CUDA package (`cumesh`), PyPI deps pinned via custom simple indexes (`pyQuadriFlow`, `pygeogram`, `pypmp`, `pymesh2`), and per-platform extras (`mesalib`/`libglu`/`xorg-libsm` on Linux, `embreex`/`msvc-runtime` on Windows). This is the env that doesn't fit in the host venv.
+- **[cookiecutter-comfy-extension](https://github.com/PozzettiAndrea/cookiecutter-comfy-extension)** -- scaffold for new node packs; ships a minimal `comfy-env.toml` template and the canonical `install.py` / `prestartup_script.py` / `__init__.py` triplet.
+
+
 
 ## How It Works
 
-**Build time** (`install.py`): For each subdirectory with a `comfy-env.toml`, comfy-env hashes the config contents + its own package version, checks the central build cache (`<drive>/ce` on Windows, `~/.ce` on Unix; override with `COMFY_ENV_BUILD_BASE`), and builds a pixi environment if needed. The result is linked into the node directory as `_env_<hash>` -- symlink on Unix, NTFS junction on Windows (no admin required). Identical configs across different node packs share the same cached build.
+**Build time** (`install.py`): For each subdirectory with a `comfy-env.toml`, comfy-env computes its env name (see above), generates a single `pixi.toml` in the workspace with one `[environments.<name>]` entry per discovered config, and runs `pixi install -e <name>` to materialize each environment. Identical env names from different ComfyUI installs share the same materialized env on disk -- env names act as the global identifier.
 
-**Workspace location**: a single global pixi workspace at `C:\ce` (Windows) / `~/.ce` (Unix) is shared by every ComfyUI install on the machine. Env names (`sam3-nodes`, `motioncapture-nodes`, …) act as the global identifier — installs that need the same node pack share the same env. Override the root with `COMFY_ENV_ROOT`. The short path is what keeps Windows `LoadLibrary` (260-char limit) happy on deeply-nested CI checkouts.
+**Workspace location**: a single per-user pixi workspace, shared by every ComfyUI install on the machine.
+On Windows the default is `%LOCALAPPDATA%\Programs\comfy-env` (sits next to the ComfyUI Desktop install at `%LOCALAPPDATA%\Programs\ComfyUI`; never needs admin to create).
+If comfy-env detects an env at the legacy drive-root path `C:\ce`, it prints a one-line "please reinstall" nudge at startup so users notice the migration.
 
-**Runtime** (`register_nodes()`): Discovers all node subdirectories. Those with a built `_env_*` run in persistent subprocess workers using the isolated Python interpreter. Those without a config are imported normally. Workers communicate via Unix domain sockets (TCP on Windows) and support bidirectional callbacks for VRAM budget negotiation and progress reporting.
+On Linux/MACOS the default is `~/.ce`. Override with the `COMFY_ENV_ROOT` env var. 
 
-**CUDA packages**: Listed in `[cuda]`, installed from the PyTorch wheel index or [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) -- pre-built wheels for nvdiffrast, pytorch3d, gsplat, etc. No CUDA toolkit or C++ compiler needed.
+**Runtime** (`register_nodes()`): Discovers all node subdirectories. Those with a built env at `<workspace>/.pixi/envs/<env_name>/` run in persistent subprocess workers using the isolated Python interpreter. Those without a config (or whose env hasn't been materialized yet) are imported normally in the main ComfyUI process. Workers communicate via Unix domain sockets (TCP on Windows) and support bidirectional callbacks for VRAM budget negotiation and progress reporting.
 
-## Future work: replace `share_torch` with pixi's Multi-Environment feature
+**CUDA packages**: Listed in `[cuda]`, installed from the PyTorch wheel index or [cuda-wheels](https://pozzettiandrea.github.io/cuda-wheels/) -- pre-built wheels for nvdiffrast, pytorch3d, gsplat, flash-attn, etc. No CUDA toolkit or C++ compiler needed. The resolver tries the GitHub Pages simple index first, retries transient TCP-reset errors with a real User-Agent (corp proxies / AV products RST `Python-urllib`), and falls back to the GitHub Releases API on a different routing edge when Pages is unreachable end-to-end.
 
-Today, when the host ComfyUI venv and an isolation env agree on torch version, `share_torch` installs torch into the isolation env, then `uv pip uninstall`s it, and redirects the worker's `sys.path` to the host's torch at runtime. This is fragile on Windows: the uninstall leaves `torch/lib/*.dll` files on disk (pip/uv strip the dist-info but not the DLLs), which causes `OSError: [WinError 127]` in cold-install scenarios because Python finds the half-gutted `torch/` folder and tries to load its stranded DLLs.
+## Startup logging
 
-The intended fix is to drop the strip-after-install approach entirely and use pixi's [Multi-Environment feature](https://pixi.prefix.dev/latest/workspace/multi_environment/). Pixi lets you declare `[feature.X]` tables (e.g., a shared `host-torch` feature with the same torch/torchvision the host uses) and compose them into named environments. Packages present in multiple environments at the same version are stored **once on disk and hardlinked** into each environment -- no physical duplication, no runtime sys.path hacks, no uninstall step that Windows can't do cleanly.
+On every ComfyUI launch, `comfy-env`'s prestartup hook tells you exactly where envs live and whether each one is built:
 
-Concrete migration sketch:
+```
+[comfy-env] Workspace: C:\Users\you\AppData\Local\Programs\comfy-env
+[comfy-env] comfyui-motioncapture: 1 isolation env(s):
+[comfy-env]   nodes -> C:\Users\you\...\custom_nodes\comfyui-motioncapture\nodes
+[comfy-env]     env: C:\Users\you\AppData\Local\Programs\comfy-env\.pixi\envs\motioncapture-nodes  [OK]
+[comfy-env] prestartup complete
+```
 
-1. Generate a single `pixi.toml` for the whole node pack with a `host-torch` feature (torch, torchvision, CUDA wheels) and one feature per isolation env.
-2. Define one `environment` per isolation env as `[host-torch, <node-feature>]`.
-3. Drop the `share_torch` codepath; workers use their composed env directly.
-
-Research on alternatives (April 2026): pip/uv/pixi/poetry overrides only change *versions*, not install decisions -- "constraints and overrides cannot exclude packages from installation" (uv docs). conda's `--stack` mutates sys.path at activate time and is known to break (base-env packages sometimes unimportable). Multi-Environment is the only first-class primitive that actually composes envs with real on-disk dedup.
+`[MISSING -- run install.py]` instead of `[OK]` means the config was discovered but the pixi env hasn't been materialized; run the node's `install.py` to build it.
 
 ## Usage
 
@@ -86,15 +116,3 @@ NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = register_nodes()
 ```bash
 pip install comfy-env
 ```
-
-## Docs
-
-- [Getting Started](docs/getting-started.md) -- setup guide and walkthrough
-- [Config Reference](docs/config-reference.md) -- all config options for both files
-- [CLI](docs/cli.md) -- command-line tools
-- [Build Internals](docs/isolation-build.md) -- how isolated environments are built
-- [Worker Architecture](docs/worker-overview.md) -- subprocess IPC, serialization, memory, lifecycle
-
-## Example
-
-[ComfyUI-GeometryPack](https://github.com/PozzettiAndrea/ComfyUI-GeometryPack) -- multiple isolated environments (CGAL, Blender, GPU) with per-subdirectory configs and different Python versions.
