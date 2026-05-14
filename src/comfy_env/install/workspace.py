@@ -47,8 +47,9 @@ def _resolve_workspace_torch(
     `torch = "*"` and the cuda-wheel picker reads the actual version from the
     materialized template env post-install).
 
-    macOS: (cpu_index, None, None, py, torch). Linux/Windows + NVIDIA: cu* index +
-    version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
+    macOS: (None, None, None, py, torch) -- pixi falls through to default PyPI
+    which has osx-arm64/osx-64 torch wheels. Linux/Windows + NVIDIA: cu* index
+    + version. Linux/Windows without GPU: (cpu_index, None, None, py, torch).
     """
     from ..detection import (
         get_recommended_cuda_version,
@@ -92,7 +93,12 @@ def _resolve_workspace_torch(
         )
 
     if sys.platform == "darwin":
-        return cpu_index, None, None, python_version, torch_version
+        # PyTorch's `/whl/cpu/` index is Linux+Windows-only — there are no
+        # osx-arm64 / osx-64 wheels there. macOS torch lives on regular PyPI
+        # (the wheel is implicitly CPU-only since there's no CUDA on Apple
+        # Silicon). Returning None for torch_index lets pixi resolve from the
+        # default PyPI index instead of erroring "no matching platform tag".
+        return None, None, None, python_version, torch_version
 
     log(f"[comfy-env] GPU: {get_gpu_summary()}")
     cuda_version = bootstrap_cuda or get_recommended_cuda_version()

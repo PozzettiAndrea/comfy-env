@@ -19,7 +19,7 @@ from ..config import (
     CONFIG_FILE_NAME,
     ROOT_CONFIG_FILE_NAME,
 )
-from .helpers import USE_COMFY_ENV_VAR, _enable_windows_long_paths
+from .helpers import USE_COMFY_ENV_VAR
 from .plugin import (
     _install_node_dependencies,
     _reinstall_main_requirements,
@@ -52,7 +52,6 @@ def install(
         node_dir = Path(inspect.stack()[1].filename).parent.resolve()
 
     log = log_callback or print
-    _enable_windows_long_paths(log)
 
     if config is not None:
         config_path = Path(config)

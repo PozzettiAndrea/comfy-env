@@ -33,26 +33,6 @@ def _is_comfy_env_enabled() -> bool:
     return os.environ.get(USE_COMFY_ENV_VAR, "1").lower() not in ("0", "false", "no", "off")
 
 
-def _enable_windows_long_paths(log: Callable[[str], None]) -> None:
-    """Enable Windows long path support via registry (requires admin)."""
-    if sys.platform != "win32":
-        return
-    try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\FileSystem",
-            0, winreg.KEY_SET_VALUE
-        )
-        winreg.SetValueEx(key, "LongPathsEnabled", 0, winreg.REG_DWORD, 1)
-        winreg.CloseKey(key)
-        log("[comfy-env] Enabled Windows long path support")
-    except PermissionError:
-        log("[comfy-env] WARNING: Could not enable long paths (needs admin)")
-    except Exception:
-        pass
-
-
 def _patch_uv_platform_py(log: Callable[[str], None] = print) -> None:
     """Patch uv-managed Python's platform.py to handle conda-forge version strings.
 
