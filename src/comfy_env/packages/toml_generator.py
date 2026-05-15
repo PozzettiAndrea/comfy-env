@@ -179,19 +179,27 @@ def _torch_family_pypi(
     torch_index: Optional[str],
     log: Callable[[str], None],
 ) -> Dict[str, Any]:
-    """Build `{torch, torchvision, torchaudio}` pypi-deps with `index` attached.
+    """Build `{torch, torchvision, torchaudio}` pypi-deps, optionally with `index` attached.
 
     Replicated verbatim into every feature so each env resolves identical torch
-    files and pixi's content-addressable cache hardlink-shares them. Returns {}
-    on CPU/macOS hosts where there's no workspace-wide pin.
+    files and pixi's content-addressable cache hardlink-shares them. When
+    `torch_index` is set (Linux/Windows + CUDA path), the index is attached to
+    every entry. When it's None (macOS, where the PyTorch /whl/cpu index has no
+    osx-arm64 wheels), the pin is emitted without an index so pixi resolves
+    from the default PyPI. `_torch_family_pins` already returns a partial map
+    `{"torch": pin}` when the family table doesn't know `torch.minor` yet --
+    that's the right behavior for torch 2.12-style "ahead of family" cases
+    where torchaudio hasn't shipped yet.
     """
-    if not torch_pin or not torch_index:
+    if not torch_pin:
         return {}
     pin_map = _torch_family_pins(torch_pin, log)
     if not pin_map:
         return {}
-    return {pkg: {"version": pin, "index": torch_index}
-            for pkg, pin in pin_map.items()}
+    if torch_index:
+        return {pkg: {"version": pin, "index": torch_index}
+                for pkg, pin in pin_map.items()}
+    return dict(pin_map)
 
 
 def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
