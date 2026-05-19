@@ -572,6 +572,164 @@ def write_workspace_pixi_toml(
     return pixi_toml, cuda_urls_by_env
 
 
+# ---------------------------------------------------------------------------
+# Per-env manifest builder + writer (v0.4 per-env layout)
+# ---------------------------------------------------------------------------
+
+def build_env_toml(
+    env_name: str,
+    cfg: ComfyEnvConfig,
+    torch_index: Optional[str],
+    bootstrap_python: Optional[str] = None,
+    torch_pin: Optional[str] = None,
+    chosen_torch_index: Optional[str] = None,
+    chosen_torch_pin: Optional[str] = None,
+    chosen_cuda: Optional[str] = None,
+    chosen_torch_short: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Build a self-contained pixi.toml dict for one isolated env.
+
+    Each env gets its own manifest declaring a single feature ``default``
+    and a single environment ``default``. No solve-groups, no cross-env
+    references. A parse error in one env's pixi.toml has zero effect on
+    any other env.
+
+    Args:
+        env_name: Logical env name (used in workspace/name only, not as the
+            pixi environment name -- that's always ``default``).
+        cfg: Node's parsed comfy-env.toml.
+        torch_index: Workspace-wide bootstrap torch index URL (cu*/cpu).
+        torch_pin: Workspace-wide bootstrap torch version pin (``==X.Y.Z``).
+        chosen_*: Override combo for cuda-only nodes (from cuda-wheel resolver).
+    """
+    host_py = bootstrap_python or f"{sys.version_info.major}.{sys.version_info.minor}"
+    current_platform = get_pixi_platform()
+
+    _validate_node_config(env_name, cfg)
+
+    # Workspace-section channels: conda-forge + any extras from this node's config
+    channels: List[str] = ["conda-forge"]
+    for ch in cfg.pixi_passthrough.get("workspace", {}).get("channels", []):
+        if ch not in channels:
+            channels.append(ch)
+
+    # Auto-detect host glibc (same as build_workspace_toml)
+    import platform as _platform
+    libc_family, libc_version = _platform.libc_ver()
+    glibc_version: Optional[str] = None
+    if libc_family == "glibc" and libc_version:
+        glibc_version = libc_version
+
+    # cuda-wheel-only nodes use the override combo; everyone else gets bootstrap.
+    cuda_only = [p for p in cfg.cuda_packages if p not in _TORCH_PKGS]
+    if cuda_only and chosen_torch_pin and chosen_torch_index:
+        node_torch_pin: Optional[str] = chosen_torch_pin
+        node_torch_index: Optional[str] = chosen_torch_index
+    else:
+        node_torch_pin = torch_pin
+        node_torch_index = torch_index
+
+    env_python = cfg.python or host_py
+    # Feature name MUST NOT be "default" -- pixi reserves that name for the
+    # implicit feature that picks up any tables at the toml root, and refuses
+    # to parse a manifest that declares `[feature.default.*]` explicitly.
+    # Use "node" instead; the user-facing pixi environment name stays "default".
+    feat = _build_node_feature(
+        cfg, "node", env_python,
+        torch_pin=node_torch_pin,
+        torch_index=node_torch_index,
+        glibc_version=glibc_version,
+        log=log,
+    )
+
+    return {
+        "workspace": {
+            "name": f"comfy-env-{env_name}",
+            "version": "0.1.0",
+            "channels": channels,
+            "platforms": [current_platform],
+        },
+        "feature": {"node": feat},
+        "environments": {
+            "default": {"features": ["node"], "no-default-feature": True},
+        },
+    }
+
+
+def write_env_pixi_toml(
+    env_manifest_dir: Path,
+    env_name: str,
+    cfg: ComfyEnvConfig,
+    torch_index: Optional[str],
+    bootstrap_python: Optional[str] = None,
+    torch_pin: Optional[str] = None,
+    chosen_torch_index: Optional[str] = None,
+    chosen_torch_pin: Optional[str] = None,
+    chosen_cuda: Optional[str] = None,
+    chosen_torch_short: Optional[str] = None,
+    log: Callable[[str], None] = print,
+) -> Path:
+    """Write ``<env_manifest_dir>/pixi.toml`` for one isolated env.
+
+    Returns the manifest path. Overwrites any existing file -- per-env
+    manifests are deterministically regenerated from the node's config.
+    """
+    tomli_w = _require_tomli_w()
+    env_manifest_dir.mkdir(parents=True, exist_ok=True)
+    pixi_toml = env_manifest_dir / "pixi.toml"
+    data = build_env_toml(
+        env_name=env_name,
+        cfg=cfg,
+        torch_index=torch_index,
+        bootstrap_python=bootstrap_python,
+        torch_pin=torch_pin,
+        chosen_torch_index=chosen_torch_index,
+        chosen_torch_pin=chosen_torch_pin,
+        chosen_cuda=chosen_cuda,
+        chosen_torch_short=chosen_torch_short,
+        log=log,
+    )
+    with open(pixi_toml, "wb") as f:
+        tomli_w.dump(data, f)
+    return pixi_toml
+
+
+def resolve_env_cuda_wheel_urls(
+    env_name: str,
+    cfg: ComfyEnvConfig,
+    bootstrap_python: Optional[str],
+    chosen_cuda: Optional[str],
+    chosen_torch_short: Optional[str],
+    log: Callable[[str], None] = print,
+) -> Dict[str, str]:
+    """Return the cuda-wheel URLs needed for one env's post-pixi install.
+
+    Mirrors the per-env loop inside the legacy ``build_workspace_toml`` so
+    callers using ``write_env_pixi_toml`` can still drive the post-pixi
+    ``uv pip install --no-deps`` pass.
+    """
+    cuda_only = [p for p in cfg.cuda_packages if p not in _TORCH_PKGS]
+    if not (cuda_only and chosen_cuda and chosen_torch_short):
+        return {}
+    env_python = cfg.python or bootstrap_python
+    if not env_python:
+        return {}
+
+    from .cuda_wheels import get_wheel_url as _get_wheel_url
+    urls: Dict[str, str] = {}
+    for pkg in cuda_only:
+        url = _get_wheel_url(pkg, chosen_torch_short, chosen_cuda, env_python, log=log)
+        if not url:
+            raise RuntimeError(
+                f"cuda-wheel {pkg!r} unavailable for "
+                f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{env_python}; "
+                f"_resolve_wheel_combo should have caught this earlier."
+            )
+        urls[pkg] = url
+    return urls
+
+
 def _merge_into_existing(existing: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
     """Merge `fresh` (this install's envs) on top of `existing` (prior installs).
 

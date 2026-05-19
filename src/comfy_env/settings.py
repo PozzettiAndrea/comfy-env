@@ -36,12 +36,14 @@ def _is_on(var: str, default: bool = False) -> bool:
 GENERAL_SETTINGS = [
     ("COMFY_ENV_INSTALL_ISOLATED", "Install to isolated envs (pixi)"),
     ("COMFY_ENV_ISOLATE", "Run nodes in subprocess workers"),
+    ("COMFY_ENV_AUTO_INSTALL", "Auto-materialize missing envs on first node load (blocks startup)"),
     ("COMFY_ENV_POOL_IPC", "Pool IPC (zero-copy GPU tensor transfer)"),
 ]
 
 GENERAL_DEFAULTS = {
     "COMFY_ENV_INSTALL_ISOLATED": True,
     "COMFY_ENV_ISOLATE": True,
+    "COMFY_ENV_AUTO_INSTALL": False,   # OFF by default -- explicit opt-in (multi-min installs)
     "COMFY_ENV_POOL_IPC": False,
 }
 
@@ -78,6 +80,7 @@ PATCH_DEFAULTS = {
 SETTINGS_KEY_MAP = {
     "isolate": "COMFY_ENV_ISOLATE",
     "install_isolated": "COMFY_ENV_INSTALL_ISOLATED",
+    "auto_install": "COMFY_ENV_AUTO_INSTALL",
     "pool_ipc": "COMFY_ENV_POOL_IPC",
     "worker_vram_budget": "COMFY_ENV_WORKER_VRAM_BUDGET",
 }

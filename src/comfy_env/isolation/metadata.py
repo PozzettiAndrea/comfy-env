@@ -333,16 +333,20 @@ def fetch_metadata(
         # lockfile per scan.
         is_pixi = ".pixi" in str(python)
         if is_pixi:
-            # python is at <workspace>/.pixi/envs/<env_name>/python.exe (Win)
-            # or <workspace>/.pixi/envs/<env_name>/bin/python (POSIX).
-            env_root = python.parent if sys.platform == "win32" else python.parent.parent
-            env_name = env_root.name
-            workspace_dir = env_root.parent.parent.parent  # strip envs/<name> and .pixi
+            from ..environment.cache import resolve_pixi_manifest
             from ..packages.pixi import PIXI
+            # Per-env layout: python lives at
+            #   <workspace>/envs/<name>/.pixi/envs/default/{bin,Scripts}/python
+            # so the per-env manifest is at <workspace>/envs/<name>/pixi.toml
+            # and the pixi env inside it is always named "default". Each
+            # env's manifest is independent -- a parse error in one cannot
+            # break this scan.
+            env_root = python.parent if sys.platform == "win32" else python.parent.parent
+            manifest_path, env_pixi_name = resolve_pixi_manifest(env_root)
             cmd = [
                 PIXI, "run", "--as-is",
-                "--manifest-path", str(workspace_dir / "pixi.toml"),
-                "-e", env_name,
+                "--manifest-path", str(manifest_path),
+                "-e", env_pixi_name,
                 "python", script_file, str(working_dir), package_name, output_file,
             ]
         else:

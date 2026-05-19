@@ -372,23 +372,23 @@ class SubprocessWorker(Worker):
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
-            # <workspace>/.pixi/envs/<env_name>/python.exe (Windows) or
-            # <workspace>/.pixi/envs/<env_name>/bin/python (POSIX). Walk up to
-            # find the workspace dir (parent of `.pixi/`) and the env name.
+            # Per-env layout: python lives at
+            #   <workspace>/envs/<name>/.pixi/envs/default/{bin,Scripts}/python
+            # so the manifest is at <workspace>/envs/<name>/pixi.toml and the
+            # pixi env name is always "default".
             if sys.platform == "win32":
                 pixi_env_root = self.python.parent
             else:
                 pixi_env_root = self.python.parent.parent
-            env_name = pixi_env_root.name
-            # pixi_env_root is <workspace>/.pixi/envs/<env_name>; walk up 3 levels.
-            workspace_dir = pixi_env_root.parent.parent.parent
 
+            from ...environment.cache import resolve_pixi_manifest
             from ...packages.pixi import PIXI
+            manifest_path, env_pixi_name = resolve_pixi_manifest(pixi_env_root)
 
             cmd = [
                 PIXI, "run", "--as-is",
-                "--manifest-path", str(workspace_dir / "pixi.toml"),
-                "-e", env_name,
+                "--manifest-path", str(manifest_path),
+                "-e", env_pixi_name,
                 "python", str(self._worker_script), self._socket_addr,
             ]
             launch_env = env

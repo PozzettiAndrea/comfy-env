@@ -138,6 +138,12 @@ def _discover_node_configs(
         if plugin_dir.name.startswith((".", "_")):
             log(f"[comfy-env] _discover: skip {plugin_dir.name} (dot/underscore prefix)")
             continue
+        # Quarantine suffix used by _node_guard and other "disable this node
+        # without deleting it" tools. Skip so we don't materialize a pixi env
+        # for a node that isn't even being loaded by ComfyUI.
+        if plugin_dir.name.endswith((".disabled", "._disabled")):
+            log(f"[comfy-env] _discover: skip {plugin_dir.name} (quarantine suffix)")
+            continue
         toml_files = [cf for cf in sorted(plugin_dir.rglob(CONFIG_FILE_NAME))
                       if cf.name != ROOT_CONFIG_FILE_NAME]
         if not toml_files:
@@ -215,6 +221,8 @@ def _collect_root_conda_deps(
     for plugin_dir in sorted(custom_nodes.iterdir()):
         if not plugin_dir.is_dir() or plugin_dir.name.startswith((".", "_")):
             continue
+        if plugin_dir.name.endswith((".disabled", "._disabled")):
+            continue
         root_cfg_path = plugin_dir / ROOT_CONFIG_FILE_NAME
         if not root_cfg_path.exists():
             continue
@@ -245,10 +253,11 @@ def _dedupe_envs_libomp(
     if sys.platform != "darwin":
         return
     import glob as _glob
+    from ..environment.cache import get_workspace_env_dir
     from ..environment.libomp import dedupe_libomp
 
     for env_name, _plugin, _cf, _cfg in discovered:
-        env_dir = workspace_dir / ".pixi" / "envs" / env_name
+        env_dir = get_workspace_env_dir(workspace_dir, env_name)
         sp_matches = _glob.glob(str(env_dir / "lib" / "python*" / "site-packages"))
         if not sp_matches:
             continue
@@ -491,14 +500,27 @@ def install_workspace(
     log: Callable[[str], None] = print,
     dry_run: bool = False,
 ) -> Optional[Path]:
-    """Generate `<comfyui_dir>/.ce/pixi.toml` and run `pixi install --all`.
+    """Generate one ``pixi.toml`` per env under ``<workspace>/envs/<name>/`` and
+    run ``pixi install --manifest-path <env>/pixi.toml`` for each.
+
+    Per-env layout (v0.4+): each env's manifest is fully isolated. A parse
+    error in one env's pixi.toml cannot poison another env's scan or install.
+
+    No backward compatibility with the v0.3.x single-file workspace layout.
+    Users upgrading should ``rm -rf <workspace>/.pixi/`` and
+    ``<workspace>/pixi.toml`` before the first install; this function
+    re-materializes everything in the new layout.
 
     Returns the workspace directory on success, None if nothing to install.
     """
     from ..packages.pixi import ensure_pixi, PIXI
     ensure_pixi()
-    from ..environment.cache import CE_WORKSPACE_DIR, get_workspace_dir
-    from ..packages.toml_generator import write_workspace_pixi_toml
+    from ..environment.cache import (
+        CE_WORKSPACE_DIR, get_workspace_dir, get_env_manifest_dir,
+    )
+    from ..packages.toml_generator import (
+        write_env_pixi_toml, resolve_env_cuda_wheel_urls,
+    )
 
     comfyui_dir = Path(comfyui_dir).resolve()
     discovered = _discover_node_configs(comfyui_dir, log=log)
@@ -508,6 +530,11 @@ def install_workspace(
 
     workspace_dir = get_workspace_dir(comfyui_dir)
 
+    # No backward compatibility with v0.3.x layout. Per-env manifests under
+    # <workspace>/envs/<name>/ only. If a workspace still has
+    # <workspace>/pixi.toml + <workspace>/.pixi/envs/<name>/ from an older
+    # comfy-env, the user is expected to `rm -rf` those manually; this
+    # install will re-materialize at the new layout.
     legacy_workspace = comfyui_dir / CE_WORKSPACE_DIR
     if (legacy_workspace / ".pixi").is_dir():
         log(
@@ -549,7 +576,7 @@ def install_workspace(
             log(f"  - {env_name} <- {rel} (python={cfg.python or 'host'})")
 
         (
-            torch_index, cuda_version, cuda_major,
+            torch_index, cuda_version, _cuda_major,
             bootstrap_python, bootstrap_torch,
         ) = _resolve_workspace_torch(log)
 
@@ -559,10 +586,6 @@ def install_workspace(
         combo = _resolve_wheel_combo(
             discovered, bootstrap_python, cuda_version, bootstrap_torch, log,
         )
-        # The comfyui feature ALWAYS pins the bootstrap torch — it's what
-        # python_embeded ships with on portable, and what the main ComfyUI
-        # process actually loads. Per-node envs that have cuda-only wheel
-        # requirements get an explicit override toward the chosen combo.
         torch_pin: Optional[str] = (
             f"=={bootstrap_torch}" if bootstrap_torch else None
         )
@@ -581,30 +604,46 @@ def install_workspace(
                 ".".join(bootstrap_torch.split(".")[:2]) if bootstrap_torch else None
             )
 
-        # Collect conda deps from root configs for the comfyui feature
-        root_conda_deps = _collect_root_conda_deps(comfyui_dir, log)
-
         # On Desktop app, requirements.txt is in the app bundle (source dir),
-        # not the user data dir. Resolve source dir separately.
+        # not the user data dir. Resolve source dir separately for downstream use.
         from ..environment.cache import find_comfyui_source_dir
         source_dir = find_comfyui_source_dir(comfyui_dir / "custom_nodes")
         if source_dir and source_dir != comfyui_dir:
             log(f"[comfy-env] Desktop app detected: source={source_dir}, data={comfyui_dir}")
 
-        node_configs = [(env_name, cfg) for env_name, _, _, cfg in discovered]
-        _, cuda_urls_by_env = write_workspace_pixi_toml(
-            workspace_dir, comfyui_dir, torch_index, cuda_major, node_configs,
-            bootstrap_python=bootstrap_python,
-            torch_pin=torch_pin,
-            log=log,
-            chosen_torch_index=chosen_torch_index,
-            chosen_torch_pin=chosen_torch_pin_for_override,
-            chosen_cuda=chosen_cuda if combo is not None else None,
-            chosen_torch_short=chosen_torch_short if combo is not None else None,
-            chosen_python=chosen_python if combo is not None else None,
-            root_conda_deps=root_conda_deps or None,
-            comfyui_source_dir=source_dir,
-        )
+        # Emit one pixi.toml per env under <workspace>/envs/<env_name>/.
+        log(f"[comfy-env] Writing {len(discovered)} per-env manifest(s):")
+        cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
+        for env_name, _plugin, _cf, cfg in discovered:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            write_env_pixi_toml(
+                env_manifest_dir=env_manifest_dir,
+                env_name=env_name,
+                cfg=cfg,
+                torch_index=torch_index,
+                bootstrap_python=bootstrap_python,
+                torch_pin=torch_pin,
+                chosen_torch_index=chosen_torch_index,
+                chosen_torch_pin=chosen_torch_pin_for_override,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
+            urls = resolve_env_cuda_wheel_urls(
+                env_name=env_name,
+                cfg=cfg,
+                bootstrap_python=bootstrap_python,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            if urls:
+                cuda_urls_by_env[env_name] = urls
+                log(
+                    f"[comfy-env] {env_name}: cuda-wheels deferred for post-pixi "
+                    f"install ({', '.join(urls.keys())})"
+                )
 
         if dry_run:
             log("[comfy-env] dry_run -- skipping `pixi install`")
@@ -615,10 +654,13 @@ def install_workspace(
         pixi_env = dict(os.environ)
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(workspace_dir / "_no_python")
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
-        pixi_env["PIXI_NO_PROGRESS"] = "true"  # plain text output instead of progress bars
+        pixi_env["PIXI_NO_PROGRESS"] = "true"
 
-        log(f"[comfy-env] Installing {len(node_configs)} environment(s):")
-        for env_name, cfg in node_configs:
+        # Install each env independently. One failure doesn't stop the others
+        # by default (we collect and raise at the end), so users see all
+        # diagnostics from one run instead of having to re-trigger after each fix.
+        log(f"[comfy-env] Installing {len(discovered)} environment(s):")
+        for env_name, _plugin, _cf, cfg in discovered:
             py = cfg.python or "host"
             deps = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys())
             cuda = cfg.cuda_packages
@@ -628,46 +670,53 @@ def install_workspace(
             if cuda:
                 parts.append(f"{len(cuda)} cuda wheels")
             log(f"  - {env_name} ({', '.join(parts)})")
-        # Install only this run's envs. Envs from other ComfyUI installs that
-        # share this global workspace stay materialized; we don't touch them.
-        install_envs: List[str] = [env_name for env_name, _, _, _ in discovered]
-        env_flags: List[str] = []
-        for n in install_envs:
-            env_flags += ["-e", n]
-        log(f"[comfy-env] Running `pixi install {' '.join(env_flags)}`...")
-        result = _run_streaming(
-            [PIXI, "install", *env_flags],
-            log=log, cwd=workspace_dir, env=pixi_env,
-        )
-        _log_subprocess(log, result, f"pixi install {' '.join(env_flags)}")
-        if result.returncode != 0:
+
+        install_failures: List[str] = []
+        for env_name, _plugin, _cf, _cfg in discovered:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            env_manifest = env_manifest_dir / "pixi.toml"
+            log(f"[comfy-env] Running `pixi install --manifest-path {env_manifest}` ...")
+            result = _run_streaming(
+                [PIXI, "install", "--manifest-path", str(env_manifest)],
+                log=log, cwd=env_manifest_dir, env=pixi_env,
+            )
+            _log_subprocess(log, result, f"pixi install ({env_name})")
+            if result.returncode != 0:
+                install_failures.append(env_name)
+                log(
+                    f"[comfy-env] {env_name}: pixi install FAILED (exit {result.returncode}). "
+                    f"Continuing with remaining envs."
+                )
+
+        if install_failures:
             raise RuntimeError(
-                f"pixi install failed:\nstderr: {result.stderr}\nstdout: {result.stdout}"
+                f"pixi install failed for {len(install_failures)} env(s): "
+                f"{', '.join(install_failures)}"
             )
 
-        # Report envs that aren't in the current manifest, but DO NOT prune.
-        # A user may have multiple ComfyUI installs sharing this `.ce` workspace,
-        # or a node's `comfy-env.toml` may be transiently missing (mid-clone,
-        # partial checkout). Auto-pruning here would delete real working envs.
-        envs_dir = workspace_dir / ".pixi" / "envs"
-        if envs_dir.is_dir():
+        # Report envs on disk that no node declares -- DO NOT prune. A user may
+        # have multiple ComfyUI installs sharing this workspace, or a node's
+        # `comfy-env.toml` may be transiently missing (mid-clone, partial checkout).
+        new_envs_root = workspace_dir / "envs"
+        if new_envs_root.is_dir():
             current_names = {env_name for env_name, _, _, _ in discovered}
-            for d in envs_dir.iterdir():
+            for d in sorted(new_envs_root.iterdir()):
                 if not d.is_dir() or d.name in current_names:
                     continue
                 log(
                     f"[comfy-env] Note: env `{d.name}` is on disk but no node "
                     f"declares it in this run. Leaving as-is. "
-                    f"Remove via `pixi clean --environment {d.name}` if intended."
+                    f"Remove via `rm -rf {d}` if intended."
                 )
 
-        # CUDA-only wheels (cumesh, flash-attn, etc.) are installed with
-        # --no-deps after pixi, because pixi's resolver cannot suppress their
-        # declared dependencies (which are often wrong for custom-built wheels).
+        # CUDA-only wheels installed with --no-deps after pixi (pixi's resolver
+        # can't suppress their declared dependencies, which are often wrong for
+        # custom-built wheels).
         if cuda_urls_by_env:
             uv_path = _find_uv()
+            from ..environment.cache import get_workspace_env_dir
             for env_name, pkg_urls in cuda_urls_by_env.items():
-                env_dir = envs_dir / env_name
+                env_dir = get_workspace_env_dir(workspace_dir, env_name)
                 if not env_dir.is_dir():
                     log(f"[comfy-env] Warning: env dir {env_dir} not found, skipping cuda-wheels")
                     continue
@@ -676,11 +725,9 @@ def install_workspace(
                     f"[comfy-env] {env_name}: installing cuda-wheels with --no-deps "
                     f"({', '.join(pkg_urls.keys())})"
                 )
-                # Use the pixi env's Python so uv installs into the
-                # correct site-packages and validates wheel compatibility.
                 env_python = env_dir / "bin" / "python"
                 if not env_python.exists():
-                    env_python = env_dir / "python.exe"  # pixi on Windows
+                    env_python = env_dir / "python.exe"
                 if not env_python.exists():
                     env_python = env_dir / "Scripts" / "python.exe"
                 uv_result = _run_streaming(

@@ -287,10 +287,44 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
     env_dir = get_workspace_env_dir(comfyui_dir, env_name)
     if env_dir.exists():
         return env_dir.resolve() if sys.platform == "win32" else env_dir
+
+    # Auto-install gate. Default OFF -- explicit opt-in via env var because
+    # a synchronous `pixi install` can block ComfyUI startup for minutes on
+    # heavy CUDA nodes. With it ON, missing envs are materialized on first
+    # node load; with it OFF, we log a clear warning and fall back to
+    # in-process import (the legacy behavior).
+    from ..settings import resolve_bool, GENERAL_DEFAULTS
+    auto_install_enabled = resolve_bool(
+        "COMFY_ENV_AUTO_INSTALL", None,
+        GENERAL_DEFAULTS["COMFY_ENV_AUTO_INSTALL"],
+    )
+    if auto_install_enabled:
+        try:
+            from .auto_install import ensure_env_materialized
+            materialized = ensure_env_materialized(
+                env_name=env_name,
+                plugin_dir=plugin_dir,
+                config_path=config_path,
+                comfyui_dir=comfyui_dir,
+                log=_log,
+            )
+            if materialized and materialized.exists():
+                return (
+                    materialized.resolve()
+                    if sys.platform == "win32"
+                    else materialized
+                )
+        except Exception as e:
+            _log(
+                f"[comfy-env] auto-install of `{env_name}` raised "
+                f"{type(e).__name__}: {e}"
+            )
+
     _log(
         f"[comfy-env] isolation env not found at {env_dir}: pixi has not "
         f"materialized `{env_name}`; using in-process import. Run "
-        f"`comfy-env install` (or your node's `install.py`) to create it."
+        f"`comfy-env install` to create it, or set "
+        f"COMFY_ENV_AUTO_INSTALL=1 to materialize missing envs at startup."
     )
     return None
 
