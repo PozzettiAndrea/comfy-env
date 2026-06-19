@@ -428,6 +428,113 @@ def fetch_metadata(
 
 
 # ---------------------------------------------------------------------------
+# Dynamic combo refresh (parent-side directory rescan)
+# ---------------------------------------------------------------------------
+#
+# Isolated nodes are represented in the main process by a proxy whose
+# INPUT_TYPES would otherwise return a snapshot captured once at scan time, so
+# combos built from a filesystem scan (e.g. "list the files in input/cad") never
+# refresh -- newly uploaded files never appear in the dropdown, even on reload.
+#
+# A node opts a combo into live refresh by attaching a marker to its options
+# dict (via io.Combo.Input(extra_dict=...)). Simple single-directory form:
+#     {"comfy_env_dynamic_dir": "cad",
+#      "comfy_env_exts": [".step", ".stp", ".iges", ".igs", ".brep"],
+#      "comfy_env_placeholder": "(no CAD files found in input/cad)"}
+# Richer multi-source form (e.g. a recursive subfolder plus the input root), where
+# each source is {"dir": <subdir>, "recursive": bool, "rel_to_input": bool}:
+#     {"comfy_env_dynamic_dir": "3d",   # trigger; ignored when sources given
+#      "comfy_env_sources": [
+#          {"dir": "3d", "recursive": True,  "rel_to_input": True},
+#          {"dir": "",   "recursive": False, "rel_to_input": False}],
+#      "comfy_env_exts": [...], "comfy_env_placeholder": "..."}
+# All dirs are relative to ComfyUI's input directory; rel_to_input controls whether
+# returned values are relative to the input root (e.g. "3d/foo.obj") or to the
+# scanned dir (e.g. "foo.obj"). The scan is plain os.listdir/os.walk of a ComfyUI
+# input folder -- it needs none of the node's isolated dependencies and runs
+# cheaply in the parent on every /object_info, keeping the fast read path off the
+# (possibly slow/hung) worker.
+
+_DYNAMIC_DIR_KEY = "comfy_env_dynamic_dir"
+_DYNAMIC_SOURCES_KEY = "comfy_env_sources"
+
+
+def _extract_dynamic_spec(entry):
+    """Return the marker dict from a captured INPUT_TYPES combo entry, or None.
+
+    A combo entry is a (io_type_or_options, opts_dict) tuple/list; the marker
+    lives in opts_dict (the first dict element)."""
+    if not isinstance(entry, (list, tuple)):
+        return None
+    for el in entry:
+        if isinstance(el, dict) and (_DYNAMIC_DIR_KEY in el or _DYNAMIC_SOURCES_KEY in el):
+            return el
+    return None
+
+
+def _scan_one_source(base, src, exts):
+    """Scan a single {dir, recursive, rel_to_input} source. Never raises."""
+    subdir = src.get("dir", "") or ""
+    recursive = bool(src.get("recursive", False))
+    rel_to_input = bool(src.get("rel_to_input", False))
+    root = os.path.join(base, subdir) if subdir else base
+    out = []
+    try:
+        if recursive:
+            for r, _dirs, files in os.walk(root):
+                for fn in files:
+                    if exts and os.path.splitext(fn)[1].lower() not in exts:
+                        continue
+                    full = os.path.join(r, fn)
+                    rel = os.path.relpath(full, base if rel_to_input else root)
+                    out.append(rel.replace(os.sep, "/"))
+        else:
+            for fn in os.listdir(root):
+                if not os.path.isfile(os.path.join(root, fn)):
+                    continue
+                if exts and os.path.splitext(fn)[1].lower() not in exts:
+                    continue
+                if rel_to_input and subdir:
+                    out.append(os.path.join(subdir, fn).replace(os.sep, "/"))
+                else:
+                    out.append(fn)
+    except Exception:
+        pass
+    return out
+
+
+def _scan_dynamic_dir(spec):
+    """Live-scan the input folder(s) named by a marker spec, in the parent.
+
+    Returns a sorted, de-duplicated list of matching filenames, the placeholder
+    when empty, or None if the input directory can't be resolved. Never raises --
+    it runs on the /object_info path which enumerates every node."""
+    try:
+        import folder_paths  # ComfyUI core; available in the main process
+        base = folder_paths.get_input_directory()
+    except Exception:
+        return None
+    exts = [str(e).lower() for e in spec.get("comfy_env_exts", []) or []]
+    placeholder = spec.get("comfy_env_placeholder")
+    sources = spec.get(_DYNAMIC_SOURCES_KEY)
+    if not sources:
+        subdir = spec.get(_DYNAMIC_DIR_KEY)
+        if subdir is None:
+            return None
+        sources = [{"dir": subdir, "recursive": False, "rel_to_input": False}]
+    names, seen = [], set()
+    for src in sources:
+        for n in _scan_one_source(base, src, exts):
+            if n not in seen:
+                seen.add(n)
+                names.append(n)
+    names.sort()
+    if not names and placeholder is not None:
+        names = [placeholder]
+    return names
+
+
+# ---------------------------------------------------------------------------
 # Proxy class builder
 # ---------------------------------------------------------------------------
 
@@ -504,10 +611,41 @@ def build_proxy_class(
             for k, v in input_types["hidden"].items()
         }
 
-    # INPUT_TYPES classmethod returning cached metadata
-    @classmethod
-    def _input_types(cls, _cached=input_types):
-        return _cached
+    # Detect combos opted into live refresh (parent-side directory rescan).
+    # Each entry: (section, input_name, marker_spec).
+    dynamic_dir_inputs = []
+    for section in ("required", "optional"):
+        for name, entry in input_types.get(section, {}).items():
+            spec = _extract_dynamic_spec(entry)
+            if spec is not None:
+                dynamic_dir_inputs.append((section, name, spec))
+
+    if dynamic_dir_inputs:
+        # INPUT_TYPES re-scans the marked directories live on each call, splicing
+        # fresh option lists into a copy of the cached snapshot. ComfyUI calls
+        # this on every /object_info, so a just-uploaded file shows up on reload.
+        @classmethod
+        def _input_types(cls, _cached=input_types, _marks=dynamic_dir_inputs):
+            result = {sec: dict(entries) for sec, entries in _cached.items()}
+            for sec, name, spec in _marks:
+                fresh = _scan_dynamic_dir(spec)
+                if fresh is None:
+                    continue  # couldn't resolve input dir -- keep cached options
+                entry = _cached[sec][name]
+                if isinstance(entry[0], (list, tuple)):
+                    # V1 bare-list combo: options are entry[0]
+                    result[sec][name] = (fresh, *entry[1:])
+                elif len(entry) >= 2 and isinstance(entry[1], dict):
+                    # V3 combo: ("COMBO", {"options": [...], ...})
+                    new_opts = dict(entry[1])
+                    new_opts["options"] = fresh
+                    result[sec][name] = (entry[0], new_opts)
+            return result
+    else:
+        # INPUT_TYPES classmethod returning cached metadata
+        @classmethod
+        def _input_types(cls, _cached=input_types):
+            return _cached
     attrs["INPUT_TYPES"] = _input_types
 
     # Hidden kwargs to strip before sending to worker (V3 execute() won't
