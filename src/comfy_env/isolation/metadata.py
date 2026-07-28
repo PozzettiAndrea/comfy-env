@@ -21,7 +21,7 @@ from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "10"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "11"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -167,6 +167,11 @@ module = importlib.import_module(package_name)
 if _debug:
     print(f"[meta-scan] import OK", file=sys.stderr, flush=True)
 
+try:
+    from comfy_api.internal import _ComfyNodeInternal as _V3Base
+except Exception:
+    _V3Base = None
+
 nodes = {}
 for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
     meta = {
@@ -187,6 +192,21 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
         except Exception as e:
             meta["input_types"] = {"required": {}}
             meta["input_types_error"] = str(e)
+
+    # V3 detection + native metadata capture. The real class lives here in the
+    # isolation env, so its schema-backed classproperties/GET_NODE_INFO_V1 resolve
+    # correctly; we capture the plain-dict results (Schema objects don't pickle).
+    is_v3 = _V3Base is not None and isinstance(cls, type) and issubclass(cls, _V3Base)
+    meta["is_v3"] = is_v3
+    if is_v3:
+        try:
+            meta["node_info_v1"] = cls.GET_NODE_INFO_V1()
+            meta["not_idempotent"] = bool(getattr(cls, "NOT_IDEMPOTENT", False))
+            meta["accept_all_inputs"] = bool(getattr(cls, "ACCEPT_ALL_INPUTS", False))
+        except Exception as e:
+            # degrade gracefully: build the V1 proxy for this node instead
+            meta["is_v3"] = False
+            print(f"[meta-scan] V3 capture failed for {name}: {e}", file=sys.stderr, flush=True)
 
     nodes[name] = meta
 
@@ -538,6 +558,218 @@ def _scan_dynamic_dir(spec):
 # Proxy class builder
 # ---------------------------------------------------------------------------
 
+def _collect_dynamic_marks(input_types: Dict[str, Any]):
+    """[(section, input_name, marker_spec)] for combos opted into live dir rescan."""
+    marks = []
+    for section in ("required", "optional"):
+        for name, entry in (input_types.get(section) or {}).items():
+            spec = _extract_dynamic_spec(entry)
+            if spec is not None:
+                marks.append((section, name, spec))
+    return marks
+
+
+def _splice_dynamic_options(sections: Dict[str, Any], marks) -> Dict[str, Any]:
+    """Return a copy of a {'required': {...}, 'optional': {...}} dict with each
+    marked combo's option list re-scanned live from disk."""
+    result = {sec: dict(entries) for sec, entries in sections.items()}
+    for sec, name, spec in marks:
+        entries = sections.get(sec) or {}
+        if name not in entries:
+            continue
+        fresh = _scan_dynamic_dir(spec)
+        if fresh is None:
+            continue  # couldn't resolve input dir -- keep cached options
+        entry = entries[name]
+        if isinstance(entry[0], (list, tuple)):
+            # V1 bare-list combo: options are entry[0]
+            result[sec][name] = (fresh, *entry[1:])
+        elif len(entry) >= 2 and isinstance(entry[1], dict):
+            # V3 combo: ("COMBO", {"options": [...], ...})
+            new_opts = dict(entry[1])
+            new_opts["options"] = fresh
+            result[sec][name] = (entry[0], new_opts)
+    return result
+
+
+def _build_v3_proxy_class(
+    node_name: str,
+    meta: Dict[str, Any],
+    env_dir: Path,
+    package_root: Path,
+    sys_path: list,
+    lib_path: Optional[str],
+    env_vars: Dict[str, str],
+    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
+) -> type:
+    """Build a V3-native proxy: a genuine io.ComfyNode subclass, so ComfyUI's
+    server treats it exactly like the real V3 node it stands in for.
+
+    Why this exists: the V1 proxy needed a compatibility hack that flattened every
+    DynamicCombo option's children into dotted `parent.child` optional inputs
+    (the V1 execution path drops undeclared dotted inputs). The flattened extras
+    were then materialized as widgets by the frontend on node creation, showing
+    every backend's parameters at once. As a real V3 class, the server finalizes
+    dynamic inputs (`get_finalized_class_inputs`) and nests dotted prompt keys
+    into dicts (`build_nested_inputs`) natively -- no flattening, no manual
+    re-nesting, no hidden-tuple unwrapping.
+
+    Contract notes (all verified against execution.py/server.py/_io.py):
+    - `/object_info` for V3 is served solely by `GET_NODE_INFO_V1()`; we return
+      the dict captured verbatim from the real class during the metadata scan.
+    - `FUNCTION = "execute"` (a plain string) bypasses the base's
+      EXECUTE_NORMALIZED classproperty, so no SCHEMA object is needed even when
+      the worker returns an expand graph -- the output stage handles NodeOutput
+      and plain dicts class-agnostically.
+    - `define_schema` must EXIST as a distinct classmethod (VALIDATE_CLASS checks
+      for a real override) but is never called, because every schema-derived
+      classproperty is shadowed with plain attrs below.
+    - `@final` decorators in comfy_api are typing-only; shadowing is legal at
+      runtime.
+    """
+    from comfy_api.latest import io as _comfy_io
+
+    func_name = meta["function"] or "EXECUTE_NORMALIZED"
+    module_name = meta["module_name"]
+    class_name = meta["class_name"]
+    input_types = {k: dict(v) if isinstance(v, dict) else v
+                   for k, v in meta.get("input_types", {"required": {}}).items()}
+    node_info = meta["node_info_v1"]
+
+    dynamic_marks = _collect_dynamic_marks(input_types)
+
+    return_types = tuple(meta.get("return_types", ()) or ())
+    output_is_list = meta.get("output_is_list")
+    if not output_is_list or len(output_is_list) != len(return_types):
+        output_is_list = tuple(bool(x) for x in (output_is_list or ())) \
+            + (False,) * (len(return_types) - len(output_is_list or ()))
+
+    if dynamic_marks:
+        @classmethod
+        def _input_types(cls, _cached=input_types, _marks=dynamic_marks):
+            result = _splice_dynamic_options(
+                {s: e for s, e in _cached.items() if s in ("required", "optional")}, _marks)
+            for s, e in _cached.items():
+                if s not in ("required", "optional"):
+                    result[s] = e
+            return result
+
+        @classmethod
+        def _get_node_info_v1(cls, _info=node_info, _marks=dynamic_marks):
+            info = dict(_info)
+            inp = info.get("input") or {}
+            sections = {s: e for s, e in inp.items() if s in ("required", "optional")}
+            spliced = _splice_dynamic_options(sections, _marks)
+            new_inp = dict(inp)
+            new_inp.update(spliced)
+            info["input"] = new_inp
+            # RELATIVE_PYTHON_MODULE is stamped on the registered class by the main
+            # process (nodes.py), not the scan env -- re-read it here or the frontend
+            # crashes on python_module=None.
+            info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
+            return info
+    else:
+        @classmethod
+        def _input_types(cls, _cached=input_types):
+            return _cached
+
+        @classmethod
+        def _get_node_info_v1(cls, _info=node_info):
+            info = dict(_info)
+            info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
+            return info
+
+    @classmethod
+    def _define_schema_stub(cls):
+        raise NotImplementedError(
+            f"comfy-env V3 proxy for {node_name}: define_schema is a stub -- the real "
+            f"schema lives in the isolation env. If this is reached, a code path is "
+            f"bypassing the proxy's shadowed classmethods.")
+
+    def _make_v3_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, nn):
+        def proxy(cls, **kwargs):
+            from .wrap import (_get_or_create_worker, _remove_worker,
+                               _register_new_patchers)
+
+            # I/O + VRAM logging (before call)
+            if _DBG_IO:
+                inputs_desc = ", ".join(_describe_value(k, v) for k, v in kwargs.items())
+                _log(f"[comfy-env] Running {nn}: {inputs_desc}")
+            if _DBG_VRAM:
+                _log_vram(f"Before {nn}")
+
+            worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
+            _t0 = time.perf_counter()
+            try:
+                try:
+                    from .tensor_utils import prepare_for_ipc_recursive
+                    kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
+                except ImportError:
+                    pass
+
+                result = worker.call_method(
+                    module_name=mod,
+                    class_name=cn,
+                    method_name=fn,
+                    self_state=None,
+                    kwargs=kwargs,
+                    timeout=600.0,
+                )
+
+                try:
+                    from .tensor_utils import prepare_for_ipc_recursive
+                    result = prepare_for_ipc_recursive(result)
+                except ImportError:
+                    pass
+
+                # Create patchers for any models auto-detected during this call
+                _register_new_patchers(ed, worker, gen)
+
+                # I/O + VRAM logging (after call)
+                if _DBG_IO:
+                    elapsed = time.perf_counter() - _t0
+                    if isinstance(result, tuple):
+                        out_desc = ", ".join(
+                            _describe_value(f"[{i}]", v) for i, v in enumerate(result)
+                        )
+                    else:
+                        out_desc = _describe_value("result", result)
+                    _log(f"[comfy-env] {nn} done ({elapsed:.2f}s): {out_desc}")
+                if _DBG_VRAM:
+                    _log_vram(f"After {nn}")
+
+                return result
+            except (RuntimeError, ConnectionError):
+                _remove_worker(ed)
+                raise
+        return proxy
+
+    attrs = {
+        "INPUT_TYPES": _input_types,
+        "GET_NODE_INFO_V1": _get_node_info_v1,
+        "define_schema": _define_schema_stub,
+        "execute": classmethod(_make_v3_proxy(
+            func_name, module_name, class_name,
+            env_dir, package_root, sys_path, lib_path, env_vars,
+            health_check_timeout, node_name,
+        )),
+        "FUNCTION": "execute",
+        "RETURN_TYPES": return_types,
+        "RETURN_NAMES": tuple(meta.get("return_names", ()) or ()),
+        "OUTPUT_IS_LIST": tuple(output_is_list),
+        "INPUT_IS_LIST": bool(meta.get("input_is_list") or False),
+        "OUTPUT_NODE": bool(meta.get("output_node", False)),
+        "NOT_IDEMPOTENT": bool(meta.get("not_idempotent", False)),
+        "ACCEPT_ALL_INPUTS": bool(meta.get("accept_all_inputs", False)),
+        "CATEGORY": meta.get("category", ""),
+        "_comfy_env_isolated": True,
+        "_comfy_env_module": module_name,
+        "_comfy_env_class": class_name,
+    }
+
+    return type(class_name, (_comfy_io.ComfyNode,), attrs)
+
+
 def build_proxy_class(
     node_name: str,
     meta: Dict[str, Any],
@@ -550,10 +782,19 @@ def build_proxy_class(
 ) -> type:
     """Build a proxy class from metadata that delegates execution to subprocess.
 
-    The returned class has all the ComfyUI metadata attributes (INPUT_TYPES,
-    RETURN_TYPES, FUNCTION, CATEGORY, etc.) but the FUNCTION method spawns
-    a SubprocessWorker to run the real code in the isolation env.
+    V3-scanned nodes (is_v3 + node_info_v1 captured) get a V3-native proxy --
+    see _build_v3_proxy_class. V1 nodes keep the classic V1 proxy below, with
+    its DynamicCombo-flattening/nesting compatibility hacks.
     """
+    if meta.get("is_v3") and meta.get("node_info_v1") is not None:
+        try:
+            return _build_v3_proxy_class(
+                node_name, meta, env_dir, package_root, sys_path, lib_path,
+                env_vars, health_check_timeout)
+        except Exception as e:
+            print(f"[comfy-env] V3 proxy build failed for {node_name}, "
+                  f"falling back to V1 proxy: {e}", file=sys.stderr, flush=True)
+
     func_name = meta["function"]
     module_name = meta["module_name"]
     class_name = meta["class_name"]

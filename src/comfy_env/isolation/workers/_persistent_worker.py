@@ -1230,6 +1230,11 @@ def main():
         wlog(f"[print] {message}")
 
     builtins.print = _forwarded_print
+    # Make the forwarder reachable as a module attribute of __main__. numba's
+    # @infer_global(print) does getattr(sys.modules[print.__module__], print.__name__)
+    # at import; without this, that lookup raises AttributeError and silently breaks
+    # `import numba` in node code (forcing slow fallbacks). Harmless for everything else.
+    globals()["_forwarded_print"] = _forwarded_print
 
     # Also forward logging module output
     class SocketLogHandler(logging.Handler):
