@@ -43,6 +43,36 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
 FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
 
+# --- Backend -> wheel-index registry -------------------------------------------
+# The single seam for adding a non-CUDA accelerator's prebuilt wheels: register
+# its index base URL + tier-2 fallback combo here (data, not an `if backend ==`),
+# and ship a resolver alongside. Only `cuda` is populated today -- this module IS
+# the cuda resolver. A backend-dispatching caller uses `resolve_index_url(backend)`
+# instead of hardcoding an index; adding `rocm` is one dict entry + a rocm resolver.
+WHEEL_INDEX_REGISTRY: dict[str, dict] = {
+    "cuda": {"index": CUDA_WHEELS_INDEX, "fallback_combo": FALLBACK_COMBO},
+    # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
+}
+
+
+def resolve_index_url(backend: str = "cuda") -> str:
+    """Wheel-index base URL for a backend. Raises for an unregistered backend."""
+    try:
+        return WHEEL_INDEX_REGISTRY[backend]["index"]
+    except KeyError:
+        raise ValueError(
+            f"no wheel index registered for backend {backend!r}; "
+            f"known: {sorted(WHEEL_INDEX_REGISTRY)}"
+        ) from None
+
+
+def resolve_fallback_combo(backend: str = "cuda") -> tuple:
+    """Tier-2 (toolkit, torch) fallback combo for a backend."""
+    try:
+        return WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
+    except KeyError:
+        raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
+
 # torch.minor -> (torchvision_minor, torchaudio_minor). torchaudio mirrors
 # torch's major.minor exactly; torchvision is `0.(torch_minor + 15)` for the
 # torch-2.x line. Verified against pytorch.org/get-started/previous-versions

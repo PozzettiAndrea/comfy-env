@@ -4,6 +4,11 @@ Detection layer - Pure functions for system detection.
 No side effects. These functions gather information about the runtime environment.
 """
 
+from .backend import (
+    detect_backend,
+    is_accelerator,
+    KNOWN_BACKENDS,
+)
 from .cuda import (
     has_nvidia_gpu,
     detect_cuda_version,
@@ -67,6 +72,10 @@ def is_macos() -> bool:
 
 
 __all__ = [
+    # Backend detection (which accelerator torch will use)
+    "detect_backend",
+    "is_accelerator",
+    "KNOWN_BACKENDS",
     # CUDA detection
     "has_nvidia_gpu",
     "detect_cuda_version",
