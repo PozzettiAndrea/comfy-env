@@ -762,6 +762,17 @@ def _build_v3_proxy_class(
         "NOT_IDEMPOTENT": bool(meta.get("not_idempotent", False)),
         "ACCEPT_ALL_INPUTS": bool(meta.get("accept_all_inputs", False)),
         "CATEGORY": meta.get("category", ""),
+        # Every schema-backed lazy classproperty on the io.ComfyNode base must be
+        # shadowed with a plain value: any that isn't falls through to the base
+        # descriptor, which calls GET_SCHEMA() -> our define_schema stub -> raise.
+        "DESCRIPTION": node_info.get("description") or "",
+        "EXPERIMENTAL": bool(node_info.get("experimental", False)),
+        "DEPRECATED": bool(node_info.get("deprecated", False)),
+        "DEV_ONLY": bool(node_info.get("dev_only", False)),
+        "API_NODE": node_info.get("api_node"),
+        "HAS_INTERMEDIATE_OUTPUT": bool(node_info.get("has_intermediate_output", False)),
+        "OUTPUT_TOOLTIPS": tuple(node_info["output_tooltips"])
+            if node_info.get("output_tooltips") else None,
         "_comfy_env_isolated": True,
         "_comfy_env_module": module_name,
         "_comfy_env_class": class_name,
