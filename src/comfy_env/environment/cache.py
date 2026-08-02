@@ -302,9 +302,82 @@ def find_comfyui_source_dir(node_dir=None):
     return _find_desktop_source_dir()
 
 
+_FOLDER_PATH_ATTR = {
+    "input":  "get_input_directory",
+    "output": "get_output_directory",
+    "temp":   "get_temp_directory",
+    "user":   "get_user_directory",
+}
+
+
+def _resolve_dst_via_folder_paths(dst):
+    """If `dst` is a relative str whose first path segment names a known
+    ComfyUI directory type, resolve that segment via ComfyUI's
+    `folder_paths` module. Returns an absolute Path on success, or None
+    if the smart resolution doesn't apply (caller then does its normal
+    resolution).
+
+    This is the single fix that makes writers of ComfyUI input/output/
+    temp/user dirs match ComfyUI's runtime resolvers on every deployment
+    shape — vanilla, Comfy Desktop with `inputDir` override, launches
+    with `--input-directory` / `--base-directory` / etc.
+    """
+    if not isinstance(dst, str):
+        return None
+    if Path(dst).is_absolute():
+        return None
+    parts = dst.replace("\\", "/").split("/", 1)
+    head = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    if head not in _FOLDER_PATH_ATTR:
+        return None
+    try:
+        import folder_paths
+        base = Path(getattr(folder_paths, _FOLDER_PATH_ATTR[head])())
+        return base / rest if rest else base
+    except Exception:
+        # folder_paths not importable (e.g. helper called outside a
+        # ComfyUI process). Fall through so caller-relative resolution
+        # is attempted instead.
+        return None
+
+
 def copy_files(src, dst, pattern="*", overwrite=False):
-    """Copy files matching pattern from src to dst."""
-    src, dst = Path(src), Path(dst)
+    """Copy files matching `pattern` from `src` to `dst`.
+
+    Both `src` and `dst` accept:
+      - absolute Path/str: used as-is (back-compat)
+      - relative Path/str: resolved against the CALLING SCRIPT's
+        directory (via frame inspection). So `copy_files("assets",
+        "input/3d", "**/*")` from inside a custom node's
+        `prestartup_script.py` finds `<node>/assets/` and copies to the
+        ComfyUI-configured input dir + `/3d`.
+
+    `dst` special-case: a relative str whose first path segment is
+    `input`, `output`, `temp`, or `user` — that segment is resolved via
+    `folder_paths` (the single source of truth ComfyUI itself uses),
+    guaranteeing writer/reader parity on hosts that redirect these
+    paths (Comfy Desktop's inputDir override, `--input-directory`,
+    `extra_model_paths.yaml`, etc.). Examples:
+      - `"input"`                    → folder_paths.get_input_directory()
+      - `"input/cad"`                → get_input_directory() / "cad"
+      - `"user/default/workflows"`   → get_user_directory() / "default/workflows"
+    """
+    caller_dir = None
+    def _resolve_relative(p):
+        nonlocal caller_dir
+        pp = Path(p)
+        if pp.is_absolute():
+            return pp
+        if caller_dir is None:
+            frame_file = sys._getframe(2).f_globals.get("__file__")
+            caller_dir = Path(frame_file).resolve().parent if frame_file else Path.cwd()
+        return caller_dir / pp
+
+    dst_smart = _resolve_dst_via_folder_paths(dst)
+    dst = dst_smart if dst_smart is not None else _resolve_relative(dst)
+    src = _resolve_relative(src)
+
     if not src.exists():
         return 0
     dst.mkdir(parents=True, exist_ok=True)
