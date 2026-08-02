@@ -242,6 +242,7 @@ def _build_node_feature(
     glibc_version: Optional[str],
     log: Callable[[str], None] = print,
     cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    macos_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
 
@@ -303,14 +304,20 @@ def _build_node_feature(
     if pypi_options:
         feat["pypi-options"] = pypi_options
 
-    # System requirements: node-declared wins, else workspace glibc
+    # System requirements: node-declared wins outright; else auto-detect from
+    # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
+    # set on the same platform if applicable.
     sys_reqs = cfg.pixi_passthrough.get("system-requirements")
     if sys_reqs:
         feat["system-requirements"] = copy.deepcopy(sys_reqs)
-    elif glibc_version:
-        feat["system-requirements"] = {
-            "libc": {"family": "glibc", "version": glibc_version},
-        }
+    else:
+        auto_reqs: Dict[str, Any] = {}
+        if glibc_version:
+            auto_reqs["libc"] = {"family": "glibc", "version": glibc_version}
+        if macos_version:
+            auto_reqs["macos"] = macos_version
+        if auto_reqs:
+            feat["system-requirements"] = auto_reqs
 
     feat["activation"] = {"env": {"KMP_DUPLICATE_LIB_OK": "TRUE"}}
     return feat
@@ -441,6 +448,15 @@ def build_workspace_toml(
         glibc_version = libc_version
         log(f"[comfy-env] Host glibc {libc_version} -> system-requirements")
 
+    # Auto-detect torch's macOS wheel floor (see build_env_toml for rationale).
+    macos_version: Optional[str] = None
+    if sys.platform == "darwin":
+        from ..detection.cuda import get_bootstrap_torch_macos_min
+        macos_version = get_bootstrap_torch_macos_min()
+        if macos_version:
+            log(f"[comfy-env] Torch wheel targets macOS {macos_version}+ "
+                f"-> emitting system-requirements macos={macos_version}")
+
     out["feature"] = {}
 
     # Resolve cuda-wheel URLs for each cuda node so pixi installs them as part
@@ -491,6 +507,7 @@ def build_workspace_toml(
             torch_pin=node_torch_pin,
             torch_index=node_torch_index,
             glibc_version=glibc_version,
+            macos_version=macos_version,
             log=log,
         )
 
@@ -621,6 +638,17 @@ def build_env_toml(
     if libc_family == "glibc" and libc_version:
         glibc_version = libc_version
 
+    # Auto-detect torch's macOS wheel floor. pixi defaults osx-arm64 to
+    # macOS 13, but torch 2.12+ only ships macosx_14_0_arm64 wheels — so
+    # without this, pixi solve fails with "no matching platform tag".
+    macos_version: Optional[str] = None
+    if sys.platform == "darwin":
+        from ..detection.cuda import get_bootstrap_torch_macos_min
+        macos_version = get_bootstrap_torch_macos_min()
+        if macos_version:
+            log(f"[comfy-env] Torch wheel targets macOS {macos_version}+ "
+                f"-> emitting system-requirements macos={macos_version}")
+
     # cuda-wheel-only nodes use the override combo; everyone else gets bootstrap.
     cuda_only = [p for p in cfg.cuda_packages if p not in _TORCH_PKGS]
     if cuda_only and chosen_torch_pin and chosen_torch_index:
@@ -640,6 +668,7 @@ def build_env_toml(
         torch_pin=node_torch_pin,
         torch_index=node_torch_index,
         glibc_version=glibc_version,
+        macos_version=macos_version,
         log=log,
     )
 

@@ -49,6 +49,39 @@ def get_bootstrap_torch_version() -> str | None:
         return None
 
 
+def get_bootstrap_torch_macos_min() -> str | None:
+    """Min macOS version the installed torch wheel targets, e.g. '14.0'.
+
+    Reads the wheel's `WHEEL` metadata (`Tag: cp313-cp313-macosx_14_0_arm64`)
+    so we track torch's actual wheel matrix — no hardcoded version→macOS
+    table. Returns None if torch isn't installed or wasn't installed from
+    a macOS wheel (e.g. sdist, or a Linux/Windows wheel on this box).
+
+    Motivation: pixi defaults osx-arm64 to macOS 13, but torch 2.12+ only
+    ships macosx_14_0_arm64 wheels — pixi can't resolve. Emitting
+    `[system-requirements] macos = "14.0"` in the generated pixi.toml
+    lets pixi see the newer wheel.
+    """
+    try:
+        from importlib.metadata import distribution, PackageNotFoundError
+        import re
+        try:
+            wheel_text = distribution("torch").read_text("WHEEL")
+        except PackageNotFoundError:
+            return None
+        if not wheel_text:
+            return None
+        for line in wheel_text.splitlines():
+            if not line.startswith("Tag:"):
+                continue
+            m = re.search(r"macosx_(\d+)_(\d+)_", line)
+            if m:
+                return f"{m.group(1)}.{m.group(2)}"
+    except Exception:
+        pass
+    return None
+
+
 def get_bootstrap_torch_cuda() -> str | None:
     """CUDA version the host torch was built against (e.g. '12.8').
 
