@@ -1188,18 +1188,57 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    # On Desktop app, folder_paths needs user data dir for input/output/models
-    _user_dir = os.environ.get("COMFYUI_USER_DIR")
-    if _user_dir:
+    # Apply the parent process's folder_paths state so this worker's
+    # folder_paths module (a separate import in this subprocess) resolves
+    # input/output/temp/user to the SAME dirs ComfyUI actually uses. The
+    # parent snapshotted them from its own `import folder_paths` before
+    # sending config, so this covers every override mechanism (Comfy
+    # Desktop inputDir, --input-directory, --base-directory,
+    # extra_model_paths.yaml, etc.) without special-casing per host.
+    _fps = config.get("folder_paths_state") or {}
+    if _fps:
         try:
             import folder_paths
-            folder_paths.base_path = _user_dir
-            folder_paths.output_directory = os.path.join(_user_dir, "output")
-            folder_paths.input_directory = os.path.join(_user_dir, "input")
-            folder_paths.user_directory = os.path.join(_user_dir, "user")
-            wlog(f"[worker] folder_paths redirected to {_user_dir}")
+            if _fps.get("base_path"):
+                folder_paths.base_path = _fps["base_path"]
+            if _fps.get("input_directory"):
+                folder_paths.set_input_directory(_fps["input_directory"])
+            if _fps.get("output_directory"):
+                folder_paths.set_output_directory(_fps["output_directory"])
+            if _fps.get("temp_directory"):
+                folder_paths.set_temp_directory(_fps["temp_directory"])
+            if _fps.get("user_directory"):
+                folder_paths.set_user_directory(_fps["user_directory"])
+            # Rebuild folder_names_and_paths — the models search-paths
+            # registry. Extensions were serialized as sorted list; rebuild
+            # as set to match folder_paths' expected shape.
+            _fnap = _fps.get("folder_names_and_paths") or {}
+            if _fnap:
+                folder_paths.folder_names_and_paths = {
+                    k: (list(v[0]), set(v[1]))
+                    for k, v in _fnap.items()
+                    if isinstance(v, (list, tuple)) and len(v) == 2
+                }
+            wlog(f"[worker] folder_paths applied from parent: "
+                 f"input={_fps.get('input_directory')} "
+                 f"output={_fps.get('output_directory')} "
+                 f"model_categories={len(_fnap)}")
         except ImportError:
             pass
+    else:
+        # Legacy fallback: honor COMFYUI_USER_DIR env var for older
+        # invocations that don't pass folder_paths_state in config.
+        _user_dir = os.environ.get("COMFYUI_USER_DIR")
+        if _user_dir:
+            try:
+                import folder_paths
+                folder_paths.base_path = _user_dir
+                folder_paths.output_directory = os.path.join(_user_dir, "output")
+                folder_paths.input_directory = os.path.join(_user_dir, "input")
+                folder_paths.user_directory = os.path.join(_user_dir, "user")
+                wlog(f"[worker] folder_paths redirected to {_user_dir} (legacy env-var path)")
+            except ImportError:
+                pass
 
     # Try to import torch (optional - not all isolated envs need it)
     _HAS_TORCH = False

@@ -436,9 +436,45 @@ class SubprocessWorker(Worker):
 
         self._transport = SocketTransport(client_sock)
 
-        # Send config
+        # Send config to the worker. Include the main process's currently-
+        # resolved folder_paths values so the worker's separate folder_paths
+        # module state matches what ComfyUI's runtime actually uses. Without
+        # this, a worker running (e.g.) CADabra's CAD_Load calls
+        # folder_paths.get_input_directory() and gets the module DEFAULT
+        # (<comfy_root>/input) instead of Comfy Desktop's
+        # `~/ComfyUI-Shared/input` override — files land in the shared dir
+        # but the reader looks in the wrong dir.
+        folder_paths_state = {}
+        try:
+            import folder_paths as _fp
+            # folder_names_and_paths is a dict[str, tuple[list[str], set[str]]]
+            # — the models search-paths registry (e.g. "checkpoints" ->
+            # ([<comfy_root>/models/checkpoints, ~/ComfyUI-Shared/models/
+            # checkpoints], {.ckpt, .safetensors, ...})). Serialize the
+            # tuple values as-is; JSON transport preserves lists but
+            # collapses sets to lists — worker rebuilds the set on apply.
+            _fnap = {}
+            for k, v in getattr(_fp, "folder_names_and_paths", {}).items():
+                try:
+                    paths, exts = v
+                    _fnap[k] = [list(paths), sorted(exts)]
+                except Exception:
+                    continue
+            folder_paths_state = {
+                "base_path":              getattr(_fp, "base_path", None),
+                "input_directory":        _fp.get_input_directory(),
+                "output_directory":       _fp.get_output_directory(),
+                "temp_directory":         _fp.get_temp_directory(),
+                "user_directory":         _fp.get_user_directory(),
+                "folder_names_and_paths": _fnap,
+            }
+        except Exception:
+            # folder_paths not importable in the parent (e.g. running
+            # outside a ComfyUI process). Worker falls back to defaults.
+            pass
         config = {
             "sys_paths": all_sys_path,
+            "folder_paths_state": folder_paths_state,
         }
         self._transport.send(config)
 
