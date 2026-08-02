@@ -49,6 +49,29 @@ def get_bootstrap_torch_version() -> str | None:
         return None
 
 
+def get_bootstrap_torchvision_version() -> str | None:
+    """Torchvision version from installed metadata, or None if not present."""
+    try:
+        from importlib.metadata import version
+        return str(version("torchvision")).split("+", 1)[0]
+    except Exception:
+        return None
+
+
+def get_bootstrap_torchaudio_version() -> str | None:
+    """Torchaudio version from installed metadata, or None if not present.
+
+    torchaudio's release cadence can decouple from torch's (e.g. torch 2.12
+    shipped with no matching torchaudio 2.12; latest is 2.11.x). Reading
+    the bootstrap value directly is the only reliable source.
+    """
+    try:
+        from importlib.metadata import version
+        return str(version("torchaudio")).split("+", 1)[0]
+    except Exception:
+        return None
+
+
 def get_bootstrap_torch_macos_min() -> str | None:
     """Min macOS version the installed torch wheel targets, e.g. '14.0'.
 

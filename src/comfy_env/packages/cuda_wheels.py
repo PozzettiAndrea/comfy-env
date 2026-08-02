@@ -73,10 +73,12 @@ def resolve_fallback_combo(backend: str = "cuda") -> tuple:
     except KeyError:
         raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
 
-# torch.minor -> (torchvision_minor, torchaudio_minor). torchaudio mirrors
-# torch's major.minor exactly; torchvision is `0.(torch_minor + 15)` for the
-# torch-2.x line. Verified against pytorch.org/get-started/previous-versions
-# and torchvision's PyPI release history. Update whenever a new torch lands.
+# torch.minor -> (torchvision_minor, torchaudio_minor). Used as a fallback
+# when the bootstrap venv doesn't have torchvision/torchaudio installed
+# (bare-env cases). For Desktop / any bootstrap that already has the family
+# installed, `derive_family_pins` reads the actual installed versions instead
+# — auto-tracks decouplings like torch 2.12 shipping without a matching
+# torchaudio (latest torchaudio for that torch line is 2.11).
 TORCH_FAMILY_COMPAT: dict = {
     "2.4":  ("0.19", "2.4"),
     "2.5":  ("0.20", "2.5"),
@@ -86,22 +88,43 @@ TORCH_FAMILY_COMPAT: dict = {
     "2.9":  ("0.24", "2.9"),
     "2.10": ("0.25", "2.10"),
     "2.11": ("0.26", "2.11"),
-    "2.12": ("0.27", "2.12"),
+    "2.12": ("0.27", "2.11"),   # torchaudio never shipped 2.12; stuck at 2.11
 }
 
 
 def derive_family_pins(torch_pin: str) -> Optional[tuple]:
     """Given a torch pin like '==2.11.0' or '==2.8.*', return
-    `(torchvision_pin, torchaudio_pin)` derived from `TORCH_FAMILY_COMPAT`,
-    or `None` if torch's minor isn't in the table.
+    `(torchvision_pin, torchaudio_pin)` as `==X.Y.*` specs.
 
-    Returned pins are major.minor `.*` specs (e.g. `'==0.26.*'`, `'==2.11.*'`),
-    so the resolver picks the latest matching patch from the cu-tagged index.
+    Prefers the bootstrap venv's actually-installed versions when torch_pin
+    matches bootstrap torch — auto-tracks releases like the missing
+    torchaudio 2.12 without needing a table update. Falls back to
+    `TORCH_FAMILY_COMPAT` otherwise (bare envs, cuda-wheel-resolver
+    fallback combos that differ from bootstrap, etc).
     """
     m = re.match(r"==\s*(\d+)\.(\d+)", torch_pin)
     if not m:
         return None
     minor_key = f"{m.group(1)}.{m.group(2)}"
+
+    # Bootstrap-derived: authoritative when torch_pin matches bootstrap.
+    try:
+        from ..detection.cuda import (
+            get_bootstrap_torch_version,
+            get_bootstrap_torchvision_version,
+            get_bootstrap_torchaudio_version,
+        )
+        bt_torch = get_bootstrap_torch_version()
+        if bt_torch and bt_torch.startswith(f"{minor_key}."):
+            bt_vision = get_bootstrap_torchvision_version()
+            bt_audio = get_bootstrap_torchaudio_version()
+            if bt_vision and bt_audio:
+                v_mm = ".".join(bt_vision.split(".")[:2])
+                a_mm = ".".join(bt_audio.split(".")[:2])
+                return (f"=={v_mm}.*", f"=={a_mm}.*")
+    except Exception:
+        pass
+
     pair = TORCH_FAMILY_COMPAT.get(minor_key)
     if not pair:
         return None
