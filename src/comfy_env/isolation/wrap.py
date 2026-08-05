@@ -286,7 +286,22 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
     env_name = get_env_name(plugin_dir, config_path)
     env_dir = get_workspace_env_dir(comfyui_dir, env_name)
     if env_dir.exists():
-        return env_dir.resolve() if sys.platform == "win32" else env_dir
+        # Never bind on directory existence alone. The env's worker shares
+        # tensors with this process over torch's PRIVATE multiprocessing ABI
+        # (reduce_storage / rebuild_cuda_tensor) -- there is no version
+        # handshake downstream, so a foreign-stack env fails as DLL-load
+        # chaos (ERROR_PROC_NOT_FOUND on shm.dll) or worse, not as a clean
+        # error. The stamp written at install time is checked here instead.
+        from ..environment.cache import validate_env_stamp
+        ok, reason = validate_env_stamp(env_dir.parent.parent.parent)
+        if not ok:
+            _log(
+                f"[comfy-env] REFUSING env `{env_name}` at {env_dir}: {reason}. "
+                f"Re-run `comfy-env install` from this ComfyUI to materialize "
+                f"one for this stack; falling back to in-process import."
+            )
+        else:
+            return env_dir.resolve() if sys.platform == "win32" else env_dir
 
     # Auto-install gate. Default OFF -- explicit opt-in via env var because
     # a synchronous `pixi install` can block ComfyUI startup for minutes on

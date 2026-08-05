@@ -46,8 +46,21 @@ def main(args: Optional[List[str]] = None) -> int:
     # debug (alias for settings, opens on Debug tab)
     sub.add_parser("debug", help="Toggle debug logging categories")
 
-    # cleanup
-    sub.add_parser("cleanup", help="Remove orphaned environments")
+    # gc (cleanup kept as a deprecated alias)
+    for _name in ("gc", "cleanup"):
+        p_gc = sub.add_parser(
+            _name,
+            help="List and optionally delete environments no installed node references",
+        )
+        p_gc.add_argument(
+            "--delete", action="store_true",
+            help="Actually delete (default is a dry run that only lists)",
+        )
+        p_gc.add_argument(
+            "--comfyui-dir", type=str, default=None,
+            help="ComfyUI base dir whose custom_nodes anchor the referenced set "
+                 "(default: auto-detect from cwd)",
+        )
 
     parsed = parser.parse_args(args)
     if not parsed.command:
@@ -57,7 +70,8 @@ def main(args: Optional[List[str]] = None) -> int:
     commands = {
         "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
         "info": cmd_info, "doctor": cmd_doctor,
-        "settings": cmd_settings, "debug": cmd_debug, "cleanup": cmd_cleanup,
+        "settings": cmd_settings, "debug": cmd_debug,
+        "gc": cmd_gc, "cleanup": cmd_gc,
     }
 
     try:
@@ -571,10 +585,97 @@ def _save_all_settings(tab_items, tab_selected, tab_files,
     print(f"Saved to {', '.join(all_files)}")
 
 
-def cmd_cleanup(args) -> int:
-    print("Cleanup is no longer needed -- envs are stored directly in node dirs.")
-    print("To remove an env, delete the _env_* folder in the node directory.")
+def cmd_gc(args) -> int:
+    """List/delete envs no installed node references.
+
+    Replaces the old `cleanup` stub, which printed advice about a layout
+    (`_env_*` folders in node dirs) that has not existed since v0.4. Envs are
+    6-11 GB each and NOTHING else ever deletes one -- every ABI bump and every
+    rename orphans a full copy, so without this the machine-global root only
+    grows.
+
+    Referenced = for each comfy-env.toml discovered under this install's
+    custom_nodes, the ABI-tagged directory name for the CURRENT stack. Every
+    other directory under <root>/envs is a candidate: other stacks' tags for
+    the same node, pre-tag unqualified dirs, and nodes since uninstalled.
+    NOTE the referenced set is per-install by construction -- on a machine
+    where several ComfyUI installs share the root, run gc from EACH install
+    before trusting --delete, or another install's live env (different ABI
+    tag, so unreferenced from here) will be listed. This is why dry-run is
+    the default.
+    """
+    import shutil
+
+    from .environment.cache import (
+        get_env_name, get_workspace_dir, _env_dir_name,
+    )
+    from .install.workspace import _discover_node_configs
+
+    comfyui_dir = Path(args.comfyui_dir) if args.comfyui_dir else _find_comfyui_dir()
+    envs_root = get_workspace_dir(None) / "envs"
+    if not envs_root.is_dir():
+        print(f"No envs at {envs_root} -- nothing to do.")
+        return 0
+
+    referenced = set()
+    if comfyui_dir and (comfyui_dir / "custom_nodes").is_dir():
+        try:
+            for env_name, _plugin, _cf, _cfg in _discover_node_configs(comfyui_dir):
+                referenced.add(_env_dir_name(env_name))
+        except Exception as e:
+            print(f"WARNING: node discovery failed ({e}); treating ALL envs as "
+                  f"unreferenced would be unsafe -- aborting.", file=sys.stderr)
+            return 1
+    else:
+        print("WARNING: no ComfyUI install found (use --comfyui-dir); every env "
+              "would count as unreferenced. Listing only, refusing --delete.",
+              file=sys.stderr)
+        args.delete = False
+
+    total_mb = 0
+    victims = []
+    for d in sorted(envs_root.iterdir()):
+        if not d.is_dir() or d.name in referenced:
+            continue
+        size_mb = sum(
+            f.stat().st_size for f in d.rglob("*") if f.is_file()
+        ) // (1024 * 1024)
+        total_mb += size_mb
+        victims.append((d, size_mb))
+
+    if not victims:
+        print(f"All {len(referenced)} env(s) under {envs_root} are referenced. "
+              f"Nothing to collect.")
+        return 0
+
+    print(f"Unreferenced env(s) under {envs_root} "
+          f"(referenced by this install: {len(referenced)}):")
+    for d, size_mb in victims:
+        print(f"  {size_mb:>7} MB  {d.name}")
+    print(f"  {total_mb:>7} MB  total")
+
+    if not args.delete:
+        print("\nDry run. Re-run with --delete to remove. If other ComfyUI "
+              "installs share this machine, run gc from each of them first.")
+        return 0
+
+    for d, size_mb in victims:
+        print(f"Deleting {d} ({size_mb} MB)...")
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"Reclaimed ~{total_mb} MB.")
     return 0
+
+
+def _find_comfyui_dir():
+    """Walk up from cwd looking for a ComfyUI base (main.py + custom_nodes)."""
+    cur = Path.cwd()
+    for cand in [cur, *cur.parents]:
+        if (cand / "main.py").is_file() and (cand / "custom_nodes").is_dir():
+            return cand
+        sub = cand / "ComfyUI"
+        if (sub / "main.py").is_file() and (sub / "custom_nodes").is_dir():
+            return sub
+    return None
 
 
 if __name__ == "__main__":

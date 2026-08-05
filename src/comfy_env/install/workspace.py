@@ -164,43 +164,64 @@ def _discover_node_configs(
     return out
 
 
-def _compute_workspace_hash(
-    comfyui_dir: Path,
+def _compute_env_hash(
+    cf: Path,
     discovered: List[Tuple[str, "Path", "Path", "ComfyEnvConfig"]],
 ) -> str:
-    """SHA-256 over the inputs that determine the generated pixi.toml.
+    """SHA-256 over the inputs that determine ONE env's generated pixi.toml.
 
-    Used by `install_workspace` to short-circuit when nothing relevant has
-    changed since the last successful install. Inputs:
+    Used by `install_workspace` to skip regenerate+install for envs whose
+    inputs have not changed since their last successful install. Stored
+    per-env at `<workspace>/envs/<dir>/install.hash`.
+
+    Why per-env and not one workspace-level file: the workspace root is shared
+    machine-wide, and the old single `<workspace>/install.hash` was keyed on
+    *this install's* discovered node set -- so two ComfyUI installs with
+    different node sets could never both be "clean"; each run flipped the file
+    and forced the other to redo its entire pass. Per-env files make the skip
+    decision belong to the thing being skipped.
+
+    Inputs:
       - comfy-env package version (version bumps invalidate)
-      - bytes of every per-node `comfy-env.toml` discovered
+      - bootstrap ABI tag (python/torch/backend -- a different stack must
+        never skip on the strength of another stack's install)
+      - this env's `comfy-env.toml` bytes
+      - the workspace-wide cuda-wheel combo INPUTS: the union of cuda packages
+        and python pins across every discovered node. The tier-1/tier-2 combo
+        decision in `_resolve_wheel_combo` depends on ALL nodes' cuda packages,
+        and its result is baked into every cuda env's manifest -- so installing
+        an unrelated cuda node genuinely changes this env's torch pin, and the
+        hash must notice.
 
-    `comfy-env-root.toml` is intentionally excluded: it drives `node_reqs`
-    (which plugins get cloned) but does not affect any pixi env's solve, so
-    editing it shouldn't force a workspace reinstall. Bootstrap python/torch
-    are also excluded: rare to change; user can force a reinstall by deleting
-    `<workspace>/install.hash`.
+    `comfy-env-root.toml` stays excluded: it drives `node_reqs` (which plugins
+    get cloned) but does not affect any pixi env's solve.
     """
     from .. import __version__ as ce_version
+    from ..environment.cache import _abi_tag
 
     h = hashlib.sha256()
     h.update(b"comfy-env-version:")
     h.update(ce_version.encode())
     h.update(b"\n")
+    h.update(b"abi:")
+    h.update(_abi_tag().encode())
+    h.update(b"\n")
 
-    for _env_name, _plugin_dir, cf, _cfg in sorted(discovered, key=lambda x: str(x[2])):
-        try:
-            rel = cf.relative_to(comfyui_dir)
-        except ValueError:
-            rel = cf
-        h.update(b"toml:")
-        h.update(str(rel).encode())
-        h.update(b"\n")
-        try:
-            h.update(cf.read_bytes())
-        except OSError:
-            pass
-        h.update(b"\n")
+    combo_inputs = sorted(
+        {pkg for _n, _p, _c, cfg in discovered for pkg in cfg.cuda_packages}
+    ) + sorted(
+        {cfg.python or "host" for _n, _p, _c, cfg in discovered}
+    )
+    h.update(b"combo-inputs:")
+    h.update(",".join(combo_inputs).encode())
+    h.update(b"\n")
+
+    h.update(b"toml:")
+    try:
+        h.update(cf.read_bytes())
+    except OSError:
+        pass
+    h.update(b"\n")
 
     return h.hexdigest()
 
@@ -447,7 +468,12 @@ def _resolve_wheel_combo(
                 bootstrap_python,
                 bootstrap_cuda,
                 torch_short,
-                f"=={bootstrap_torch}",
+                # major.minor, matching tier 2 below and the ABI tag in the env
+                # directory name. Pinning the exact patch here made the pin
+                # FINER than the key: installs on 2.10.0 and 2.10.2 share
+                # `...-torch2-10-...` and rewrote each other's manifest on every
+                # alternation. The cuda wheels are stamped `torch2.10` anyway.
+                f"=={torch_short}.*",
                 "bootstrap",
             )
         log(
@@ -542,23 +568,37 @@ def install_workspace(
             f"no longer used"
         )
 
-    # Hash-and-skip: bypass the entire install when nothing relevant has
-    # changed since the last successful run (every per-plugin `install.py`
-    # ends up here, so the same workspace gets reinstalled N times per CI
-    # run otherwise). See `_compute_workspace_hash` for inputs.
-    inputs_hash = _compute_workspace_hash(comfyui_dir, discovered)
-    hash_path = workspace_dir / _INSTALL_HASH_FILE
-    if not dry_run and hash_path.is_file():
-        try:
-            prev = hash_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            prev = ""
-        if prev == inputs_hash:
-            log(
-                f"[comfy-env] Workspace inputs unchanged (hash {inputs_hash[:12]}) "
-                f"-- skipping install. Delete {hash_path} to force."
-            )
-            return workspace_dir
+    # Hash-and-skip, per env: an env whose inputs are unchanged since its last
+    # successful install (hash recorded in ITS OWN directory) is not
+    # regenerated or reinstalled. When every env is clean the whole run
+    # short-circuits before torch/combo resolution, which is what keeps the
+    # N-installs-per-CI-run case cheap. See `_compute_env_hash` for inputs and
+    # for why this is per-env rather than one workspace-level file.
+    env_hashes: Dict[str, str] = {}
+    stale: List[str] = []
+    for env_name, _plugin, cf, _cfg in discovered:
+        env_hashes[env_name] = _compute_env_hash(cf, discovered)
+        env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+        hp = env_manifest_dir / _INSTALL_HASH_FILE
+        prev = ""
+        if hp.is_file():
+            try:
+                prev = hp.read_text(encoding="utf-8").strip()
+            except OSError:
+                prev = ""
+        if prev != env_hashes[env_name]:
+            stale.append(env_name)
+    if not dry_run and not stale:
+        log(
+            f"[comfy-env] All {len(discovered)} env(s) unchanged since last "
+            f"successful install -- skipping. Delete an env's install.hash to force."
+        )
+        return workspace_dir
+    if stale and len(stale) < len(discovered):
+        log(
+            f"[comfy-env] {len(stale)}/{len(discovered)} env(s) need install: "
+            f"{', '.join(stale)} (others unchanged, will be skipped)"
+        )
 
     log_path = workspace_dir / "install.log"
     tee_log = _make_tee_log(log, log_path)
@@ -586,8 +626,14 @@ def install_workspace(
         combo = _resolve_wheel_combo(
             discovered, bootstrap_python, cuda_version, bootstrap_torch, log,
         )
+        # major.minor, not the exact patch -- must match the granularity of the
+        # ABI tag that names the env directory (see environment/cache.py
+        # _abi_tag). A finer pin than the key means two installs collide on one
+        # directory and re-solve each other; a coarser pin than the key would
+        # mean an env could silently satisfy a stack it was not built for.
         torch_pin: Optional[str] = (
-            f"=={bootstrap_torch}" if bootstrap_torch else None
+            "==" + ".".join(bootstrap_torch.split(".")[:2]) + ".*"
+            if bootstrap_torch else None
         )
         chosen_torch_index: Optional[str] = None
         chosen_torch_pin_for_override: Optional[str] = None
@@ -611,10 +657,17 @@ def install_workspace(
         if source_dir and source_dir != comfyui_dir:
             log(f"[comfy-env] Desktop app detected: source={source_dir}, data={comfyui_dir}")
 
-        # Emit one pixi.toml per env under <workspace>/envs/<env_name>/.
-        log(f"[comfy-env] Writing {len(discovered)} per-env manifest(s):")
+        # Emit one pixi.toml per STALE env under <workspace>/envs/<env_name>/.
+        # Clean envs keep their manifest untouched -- regenerating it would be
+        # harmless for byte-identical output but rewrites mtimes and, worse,
+        # would clobber another install's manifest when this install's inputs
+        # differ (the exact last-writer-wins thrash per-env hashing exists to
+        # stop).
+        _stale_set = set(stale)
+        to_install = [d for d in discovered if d[0] in _stale_set]
+        log(f"[comfy-env] Writing {len(to_install)} per-env manifest(s):")
         cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
-        for env_name, _plugin, _cf, cfg in discovered:
+        for env_name, _plugin, _cf, cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
             write_env_pixi_toml(
                 env_manifest_dir=env_manifest_dir,
@@ -656,11 +709,11 @@ def install_workspace(
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
         pixi_env["PIXI_NO_PROGRESS"] = "true"
 
-        # Install each env independently. One failure doesn't stop the others
-        # by default (we collect and raise at the end), so users see all
+        # Install each stale env independently. One failure doesn't stop the
+        # others by default (we collect and raise at the end), so users see all
         # diagnostics from one run instead of having to re-trigger after each fix.
-        log(f"[comfy-env] Installing {len(discovered)} environment(s):")
-        for env_name, _plugin, _cf, cfg in discovered:
+        log(f"[comfy-env] Installing {len(to_install)} environment(s):")
+        for env_name, _plugin, _cf, cfg in to_install:
             py = cfg.python or "host"
             deps = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys())
             cuda = cfg.cuda_packages
@@ -672,7 +725,7 @@ def install_workspace(
             log(f"  - {env_name} ({', '.join(parts)})")
 
         install_failures: List[str] = []
-        for env_name, _plugin, _cf, _cfg in discovered:
+        for env_name, _plugin, _cf, _cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
             env_manifest = env_manifest_dir / "pixi.toml"
             log(f"[comfy-env] Running `pixi install --manifest-path {env_manifest}` ...")
@@ -699,7 +752,13 @@ def install_workspace(
         # `comfy-env.toml` may be transiently missing (mid-clone, partial checkout).
         new_envs_root = workspace_dir / "envs"
         if new_envs_root.is_dir():
-            current_names = {env_name for env_name, _, _, _ in discovered}
+            # Compare DIRECTORY names, not logical env names: directories carry
+            # the ABI tag (`<name>-py313-torch2-10-cu128`), so matching the bare
+            # name here would report every live env as orphaned.
+            from ..environment.cache import _env_dir_name
+            current_names = {
+                _env_dir_name(env_name) for env_name, _, _, _ in discovered
+            }
             for d in sorted(new_envs_root.iterdir()):
                 if not d.is_dir() or d.name in current_names:
                     continue
@@ -743,16 +802,44 @@ def install_workspace(
                     )
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
-        _dedupe_envs_libomp(workspace_dir, discovered, log)
+        _dedupe_envs_libomp(workspace_dir, to_install, log)
 
-        # Record the inputs hash so subsequent runs with the same inputs
-        # short-circuit. Only written after pixi install + post-steps all
-        # succeed -- a failed install leaves no hash and forces a retry.
+        # Stamp each freshly-built env with what it was built from/against.
+        # `_find_env_dir` validates this at bind time: today an env is trusted
+        # because its directory exists, which is how a foreign-stack env gets
+        # silently loaded into torch's private multiprocessing ABI with no
+        # handshake anywhere downstream (see _ipc_parent.py). The stamp turns
+        # that into a loud mismatch instead.
+        from ..environment.cache import write_env_stamp
+        for env_name, _plugin, cf, _cfg in to_install:
+            write_env_stamp(
+                get_env_manifest_dir(env_name, comfyui_dir),
+                torch_pin=(chosen_torch_pin_for_override
+                           if (combo is not None and _cfg.cuda_packages)
+                           else torch_pin),
+                provenance="install_workspace",
+                log=log,
+            )
+
+        # Record each env's inputs hash IN ITS OWN DIRECTORY so subsequent runs
+        # skip it individually. Only written after pixi install + post-steps all
+        # succeed -- a failed install leaves no hash and forces a retry. The old
+        # workspace-level install.hash is removed if present: leaving it would
+        # let a pre-split comfy-env skip installs this version performed.
+        for env_name, _plugin, cf, _cfg in to_install:
+            hp = get_env_manifest_dir(env_name, comfyui_dir) / _INSTALL_HASH_FILE
+            try:
+                hp.write_text(env_hashes[env_name] + "\n", encoding="utf-8")
+                log(f"[comfy-env] Recorded install hash {env_hashes[env_name][:12]} -> {hp}")
+            except OSError as e:
+                log(f"[comfy-env] WARNING: could not write {hp}: {e}")
         try:
-            hash_path.write_text(inputs_hash + "\n", encoding="utf-8")
-            log(f"[comfy-env] Recorded install hash {inputs_hash[:12]} -> {hash_path}")
-        except OSError as e:
-            log(f"[comfy-env] WARNING: could not write {hash_path}: {e}")
+            legacy_hash = workspace_dir / _INSTALL_HASH_FILE
+            if legacy_hash.is_file():
+                legacy_hash.unlink()
+                log(f"[comfy-env] Removed legacy workspace-level {legacy_hash}")
+        except OSError:
+            pass
 
         log(f"[comfy-env] Install log: {log_path}")
         return workspace_dir

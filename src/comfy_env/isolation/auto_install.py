@@ -197,6 +197,13 @@ def ensure_env_materialized(
             ok = _run_pixi_install(env_manifest_dir, env_manifest, log)
             if not ok:
                 return None
+            # Stamp with provenance=auto_install: this path deliberately skips
+            # the workspace-wide cuda-wheel combo and pins to bootstrap torch
+            # only, so the same directory means something different depending
+            # on who built it. The stamp records which one this is.
+            from ..environment.cache import write_env_stamp
+            write_env_stamp(env_manifest_dir, torch_pin=None,
+                            provenance="auto_install", log=log)
             log(f"[comfy-env] `{env_name}` materialized.")
     except RuntimeError as e:
         log(f"[comfy-env] auto-install of `{env_name}` aborted: {e}")

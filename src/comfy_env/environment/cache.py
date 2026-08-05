@@ -45,6 +45,119 @@ def _sanitize_pixi_name(s: str) -> str:
     return re.sub(r"-+", "-", s).strip("-")
 
 
+def _windows_local_appdata() -> Path:
+    """Real user's LOCALAPPDATA, never the systemprofile one.
+
+    Same hazard `_candidate_config_dirs` already guards against, but it only
+    guarded ComfyUI Desktop config discovery -- the workspace root read
+    LOCALAPPDATA raw. Under a SYSTEM/service/scheduled-task shell that resolves
+    to C:\\Windows\\System32\\config\\systemprofile\\AppData\\Local, so a whole
+    SECOND machine-global store gets built there. That defeats the entire point
+    of this root, which exists so installs SHARE one multi-GB materialized env
+    (see module docstring); two roots share nothing.
+
+    Observed on this box: USERNAME=ANDREW-PC$ (a machine account),
+    LOCALAPPDATA under systemprofile, while USERPROFILE=C:\\Users\\andrew was
+    correct -- hence the USERPROFILE fallback before the C:\\Users\\* glob.
+    """
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local and "systemprofile" not in local.lower():
+        return Path(local)
+
+    userprofile = os.environ.get("USERPROFILE", "")
+    if userprofile and "systemprofile" not in userprofile.lower():
+        return Path(userprofile) / "AppData" / "Local"
+
+    username = os.environ.get("USERNAME", "")
+    # Reject SYSTEM and machine accounts (trailing '$'), which have no profile
+    # of their own. _candidate_config_dirs does not cover the '$' case.
+    if username and username.upper() != "SYSTEM" and not username.endswith("$"):
+        return Path("C:/Users") / username / "AppData" / "Local"
+
+    try:
+        from glob import glob as _glob
+        skip = ("default", "default user", "public", "all users")
+        for p in _glob(r"C:\Users\*\AppData\Local"):
+            parts = Path(p).parts
+            if len(parts) > 2 and parts[2].lower() in skip:
+                continue
+            return Path(p)
+    except Exception:
+        pass
+
+    # Nothing usable: fall back to the raw value rather than inventing a path,
+    # so the failure is visible in the announced workspace line.
+    return Path(local) if local else Path.home() / "AppData" / "Local"
+
+
+_ABI_TAG = None
+
+
+def _abi_tag():
+    """ABI identity of the bootstrap interpreter, e.g. ``py313-torch2.10-cu128``.
+
+    The workspace root is shared machine-wide and envs were keyed on the node
+    name ALONE, but a materialized env is not interchangeable across stacks:
+    its manifest pins ``python = "3.13.*"`` and ``torch == "2.10.0"`` from
+    whichever ComfyUI happened to run the install, and its cuda-only wheels are
+    stamped with the same (``cumesh-0.0.1+cu128torch2.10``).
+
+    So two ComfyUI installs on different stacks both resolved to
+    ``envs/<node>/`` and either
+
+      * thrashed -- the second install regenerated the shared pixi.toml from
+        its own bootstrap and re-materialized the whole multi-GB env, and
+        switching back did it again; or
+      * silently loaded extensions built for the other stack's torch, which is
+        undefined behaviour (see the WinError 127 note in isolation/metadata.py).
+
+    Putting the ABI in the directory name keeps the sharing this root exists
+    for -- two installs on the SAME stack still share one env -- while making
+    incompatible reuse structurally impossible.
+    """
+    global _ABI_TAG
+    if _ABI_TAG is not None:
+        return _ABI_TAG
+
+    from ..detection.backend import detect_backend
+    from ..detection.cuda import (
+        get_bootstrap_python_version,
+        get_bootstrap_torch_version,
+    )
+
+    py = get_bootstrap_python_version() or "unknown"
+    parts = ["py" + py.replace(".", "")]
+
+    torch_v = get_bootstrap_torch_version()
+    if torch_v:
+        # major.minor only: torch patch releases do not break the C++ ABI, and
+        # keying on them would rebuild multi-GB envs for nothing.
+        parts.append("torch" + ".".join(torch_v.split(".")[:2]))
+        backend, ver = detect_backend()
+        if backend == "cuda" and ver:
+            parts.append("cu" + ver.replace(".", ""))
+        elif backend == "rocm" and ver:
+            parts.append("rocm" + ver.replace(".", ""))
+        else:
+            parts.append(backend)
+    else:
+        # No torch in the bootstrap: the comfyui feature stays torch-less, so
+        # there is no ABI to pin beyond the interpreter.
+        parts.append("notorch")
+
+    _ABI_TAG = _sanitize_pixi_name("-".join(parts))
+    return _ABI_TAG
+
+
+def _env_dir_name(env_name: str) -> str:
+    """On-disk directory for a logical env name, ABI-qualified.
+
+    ``env_name`` stays the logical identity (manifests, logs, config lookup);
+    only the directory carries the ABI tag.
+    """
+    return f"{env_name}-{_abi_tag()}"
+
+
 def _short_global_root():
     """Resolve workspace root. Defaults to %LOCALAPPDATA%\\Programs\\comfy-env
     on Windows (sits next to the ComfyUI Desktop install at
@@ -58,8 +171,7 @@ def _short_global_root():
     if override:
         root = Path(override)
     elif sys.platform == "win32":
-        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-        root = base / "Programs" / "comfy-env"
+        root = _windows_local_appdata() / "Programs" / "comfy-env"
     else:
         root = Path.home() / ".ce"
 
@@ -124,18 +236,44 @@ def get_workspace_dir(comfyui_dir=None):
     return _short_global_root()
 
 
+_ORPHAN_WARNED = set()
+
+
+def _warn_if_orphaned(envs_root: Path, env_name: str, target: Path):
+    """One-shot notice when an ABI-unqualified env from before this change exists.
+
+    Without it the only symptom of the rename is a multi-GB re-materialization
+    with no explanation.
+    """
+    if env_name in _ORPHAN_WARNED:
+        return
+    _ORPHAN_WARNED.add(env_name)
+    legacy = envs_root / env_name
+    if legacy.is_dir() and not target.is_dir():
+        print(
+            f"[comfy-env] Env '{env_name}' exists unqualified at {legacy} but is "
+            f"not ABI-tagged; it was built for an unknown python/torch/backend "
+            f"and cannot be trusted for this stack ({_abi_tag()}). Materializing "
+            f"{target.name} instead -- delete the old dir once you are happy.",
+            file=sys.stderr, flush=True,
+        )
+
+
 def get_env_manifest_dir(env_name: str, comfyui_dir=None) -> Path:
     """Directory containing one env's `pixi.toml` (new per-env layout).
 
-    `<workspace>/envs/<env_name>/`
+    `<workspace>/envs/<env_name>-<abi_tag>/`
     """
-    return get_workspace_dir(comfyui_dir) / "envs" / env_name
+    envs_root = get_workspace_dir(comfyui_dir) / "envs"
+    target = envs_root / _env_dir_name(env_name)
+    _warn_if_orphaned(envs_root, env_name, target)
+    return target
 
 
 def get_env_manifest_path(env_name: str, comfyui_dir=None) -> Path:
     """Path to one env's `pixi.toml` (new per-env layout).
 
-    `<workspace>/envs/<env_name>/pixi.toml`
+    `<workspace>/envs/<env_name>-<abi_tag>/pixi.toml`
     """
     return get_env_manifest_dir(env_name, comfyui_dir) / "pixi.toml"
 
@@ -158,10 +296,84 @@ def resolve_pixi_manifest(env_root: Path) -> tuple[Path, str]:
 def get_workspace_env_dir(comfyui_dir, env_name):
     """Path to one environment's materialized site-packages root.
 
-    Always ``<workspace>/envs/<env_name>/.pixi/envs/default/`` -- the v0.4+
-    per-env layout. No legacy fallback.
+    Always ``<workspace>/envs/<env_name>-<abi_tag>/.pixi/envs/default/``.
+    The ABI tag is what stops two ComfyUI installs on different
+    python/torch/backend stacks from sharing an env that only one of them can
+    actually load -- see _abi_tag(). No legacy fallback.
     """
-    return get_workspace_dir(comfyui_dir) / "envs" / env_name / ".pixi" / "envs" / "default"
+    return get_env_manifest_dir(env_name, comfyui_dir) / ".pixi" / "envs" / "default"
+
+
+_STAMP_FILE = "env.stamp.json"
+
+
+def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown", log=None):
+    """Record what an env was built from and against, next to its manifest.
+
+    Written only after a successful install. `validate_env_stamp` checks it at
+    bind time -- without this, an env is trusted purely because its directory
+    exists, and a foreign-stack env gets loaded into torch's private
+    multiprocessing ABI (reduce_storage/rebuild_cuda_tensor) which has no
+    version handshake of its own.
+    """
+    import hashlib as _hashlib
+    import json as _json
+
+    from .. import __version__ as ce_version
+
+    env_manifest_dir = Path(env_manifest_dir)
+    lock = env_manifest_dir / "pixi.lock"
+    lock_sha = None
+    try:
+        if lock.is_file():
+            lock_sha = _hashlib.sha256(lock.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    stamp = {
+        "comfy_env_version": ce_version,
+        "abi_tag": _abi_tag(),
+        "torch_pin": torch_pin,
+        "provenance": provenance,
+        "pixi_lock_sha256": lock_sha,
+    }
+    try:
+        (env_manifest_dir / _STAMP_FILE).write_text(
+            _json.dumps(stamp, indent=2) + "\n", encoding="utf-8")
+        if log:
+            log(f"[comfy-env] Stamped {env_manifest_dir.name}: "
+                f"abi={stamp['abi_tag']} torch={torch_pin} ({provenance})")
+    except OSError as e:
+        if log:
+            log(f"[comfy-env] WARNING: could not write env stamp: {e}")
+
+
+def validate_env_stamp(env_manifest_dir):
+    """Check a materialized env's stamp against the current stack.
+
+    Returns (ok, reason). Unstamped envs pass with a note -- they predate
+    stamping, and hard-failing them would orphan every existing env (the
+    don't-break-userspace case). A PRESENT stamp that disagrees on the ABI tag
+    fails: that env was demonstrably built for a different stack, and binding
+    to it is the silent-mismatch bug.
+    """
+    import json as _json
+
+    p = Path(env_manifest_dir) / _STAMP_FILE
+    if not p.is_file():
+        return True, "unstamped (pre-stamping env; not verified)"
+    try:
+        stamp = _json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return True, f"stamp unreadable ({e}); not verified"
+    want = _abi_tag()
+    got = stamp.get("abi_tag")
+    if got and got != want:
+        return False, (
+            f"built for abi={got}, current stack is abi={want} "
+            f"(provenance={stamp.get('provenance')}, "
+            f"torch_pin={stamp.get('torch_pin')})"
+        )
+    return True, f"abi={got} verified"
 
 
 def _candidate_config_dirs():
