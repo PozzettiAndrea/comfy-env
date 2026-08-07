@@ -1784,7 +1784,7 @@ def main():
 
             try:
                 import torch as _torch_worker
-                _infer_mode = _torch_worker.inference_mode
+                _infer_mode = _torch_worker.no_grad  # alix: torch.inference_mode() breaks models with nn.Parameter buffers (PyTorch #90882)
             except ImportError:
                 import contextlib as _contextlib_worker
                 _infer_mode = _contextlib_worker.nullcontext
