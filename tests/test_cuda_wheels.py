@@ -55,4 +55,6 @@ def test_find_matching_wheel_picks_highest_version_numerically(monkeypatch):
 def test_version_key_ordering():
     assert cw._version_key("1.10") > cw._version_key("1.9")
     assert cw._version_key("0.0.1") < cw._version_key("1.0")
-    assert cw._version_key("2.0") > cw._version_key("2.0rc1") or True  # no crash on suffixes
+    # Pre-release suffixes sort under the release, PEP-440-like.
+    assert cw._version_key("2.0rc1") < cw._version_key("2.0")
+    assert cw._version_key("2.0") < cw._version_key("2.0.1")

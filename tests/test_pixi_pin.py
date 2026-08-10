@@ -11,10 +11,12 @@ import comfy_env.packages.pixi as px
 
 
 def test_version_is_pinned_not_latest():
+    # Positive assertions only (a negative source-grep false-positived on
+    # docstrings twice): the download URL is built from the pinned version.
     assert px.PIXI_VERSION != "latest"
-    # No URL in the module may reference releases/latest anymore.
     import inspect
-    assert "releases/latest" not in inspect.getsource(px)
+    src = inspect.getsource(px.ensure_pixi)
+    assert "releases/download/" in src and "v{PIXI_VERSION}" in src
 
 
 def test_all_platforms_have_vendored_hashes():

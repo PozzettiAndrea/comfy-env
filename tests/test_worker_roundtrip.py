@@ -66,14 +66,10 @@ def test_timeout_kills_worker(worker):
         worker.call_module(module="echo_node", func="slow", seconds=60, timeout=3)
 
 
-def test_faulthandler_filename_agreement():
-    # Parent diagnostic and worker dump must name the same file. They drifted
-    # once (.log vs .txt) and crash dumps were silently never surfaced.
-    assert _ipc_shared.WORKER_FAULTHANDLER_BASENAME in _PERSISTENT_WORKER_SCRIPT
-
-
-def test_retention_window_agreement():
-    # Parent and worker must hold shared tensors for the same window; an
-    # asymmetric worker window can free memory the parent hasn't mapped yet.
-    needle = f"retention_seconds={_ipc_shared.TENSOR_KEEPER_TTL}"
-    assert _PERSISTENT_WORKER_SCRIPT.count(needle) >= 2  # TensorKeeper + ShmKeeper
+def test_worker_imports_shared_constants():
+    # The worker takes the faulthandler filename and retention windows FROM
+    # _ipc_shared (single source of truth) -- the hand-synced literals that
+    # once drifted (.log vs .txt; 30s vs 60s) are structurally gone.
+    assert "import _ipc_shared" in _PERSISTENT_WORKER_SCRIPT
+    assert "_ipc_shared.WORKER_FAULTHANDLER_BASENAME" in _PERSISTENT_WORKER_SCRIPT
+    assert "_ipc_shared.TENSOR_KEEPER_TTL" in _PERSISTENT_WORKER_SCRIPT

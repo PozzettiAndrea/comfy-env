@@ -35,10 +35,9 @@ CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT = 5
 # they drifted once (.log vs .txt) and crash dumps were silently never found.
 WORKER_FAULTHANDLER_BASENAME = "comfy_worker_faulthandler.log"
 
-# Timing constants
-# NOTE: the worker (_persistent_worker.py) cannot rely on importing this
-# module at its very top (the faulthandler hook runs before imports), so it
-# repeats these literals -- keep them in sync with the values here.
+# Timing constants (single source of truth -- the worker imports this
+# module at its top; its own directory is sys.path[0], and the file is
+# always copied alongside by SubprocessWorker)
 TENSOR_KEEPER_TTL = 60.0        # seconds to hold shared tensors before GC
 WATCHDOG_INTERVAL = 60          # seconds between watchdog thread dumps
 VRAM_POLL_THRESHOLD = 200 * 1024 * 1024  # 200MB change triggers log

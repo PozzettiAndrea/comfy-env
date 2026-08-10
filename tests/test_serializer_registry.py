@@ -59,6 +59,10 @@ def test_unknown_type_is_opaque_and_survives_roundtrip(worker):
 
 
 def test_stale_call_id_frames_are_dropped():
+    # Deliberate exception to the no-internal-mocks rule: a stale-frame race
+    # cannot be triggered deterministically through a real socket. If
+    # SocketTransport's recv/send semantics change, update this fake to
+    # match -- it is the one place in the suite that can drift.
     class FakeTransport:
         def __init__(self, frames):
             self.frames = list(frames)

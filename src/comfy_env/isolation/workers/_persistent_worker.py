@@ -14,9 +14,15 @@ from types import SimpleNamespace
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
+# _ipc_shared.py is always copied next to this script by SubprocessWorker,
+# and the script's own directory is sys.path[0] -- so shared constants are
+# importable even this early. One source of truth; no hand-synced literals.
+import _ipc_shared
+
 # Also dump to a file so we can see segfaults even if stderr is lost
 import tempfile as _fh_tempfile
-_faulthandler_log = os.path.join(_fh_tempfile.gettempdir(), "comfy_worker_faulthandler.log")
+_faulthandler_log = os.path.join(
+    _fh_tempfile.gettempdir(), _ipc_shared.WORKER_FAULTHANDLER_BASENAME)
 try:
     _fh_file = open(_faulthandler_log, "a")
     faulthandler.enable(file=_fh_file, all_threads=True)
@@ -215,7 +221,7 @@ class TensorKeeper:
     its references for the same window; an asymmetric (shorter) worker window
     lets the worker free memory the parent may not have mapped yet.
     """
-    def __init__(self, retention_seconds=60.0):
+    def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()
@@ -720,7 +726,7 @@ class ShmKeeper:
 
     Default matches TENSOR_KEEPER_TTL in _ipc_shared.py (see TensorKeeper).
     """
-    def __init__(self, retention_seconds=60.0):
+    def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()

@@ -342,15 +342,16 @@ def find_available_wheels(package: str) -> List[str]:
 
 def _version_key(version: str):
     """Sortable key for wheel version strings: numeric segments compare as
-    numbers, so '1.10' > '1.9' and '0.0.1' < '1.0' (plain string comparison
-    gets both wrong)."""
+    numbers ('1.10' > '1.9', '0.0.1' < '1.0' -- string comparison gets both
+    wrong) and non-numeric segments sort BELOW numeric ones, so pre-release
+    suffixes order under the release ('2.0rc1' < '2.0', PEP-440-like)."""
     main = version.split("+", 1)[0]
     key = []
     for piece in re.split(r"[._-]", main):
         if piece.isdigit():
-            key.append((0, int(piece), ""))
+            key.append((1, int(piece), ""))
         else:
-            key.append((1, 0, piece))
+            key.append((0, 0, piece))
     return key
 
 
