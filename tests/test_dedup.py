@@ -81,7 +81,11 @@ def test_workers_share_torch_code_pages():
 
         shared = []
         for pid in pids:
-            mi = psutil.Process(pid).memory_full_info()
+            try:
+                mi = psutil.Process(pid).memory_full_info()
+            except psutil.AccessDenied:
+                pytest.skip("OS denies process memory introspection "
+                            "(macOS task_for_pid) -- cannot measure sharing here")
             assert mi.uss < mi.rss, "uss >= rss: measurement is broken"
             shared.append(mi.rss - mi.uss)
         # Both workers map the same torch binaries -> tens of MB of shared
