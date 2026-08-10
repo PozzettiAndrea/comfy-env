@@ -23,9 +23,16 @@ def test_all_platforms_have_vendored_hashes():
         assert asset.endswith((".tar.gz", ".zip")), key
 
 
+def test_owned_path_is_version_keyed_and_not_user_pixi():
+    # Version-keyed comfy-env-owned dir: bumping PIXI_VERSION re-provisions;
+    # the user's own ~/.pixi install is never touched.
+    assert px.PIXI_VERSION in px.PIXI
+    assert ".pixi" not in px.PIXI.replace(".pixi.exe", "")
+    assert ".comfy-env" in px.PIXI
+
+
 def test_checksum_mismatch_refuses_install(monkeypatch, tmp_path):
     monkeypatch.setattr(px, "PIXI", str(tmp_path / "bin" / "pixi"))
-    monkeypatch.setattr(px, "_VERSION_MARKER", tmp_path / "bin" / "marker")
 
     class FakeResp(io.BytesIO):
         def __enter__(self):
@@ -60,7 +67,6 @@ def test_good_checksum_installs_and_marks(monkeypatch, tmp_path):
 
     dest = tmp_path / "bin" / ("pixi.exe" if px.sys.platform == "win32" else "pixi")
     monkeypatch.setattr(px, "PIXI", str(dest))
-    monkeypatch.setattr(px, "_VERSION_MARKER", tmp_path / "bin" / "marker")
     key = (px.platform.system(), px.platform.machine())
     monkeypatch.setitem(px._ASSETS, key, (asset_name, hashlib.sha256(data).hexdigest()))
 
@@ -76,7 +82,6 @@ def test_good_checksum_installs_and_marks(monkeypatch, tmp_path):
 
     assert px.ensure_pixi() == str(dest)
     assert dest.read_bytes() == payload
-    assert (tmp_path / "bin" / "marker").read_text().strip() == px.PIXI_VERSION
     # Second call short-circuits (no download): break urlopen to prove it.
     monkeypatch.setattr(px.urllib.request, "urlopen",
                         lambda url, context=None: (_ for _ in ()).throw(AssertionError("downloaded again")))

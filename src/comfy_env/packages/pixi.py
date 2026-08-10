@@ -1,10 +1,12 @@
-"""Pixi binary management: pinned version, checksum-verified, cached.
+"""Pixi binary management: pinned version, checksum-verified, comfy-env-owned.
 
-The binary is downloaded as the official release ARCHIVE for the pinned
-version and verified against a sha256 vendored here (from the release's
-sha256.sum) -- never a floating latest tag, never unverified. A version marker
-next to the binary makes upgrades explicit: bumping PIXI_VERSION (plus
-hashes) triggers a re-download on every machine; nothing else does.
+The pinned pixi lives in a comfy-env-owned, VERSION-KEYED directory
+(~/.comfy-env/pixi/<version>/). The path existing IS the version check --
+no marker files -- and bumping PIXI_VERSION (plus hashes) provisions the
+new version on every machine without ever touching a user's own pixi
+install at ~/.pixi. The download is the official release archive for the
+pinned version, verified against a sha256 vendored here from the release's
+sha256.sum; a checksum mismatch refuses to install.
 """
 
 import hashlib
@@ -22,9 +24,10 @@ from pathlib import Path
 PIXI_VERSION = "0.75.0"
 
 _name = "pixi.exe" if sys.platform == "win32" else "pixi"
-PIXI_HOME = Path.home() / ".pixi"
-PIXI = str(PIXI_HOME / "bin" / _name)
-_VERSION_MARKER = PIXI_HOME / "bin" / "pixi.comfy-env-version"
+# comfy-env-owned install root -- deliberately NOT ~/.pixi, which belongs
+# to the user's own pixi installation and must never be clobbered.
+PIXI_HOME = Path.home() / ".comfy-env" / "pixi" / PIXI_VERSION
+PIXI = str(PIXI_HOME / _name)
 
 # (asset archive name, sha256) per platform -- hashes from the official
 # sha256.sum of the pinned release. The bare binaries are not individually
@@ -61,28 +64,12 @@ def _extract_binary(asset_name: str, data: bytes) -> bytes:
         return f.read()
 
 
-def _installed_version_ok() -> bool:
-    """True iff the installed binary is the pinned version.
-
-    A binary without a marker predates pinning (unknown version, downloaded
-    unverified from the floating latest endpoint) -- it gets replaced by the
-    pinned, verified one exactly once; after that the marker short-circuits.
-    """
-    if not Path(PIXI).exists():
-        return False
-    try:
-        return _VERSION_MARKER.read_text(encoding="utf-8").strip() == PIXI_VERSION
-    except OSError:
-        return False
-
-
 def ensure_pixi():
-    """Ensure the pinned pixi version is installed at ~/.pixi/bin/pixi.
-
-    Downloads the pinned release archive, verifies its vendored sha256, and
-    extracts the binary. Raises RuntimeError on checksum mismatch.
+    """Ensure the pinned pixi version is installed at the comfy-env-owned
+    path. Downloads the pinned release archive, verifies its vendored
+    sha256, extracts the binary. Raises RuntimeError on checksum mismatch.
     """
-    if _installed_version_ok():
+    if Path(PIXI).exists():
         return PIXI
 
     key = (platform.system(), platform.machine())
@@ -119,7 +106,6 @@ def ensure_pixi():
     if sys.platform != "win32":
         tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     os.replace(tmp, dest)
-    _VERSION_MARKER.write_text(PIXI_VERSION + "\n", encoding="utf-8")
 
     print(f"[comfy-env] pixi {PIXI_VERSION} installed: {PIXI}", file=sys.stderr, flush=True)
     return PIXI
