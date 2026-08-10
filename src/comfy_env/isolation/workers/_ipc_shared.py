@@ -30,7 +30,14 @@ CUDA_MEM_LOCATION_TYPE_DEVICE = 1
 CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 3
 CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT = 5
 
-# Timing constants
+# Worker faulthandler dump file (basename under tempdir). The worker writes
+# it; the parent's crash diagnostic reads it. MUST match on both sides --
+# they drifted once (.log vs .txt) and crash dumps were silently never found.
+WORKER_FAULTHANDLER_BASENAME = "comfy_worker_faulthandler.log"
+
+# Timing constants (single source of truth -- the worker imports this
+# module at its top; its own directory is sys.path[0], and the file is
+# always copied alongside by SubprocessWorker)
 TENSOR_KEEPER_TTL = 60.0        # seconds to hold shared tensors before GC
 WATCHDOG_INTERVAL = 60          # seconds between watchdog thread dumps
 VRAM_POLL_THRESHOLD = 200 * 1024 * 1024  # 200MB change triggers log
@@ -312,6 +319,141 @@ def _evict_cache_if_needed(cache_dict):
 
 
 # =============================================================================
+# Serializer registry (custom data types)
+# =============================================================================
+#
+# Node packs can teach the transport about their own types. Both sides of the
+# process boundary carry THIS module (the parent imports it from comfy_env;
+# the worker imports the copy placed next to it), so a serializer module
+# imported on both sides registers identical rules by construction.
+#
+# A serializer module is declared in comfy-env.toml:
+#
+#     [serializers]
+#     modules = ["mypack.ipc_types"]
+#
+# and looks like:
+#
+#     try:  # parent process
+#         from comfy_env.isolation.workers import _ipc_shared as ipc
+#     except ImportError:  # worker process (module copied next to the worker)
+#         import _ipc_shared as ipc
+#
+#     def _ser(obj, recurse):
+#         return {"verts": recurse(obj.vertices), "id": obj.id}
+#
+#     def _deser(payload, recurse):
+#         return MyMesh(recurse(payload["verts"]), payload["id"])
+#
+#     ipc.register_serializer("MyMesh", _ser, _deser)
+#
+# `recurse` routes nested values through the normal transport, so tensors
+# inside a custom payload keep their zero-copy paths.
+#
+# If the RECEIVING side has no deserializer for a tag (typical for the parent,
+# whose env deliberately lacks the pack's classes), the value arrives as an
+# OpaquePayload -- an inert container that re-serializes back to the identical
+# wire form. Custom objects therefore survive worker -> parent -> worker
+# round trips without the parent understanding them.
+
+
+class SerializerRegistry:
+    """Per-process registry: type name -> (tag, serialize); tag -> deserialize."""
+
+    def __init__(self):
+        self._by_type = {}    # type __name__ -> (tag, serialize_fn)
+        self._by_tag = {}     # tag -> deserialize_fn
+
+    def register(self, type_name, serialize, deserialize=None, tag=None):
+        tag = tag or type_name
+        self._by_type[type_name] = (tag, serialize)
+        if deserialize is not None:
+            self._by_tag[tag] = deserialize
+
+    def lookup_serializer(self, obj):
+        """Match by exact class name, then by MRO (base class names)."""
+        entry = self._by_type.get(type(obj).__name__)
+        if entry is not None:
+            return entry
+        for base in type(obj).__mro__[1:-1]:  # skip cls itself and object
+            entry = self._by_type.get(base.__name__)
+            if entry is not None:
+                return entry
+        return None
+
+    def lookup_deserializer(self, tag):
+        return self._by_tag.get(tag)
+
+
+REGISTRY = SerializerRegistry()
+
+
+def register_serializer(type_name, serialize, deserialize=None, tag=None):
+    """Register a custom type with the transport (see module comment above).
+
+    Args:
+        type_name: class __name__ to match (base-class names match via MRO).
+        serialize: callable(obj, recurse) -> JSON-safe payload.
+        deserialize: callable(payload, recurse) -> obj. Optional on sides
+            that only forward the type (they get OpaquePayload instead).
+        tag: wire tag; defaults to type_name.
+    """
+    REGISTRY.register(type_name, serialize, deserialize, tag)
+
+
+class OpaquePayload:
+    """A custom-tagged value this process cannot reconstruct.
+
+    Holds the wire payload verbatim; re-serializing emits the identical
+    frame, so the value survives pass-through untouched.
+    """
+
+    def __init__(self, tag, payload):
+        self.tag = tag
+        self.payload = payload
+
+    def __repr__(self):
+        return f"OpaquePayload(tag={self.tag!r})"
+
+
+def deserialize_custom(obj, recurse):
+    """Handle a {"__shm_custom__": tag, "payload": ...} frame.
+
+    Called by both sides' _from_shm. Unknown tags become OpaquePayload.
+    Note: payload contents are passed to the deserializer RAW -- the
+    deserializer's own `recurse` calls decide which nested parts to
+    reconstruct (so it can skip or transform sections deliberately).
+    """
+    tag = obj["__shm_custom__"]
+    deser = REGISTRY.lookup_deserializer(tag)
+    if deser is None:
+        return OpaquePayload(tag, obj["payload"])
+    return deser(obj["payload"], recurse)
+
+
+def load_serializer_modules(spec, log=None):
+    """Import comma-separated serializer modules (COMFY_ENV_SERIALIZER_MODULES).
+
+    Import errors are reported, not raised: a side that cannot import a
+    pack's module (e.g. the parent env lacking the pack's deps) still works
+    -- that side just handles the types as OpaquePayload.
+    """
+    import importlib
+    for name in (spec or "").split(","):
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            importlib.import_module(name)
+            if log:
+                log(f"[comfy-env] serializers loaded from {name}")
+        except Exception as e:
+            if log:
+                log(f"[comfy-env] serializer module {name} not importable "
+                    f"here ({e}); its types pass through as opaque")
+
+
+# =============================================================================
 # Generic shared memory serialization (_to_shm)
 # =============================================================================
 
@@ -337,6 +479,26 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
         return visited[obj_id]
 
     t = type(obj).__name__
+
+    # Opaque pass-through: a custom value this process couldn't reconstruct
+    # re-serializes to its original wire form, untouched.
+    if isinstance(obj, OpaquePayload):
+        return {"__shm_custom__": obj.tag, "payload": obj.payload}
+
+    # Registered custom types take precedence over the built-in branches so
+    # a pack may deliberately override handling of a named type.
+    entry = REGISTRY.lookup_serializer(obj)
+    if entry is not None:
+        tag, serialize = entry
+
+        def _recurse(v):
+            return _to_shm_generic(v, registry, visited,
+                                   tensor_serializer=tensor_serializer,
+                                   node_output_serializer=node_output_serializer)
+
+        result = {"__shm_custom__": tag, "payload": serialize(obj, _recurse)}
+        visited[obj_id] = result
+        return result
 
     # torch.Tensor -> delegate to caller-provided strategy
     if t == 'Tensor':

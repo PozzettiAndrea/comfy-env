@@ -43,6 +43,7 @@ from ._ipc_shared import (
     _cleanup_shm,
     _evict_cache_if_needed,
     _to_shm_generic,
+    deserialize_custom,
 )
 
 # Debug logging -- imported by subprocess.py, passed through here
@@ -505,15 +506,25 @@ def _serialize_pool_ipc_parent(t):
 # Shared memory serialization (parent -> worker)
 # =============================================================================
 
+# Set by SubprocessWorker around each call. True = the startup canary
+# handshake failed a GPU zero-copy round-trip for the target worker, so
+# CUDA tensors take the CPU shared-memory path for that worker instead of
+# risking a silently-wrong transfer across torch's private reduction ABI.
+_gpu_zero_copy_demoted = False
+
+
 def _parent_tensor_serializer(obj, registry, visited):
     """Parent-side tensor serialization strategy.
 
-    Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory.
+    Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory. GPU
+    zero-copy tiers are skipped when the canary handshake demoted them for
+    the current worker (_gpu_zero_copy_demoted).
     """
-    if obj.is_cuda and _parent_shareable_pool is not None:
-        return _serialize_pool_ipc_parent(obj)
-    if obj.is_cuda and _probe_cuda_ipc():
-        return _serialize_cuda_ipc(obj)
+    if obj.is_cuda and not _gpu_zero_copy_demoted:
+        if _parent_shareable_pool is not None:
+            return _serialize_pool_ipc_parent(obj)
+        if _probe_cuda_ipc():
+            return _serialize_cuda_ipc(obj)
     tensor = obj.detach().cpu().contiguous()
     return _serialize_tensor_native_parent(tensor, registry)
 
@@ -594,6 +605,10 @@ def _from_shm(obj, unlink=True):
         if isinstance(obj, list):
             return [_from_shm(v, unlink) for v in obj]
         return obj
+
+    # Registered custom type (or OpaquePayload when unknown on this side)
+    if "__shm_custom__" in obj:
+        return deserialize_custom(obj, lambda v: _from_shm(v, unlink))
 
     # PoolIPC -> zero-copy CUDA tensor via shareable pool (worker -> parent)
     if obj.get("__type__") == "PoolIPC":

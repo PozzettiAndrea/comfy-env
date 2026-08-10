@@ -278,7 +278,8 @@ class SubprocessWorker(Worker):
             except Exception:
                 pass
         # Check faulthandler dump
-        fault_file = os.path.join(tempfile.gettempdir(), "comfy_worker_faulthandler.txt")
+        from ._ipc_shared import WORKER_FAULTHANDLER_BASENAME
+        fault_file = os.path.join(tempfile.gettempdir(), WORKER_FAULTHANDLER_BASENAME)
         if os.path.exists(fault_file):
             try:
                 with open(fault_file, "r", encoding="utf-8", errors="replace") as f:
@@ -607,6 +608,17 @@ class SubprocessWorker(Worker):
                     self._transport.send(callback_response)
                     continue  # Keep waiting for actual response
 
+                # Correlation check: every worker response echoes the request's
+                # call_id. A mismatched frame is a stale late reply (e.g. from
+                # a predecessor that timed out) -- drop it and keep waiting
+                # instead of returning the wrong result to the wrong caller.
+                resp_id = response.get("call_id")
+                if resp_id is not None and call_id is not None and resp_id != call_id:
+                    print(f"[{self.name}] Dropping stale frame "
+                          f"call_id={resp_id} (expecting {call_id})",
+                          file=sys.stderr, flush=True)
+                    continue
+
                 # Got a real response
                 break
         except ConnectionError as e:
@@ -673,6 +685,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
+            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
 
             try:
                 # Serialize kwargs to shared memory
@@ -726,6 +739,7 @@ class SubprocessWorker(Worker):
                 return None
 
             finally:
+                _ipc_parent._gpu_zero_copy_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
@@ -743,6 +757,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
+            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
 
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
@@ -773,9 +788,103 @@ class SubprocessWorker(Worker):
                 return None
 
             finally:
+                _ipc_parent._gpu_zero_copy_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
+
+    def echo(self, **kwargs) -> tuple:
+        """Round-trip kwargs through the PRODUCTION serialization path.
+
+        Same _to_shm/_from_shm code as call_module -- deliberately not a
+        separate test serializer. Returns (payload, worker_torch_version).
+        Used by verify_transport(); harmless to call any time.
+        """
+        with self._lock:
+            self._ensure_started()
+            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            shm_registry = []
+            try:
+                kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else {}
+                self._call_counter += 1
+                request = {"type": "echo", "call_id": self._call_counter,
+                           "kwargs": kwargs_meta}
+                response = self._send_request(request, timeout=120.0)
+                if response.get("status") == "error":
+                    raise WorkerError(response.get("error", "Unknown"),
+                                      traceback=response.get("traceback"))
+                result_meta = response.get("result")
+                result = _from_shm(result_meta) if result_meta is not None else None
+                return result, response.get("torch_version")
+            finally:
+                _ipc_parent._gpu_zero_copy_demoted = False
+                _cleanup_shm(shm_registry)
+                _cleanup_parent_fds(_parent_fd_registry)
+
+    @staticmethod
+    def _torch_family(version: Optional[str]) -> Optional[str]:
+        """'2.8.0+cu128' -> '2.8'. None-safe."""
+        if not version:
+            return None
+        return ".".join(version.split("+")[0].split(".")[:2])
+
+    def verify_transport(self) -> bool:
+        """Canary handshake: verify each transport tier by round-tripping a
+        tensor through the production serialization path; demote GPU
+        zero-copy for this worker if its round-trip fails or corrupts.
+
+        Probing reality beats predicting compatibility from version numbers:
+        the zero-copy tiers ride torch's PRIVATE multiprocessing reduction
+        protocol, which has no cross-version guarantee. A failed CPU-tier
+        canary is a hard error (broken IPC, not version skew). A torch
+        family mismatch between parent and worker is a warning plus
+        whatever the canaries prove.
+
+        Returns True if every applicable tier verified.
+        """
+        self.gpu_zero_copy_ok = True
+        try:
+            import torch
+        except ImportError:
+            print(f"[{self.name}] Transport canary skipped: no torch in parent",
+                  file=sys.stderr, flush=True)
+            return True
+
+        canary = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+
+        # CPU tier (TensorRef/shm): must work, no excuses.
+        result, worker_torch = self.echo(canary=canary)
+        if not (isinstance(result, dict) and torch.equal(result["canary"].cpu(), canary)):
+            raise RuntimeError(
+                f"{self.name}: transport canary FAILED on the CPU tier -- "
+                f"shared-memory round-trip corrupted or lost the payload. "
+                f"Refusing to use this worker.")
+
+        parent_family = self._torch_family(torch.__version__)
+        worker_family = self._torch_family(worker_torch)
+        if worker_family and parent_family != worker_family:
+            print(f"[{self.name}] WARNING: torch family mismatch -- parent "
+                  f"{torch.__version__} vs worker {worker_torch}. Zero-copy "
+                  f"transport is subject to canary verification.",
+                  file=sys.stderr, flush=True)
+
+        # GPU zero-copy tiers: verify only if the parent can produce a CUDA
+        # canary. Failure here is DEMOTION, not an error -- the worker keeps
+        # working via the CPU path.
+        ok = True
+        if torch.cuda.is_available():
+            try:
+                gpu_canary = canary.cuda()
+                gpu_result, _ = self.echo(canary=gpu_canary)
+                if not torch.equal(gpu_result["canary"].detach().cpu(), canary):
+                    raise RuntimeError("GPU canary round-trip mismatch")
+            except Exception as e:
+                self.gpu_zero_copy_ok = False
+                ok = False
+                print(f"[{self.name}] GPU zero-copy demoted for this worker "
+                      f"(canary failed: {e}). CUDA tensors will use the CPU "
+                      f"shared-memory path.", file=sys.stderr, flush=True)
+        return ok
 
     def send_command(self, method, **params):
         """Send a management command to the worker (model device moves, etc.).

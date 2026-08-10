@@ -1,6 +1,6 @@
 [project]
 name = "comfy-env"
-version = "0.4.12"
+version = "0.4.13"
 description = "Environment management for ComfyUI custom nodes - CUDA wheel resolution and process isolation"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,6 +28,13 @@ dependencies = [
     "pre-commit",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff",
+    "psutil",
+]
+
 [project.urls]
 Homepage = "https://github.com/PozzettiAndrea/comfy-env"
 Repository = "https://github.com/PozzettiAndrea/comfy-env"
@@ -46,3 +53,16 @@ packages = ["src/comfy_env"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# CI gate is fatal-only for now: syntax errors, bad comparisons, undefined
+# names. Widen once the existing style debt is paid down.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU (run via self-hosted dispatch, skipped in hosted CI)",
+    "network: touches the network (pixi bootstrap, wheel index)",
+    "comfyui: needs a ComfyUI checkout (compat canary)",
+]

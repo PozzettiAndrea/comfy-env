@@ -396,7 +396,6 @@ def build_workspace_toml(
     chosen_cuda: Optional[str] = None,
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
-    root_conda_deps: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble the full workspace pixi.toml as a dict.
 
@@ -543,7 +542,6 @@ def write_workspace_pixi_toml(
     chosen_cuda: Optional[str] = None,
     chosen_torch_short: Optional[str] = None,
     chosen_python: Optional[str] = None,
-    root_conda_deps: Optional[Dict[str, Any]] = None,
     comfyui_source_dir: Optional[Path] = None,
 ) -> Path:
     """Generate `<workspace_dir>/pixi.toml` from the parts above.
@@ -565,7 +563,6 @@ def write_workspace_pixi_toml(
         chosen_cuda=chosen_cuda,
         chosen_torch_short=chosen_torch_short,
         chosen_python=chosen_python,
-        root_conda_deps=root_conda_deps,
     )
 
     # The workspace is shared across every ComfyUI install on this machine

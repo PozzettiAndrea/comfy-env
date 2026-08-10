@@ -14,9 +14,15 @@ from types import SimpleNamespace
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
 faulthandler.enable(file=sys.stderr, all_threads=True)
 
+# _ipc_shared.py is always copied next to this script by SubprocessWorker,
+# and the script's own directory is sys.path[0] -- so shared constants are
+# importable even this early. One source of truth; no hand-synced literals.
+import _ipc_shared
+
 # Also dump to a file so we can see segfaults even if stderr is lost
 import tempfile as _fh_tempfile
-_faulthandler_log = os.path.join(_fh_tempfile.gettempdir(), "comfy_worker_faulthandler.log")
+_faulthandler_log = os.path.join(
+    _fh_tempfile.gettempdir(), _ipc_shared.WORKER_FAULTHANDLER_BASENAME)
 try:
     _fh_file = open(_faulthandler_log, "a")
     faulthandler.enable(file=_fh_file, all_threads=True)
@@ -167,40 +173,37 @@ except Exception as e:
     wlog(f"[worker] PyTorch not available: {e}")
 
 from multiprocessing import shared_memory as shm
-import mmap as _mmap_mod
+import mmap as _mmap_mod  # noqa: F401 -- kept for worker-local mmap users
 import numpy as np
 
-# --- Anonymous shared memory via memfd_create (Linux) ---
-_USE_MEMFD = sys.platform == "linux"
-_libc = None
-
-def _memfd_write(data):
-    """Create anonymous shared memory, write data. Returns (fd, size)."""
-    global _libc
-    if _libc is None:
-        import ctypes, ctypes.util
-        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    fd = _libc.memfd_create(b"comfy_ipc", 0)
-    if fd < 0:
-        import ctypes
-        raise OSError(ctypes.get_errno(), "memfd_create failed")
-    size = len(data)
-    os.ftruncate(fd, size)
-    buf = _mmap_mod.mmap(fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_WRITE)
-    buf[:size] = data
-    buf.close()
-    return fd, size
-
-def _memfd_read(pid, fd, size):
-    """Read data from another process's memfd via procfs."""
-    local_fd = os.open(f"/proc/{pid}/fd/{fd}", os.O_RDONLY)
-    try:
-        buf = _mmap_mod.mmap(local_fd, size, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_READ)
-        data = bytes(buf[:size])
-        buf.close()
-        return data
-    finally:
-        os.close(local_fd)
+# The shared IPC module is copied next to this script by SubprocessWorker
+# (subprocess.py) -- import it instead of duplicating its contents. It is
+# stdlib-only at module scope, so this import is safe w.r.t. the torch/numpy
+# DLL-ordering constraints above.
+import _ipc_shared
+# Alias the local copy under its package name: a serializer module that does
+# `from comfy_env.isolation.workers import _ipc_shared` (the parent-side
+# spelling) inside a worker whose env happens to have comfy_env installed
+# must land on THIS instance -- two module instances would mean two
+# registries and silently unregistered types.
+sys.modules.setdefault("comfy_env.isolation.workers._ipc_shared", _ipc_shared)
+from _ipc_shared import (  # noqa: F401 -- re-exported names used below
+    _USE_MEMFD,
+    _memfd_write,
+    _memfd_read,
+    _create_shareable_pool,
+    _export_pool_fd,
+    _import_pool_from_fd,
+    _set_device_pool,
+    _export_pointer,
+    _import_pointer,
+    _trim_pool,
+    _get_pool_mem_stats,
+    _send_fd,
+    _recv_fd,
+    _PoolPtr,
+    _prepare_trimesh_for_pickle,
+)
 
 # Release CPU affinity back to all cores for actual GPU work
 if _affinity_pinned:
@@ -212,8 +215,13 @@ if _affinity_pinned:
 
 # Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
 class TensorKeeper:
-    """Keep tensors alive for a retention period to prevent shared memory deletion."""
-    def __init__(self, retention_seconds=30.0):
+    """Keep tensors alive for a retention period to prevent shared memory deletion.
+
+    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py -- the parent holds
+    its references for the same window; an asymmetric (shorter) worker window
+    lets the worker free memory the parent may not have mapped yet.
+    """
+    def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()
@@ -348,118 +356,15 @@ def _deserialize_cuda_ipc(data):
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 _pool_ipc_ok = False
 _our_pool = None
+# Parent's shareable pool (parent->worker zero-copy); imported in main()'s
+# handshake, read by the module-level _from_shm().
+_parent_pool = None
 _pool_ipc_metadata_cache = {}
 _pool_ipc_cache_tensors = {}
 
-import ctypes
-import ctypes.util
-
-class _CudaMemPoolPtrExportData(ctypes.Structure):
-    _fields_ = [("reserved", ctypes.c_ubyte * 64)]
-
-class _CudaMemPoolProps(ctypes.Structure):
-    _fields_ = [
-        ("allocType", ctypes.c_int),
-        ("handleTypes", ctypes.c_int),
-        ("location_type", ctypes.c_int),
-        ("location_id", ctypes.c_int),
-        ("win32HandleMetaData", ctypes.c_void_p),
-        ("maxSize", ctypes.c_size_t),
-        ("reserved", ctypes.c_ubyte * 56),
-    ]
-
-_CUDA_MEM_HANDLE_TYPE_POSIX_FD = 1
-_CUDA_MEM_ALLOCATION_TYPE_PINNED = 1
-_CUDA_MEM_LOCATION_TYPE_DEVICE = 1
-_cudart_lib = None
-
-def _get_cudart():
-    global _cudart_lib
-    if _cudart_lib is not None:
-        return _cudart_lib
-    for name in ("libcudart.so", "libcudart.so.12", "libcudart.so.11"):
-        try:
-            _cudart_lib = ctypes.CDLL(name)
-            return _cudart_lib
-        except OSError:
-            continue
-    lib_name = ctypes.util.find_library("cudart")
-    if lib_name:
-        _cudart_lib = ctypes.CDLL(lib_name)
-        return _cudart_lib
-    return None
-
-def _cuda_check(err, name):
-    if err != 0:
-        raise RuntimeError(f"{name} returned {err}")
-
-def _create_shareable_pool(device=0):
-    cudart = _get_cudart()
-    if not cudart:
-        raise RuntimeError("libcudart not found")
-    props = _CudaMemPoolProps()
-    ctypes.memset(ctypes.addressof(props), 0, ctypes.sizeof(props))
-    props.allocType = _CUDA_MEM_ALLOCATION_TYPE_PINNED
-    props.handleTypes = _CUDA_MEM_HANDLE_TYPE_POSIX_FD
-    props.location_type = _CUDA_MEM_LOCATION_TYPE_DEVICE
-    props.location_id = device
-    pool = ctypes.c_void_p()
-    _cuda_check(cudart.cudaMemPoolCreate(ctypes.byref(pool), ctypes.byref(props)),
-                "cudaMemPoolCreate")
-    return pool
-
-def _export_pool_fd(pool):
-    cudart = _get_cudart()
-    fd = ctypes.c_int()
-    _cuda_check(cudart.cudaMemPoolExportToShareableHandle(
-        ctypes.byref(fd), pool,
-        ctypes.c_int(_CUDA_MEM_HANDLE_TYPE_POSIX_FD), ctypes.c_uint(0)),
-        "cudaMemPoolExportToShareableHandle")
-    return fd.value
-
-def _set_device_pool(device, pool):
-    cudart = _get_cudart()
-    _cuda_check(cudart.cudaDeviceSetMemPool(ctypes.c_int(device), pool),
-                "cudaDeviceSetMemPool")
-
-def _export_pointer(ptr):
-    cudart = _get_cudart()
-    export_data = _CudaMemPoolPtrExportData()
-    _cuda_check(cudart.cudaMemPoolExportPointer(
-        ctypes.byref(export_data), ctypes.c_void_p(ptr)),
-        "cudaMemPoolExportPointer")
-    return bytes(export_data)
-
-def _trim_pool(pool, min_bytes=0):
-    cudart = _get_cudart()
-    _cuda_check(cudart.cudaMemPoolTrimTo(pool, ctypes.c_size_t(min_bytes)),
-                "cudaMemPoolTrimTo")
-
-def _import_pool_from_fd(fd):
-    cudart = _get_cudart()
-    pool = ctypes.c_void_p()
-    fd_val = ctypes.c_int(fd)
-    _cuda_check(cudart.cudaMemPoolImportFromShareableHandle(
-        ctypes.byref(pool), ctypes.byref(fd_val),
-        ctypes.c_int(_CUDA_MEM_HANDLE_TYPE_POSIX_FD), ctypes.c_uint(0)),
-        "cudaMemPoolImportFromShareableHandle")
-    return pool
-
-def _import_pointer(pool, export_data_bytes):
-    cudart = _get_cudart()
-    export_data = _CudaMemPoolPtrExportData.from_buffer_copy(export_data_bytes)
-    ptr = ctypes.c_void_p()
-    _cuda_check(cudart.cudaMemPoolImportPointer(
-        ctypes.byref(ptr), pool, ctypes.byref(export_data)),
-        "cudaMemPoolImportPointer")
-    return ptr.value
-
-class _PoolPtr:
-    def __init__(self, ptr, nbytes):
-        self.__cuda_array_interface__ = {
-            'shape': (nbytes,), 'typestr': '|u1',
-            'data': (ptr, False), 'version': 3,
-        }
+# Pool ctypes primitives and _PoolPtr come from _ipc_shared (imported at the
+# top of this file). The duplicated definitions that lived here drifted from
+# the shared copies before being deleted -- do not reintroduce them.
 
 def _deserialize_pool_ipc(data, source_pool):
     import torch
@@ -475,25 +380,6 @@ def _deserialize_pool_ipc(data, source_pool):
                 tuple(data["tensor_size"]), tuple(data["tensor_stride"]))
     tensor.requires_grad_(data["requires_grad"])
     return tensor
-
-def _send_fd(sock, fd):
-    import array as _array
-    sock.sendmsg([b'\x00'],
-                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, _array.array('i', [fd]))])
-
-def _recv_fd(sock, timeout=10.0):
-    import array as _array
-    sock.settimeout(timeout)
-    try:
-        msg, ancdata, flags, addr = sock.recvmsg(1, socket.CMSG_LEN(4))
-        for level, type_, data in ancdata:
-            if level == socket.SOL_SOCKET and type_ == socket.SCM_RIGHTS:
-                fds = _array.array('i')
-                fds.frombytes(data[:fds.itemsize])
-                return fds[0]
-        raise RuntimeError("No FD in ancillary data")
-    finally:
-        sock.settimeout(None)
 
 def _serialize_pool_ipc(t):
     """Serialize CUDA tensor via pool pointer export (zero-copy)."""
@@ -537,18 +423,7 @@ def _serialize_pool_ipc(t):
     return result
 
 
-def _prepare_trimesh_for_pickle(mesh):
-    """
-    Prepare a trimesh object for cross-Python-version pickling.
-    Strips native extension helpers that cause import errors.
-    """
-    mesh = mesh.copy()
-    for attr in ('ray', '_ray', 'permutate', 'nearest'):
-        try:
-            delattr(mesh, attr)
-        except AttributeError:
-            pass
-    return mesh
+# _prepare_trimesh_for_pickle comes from _ipc_shared.
 
 
 def _serialize_tensor_native(t, registry):
@@ -598,144 +473,52 @@ def _serialize_tensor_native(t, registry):
         raise RuntimeError(f"Unexpected reduce function: {sfunc.__name__}")
 
 
+def _worker_tensor_serializer(t, registry, visited):
+    """Worker-side Tensor strategy: Pool IPC -> legacy CUDA IPC -> CPU shm."""
+    import torch  # noqa: F401 -- ensures torch is importable before use
+    if t.is_cuda:
+        # Pool IPC: zero-copy via shareable pool (cudaMallocAsync-safe)
+        if _pool_ipc_ok and _our_pool is not None:
+            try:
+                return _serialize_pool_ipc(t)
+            except Exception as e:
+                wlog(f"[worker] Pool IPC serialize failed: {e}, falling back")
+        # Legacy CUDA IPC (only works without cudaMallocAsync)
+        if _probe_cuda_ipc():
+            return _serialize_cuda_ipc(t)
+    tensor = t.detach().cpu().contiguous()
+    return _serialize_tensor_native(tensor, registry)
+
+
+def _worker_node_output_serializer(obj, registry, visited):
+    """V3 NodeOutput -> tagged dict for IPC serialization."""
+    ui_val = obj.ui
+    if hasattr(ui_val, 'as_dict'):
+        ui_val = ui_val.as_dict()
+    return {
+        "__node_output__": True,
+        "args": _to_shm(list(obj.args), registry, visited),
+        "ui": _to_shm(ui_val, registry, visited) if ui_val is not None else None,
+        "expand": _to_shm(obj.expand, registry, visited) if obj.expand is not None else None,
+        "block_execution": obj.block_execution,
+    }
+
+
 def _to_shm(obj, registry, visited=None):
-    """Serialize to shared memory. Returns JSON-safe metadata."""
+    """Serialize to shared memory. Returns JSON-safe metadata.
+
+    Thin wrapper over the SHARED walker in _ipc_shared -- only the tensor
+    strategy and NodeOutput handling are worker-specific. This replaced a
+    full local reimplementation of the walker that had already drifted from
+    the shared copy.
+    """
     if visited is None:
         visited = {}
-    obj_id = id(obj)
-    if obj_id in visited:
-        return visited[obj_id]
-    t = type(obj).__name__
-
-    # Tensor -> Pool IPC (zero-copy, async-safe) or legacy CUDA IPC or CPU shm
-    if t == 'Tensor':
-        import torch
-        if obj.is_cuda:
-            # Pool IPC: zero-copy via shareable pool (cudaMallocAsync-safe)
-            if _pool_ipc_ok and _our_pool is not None:
-                try:
-                    result = _serialize_pool_ipc(obj)
-                    visited[obj_id] = result
-                    return result
-                except Exception as e:
-                    wlog(f"[worker] Pool IPC serialize failed: {e}, falling back")
-            # Legacy CUDA IPC (only works without cudaMallocAsync)
-            if _probe_cuda_ipc():
-                result = _serialize_cuda_ipc(obj)
-                visited[obj_id] = result
-                return result
-        tensor = obj.detach().cpu().contiguous()
-        result = _serialize_tensor_native(tensor, registry)
-        visited[obj_id] = result
-        return result
-
-    # ndarray -> prefer torch native shm, fallback to plain shm
-    if t == 'ndarray':
-        arr = np.ascontiguousarray(obj)
-        try:
-            import torch
-            tensor = torch.from_numpy(arr)
-            result = _serialize_tensor_native(tensor, registry)
-            result["__was_numpy__"] = True
-            result["numpy_dtype"] = str(arr.dtype)
-        except Exception:
-            arr_bytes = arr.tobytes()
-            if _USE_MEMFD:
-                fd, size = _memfd_write(arr_bytes)
-                registry.append(fd)
-                result = {"__shm_np__": True, "fd": fd, "pid": os.getpid(),
-                          "shape": list(arr.shape), "dtype": str(arr.dtype), "size": size}
-            else:
-                block = shm.SharedMemory(create=True, size=arr.nbytes)
-                np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
-                registry.append(block)
-                result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
-        visited[obj_id] = result
-        return result
-
-    # trimesh.Trimesh -> pickle -> shared memory
-    if t == 'Trimesh':
-        import pickle
-        obj = _prepare_trimesh_for_pickle(obj)
-        mesh_bytes = pickle.dumps(obj)
-
-        if _USE_MEMFD:
-            fd, size = _memfd_write(mesh_bytes)
-            registry.append(fd)
-            result = {"__shm_trimesh__": True, "fd": fd, "pid": os.getpid(), "size": size}
-        else:
-            block = shm.SharedMemory(create=True, size=len(mesh_bytes))
-            block.buf[:len(mesh_bytes)] = mesh_bytes
-            registry.append(block)
-            result = {"__shm_trimesh__": True, "name": block.name, "size": len(mesh_bytes)}
-
-        visited[obj_id] = result
-        return result
-
-    # SparseTensor -> decompose to coords + feats CPU tensors
-    if t == 'SparseTensor':
-        result = {
-            "__shm_sparse_tensor__": True,
-            "coords": _to_shm(obj.coords.cpu(), registry, visited),
-            "feats": _to_shm(obj.feats.cpu(), registry, visited),
-        }
-        visited[obj_id] = result
-        return result
-
-    # V3 NodeOutput -> tagged dict for IPC serialization
-    if t == 'NodeOutput':
-        ui_val = obj.ui
-        if hasattr(ui_val, 'as_dict'):
-            ui_val = ui_val.as_dict()
-        result = {
-            "__node_output__": True,
-            "args": _to_shm(list(obj.args), registry, visited),
-            "ui": _to_shm(ui_val, registry, visited) if ui_val is not None else None,
-            "expand": _to_shm(obj.expand, registry, visited) if obj.expand is not None else None,
-            "block_execution": obj.block_execution,
-        }
-        visited[obj_id] = result
-        return result
-
-    if isinstance(obj, dict):
-        result = {k: _to_shm(v, registry, visited) for k, v in obj.items()}
-        visited[obj_id] = result
-        return result
-    if isinstance(obj, (list, tuple)):
-        result = [_to_shm(v, registry, visited) for v in obj]
-        visited[obj_id] = result
-        return result
-
-    # Convert numpy scalars to Python primitives for JSON serialization
-    if isinstance(obj, (np.floating, np.integer, np.bool_)):
-        return obj.item()
-
-    # Path -> string
-    from pathlib import PurePath
-    if isinstance(obj, PurePath):
-        return str(obj)
-
-    # primitives pass through
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-
-    # Fallback: pickle any remaining object to shared memory
-    import pickle
-    try:
-        obj_bytes = pickle.dumps(obj)
-        if _USE_MEMFD:
-            fd, size = _memfd_write(obj_bytes)
-            registry.append(fd)
-            result = {"__shm_pickle__": True, "fd": fd, "pid": os.getpid(), "size": size}
-        else:
-            block = shm.SharedMemory(create=True, size=len(obj_bytes))
-            block.buf[:len(obj_bytes)] = obj_bytes
-            registry.append(block)
-            result = {"__shm_pickle__": True, "name": block.name, "size": len(obj_bytes)}
-        visited[obj_id] = result
-        return result
-    except Exception:
-        return obj
+    return _ipc_shared._to_shm_generic(
+        obj, registry, visited,
+        tensor_serializer=_worker_tensor_serializer,
+        node_output_serializer=_worker_node_output_serializer,
+    )
 
 
 def _deserialize_tensor_native(data):
@@ -811,6 +594,11 @@ def _from_shm(obj, _depth=0, _key="root"):
         if isinstance(obj, list):
             return [_from_shm(v, _depth+1, f"{_key}[{i}]") for i, v in enumerate(obj)]
         return obj
+
+    # Registered custom type (or OpaquePayload when unknown on this side)
+    if "__shm_custom__" in obj:
+        return _ipc_shared.deserialize_custom(
+            obj, lambda v: _from_shm(v, _depth + 1, f"{_key}.custom"))
 
     # PoolIPC -> zero-copy CUDA tensor via shareable pool (parent -> worker)
     if obj.get("__type__") == "PoolIPC":
@@ -934,8 +722,11 @@ def _cleanup_shm(registry):
 
 # Shared memory keeper - holds references to prevent premature GC
 class ShmKeeper:
-    """Keep shm blocks alive for a retention period to prevent race conditions."""
-    def __init__(self, retention_seconds=30.0):
+    """Keep shm blocks alive for a retention period to prevent race conditions.
+
+    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py (see TensorKeeper).
+    """
+    def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()
@@ -1187,6 +978,12 @@ def main():
     for p in config.get("sys_paths", []):
         if p not in sys.path:
             sys.path.insert(0, p)
+
+    # Load pack-declared custom serializers ([serializers].modules in
+    # comfy-env.toml, forwarded as an env var). Runs after sys.path setup so
+    # pack modules resolve; failures are non-fatal (types stay opaque).
+    _ipc_shared.load_serializer_modules(
+        os.environ.get("COMFY_ENV_SERIALIZER_MODULES"), log=wlog)
 
     # Apply the parent process's folder_paths state so this worker's
     # folder_paths module (a separate import in this subprocess) resolves
@@ -1636,7 +1433,7 @@ def main():
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---
-    global _pool_ipc_ok, _our_pool
+    global _pool_ipc_ok, _our_pool, _parent_pool
     if _POOL_IPC_ENABLED and sys.platform == "linux":
         try:
             import torch as _pt
@@ -1751,6 +1548,33 @@ def main():
         if request.get("type") == "callback_response":
             wlog(f"[worker] Ignoring stale callback_response in main loop")
             continue
+
+        # Transport canary: round-trip the payload through the PRODUCTION
+        # serialization path (_from_shm -> _to_shm) so the parent can verify
+        # each transport tier actually works for this parent/worker pair.
+        # MUST use the same code path as real calls -- a parallel test
+        # serializer would validate nothing.
+        if request.get("type") == "echo":
+            shm_registry = []
+            try:
+                payload = _from_shm(request.get("kwargs") or {})
+                payload = _deserialize_input(payload)
+                result_meta = _to_shm(payload, shm_registry)
+                try:
+                    import torch as _echo_torch
+                    _echo_tv = getattr(_echo_torch, "__version__", None)
+                except ImportError:
+                    _echo_tv = None
+                transport.send({"status": "ok", "call_id": _current_call_id,
+                                "result": result_meta, "torch_version": _echo_tv})
+                _shm_keeper.keep(shm_registry)
+            except Exception as e:
+                _cleanup_shm(shm_registry)
+                transport.send({"status": "error", "call_id": _current_call_id,
+                                "error": str(e),
+                                "traceback": traceback.format_exc()})
+            continue
+
         if "module" not in request:
             wlog(f"[worker] Ignoring unknown request format: {list(request.keys())}")
             continue

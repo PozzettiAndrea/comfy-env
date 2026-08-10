@@ -15,7 +15,7 @@ comfy-env provides **process isolation** -- nodes that need conflicting dependen
 
 Two config files, two roles:
 
-- **`comfy-env-root.toml`** (root level): System packages (apt/brew) and ComfyUI node dependency management. Never touches the Python environment -- PyPI deps stay in `requirements.txt`.
+- **`comfy-env-root.toml`** (root level): ComfyUI node dependency management plus pack-level settings and env vars. Never touches the Python environment -- PyPI deps stay in `requirements.txt`.
 - **`comfy-env.toml`** (subdirectories): Each subdirectory with this file gets its own isolated Python environment via [pixi](https://pixi.sh), with a separate interpreter, conda packages, pip packages, and pre-built CUDA wheels.
 
 Using conda CANNOT be avoided. We need to be able to use ComfyUI functions and return types within isolated nodes, which means they will need things like `av` or `ffmpeg`, and those cannot be installed through PyPI. [Pixi](https://pixi.sh) is a convenient, fast, Rust-based package manager that speaks both conda-forge AND PyPI in the same `pixi.toml`, ships a real lockfile (so envs are reproducible across machines), installs entirely per-user with no admin / no system Python pollution, and uses [uv](https://github.com/astral-sh/uv) under the hood for the PyPI side -- so it's as fast as the fastest thing in the ecosystem.

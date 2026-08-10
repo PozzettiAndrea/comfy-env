@@ -24,6 +24,7 @@ from .plugin import (
     _install_node_dependencies,
     _reinstall_main_requirements,
     _collect_node_req_dirs,
+    check_sibling_comfy_env_pins,
 )
 from .workspace import install_workspace
 from .verify import verify_installation
@@ -73,6 +74,11 @@ def install(
             nr_cfg = discover_config(nr_dir, root=True)
             if nr_cfg:
                 pass  # Future: could process nr_cfg here
+
+    # Surface stale comfy-env pins in sibling packs (warn-only): whichever
+    # pack reinstalls its requirements last wins in the shared env, so an old
+    # `comfy-env==X` elsewhere can silently downgrade us after this install.
+    check_sibling_comfy_env_pins(node_dir, log)
 
     from ..settings import resolve_bool, GENERAL_DEFAULTS
     node_settings = cfg.settings if cfg.settings else None

@@ -1,10 +1,21 @@
-"""Workspace install: generate `<comfyui>/.ce/pixi.toml` and run `pixi install --all`.
+"""Workspace install: per-env pixi manifests, materialized one at a time.
 
-Handles bootstrap torch resolution, cuda-wheel combo selection, and the post-install
-libomp dedupe. The cuda-wheel installation itself is now inlined into `pixi.toml` as
-`pypi-dependencies.{url=...}` entries by `packages/toml_generator.py`, so this module
-no longer pip-installs them out-of-band — the `_install_cuda_wheels` function below
-is dead code retained only as a reference until removed in a follow-up cleanup.
+Discovers every comfy-env.toml under custom_nodes, resolves the bootstrap
+torch pin and (when a GPU is present) a cuda-wheels combo, generates one
+self-contained pixi.toml per env (packages/toml_generator.py), and runs
+`pixi install --manifest-path envs/<name>/pixi.toml` per env -- so a broken
+manifest cannot poison another env's install (ADR-0007).
+
+CUDA wheels are deliberately NOT inlined into the manifests: pixi cannot
+express no-deps installs and the wheels' upstream Requires-Dist metadata is
+wrong for our artifacts, so after `pixi install` they are installed
+out-of-band via `uv pip install --no-deps` (the wheel pass inside
+install_workspace). This puts them outside pixi.lock -- the "two-system
+problem" in the docs -- until Requires-Dist curation in the cuda-wheels
+farm makes them resolver-safe and the inline path can revive.
+
+Also handles env stamping (ABI + version + torch pin), install-hash skip of
+unchanged envs, and the post-install libomp dedupe.
 """
 
 from __future__ import annotations
@@ -13,7 +24,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..config import (
     ComfyEnvConfig,
@@ -226,38 +237,6 @@ def _compute_env_hash(
     return h.hexdigest()
 
 
-def _collect_root_conda_deps(
-    comfyui_dir: Path, log: Callable[[str], None],
-) -> Dict[str, Any]:
-    """Collect [dependencies] from all comfy-env-root.toml files under custom_nodes/.
-
-    These are conda packages that should be added to the comfyui pixi feature
-    (the main ComfyUI environment), e.g. ffmpeg for av on macOS.
-    """
-    custom_nodes = comfyui_dir / "custom_nodes"
-    if not custom_nodes.is_dir():
-        return {}
-
-    merged: Dict[str, Any] = {}
-    for plugin_dir in sorted(custom_nodes.iterdir()):
-        if not plugin_dir.is_dir() or plugin_dir.name.startswith((".", "_")):
-            continue
-        if plugin_dir.name.endswith((".disabled", "._disabled")):
-            continue
-        root_cfg_path = plugin_dir / ROOT_CONFIG_FILE_NAME
-        if not root_cfg_path.exists():
-            continue
-        try:
-            cfg = load_config(root_cfg_path)
-        except Exception:
-            continue
-        deps = cfg.pixi_passthrough.get("dependencies", {})
-        if deps:
-            log(f"[comfy-env] Root conda deps from {plugin_dir.name}: {list(deps.keys())}")
-            merged.update(deps)
-    return merged
-
-
 def _dedupe_envs_libomp(
     workspace_dir: Path,
     discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
@@ -287,58 +266,6 @@ def _dedupe_envs_libomp(
             log(f"[comfy-env] {env_name}: deduped libomp")
         except Exception as e:
             log(f"[comfy-env] {env_name}: libomp dedupe failed: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Torch-version probe via pixi run (used by _install_cuda_wheels validation;
-# kept here so workspace.py is self-contained)
-# ---------------------------------------------------------------------------
-
-def _read_env_torch_version(
-    workspace_dir: Path,
-    env_name: str,
-    log: Optional[Callable[[str], None]] = None,
-) -> Optional[str]:
-    """Run `pixi run -e <env_name> python -c 'import torch; print(...)'`.
-
-    Returns the public torch version (e.g. "2.11.0", local label stripped), or
-    None if torch isn't importable from that env. If `log` is given, the
-    failure reason (subprocess returncode/stderr/stdout) is written to it.
-
-    Goes through `pixi run` rather than invoking the env's `python.exe`
-    directly so pixi's own activation runs first — that's what puts
-    `<env>/Library/bin` on PATH, sets KMP/MKL env vars correctly for the
-    conda-forge libs, and matches what an end-user would get if they ran
-    `pixi run -e <env> python` themselves.
-    """
-    import subprocess
-    from ..packages.pixi import PIXI
-    env = os.environ.copy()
-    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-    r = subprocess.run(
-        [PIXI, "run", "-e", env_name,
-         "python", "-c",
-         "import torch, sys; sys.stdout.write(torch.__version__)"],
-        cwd=str(workspace_dir),
-        capture_output=True, text=True, env=env,
-    )
-    if r.returncode != 0:
-        if log:
-            log(
-                f"[comfy-env] _read_env_torch_version: pixi run -e {env_name} "
-                f"exit={r.returncode}; stderr={(r.stderr or '').strip()!r}; "
-                f"stdout={(r.stdout or '').strip()!r}"
-            )
-        return None
-    out = r.stdout.strip()
-    if not out:
-        if log:
-            log(
-                f"[comfy-env] _read_env_torch_version: pixi run -e {env_name} "
-                f"exit=0 but empty stdout; stderr={(r.stderr or '').strip()!r}"
-            )
-        return None
-    return out.split("+", 1)[0]
 
 
 # ---------------------------------------------------------------------------

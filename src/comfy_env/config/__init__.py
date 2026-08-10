@@ -67,9 +67,6 @@ def parse_config(data):
     if not isinstance(cuda_packages, list):
         cuda_packages = [cuda_packages] if cuda_packages else []
 
-    data.pop("apt", None)
-    data.pop("brew", None)
-
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
     node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
     options = data.pop("options", {})
