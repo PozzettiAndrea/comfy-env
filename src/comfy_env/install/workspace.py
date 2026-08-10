@@ -237,38 +237,6 @@ def _compute_env_hash(
     return h.hexdigest()
 
 
-def _collect_root_conda_deps(
-    comfyui_dir: Path, log: Callable[[str], None],
-) -> Dict[str, Any]:
-    """Collect [dependencies] from all comfy-env-root.toml files under custom_nodes/.
-
-    These are conda packages that should be added to the comfyui pixi feature
-    (the main ComfyUI environment), e.g. ffmpeg for av on macOS.
-    """
-    custom_nodes = comfyui_dir / "custom_nodes"
-    if not custom_nodes.is_dir():
-        return {}
-
-    merged: Dict[str, Any] = {}
-    for plugin_dir in sorted(custom_nodes.iterdir()):
-        if not plugin_dir.is_dir() or plugin_dir.name.startswith((".", "_")):
-            continue
-        if plugin_dir.name.endswith((".disabled", "._disabled")):
-            continue
-        root_cfg_path = plugin_dir / ROOT_CONFIG_FILE_NAME
-        if not root_cfg_path.exists():
-            continue
-        try:
-            cfg = load_config(root_cfg_path)
-        except Exception:
-            continue
-        deps = cfg.pixi_passthrough.get("dependencies", {})
-        if deps:
-            log(f"[comfy-env] Root conda deps from {plugin_dir.name}: {list(deps.keys())}")
-            merged.update(deps)
-    return merged
-
-
 def _dedupe_envs_libomp(
     workspace_dir: Path,
     discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
