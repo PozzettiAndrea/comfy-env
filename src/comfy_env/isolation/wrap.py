@@ -698,6 +698,25 @@ def _register_new_patchers(env_dir, worker, generation):
 
 
 
+def _warn_accel_violations(meta: dict, label: str) -> None:
+    """Surface top-level accelerator imports observed by the metadata scan.
+
+    A top-level import of a [cuda] package makes the whole scan die on
+    machines where the package isn't installed -- every node in the env
+    silently vanishes. The scan observes sys.modules AFTER import (nothing
+    has executed yet), so presence is proof, not prediction.
+    """
+    violations = meta.get("accel_import_violations") or []
+    if violations:
+        _log(
+            f"[comfy-env] WARNING: {label}: accelerator package(s) "
+            f"{', '.join(violations)} imported at module top level. "
+            f"Accelerator packages must be imported lazily inside the nodes "
+            f"that declare them (ACCELERATOR=...), or this pack's nodes will "
+            f"ALL fail to load on machines without them."
+        )
+
+
 def register_nodes(nodes_package: str = "nodes") -> tuple:
     """Discover and register all nodes -- main-process and isolation.
 
@@ -770,6 +789,14 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 toml_data = tomli.load(f)
                 env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
                 health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
+                # Feed the declared accelerator packages to the metadata
+                # scan so it can detect top-level accelerator imports
+                # (accel_import_violations in the scan payload).
+                _accel_pkgs = toml_data.get("cuda", {}).get("packages", [])
+                if isinstance(_accel_pkgs, str):
+                    _accel_pkgs = [_accel_pkgs]
+                if _accel_pkgs:
+                    env_vars["COMFY_ENV_ACCEL_PKGS"] = ",".join(str(p) for p in _accel_pkgs)
         except Exception as e:
             _log(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base:
@@ -856,6 +883,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             )
             root_nodes = root_meta.get("nodes", {})
             _log(f"[comfy-env] Scanned {nodes_package} root: {len(root_nodes)} nodes ({_time.perf_counter()-_t0:.1f}s)")
+            _warn_accel_violations(root_meta, nodes_package)
             root_display = root_meta.get("display", {})
 
             package_root = env["package_root"]
@@ -953,6 +981,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 )
                 n = len(meta.get("nodes", {}))
                 _log(f"[comfy-env] Scanned {subdir.name}: {n} nodes ({time.perf_counter()-t0:.1f}s)")
+                _warn_accel_violations(meta, package_name)
                 return subdir, env, meta
 
             with ThreadPoolExecutor(max_workers=len(isolation_dirs)) as executor:

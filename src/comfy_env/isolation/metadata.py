@@ -21,7 +21,7 @@ from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "11"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "12"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -184,6 +184,11 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
         "input_is_list": getattr(cls, "INPUT_IS_LIST", None),
         "module_name": cls.__module__,
         "class_name": cls.__name__,
+        # Accelerator declaration (comfy-env convention): "cuda" | "rocm" |
+        # "xpu" | "mps" | "gpu" | None. Meaning: node REQUIRES this backend
+        # at execution time; absent/None = CPU-capable.
+        "accelerator": (str(getattr(cls, "ACCELERATOR", None))
+                        if getattr(cls, "ACCELERATOR", None) else None),
     }
     # Call INPUT_TYPES classmethod
     if hasattr(cls, "INPUT_TYPES") and callable(cls.INPUT_TYPES):
@@ -223,7 +228,35 @@ for mod_name, mod_obj in list(sys.modules.items()):
 for r in routes:
     r.setdefault("module", package_name)
 
-payload = {"nodes": nodes, "display": display, "routes": routes}
+# Accelerator import-rule check (observed, not predicted): nothing has
+# executed during this scan, so if any declared accelerator package is in
+# sys.modules NOW, some module imported it at top level -- the pattern that
+# makes this whole scan die on machines where the package isn't installed.
+# Map import names -> distributions so dist names like "faithc-aot" match
+# their actual import name.
+_accel_violations = []
+_accel_pkgs = [p.strip().lower() for p in
+               os.environ.get("COMFY_ENV_ACCEL_PKGS", "").split(",") if p.strip()]
+if _accel_pkgs:
+    _import_names = set()
+    try:
+        from importlib.metadata import packages_distributions
+        for _imp, _dists in packages_distributions().items():
+            for _d in _dists:
+                if _d.lower().replace("_", "-") in [p.replace("_", "-") for p in _accel_pkgs]:
+                    _import_names.add(_imp)
+    except Exception:
+        pass
+    for _p in _accel_pkgs:  # name-variant fallback for missing metadata
+        _import_names.add(_p.replace("-", "_"))
+    for _m in list(sys.modules):
+        _top = _m.split(".", 1)[0]
+        if _top in _import_names:
+            _accel_violations.append(_top)
+    _accel_violations = sorted(set(_accel_violations))
+
+payload = {"nodes": nodes, "display": display, "routes": routes,
+           "accel_import_violations": _accel_violations}
 
 # Sanitize payload: coerce subclass instances (e.g. AnyType(str)) back to
 # plain built-in types so pickle doesn't embed module references that may
@@ -776,9 +809,83 @@ def _build_v3_proxy_class(
         "_comfy_env_isolated": True,
         "_comfy_env_module": module_name,
         "_comfy_env_class": class_name,
+        "_comfy_env_accelerator": meta.get("accelerator"),
     }
 
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
+
+
+# ---------------------------------------------------------------------------
+# Accelerator availability (ACCELERATOR node declaration)
+# ---------------------------------------------------------------------------
+
+_MACHINE_BACKEND: Optional[str] = None
+
+
+def _machine_backend() -> str:
+    """Detected torch backend of THIS machine ("cuda"/"rocm"/"mps"/"cpu"...), cached."""
+    global _MACHINE_BACKEND
+    if _MACHINE_BACKEND is None:
+        try:
+            from ..detection.backend import detect_backend
+            _MACHINE_BACKEND = detect_backend()[0]
+        except Exception:
+            _MACHINE_BACKEND = "cpu"
+    return _MACHINE_BACKEND
+
+
+def _accelerator_available(accel: Optional[str]) -> bool:
+    """Can a node declaring ACCELERATOR=accel execute on this machine?
+
+    None/empty = CPU-capable, always available. "gpu" = any non-cpu backend.
+    """
+    if not accel:
+        return True
+    backend = _machine_backend()
+    if accel == "gpu":
+        return backend != "cpu"
+    return backend == accel
+
+
+def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
+    """Visible-but-unavailable node for machines lacking the declared backend.
+
+    Deliberately NOT hidden: a missing node type breaks workflow load with an
+    inscrutable frontend error. The stub registers with the real inputs and
+    outputs, badges its description, and raises a named-reason error when
+    executed.
+    """
+    accel = meta.get("accelerator")
+    backend = _machine_backend()
+    reason = (
+        f"Node '{node_name}' requires {str(accel).upper()}; this machine has "
+        f"backend '{backend}'"
+        + (" (no NVIDIA GPU detected)" if accel == "cuda" and backend == "cpu" else "")
+        + ". Use a CPU-capable alternative node or run on a machine with "
+        f"{str(accel).upper()}."
+    )
+    input_types = meta.get("input_types", {"required": {}})
+    func_name = meta.get("function") or "execute"
+
+    def _raiser(self, **kwargs):
+        raise RuntimeError(reason)
+
+    attrs = {
+        "RETURN_TYPES": tuple(meta.get("return_types", ())),
+        "RETURN_NAMES": tuple(meta.get("return_names", ())),
+        "FUNCTION": func_name,
+        "CATEGORY": meta.get("category", ""),
+        "OUTPUT_NODE": meta.get("output_node", False),
+        "INPUT_TYPES": classmethod(lambda cls, _cached=input_types: _cached),
+        "DESCRIPTION": f"(requires {str(accel).upper()} -- unavailable on this machine)",
+        "_comfy_env_isolated": True,
+        "_comfy_env_accelerator": accel,
+        "_comfy_env_unavailable": reason,
+        func_name: _raiser,
+    }
+    print(f"[comfy-env] {node_name}: requires {accel}, machine backend is "
+          f"'{backend}' -- registered as unavailable", file=sys.stderr, flush=True)
+    return type(f"ComfyEnvUnavailable_{meta.get('class_name', node_name)}", (), attrs)
 
 
 def build_proxy_class(
@@ -796,7 +903,13 @@ def build_proxy_class(
     V3-scanned nodes (is_v3 + node_info_v1 captured) get a V3-native proxy --
     see _build_v3_proxy_class. V1 nodes keep the classic V1 proxy below, with
     its DynamicCombo-flattening/nesting compatibility hacks.
+
+    Nodes declaring an ACCELERATOR the machine lacks get a visible
+    unavailable-stub instead of a worker proxy.
     """
+    if not _accelerator_available(meta.get("accelerator")):
+        return _build_unavailable_stub(node_name, meta)
+
     if meta.get("is_v3") and meta.get("node_info_v1") is not None:
         try:
             return _build_v3_proxy_class(
@@ -846,6 +959,7 @@ def build_proxy_class(
         "_comfy_env_isolated": True,
         "_comfy_env_module": module_name,
         "_comfy_env_class": class_name,
+        "_comfy_env_accelerator": meta.get("accelerator"),
     }
 
     # Batch processing attributes (ComfyUI uses these for list iteration)

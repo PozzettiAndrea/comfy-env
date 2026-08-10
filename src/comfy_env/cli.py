@@ -203,10 +203,22 @@ def cmd_doctor(args) -> int:
         if cfg:
             packages = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys()) + cfg.cuda_packages
 
+    rc = 0
     if packages:
-        return 0 if verify_installation(packages) else 1
-    print("  No packages to verify")
-    return 0
+        rc = 0 if verify_installation(packages) else 1
+    else:
+        print("  No packages to verify")
+
+    print("\n3. Accelerator import rule")
+    from .lint import lint_accelerator_imports
+    findings = lint_accelerator_imports(Path.cwd())
+    if not findings:
+        print("  OK -- no top-level accelerator imports found")
+    for f in findings:
+        print(f"  [{f['level'].upper()}] {f['file']}:{f['line']}: {f['message']}")
+    if any(f["level"] == "error" for f in findings):
+        rc = 1
+    return rc
 
 
 def _read_env_file(path):
