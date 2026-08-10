@@ -1762,6 +1762,33 @@ def main():
         if request.get("type") == "callback_response":
             wlog(f"[worker] Ignoring stale callback_response in main loop")
             continue
+
+        # Transport canary: round-trip the payload through the PRODUCTION
+        # serialization path (_from_shm -> _to_shm) so the parent can verify
+        # each transport tier actually works for this parent/worker pair.
+        # MUST use the same code path as real calls -- a parallel test
+        # serializer would validate nothing.
+        if request.get("type") == "echo":
+            shm_registry = []
+            try:
+                payload = _from_shm(request.get("kwargs") or {})
+                payload = _deserialize_input(payload)
+                result_meta = _to_shm(payload, shm_registry)
+                try:
+                    import torch as _echo_torch
+                    _echo_tv = getattr(_echo_torch, "__version__", None)
+                except ImportError:
+                    _echo_tv = None
+                transport.send({"status": "ok", "call_id": _current_call_id,
+                                "result": result_meta, "torch_version": _echo_tv})
+                _shm_keeper.keep(shm_registry)
+            except Exception as e:
+                _cleanup_shm(shm_registry)
+                transport.send({"status": "error", "call_id": _current_call_id,
+                                "error": str(e),
+                                "traceback": traceback.format_exc()})
+            continue
+
         if "module" not in request:
             wlog(f"[worker] Ignoring unknown request format: {list(request.keys())}")
             continue

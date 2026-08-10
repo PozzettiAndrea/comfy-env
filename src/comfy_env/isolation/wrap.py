@@ -589,6 +589,12 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         worker.register_callback("report_progress", _handle_progress)
         # Clean up stale patchers if worker restarts transparently via _ensure_started()
         worker._on_restart = lambda: _cleanup_stale_patchers(env_dir)
+        # Canary handshake: verify each transport tier through the production
+        # serialization path; demotes GPU zero-copy for this worker if its
+        # round-trip fails. A CPU-tier failure raises (broken IPC).
+        from ..settings import _is_on
+        if _is_on("COMFY_ENV_TRANSPORT_PROBE", True):
+            worker.verify_transport()
         _WORKER_POOL[key] = (worker, gen)
         return worker, gen
 

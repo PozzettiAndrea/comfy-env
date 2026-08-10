@@ -505,15 +505,25 @@ def _serialize_pool_ipc_parent(t):
 # Shared memory serialization (parent -> worker)
 # =============================================================================
 
+# Set by SubprocessWorker around each call. True = the startup canary
+# handshake failed a GPU zero-copy round-trip for the target worker, so
+# CUDA tensors take the CPU shared-memory path for that worker instead of
+# risking a silently-wrong transfer across torch's private reduction ABI.
+_gpu_zero_copy_demoted = False
+
+
 def _parent_tensor_serializer(obj, registry, visited):
     """Parent-side tensor serialization strategy.
 
-    Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory.
+    Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory. GPU
+    zero-copy tiers are skipped when the canary handshake demoted them for
+    the current worker (_gpu_zero_copy_demoted).
     """
-    if obj.is_cuda and _parent_shareable_pool is not None:
-        return _serialize_pool_ipc_parent(obj)
-    if obj.is_cuda and _probe_cuda_ipc():
-        return _serialize_cuda_ipc(obj)
+    if obj.is_cuda and not _gpu_zero_copy_demoted:
+        if _parent_shareable_pool is not None:
+            return _serialize_pool_ipc_parent(obj)
+        if _probe_cuda_ipc():
+            return _serialize_cuda_ipc(obj)
     tensor = obj.detach().cpu().contiguous()
     return _serialize_tensor_native_parent(tensor, registry)
 
