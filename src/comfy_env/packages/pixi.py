@@ -65,8 +65,8 @@ def _installed_version_ok() -> bool:
     """True iff the installed binary is the pinned version.
 
     A binary without a marker predates pinning (unknown version, downloaded
-    from `releases/latest` unverified) -- it gets replaced by the pinned,
-    verified one exactly once; after that the marker short-circuits.
+    unverified from the floating latest endpoint) -- it gets replaced by the
+    pinned, verified one exactly once; after that the marker short-circuits.
     """
     if not Path(PIXI).exists():
         return False
