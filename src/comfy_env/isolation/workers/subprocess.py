@@ -278,7 +278,8 @@ class SubprocessWorker(Worker):
             except Exception:
                 pass
         # Check faulthandler dump
-        fault_file = os.path.join(tempfile.gettempdir(), "comfy_worker_faulthandler.txt")
+        from ._ipc_shared import WORKER_FAULTHANDLER_BASENAME
+        fault_file = os.path.join(tempfile.gettempdir(), WORKER_FAULTHANDLER_BASENAME)
         if os.path.exists(fault_file):
             try:
                 with open(fault_file, "r", encoding="utf-8", errors="replace") as f:

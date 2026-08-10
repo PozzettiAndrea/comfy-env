@@ -340,6 +340,20 @@ def find_available_wheels(package: str) -> List[str]:
     return wheels
 
 
+def _version_key(version: str):
+    """Sortable key for wheel version strings: numeric segments compare as
+    numbers, so '1.10' > '1.9' and '0.0.1' < '1.0' (plain string comparison
+    gets both wrong)."""
+    main = version.split("+", 1)[0]
+    key = []
+    for piece in re.split(r"[._-]", main):
+        if piece.isdigit():
+            key.append((0, int(piece), ""))
+        else:
+            key.append((1, 0, piece))
+    return key
+
+
 def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
     """Find wheel matching CUDA/torch version, return version spec."""
     cuda_short = cuda_version.replace(".", "")[:3]
@@ -359,7 +373,10 @@ def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> 
             for local in local_patterns:
                 if local in wheel_name:
                     parts = wheel_name.split("-")
-                    if len(parts) >= 2 and (best_version is None or parts[1] > best_version):
+                    if len(parts) >= 2 and (
+                        best_version is None
+                        or _version_key(parts[1]) > _version_key(best_version)
+                    ):
                         best_version = parts[1]
                         best_match = f"{package}==={parts[1]}"
                     break

@@ -13,7 +13,7 @@ import hashlib
 import os
 import sys
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..config import (
     ComfyEnvConfig,

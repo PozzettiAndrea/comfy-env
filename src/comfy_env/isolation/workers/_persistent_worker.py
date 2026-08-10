@@ -212,8 +212,13 @@ if _affinity_pinned:
 
 # Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
 class TensorKeeper:
-    """Keep tensors alive for a retention period to prevent shared memory deletion."""
-    def __init__(self, retention_seconds=30.0):
+    """Keep tensors alive for a retention period to prevent shared memory deletion.
+
+    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py -- the parent holds
+    its references for the same window; an asymmetric (shorter) worker window
+    lets the worker free memory the parent may not have mapped yet.
+    """
+    def __init__(self, retention_seconds=60.0):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()
@@ -348,6 +353,9 @@ def _deserialize_cuda_ipc(data):
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 _pool_ipc_ok = False
 _our_pool = None
+# Parent's shareable pool (parent->worker zero-copy); imported in main()'s
+# handshake, read by the module-level _from_shm().
+_parent_pool = None
 _pool_ipc_metadata_cache = {}
 _pool_ipc_cache_tensors = {}
 
@@ -934,8 +942,11 @@ def _cleanup_shm(registry):
 
 # Shared memory keeper - holds references to prevent premature GC
 class ShmKeeper:
-    """Keep shm blocks alive for a retention period to prevent race conditions."""
-    def __init__(self, retention_seconds=30.0):
+    """Keep shm blocks alive for a retention period to prevent race conditions.
+
+    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py (see TensorKeeper).
+    """
+    def __init__(self, retention_seconds=60.0):
         self.retention_seconds = retention_seconds
         self._keeper = collections.deque()
         self._lock = threading.Lock()
@@ -1636,7 +1647,7 @@ def main():
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---
-    global _pool_ipc_ok, _our_pool
+    global _pool_ipc_ok, _our_pool, _parent_pool
     if _POOL_IPC_ENABLED and sys.platform == "linux":
         try:
             import torch as _pt

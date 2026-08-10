@@ -30,7 +30,15 @@ CUDA_MEM_LOCATION_TYPE_DEVICE = 1
 CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 3
 CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT = 5
 
+# Worker faulthandler dump file (basename under tempdir). The worker writes
+# it; the parent's crash diagnostic reads it. MUST match on both sides --
+# they drifted once (.log vs .txt) and crash dumps were silently never found.
+WORKER_FAULTHANDLER_BASENAME = "comfy_worker_faulthandler.log"
+
 # Timing constants
+# NOTE: the worker (_persistent_worker.py) cannot rely on importing this
+# module at its very top (the faulthandler hook runs before imports), so it
+# repeats these literals -- keep them in sync with the values here.
 TENSOR_KEEPER_TTL = 60.0        # seconds to hold shared tensors before GC
 WATCHDOG_INTERVAL = 60          # seconds between watchdog thread dumps
 VRAM_POLL_THRESHOLD = 200 * 1024 * 1024  # 200MB change triggers log

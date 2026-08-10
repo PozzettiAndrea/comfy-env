@@ -3,12 +3,15 @@ name: CI
 on:
   push:
     branches: [main, master]
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:
+  # PyPI publish is gated on the full test matrix passing.
+  test:
+    uses: ./.github/workflows/test.yml
+
   check-and-publish:
+    needs: test
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'push' && 'pypi' || '' }}
     permissions:
