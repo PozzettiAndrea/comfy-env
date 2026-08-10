@@ -608,6 +608,17 @@ class SubprocessWorker(Worker):
                     self._transport.send(callback_response)
                     continue  # Keep waiting for actual response
 
+                # Correlation check: every worker response echoes the request's
+                # call_id. A mismatched frame is a stale late reply (e.g. from
+                # a predecessor that timed out) -- drop it and keep waiting
+                # instead of returning the wrong result to the wrong caller.
+                resp_id = response.get("call_id")
+                if resp_id is not None and call_id is not None and resp_id != call_id:
+                    print(f"[{self.name}] Dropping stale frame "
+                          f"call_id={resp_id} (expecting {call_id})",
+                          file=sys.stderr, flush=True)
+                    continue
+
                 # Got a real response
                 break
         except ConnectionError as e:

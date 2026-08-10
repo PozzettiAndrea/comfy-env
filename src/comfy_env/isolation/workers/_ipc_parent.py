@@ -43,6 +43,7 @@ from ._ipc_shared import (
     _cleanup_shm,
     _evict_cache_if_needed,
     _to_shm_generic,
+    deserialize_custom,
 )
 
 # Debug logging -- imported by subprocess.py, passed through here
@@ -604,6 +605,10 @@ def _from_shm(obj, unlink=True):
         if isinstance(obj, list):
             return [_from_shm(v, unlink) for v in obj]
         return obj
+
+    # Registered custom type (or OpaquePayload when unknown on this side)
+    if "__shm_custom__" in obj:
+        return deserialize_custom(obj, lambda v: _from_shm(v, unlink))
 
     # PoolIPC -> zero-copy CUDA tensor via shareable pool (worker -> parent)
     if obj.get("__type__") == "PoolIPC":
