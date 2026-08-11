@@ -798,46 +798,49 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if not sp:
             continue
 
+        # ONE parser (the config layer) -- this block once tomli.load'ed the
+        # file and re-implemented env_vars/options/cuda normalization by
+        # hand; duplicated contracts drift (the .log/.txt faulthandler split
+        # was the same disease).
         env_vars = {}
         health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
         try:
-            import tomli
-            with open(cf, "rb") as f:
-                toml_data = tomli.load(f)
-                env_vars = {str(k): str(v) for k, v in toml_data.get("env_vars", {}).items()}
-                health_check_timeout = float(toml_data.get("options", {}).get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))
-                # Feed the declared accelerator packages to the metadata
-                # scan so it can detect top-level accelerator imports
-                # (accel_import_violations in the scan payload).
-                _accel_pkgs = toml_data.get("cuda", {}).get("packages", [])
-                if isinstance(_accel_pkgs, str):
-                    _accel_pkgs = [_accel_pkgs]
-                if _accel_pkgs:
-                    env_vars["COMFY_ENV_ACCEL_PKGS"] = ",".join(str(p) for p in _accel_pkgs)
-                # Custom serializer modules ([serializers].modules): forward
-                # to the worker AND load in this (parent) process so both
-                # sides register the same transport rules. Parent-side
-                # import failures are fine -- those types pass through as
-                # OpaquePayload here.
-                _ser_mods = toml_data.get("serializers", {}).get("modules", [])
-                if isinstance(_ser_mods, str):
-                    _ser_mods = [_ser_mods]
-                if _ser_mods:
-                    _spec = ",".join(str(m) for m in _ser_mods)
-                    env_vars["COMFY_ENV_SERIALIZER_MODULES"] = _spec
-                    from .workers._ipc_shared import load_serializer_modules
-                    _pkg_root = str(pkg_dir)
-                    _added = _pkg_root not in sys.path
+            from ..config import load_config
+            cfg = load_config(cf)
+            env_vars = dict(cfg.env_vars)
+            health_check_timeout = cfg.options["health_check_timeout"]
+            # Feed the declared accelerator packages to the metadata scan so
+            # it can detect top-level accelerator imports
+            # (accel_import_violations in the scan payload).
+            if cfg.cuda_packages:
+                env_vars["COMFY_ENV_ACCEL_PKGS"] = ",".join(
+                    str(p) for p in cfg.cuda_packages)
+            # Custom serializer modules ([serializers].modules): forward to
+            # the worker AND load in this (parent) process so both sides
+            # register the same transport rules. Parent-side import
+            # failures are fine -- those types pass through as
+            # OpaquePayload here. ([serializers] stays out of generated
+            # manifests via toml_generator._HANDLED_PASSTHROUGH.)
+            _ser_mods = cfg.pixi_passthrough.get(
+                "serializers", {}).get("modules", [])
+            if isinstance(_ser_mods, str):
+                _ser_mods = [_ser_mods]
+            if _ser_mods:
+                _spec = ",".join(str(m) for m in _ser_mods)
+                env_vars["COMFY_ENV_SERIALIZER_MODULES"] = _spec
+                from .workers._ipc_shared import load_serializer_modules
+                _pkg_root = str(pkg_dir)
+                _added = _pkg_root not in sys.path
+                if _added:
+                    sys.path.insert(0, _pkg_root)
+                try:
+                    load_serializer_modules(_spec, log=_log)
+                finally:
                     if _added:
-                        sys.path.insert(0, _pkg_root)
-                    try:
-                        load_serializer_modules(_spec, log=_log)
-                    finally:
-                        if _added:
-                            try:
-                                sys.path.remove(_pkg_root)
-                            except ValueError:
-                                pass
+                        try:
+                            sys.path.remove(_pkg_root)
+                        except ValueError:
+                            pass
         except Exception as e:
             _log(f"[comfy-env] Failed to parse {cf}: {e}")
         if comfyui_base:
