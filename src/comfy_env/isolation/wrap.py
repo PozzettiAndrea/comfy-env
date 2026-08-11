@@ -1071,4 +1071,17 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     _log(f"[comfy-env] Registered {len(all_mappings)} total nodes")
 
+    # ADR-0010 startup summary: accelerator nodes this machine can't serve
+    # are registered (workflows load) but hidden from the node menu.
+    unavailable = [n for n, c in all_mappings.items()
+                   if getattr(c, "_comfy_env_unavailable", None)]
+    if unavailable:
+        accels = sorted({str(getattr(all_mappings[n], "_comfy_env_accelerator", "?"))
+                         for n in unavailable})
+        _log(f"[comfy-env] WARNING: {len(unavailable)} node(s) require "
+             f"{'/'.join(accels)} but no such accelerator is present on this "
+             f"machine -- registered but hidden from the node menu: "
+             f"{', '.join(unavailable[:8])}"
+             + (" ..." if len(unavailable) > 8 else ""))
+
     return all_mappings, all_display

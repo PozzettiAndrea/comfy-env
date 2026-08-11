@@ -108,10 +108,13 @@ def test_unavailable_node_is_visible_and_raises_named_reason(monkeypatch):
         node_name="CudaNode", meta=meta, env_dir=Path("unused"),
         package_root=Path("unused"), sys_path=[], lib_path=None, env_vars={},
     )
-    # Visible: real inputs/outputs survive so workflows still load.
+    # Registered with real inputs/outputs so workflows still load...
     assert cls.INPUT_TYPES() == meta["input_types"]
     assert cls.RETURN_TYPES == ("INT",)
     assert cls._comfy_env_accelerator == "cuda"
+    # ...but hidden from the node picker (ADR-0010: DEPRECATED hides from
+    # menu/search without unregistering the type).
+    assert cls.DEPRECATED is True
     assert "requires CUDA" in cls.DESCRIPTION or "unavailable" in cls.DESCRIPTION
     # Executing raises the named reason, before any worker is spawned.
     with pytest.raises(RuntimeError, match="requires CUDA.*backend 'cpu'"):

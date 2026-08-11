@@ -878,13 +878,18 @@ def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
         "OUTPUT_NODE": meta.get("output_node", False),
         "INPUT_TYPES": classmethod(lambda cls, _cached=input_types: _cached),
         "DESCRIPTION": f"(requires {str(accel).upper()} -- unavailable on this machine)",
+        # ADR-0010: hidden from the node picker (ComfyUI hides DEPRECATED
+        # nodes from menu/search) but still REGISTERED so shared workflows
+        # load and dispatcher node-ids resolve.
+        "DEPRECATED": True,
         "_comfy_env_isolated": True,
         "_comfy_env_accelerator": accel,
         "_comfy_env_unavailable": reason,
         func_name: _raiser,
     }
     print(f"[comfy-env] {node_name}: requires {accel}, machine backend is "
-          f"'{backend}' -- registered as unavailable", file=sys.stderr, flush=True)
+          f"'{backend}' -- registered but hidden from the node menu",
+          file=sys.stderr, flush=True)
     return type(f"ComfyEnvUnavailable_{meta.get('class_name', node_name)}", (), attrs)
 
 
