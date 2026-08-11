@@ -202,7 +202,6 @@ from _ipc_shared import (  # noqa: F401 -- re-exported names used below
     _send_fd,
     _recv_fd,
     _PoolPtr,
-    _prepare_trimesh_for_pickle,
 )
 
 # Release CPU affinity back to all cores for actual GPU work
@@ -423,7 +422,6 @@ def _serialize_pool_ipc(t):
     return result
 
 
-# _prepare_trimesh_for_pickle comes from _ipc_shared.
 
 
 def _serialize_tensor_native(t, registry):
@@ -649,24 +647,6 @@ def _from_shm(obj, _depth=0, _key="root"):
         wlog(f"[_from_shm] {_key}: mapped arr shape={arr.shape}")
         return arr
 
-    # trimesh (pickled)
-    if "__shm_trimesh__" in obj:
-        import pickle
-        if "fd" in obj:
-            wlog(f"[_from_shm] {_key}: trimesh memfd pid={obj['pid']} fd={obj['fd']} size={obj['size']}")
-            mesh_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
-        else:
-            wlog(f"[_from_shm] {_key}: trimesh shm '{obj['name']}' size={obj['size']}")
-            block = shm.SharedMemory(name=obj["name"])
-            try:
-                from multiprocessing.resource_tracker import unregister
-                unregister(block._name, "shared_memory")
-            except Exception:
-                pass
-            mesh_bytes = bytes(block.buf[:obj["size"]])
-            block.close()
-        return pickle.loads(mesh_bytes)
-
     # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
     if "__shm_sparse_tensor__" in obj:
         wlog(f"[_from_shm] {_key}: SparseTensor")
@@ -791,9 +771,6 @@ def _should_use_reference(obj):
     # Dicts, lists, tuples - recurse into contents (don't ref the container)
     if isinstance(obj, (dict, list, tuple)):
         return False
-    # Trimesh - pass by value but needs special handling (see _prepare_trimesh_for_pickle)
-    if obj_type == 'Trimesh':
-        return False
     # Everything else (custom classes) - pass by reference
     return True
 
@@ -816,10 +793,7 @@ def _serialize_result(obj, visited=None):
 
     visited.add(obj_id)
 
-    # Handle trimesh objects specially - strip unpickleable native extensions
-    obj_type = type(obj).__name__
-    if obj_type == 'Trimesh':
-        return _prepare_trimesh_for_pickle(obj)
+    obj_type = type(obj).__name__  # noqa: F841
 
     if isinstance(obj, dict):
         return {k: _serialize_result(v, visited) for k, v in obj.items()}

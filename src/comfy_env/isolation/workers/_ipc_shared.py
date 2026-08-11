@@ -265,30 +265,6 @@ class _PoolPtr:
 
 
 # =============================================================================
-# Trimesh preparation for cross-process pickle
-# =============================================================================
-
-def _prepare_trimesh_for_pickle(mesh):
-    """
-    Prepare a trimesh object for cross-Python-version pickling.
-
-    Trimesh attaches helper objects (ray tracer, proximity query) that may use
-    native extensions like embreex. These cause import errors when unpickling
-    on a system without those extensions. We strip them - they'll be recreated
-    lazily when needed.
-
-    Note: Do NOT strip _cache - trimesh needs it to function properly.
-    """
-    mesh = mesh.copy()
-    for attr in ('ray', '_ray', 'permutate', 'nearest'):
-        try:
-            delattr(mesh, attr)
-        except AttributeError:
-            pass
-    return mesh
-
-
-# =============================================================================
 # Shared memory registry cleanup
 # =============================================================================
 
@@ -532,25 +508,10 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
         visited[obj_id] = result
         return result
 
-    # trimesh.Trimesh -> pickle -> shared memory
-    if t == 'Trimesh':
-        import pickle
-        obj = _prepare_trimesh_for_pickle(obj)
-        mesh_bytes = pickle.dumps(obj)
-
-        if _USE_MEMFD:
-            fd, size = _memfd_write(mesh_bytes)
-            registry.append(fd)
-            result = {"__shm_trimesh__": True, "fd": fd, "pid": os.getpid(), "size": size}
-        else:
-            from multiprocessing import shared_memory as shm
-            block = shm.SharedMemory(create=True, size=len(mesh_bytes))
-            block.buf[:len(mesh_bytes)] = mesh_bytes
-            registry.append(block)
-            result = {"__shm_trimesh__": True, "name": block.name, "size": len(mesh_bytes)}
-
-        visited[obj_id] = result
-        return result
+    # NOTE: trimesh has no builtin branch (removed 2026-08, no backcompat):
+    # packs register their own mesh serializers via the registry (ADR-0014;
+    # ComfyUI-GeometryPack's geometrypack_wire_types is the reference).
+    # Unregistered meshes fall to the generic pickle rung below.
 
     # SparseTensor -> decompose to coords + feats CPU tensors
     if t == 'SparseTensor':

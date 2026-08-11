@@ -39,7 +39,6 @@ from ._ipc_shared import (
     _PoolPtr,
     _import_pointer,
     _export_pointer,
-    _prepare_trimesh_for_pickle,
     _cleanup_shm,
     _evict_cache_if_needed,
     _to_shm_generic,
@@ -642,19 +641,6 @@ def _from_shm(obj, unlink=True):
             if unlink:
                 block.unlink()
             return arr
-
-    # trimesh (pickled to preserve visual, metadata, normals)
-    if "__shm_trimesh__" in obj:
-        import pickle
-        if "fd" in obj:
-            mesh_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
-        else:
-            block = shm.SharedMemory(name=obj["name"])
-            mesh_bytes = bytes(block.buf[:obj["size"]])
-            block.close()
-            if unlink:
-                block.unlink()
-        return pickle.loads(mesh_bytes)
 
     # SparseTensor -> reconstruct as tagged dict with coords + feats tensors
     if "__shm_sparse_tensor__" in obj:
