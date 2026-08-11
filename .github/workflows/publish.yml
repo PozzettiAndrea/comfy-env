@@ -39,7 +39,14 @@ jobs:
         if: github.event_name == 'push'
         run: |
           version="${{ steps.version.outputs.version }}"
-          git rev-parse "v$version" >/dev/null 2>&1 || { git tag "v$version" && git push origin "v$version"; }
+          # Check the REMOTE for the tag -- the shallow checkout has no tags,
+          # so a local rev-parse always says "missing" and the push then
+          # collides with the existing remote tag.
+          if [ -z "$(git ls-remote --tags origin "refs/tags/v$version")" ]; then
+            git tag "v$version" && git push origin "v$version"
+          else
+            echo "Tag v$version already exists on origin -- skipping"
+          fi
 
       - name: Build package
         if: github.event_name == 'push'
@@ -57,3 +64,7 @@ jobs:
       - name: Publish to PyPI
         if: github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-pushes of an already-published version are green no-ops, not
+          # failures (version bumps still publish normally).
+          skip-existing: true
