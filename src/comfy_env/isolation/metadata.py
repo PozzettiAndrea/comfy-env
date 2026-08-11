@@ -878,7 +878,7 @@ def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
         "OUTPUT_NODE": meta.get("output_node", False),
         "INPUT_TYPES": classmethod(lambda cls, _cached=input_types: _cached),
         "DESCRIPTION": f"(requires {str(accel).upper()} -- unavailable on this machine)",
-        # ADR-0010: hidden from the node picker (ComfyUI hides DEPRECATED
+        # ADR-0012: hidden from the node picker (ComfyUI hides DEPRECATED
         # nodes from menu/search) but still REGISTERED so shared workflows
         # load and dispatcher node-ids resolve.
         "DEPRECATED": True,

@@ -112,7 +112,7 @@ def test_unavailable_node_is_visible_and_raises_named_reason(monkeypatch):
     assert cls.INPUT_TYPES() == meta["input_types"]
     assert cls.RETURN_TYPES == ("INT",)
     assert cls._comfy_env_accelerator == "cuda"
-    # ...but hidden from the node picker (ADR-0010: DEPRECATED hides from
+    # ...but hidden from the node picker (ADR-0012: DEPRECATED hides from
     # menu/search without unregistering the type).
     assert cls.DEPRECATED is True
     assert "requires CUDA" in cls.DESCRIPTION or "unavailable" in cls.DESCRIPTION

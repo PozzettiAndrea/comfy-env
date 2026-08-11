@@ -1071,7 +1071,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     _log(f"[comfy-env] Registered {len(all_mappings)} total nodes")
 
-    # ADR-0010 startup summary: accelerator nodes this machine can't serve
+    # ADR-0012 startup summary: accelerator nodes this machine can't serve
     # are registered (workflows load) but hidden from the node menu.
     unavailable = [n for n, c in all_mappings.items()
                    if getattr(c, "_comfy_env_unavailable", None)]
