@@ -1,4 +1,6 @@
+import sys
 from pathlib import Path
+
 import tomli
 
 #Two config types:
@@ -25,18 +27,31 @@ class ComfyEnvConfig(dict):
             or self.get("pixi_passthrough", {}).get("pypi-dependencies")
         )
 
-# Role schema: the root file carries pack-level declarations only. Anything
-# else -- dead legacy keys, typos, sections that belong in an env file -- is
-# rejected at parse time rather than silently ignored (that's how a no-op
-# [env_vars] shipped in the flagship pack for months).
+# Role schemas. The root file carries pack-level declarations only; the env
+# file carries an env definition and must NOT carry the root-only sections.
+# Anything role-inappropriate -- dead legacy keys, typos, misplaced sections
+# -- is rejected at parse time rather than silently ignored (that's how a
+# no-op [env_vars] shipped in the flagship pack for months).
 ROOT_ALLOWED_SECTIONS = {"node_reqs", "settings"}
+ROOT_ONLY_SECTIONS = {"node_reqs", "settings"}
+
+# Comfy-env-owned sections of the ENV file and their known keys: the one
+# place pixi cannot validate for us, so unrecognized keys warn (a typo'd
+# `pakages` otherwise vanishes without a trace). Everything outside these
+# sections is pixi's language and is validated by pixi (ADR-0013).
+_OWNED_SECTION_KEYS = {
+    "cuda": {"packages"},
+    "options": {"health_check_timeout"},
+    "serializers": {"modules"},
+}
 
 
 def load_config(path):
     """Load a comfy-env TOML file. Returns a ComfyEnvConfig.
 
     The filename determines the role: comfy-env-root.toml is validated
-    against the root role schema (ROOT_ALLOWED_SECTIONS).
+    against the closed root schema; comfy-env.toml rejects root-only
+    sections (they were parsed-and-ignored for months -- no more).
     """
     path = Path(path)
     with open(path, "rb") as f:
@@ -50,6 +65,14 @@ def load_config(path):
                 f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs] and [settings] "
                 f"only. Env definitions (dependencies, cuda, env_vars, ...) "
                 f"go in a subdirectory {CONFIG_FILE_NAME}.")
+    elif path.name == CONFIG_FILE_NAME:
+        misplaced = sorted(ROOT_ONLY_SECTIONS & set(data))
+        if misplaced:
+            raise ValueError(
+                f"{path}: section(s) "
+                f"{', '.join('[' + s + ']' for s in misplaced)} belong in "
+                f"{ROOT_CONFIG_FILE_NAME} at the pack root -- in an env file "
+                f"they have never had any effect.")
     return parse_config(data)
 
 
@@ -79,6 +102,30 @@ def parse_config(data):
         }
     """
     data = dict(data)  # shallow copy
+
+    # Schema version (ADR-0013): absent means 1. Exists so a future format
+    # change can dispatch migrations instead of guessing from key patterns.
+    schema = data.pop("schema", 1)
+    if schema != 1:
+        raise ValueError(
+            f"schema = {schema} is not supported by this comfy-env "
+            f"(known: 1). Upgrade comfy-env or fix the config.")
+
+    # Typo guard for comfy-env-owned sections -- pixi validates everything
+    # else, but these are ours (ADR-0013).
+    owned = dict(_OWNED_SECTION_KEYS)
+    if "settings" in data:
+        from ..settings import SETTINGS_KEY_MAP
+        owned["settings"] = set(SETTINGS_KEY_MAP)
+    for section, known in owned.items():
+        table = data.get(section)
+        if isinstance(table, dict):
+            for key in table:
+                if key not in known:
+                    print(
+                        f"[comfy-env] WARNING: unrecognized key '{key}' in "
+                        f"[{section}] (known: {', '.join(sorted(known))})",
+                        file=sys.stderr, flush=True)
 
     python = data.pop("python", None)
     if python is not None:

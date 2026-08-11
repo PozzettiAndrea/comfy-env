@@ -28,15 +28,15 @@ def test_known_sections_are_extracted_not_passed_through():
     assert cfg.pixi_passthrough == {}
 
 
-def test_unknown_tables_never_reach_generated_manifests():
-    # No special-casing for legacy keys: unknown tables (e.g. the removed
-    # [apt]/[brew]) sit in pixi_passthrough but the generator only copies
-    # allowlisted keys, so they can never poison a generated pixi.toml.
+def test_unknown_tables_are_forwarded_pixi_validates():
+    # ADR-0013 honest passthrough: unknown tables (including legacy [apt])
+    # are FORWARDED into the generated manifest at feature level, where the
+    # pinned pixi rejects invalid ones loudly at install time -- pixi is the
+    # validator for its own language, comfy-env keeps no allowlist.
     from comfy_env.packages.toml_generator import build_env_toml
     cfg = parse_config({"apt": {"packages": ["libgl1"]}, "dependencies": {"ffmpeg": "*"}})
     manifest = build_env_toml("t", cfg, torch_index=None, log=lambda m: None)
-    assert "apt" not in manifest
-    assert "apt" not in str(manifest)
+    assert manifest["feature"]["node"]["apt"] == {"packages": ["libgl1"]}
 
 
 def test_cuda_scalar_normalized_to_list():
