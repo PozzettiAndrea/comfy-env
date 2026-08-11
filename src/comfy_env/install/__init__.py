@@ -65,6 +65,18 @@ def install(
     if cfg is None:
         raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
+    # Root-role config carries [node_reqs] and [settings] -- nothing else.
+    # Warn on sections that are silently inert at root so good-faith configs
+    # don't rot (root [env_vars] once shipped in the flagship pack, no-op).
+    if cfg.env_vars:
+        log(f"[comfy-env] WARNING: [env_vars] in {ROOT_CONFIG_FILE_NAME} has no "
+            f"effect -- declare env vars in the subdirectory {CONFIG_FILE_NAME} "
+            f"(they are passed to that env's workers).")
+    if cfg.cuda_packages:
+        log(f"[comfy-env] WARNING: [cuda] in {ROOT_CONFIG_FILE_NAME} has no "
+            f"effect -- CUDA packages belong in a subdirectory "
+            f"{CONFIG_FILE_NAME} (comfy-env never installs into the host env).")
+
     node_req_dirs: List[Path] = []
     if cfg.node_reqs:
         _install_node_dependencies(cfg.node_reqs, node_dir, log, dry_run)
