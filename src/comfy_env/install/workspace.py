@@ -215,47 +215,69 @@ def _discover_node_configs(
     return out
 
 
-def _compute_env_hash(
+# ---------------------------------------------------------------------------
+# Env identity (v2): two-level skip decision.
+#
+# Level 1 -- FAST KEY (pure local, no network): a hash of the local inputs
+# that could change the derivation: this env's config bytes, the bootstrap
+# ABI tag, GPU presence/backend, and the cross-env combo inputs. If the fast
+# key matches, the env is stamped tier-1 (not "fallback"), and the env is
+# materialized, the run skips with zero network -- this preserves the cheap
+# all-clean CI path.
+#
+# Level 2 -- IDENTITY (derivation OUTPUT): sha256 over the canonical
+# generated manifest plus the resolved cuda wheel URLs. Computed only when
+# the fast key missed (or the env is on a fallback combo, which a
+# later-published wheel can upgrade). Identity match = refresh the hash
+# file, do NOT rebuild; mismatch = rebuild. Consequences:
+#   - comment/[env_vars] edits cost one derivation, never a rebuild
+#     (they change the fast key but not the generated output);
+#   - a fallback-combo env re-derives every run and upgrades itself the
+#     moment its missing wheel is published (torch pin changes -> identity
+#     changes);
+#   - GPU-presence flips change the fast key -> full derivation -> the
+#     cpu/cu index flip changes the manifest -> rebuild;
+#   - comfy-env version bumps no longer force rebuilds (identity depends
+#     only on output; the version stays in the stamp for diagnostics).
+#
+# install.hash format (one entry per line):
+#   v2:<identity-sha256>
+#   fastkey:<fastkey-sha256>
+# A single-line legacy (v1) file is grandfathered: the env is accepted
+# as-built once (no surprise multi-GB rebuild on upgrade) and the file is
+# rewritten in v2 form so drift tracking starts now.
+# ---------------------------------------------------------------------------
+
+
+def _bootstrap_torch_pin(bootstrap_torch: Optional[str]) -> Optional[str]:
+    """major.minor wildcard pin (``==2.10.*``), THE pin rule for every
+    builder (install_workspace AND auto_install must agree, or the same env
+    means different things depending on who built it).
+
+    major.minor, not the exact patch: must match the granularity of the ABI
+    tag that names the env directory (environment/cache.py _abi_tag). A
+    finer pin than the key means two installs collide on one directory and
+    re-solve each other; a coarser pin would let an env silently satisfy a
+    stack it was not built for.
+    """
+    if not bootstrap_torch:
+        return None
+    return "==" + ".".join(bootstrap_torch.split(".")[:2]) + ".*"
+
+
+def _fast_key(
     cf: Path,
     discovered: List[Tuple[str, "Path", "Path", "ComfyEnvConfig"]],
 ) -> str:
-    """SHA-256 over the inputs that determine ONE env's generated pixi.toml.
-
-    Used by `install_workspace` to skip regenerate+install for envs whose
-    inputs have not changed since their last successful install. Stored
-    per-env at `<workspace>/envs/<dir>/install.hash`.
-
-    Why per-env and not one workspace-level file: the workspace root is shared
-    machine-wide, and the old single `<workspace>/install.hash` was keyed on
-    *this install's* discovered node set -- so two ComfyUI installs with
-    different node sets could never both be "clean"; each run flipped the file
-    and forced the other to redo its entire pass. Per-env files make the skip
-    decision belong to the thing being skipped.
-
-    Inputs:
-      - comfy-env package version (version bumps invalidate)
-      - bootstrap ABI tag (python/torch/backend -- a different stack must
-        never skip on the strength of another stack's install)
-      - this env's `comfy-env.toml` bytes
-      - the workspace-wide cuda-wheel combo INPUTS: the union of cuda packages
-        and python pins across every discovered node. The tier-1/tier-2 combo
-        decision in `_resolve_wheel_combo` depends on ALL nodes' cuda packages,
-        and its result is baked into every cuda env's manifest -- so installing
-        an unrelated cuda node genuinely changes this env's torch pin, and the
-        hash must notice.
-
-    `comfy-env-root.toml` stays excluded: it drives `node_reqs` (which plugins
-    get cloned) but does not affect any pixi env's solve.
-    """
-    from .. import __version__ as ce_version
+    """Local-only change detector (level 1). See block comment above."""
+    from ..detection.cuda import has_nvidia_gpu
     from ..environment.cache import _abi_tag
 
     h = hashlib.sha256()
-    h.update(b"comfy-env-version:")
-    h.update(ce_version.encode())
-    h.update(b"\n")
     h.update(b"abi:")
     h.update(_abi_tag().encode())
+    h.update(b"\ngpu:")
+    h.update(b"1" if has_nvidia_gpu() else b"0")
     h.update(b"\n")
 
     combo_inputs = sorted(
@@ -265,16 +287,64 @@ def _compute_env_hash(
     )
     h.update(b"combo-inputs:")
     h.update(",".join(combo_inputs).encode())
-    h.update(b"\n")
-
-    h.update(b"toml:")
+    h.update(b"\ntoml:")
     try:
         h.update(cf.read_bytes())
     except OSError:
         pass
     h.update(b"\n")
-
     return h.hexdigest()
+
+
+def _env_identity(manifest: Dict[str, Any], wheel_urls: List[str]) -> str:
+    """Derivation-output identity (level 2). Canonical JSON so dict insertion
+    order between call paths cannot change the hash."""
+    import json
+
+    h = hashlib.sha256()
+    h.update(json.dumps(manifest, sort_keys=True, default=str).encode())
+    h.update(b"\0")
+    h.update("\n".join(sorted(wheel_urls)).encode())
+    return "v2:" + h.hexdigest()
+
+
+def _read_hash_file(hp: Path) -> Tuple[Optional[str], Optional[str], bool]:
+    """Returns (identity, fastkey, is_legacy_v1)."""
+    try:
+        lines = [ln.strip() for ln in
+                 hp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return None, None, False
+    if not lines:
+        return None, None, False
+    identity = next((ln for ln in lines if ln.startswith("v2:")), None)
+    fastkey = next((ln[len("fastkey:"):] for ln in lines
+                    if ln.startswith("fastkey:")), None)
+    if identity is None and fastkey is None:
+        return None, None, True  # single-line v1 format
+    return identity, fastkey, False
+
+
+def _write_hash_file(hp: Path, identity: str, fastkey: str,
+                     log: Callable[[str], None]) -> None:
+    try:
+        hp.write_text(f"{identity}\nfastkey:{fastkey}\n", encoding="utf-8")
+        log(f"[comfy-env] Recorded env identity {identity[:15]} -> {hp}")
+    except OSError as e:
+        log(f"[comfy-env] WARNING: could not write {hp}: {e}")
+
+
+def _stamp_provenance(env_manifest_dir: Path) -> str:
+    """Provenance string from the env stamp ('' if unstamped/unreadable)."""
+    import json
+
+    from ..environment.cache import _STAMP_FILE
+    try:
+        stamp = json.loads(
+            (env_manifest_dir / _STAMP_FILE).read_text(encoding="utf-8"))
+        return str(stamp.get("provenance") or "")
+    except (OSError, ValueError):
+        return ""
 
 
 def _dedupe_envs_libomp(
@@ -512,7 +582,7 @@ def install_workspace(
         CE_WORKSPACE_DIR, get_workspace_dir, get_env_manifest_dir,
     )
     from ..packages.toml_generator import (
-        write_env_pixi_toml, resolve_env_cuda_wheel_urls,
+        build_env_toml, write_env_pixi_toml, resolve_env_cuda_wheel_urls,
     )
 
     comfyui_dir = Path(comfyui_dir).resolve()
@@ -535,36 +605,40 @@ def install_workspace(
             f"no longer used"
         )
 
-    # Hash-and-skip, per env: an env whose inputs are unchanged since its last
-    # successful install (hash recorded in ITS OWN directory) is not
-    # regenerated or reinstalled. When every env is clean the whole run
-    # short-circuits before torch/combo resolution, which is what keeps the
-    # N-installs-per-CI-run case cheap. See `_compute_env_hash` for inputs and
-    # for why this is per-env rather than one workspace-level file.
-    env_hashes: Dict[str, str] = {}
-    stale: List[str] = []
+    # Two-level skip decision (see the identity block comment above
+    # `_fast_key`). Level 1 here is pure-local: when every env's fast key
+    # matches, is materialized, and is not on a fallback combo, the whole
+    # run short-circuits before torch/combo resolution -- the cheap
+    # N-installs-per-CI-run path. Everything else goes to level-2
+    # DERIVATION, where only an actual identity change rebuilds.
+    from ..environment.cache import get_workspace_env_dir as _env_dir_of
+    fast_keys: Dict[str, str] = {}
+    stored_identity: Dict[str, Optional[str]] = {}
+    legacy_v1: Dict[str, bool] = {}
+    derive: List[str] = []
     for env_name, _plugin, cf, _cfg in discovered:
-        env_hashes[env_name] = _compute_env_hash(cf, discovered)
+        fast_keys[env_name] = _fast_key(cf, discovered)
         env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
-        hp = env_manifest_dir / _INSTALL_HASH_FILE
-        prev = ""
-        if hp.is_file():
-            try:
-                prev = hp.read_text(encoding="utf-8").strip()
-            except OSError:
-                prev = ""
-        if prev != env_hashes[env_name]:
-            stale.append(env_name)
-    if not dry_run and not stale:
+        identity, fastkey, legacy = _read_hash_file(
+            env_manifest_dir / _INSTALL_HASH_FILE)
+        stored_identity[env_name] = identity
+        legacy_v1[env_name] = legacy
+        materialized = _env_dir_of(workspace_dir, env_name).is_dir()
+        on_fallback = _stamp_provenance(env_manifest_dir).endswith(":fallback")
+        if (identity is not None and fastkey == fast_keys[env_name]
+                and materialized and not on_fallback):
+            continue  # clean: zero-network skip
+        derive.append(env_name)
+    if not dry_run and not derive:
         log(
             f"[comfy-env] All {len(discovered)} env(s) unchanged since last "
             f"successful install -- skipping. Delete an env's install.hash to force."
         )
         return workspace_dir
-    if stale and len(stale) < len(discovered):
+    if derive and len(derive) < len(discovered):
         log(
-            f"[comfy-env] {len(stale)}/{len(discovered)} env(s) need install: "
-            f"{', '.join(stale)} (others unchanged, will be skipped)"
+            f"[comfy-env] {len(derive)}/{len(discovered)} env(s) need a "
+            f"derivation check: {', '.join(derive)} (others clean, skipped)"
         )
 
     log_path = workspace_dir / "install.log"
@@ -593,19 +667,11 @@ def install_workspace(
         combo = _resolve_wheel_combo(
             discovered, bootstrap_python, cuda_version, bootstrap_torch, log,
         )
-        # major.minor, not the exact patch -- must match the granularity of the
-        # ABI tag that names the env directory (see environment/cache.py
-        # _abi_tag). A finer pin than the key means two installs collide on one
-        # directory and re-solve each other; a coarser pin than the key would
-        # mean an env could silently satisfy a stack it was not built for.
-        torch_pin: Optional[str] = (
-            "==" + ".".join(bootstrap_torch.split(".")[:2]) + ".*"
-            if bootstrap_torch else None
-        )
+        torch_pin: Optional[str] = _bootstrap_torch_pin(bootstrap_torch)
         chosen_torch_index: Optional[str] = None
         chosen_torch_pin_for_override: Optional[str] = None
         if combo is not None:
-            chosen_python, chosen_cuda, chosen_torch_short, chosen_torch_pin_for_override, _src = combo
+            chosen_python, chosen_cuda, chosen_torch_short, chosen_torch_pin_for_override, combo_src = combo
             chosen_torch_index = (
                 f"https://download.pytorch.org/whl/cu"
                 f"{chosen_cuda.replace('.', '')[:3]}"
@@ -624,16 +690,70 @@ def install_workspace(
         if source_dir and source_dir != comfyui_dir:
             log(f"[comfy-env] Desktop app detected: source={source_dir}, data={comfyui_dir}")
 
-        # Emit one pixi.toml per STALE env under <workspace>/envs/<env_name>/.
-        # Clean envs keep their manifest untouched -- regenerating it would be
-        # harmless for byte-identical output but rewrites mtimes and, worse,
-        # would clobber another install's manifest when this install's inputs
-        # differ (the exact last-writer-wins thrash per-env hashing exists to
-        # stop).
-        _stale_set = set(stale)
-        to_install = [d for d in discovered if d[0] in _stale_set]
-        log(f"[comfy-env] Writing {len(to_install)} per-env manifest(s):")
+        # Level-2 derivation for each candidate env: build the manifest
+        # in memory + resolve wheel URLs, then compare the OUTPUT identity
+        # with the stored one. Only a real identity change rebuilds;
+        # matches (comment edits, version bumps, fallback probe that found
+        # nothing new) just refresh the hash file. Grandfather: a legacy
+        # v1 hash with a materialized env is accepted as-built once.
+        _derive_set = set(derive)
+        candidates = [d for d in discovered if d[0] in _derive_set]
+        to_install = []
+        env_identity: Dict[str, str] = {}
         cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
+        for env_name, _plugin, _cf, cfg in candidates:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            manifest = build_env_toml(
+                env_name, cfg,
+                torch_index=torch_index,
+                bootstrap_python=bootstrap_python,
+                torch_pin=torch_pin,
+                chosen_torch_index=chosen_torch_index,
+                chosen_torch_pin=chosen_torch_pin_for_override,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            urls = resolve_env_cuda_wheel_urls(
+                env_name=env_name,
+                cfg=cfg,
+                bootstrap_python=bootstrap_python,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            identity = _env_identity(manifest, list(urls.values()))
+            env_identity[env_name] = identity
+            materialized = _env_dir_of(workspace_dir, env_name).is_dir()
+
+            if (not dry_run and materialized
+                    and identity == stored_identity[env_name]):
+                _write_hash_file(env_manifest_dir / _INSTALL_HASH_FILE,
+                                 identity, fast_keys[env_name], log)
+                log(f"[comfy-env] {env_name}: derivation unchanged -- skipping")
+                continue
+            if (not dry_run and materialized and legacy_v1[env_name]
+                    and stored_identity[env_name] is None):
+                _write_hash_file(env_manifest_dir / _INSTALL_HASH_FILE,
+                                 identity, fast_keys[env_name], log)
+                log(
+                    f"[comfy-env] {env_name}: legacy install.hash grandfathered "
+                    f"-- env accepted as-built, identity tracking starts now"
+                )
+                continue
+
+            to_install.append((env_name, _plugin, _cf, cfg))
+            if urls:
+                cuda_urls_by_env[env_name] = urls
+                log(
+                    f"[comfy-env] {env_name}: cuda-wheels deferred for post-pixi "
+                    f"install ({', '.join(urls.keys())})"
+                )
+
+        # Emit one pixi.toml per genuinely-stale env. Clean envs keep their
+        # manifest untouched (identical content, but no mtime churn and no
+        # clobbering of another install's manifest).
+        log(f"[comfy-env] Writing {len(to_install)} per-env manifest(s):")
         for env_name, _plugin, _cf, cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
             write_env_pixi_toml(
@@ -650,20 +770,6 @@ def install_workspace(
                 log=log,
             )
             log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
-            urls = resolve_env_cuda_wheel_urls(
-                env_name=env_name,
-                cfg=cfg,
-                bootstrap_python=bootstrap_python,
-                chosen_cuda=chosen_cuda if combo is not None else None,
-                chosen_torch_short=chosen_torch_short if combo is not None else None,
-                log=log,
-            )
-            if urls:
-                cuda_urls_by_env[env_name] = urls
-                log(
-                    f"[comfy-env] {env_name}: cuda-wheels deferred for post-pixi "
-                    f"install ({', '.join(urls.keys())})"
-                )
 
         if dry_run:
             log("[comfy-env] dry_run -- skipping `pixi install`")
@@ -779,27 +885,30 @@ def install_workspace(
         # that into a loud mismatch instead.
         from ..environment.cache import write_env_stamp
         for env_name, _plugin, cf, _cfg in to_install:
+            # Provenance carries the combo tier for cuda envs: envs stamped
+            # ":fallback" are re-derived on every install run so they upgrade
+            # themselves the moment their missing wheel is published.
+            if combo is not None and _cfg.cuda_packages:
+                prov = f"install_workspace:{combo_src}"
+                stamp_pin = chosen_torch_pin_for_override
+            else:
+                prov = "install_workspace"
+                stamp_pin = torch_pin
             write_env_stamp(
                 get_env_manifest_dir(env_name, comfyui_dir),
-                torch_pin=(chosen_torch_pin_for_override
-                           if (combo is not None and _cfg.cuda_packages)
-                           else torch_pin),
-                provenance="install_workspace",
+                torch_pin=stamp_pin,
+                provenance=prov,
                 log=log,
             )
 
-        # Record each env's inputs hash IN ITS OWN DIRECTORY so subsequent runs
-        # skip it individually. Only written after pixi install + post-steps all
-        # succeed -- a failed install leaves no hash and forces a retry. The old
-        # workspace-level install.hash is removed if present: leaving it would
-        # let a pre-split comfy-env skip installs this version performed.
+        # Record each env's derivation identity + fast key IN ITS OWN
+        # DIRECTORY so subsequent runs skip it individually. Only written
+        # after pixi install + post-steps all succeed -- a failed install
+        # leaves no hash and forces a retry.
         for env_name, _plugin, cf, _cfg in to_install:
-            hp = get_env_manifest_dir(env_name, comfyui_dir) / _INSTALL_HASH_FILE
-            try:
-                hp.write_text(env_hashes[env_name] + "\n", encoding="utf-8")
-                log(f"[comfy-env] Recorded install hash {env_hashes[env_name][:12]} -> {hp}")
-            except OSError as e:
-                log(f"[comfy-env] WARNING: could not write {hp}: {e}")
+            _write_hash_file(
+                get_env_manifest_dir(env_name, comfyui_dir) / _INSTALL_HASH_FILE,
+                env_identity[env_name], fast_keys[env_name], log)
         try:
             legacy_hash = workspace_dir / _INSTALL_HASH_FILE
             if legacy_hash.is_file():

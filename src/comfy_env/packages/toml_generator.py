@@ -695,11 +695,12 @@ def write_env_pixi_toml(
     chosen_cuda: Optional[str] = None,
     chosen_torch_short: Optional[str] = None,
     log: Callable[[str], None] = print,
-) -> Path:
+) -> Dict[str, Any]:
     """Write ``<env_manifest_dir>/pixi.toml`` for one isolated env.
 
-    Returns the manifest path. Overwrites any existing file -- per-env
-    manifests are deterministically regenerated from the node's config.
+    Returns the manifest DICT (used for derivation-identity hashing).
+    Overwrites any existing file -- per-env manifests are deterministically
+    regenerated from the node's config.
     """
     tomli_w = _require_tomli_w()
     env_manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -718,7 +719,7 @@ def write_env_pixi_toml(
     )
     with open(pixi_toml, "wb") as f:
         tomli_w.dump(data, f)
-    return pixi_toml
+    return data
 
 
 def resolve_env_cuda_wheel_urls(

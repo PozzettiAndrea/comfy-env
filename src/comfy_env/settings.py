@@ -1,9 +1,14 @@
 """General settings for comfy-env.
 
-Settings can be configured via:
-  1. Environment variables (highest priority)
-  2. Persistent settings in ~/.comfy-env/settings.env
-  3. Defaults
+Precedence (most specific wins -- a per-pack declaration is more specific
+than a global environment variable):
+  1. Per-pack `[settings]` in comfy-env-root.toml (via resolve_bool/
+     resolve_numeric with node_settings)
+  2. Environment variables (COMFY_ENV_*)
+  3. Persistent ~/.comfy-env/settings.env (loaded at import with
+     os.environ.setdefault -- it fills UNSET env vars, so it can never
+     override an explicitly-set one)
+  4. Defaults
 
 Workers can't import this module (different venv), so they parse env vars directly.
 """

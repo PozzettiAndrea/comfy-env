@@ -180,14 +180,17 @@ def ensure_env_materialized(
             if env_dir.is_dir():
                 return env_dir
 
-            # Generate manifest on first auto-install for this env.
-            if not env_manifest.is_file():
-                _generate_env_manifest(
-                    env_name=env_name,
-                    config_path=config_path,
-                    env_manifest_dir=env_manifest_dir,
-                    log=log,
-                )
+            # (Re)generate the manifest with the SAME generator and SAME pin
+            # rule as install_workspace -- for a non-cuda env the two
+            # builders now produce byte-identical output, so the identity
+            # recorded below matches a later `comfy-env install` and the env
+            # is not treated as stale.
+            manifest, torch_pin = _generate_env_manifest(
+                env_name=env_name,
+                config_path=config_path,
+                env_manifest_dir=env_manifest_dir,
+                log=log,
+            )
 
             log(
                 f"[comfy-env] Materializing `{env_name}` via `pixi install` "
@@ -197,13 +200,26 @@ def ensure_env_materialized(
             ok = _run_pixi_install(env_manifest_dir, env_manifest, log)
             if not ok:
                 return None
-            # Stamp with provenance=auto_install: this path deliberately skips
-            # the workspace-wide cuda-wheel combo and pins to bootstrap torch
-            # only, so the same directory means something different depending
-            # on who built it. The stamp records which one this is.
+            # Stamp with provenance=auto_install: this path deliberately
+            # skips the workspace-wide cuda-wheel combo, so cuda envs built
+            # here have no wheels yet; the differing identity makes the next
+            # `comfy-env install` rebuild them WITH wheels, while non-cuda
+            # envs match and are left alone.
             from ..environment.cache import write_env_stamp
-            write_env_stamp(env_manifest_dir, torch_pin=None,
+            from ..install.workspace import (
+                _INSTALL_HASH_FILE, _env_identity, _fast_key, _write_hash_file,
+            )
+            from ..config import load_config as _load_config
+            write_env_stamp(env_manifest_dir, torch_pin=torch_pin,
                             provenance="auto_install", log=log)
+            _cfg = _load_config(config_path)
+            _write_hash_file(
+                env_manifest_dir / _INSTALL_HASH_FILE,
+                _env_identity(manifest, []),
+                _fast_key(config_path,
+                          [(env_name, plugin_dir, config_path, _cfg)]),
+                log,
+            )
             log(f"[comfy-env] `{env_name}` materialized.")
     except RuntimeError as e:
         log(f"[comfy-env] auto-install of `{env_name}` aborted: {e}")
@@ -219,26 +235,31 @@ def _generate_env_manifest(
     config_path: Path,
     env_manifest_dir: Path,
     log: Callable[[str], None],
-) -> None:
+):
     """Generate the per-env pixi.toml from the node's comfy-env.toml.
 
+    Returns (manifest_dict, torch_pin). Uses the SAME pin rule as
+    install_workspace (`_bootstrap_torch_pin`, ``==X.Y.*``) -- an exact pin
+    here once made the two builders rewrite each other's manifest on every
+    alternation (the thrash the install-side comment warns about).
+
     Cuda-wheel combo resolution is intentionally skipped here -- that's a
-    workspace-wide decision that needs every env's configs together. Per-env
-    auto-install pins to bootstrap torch only. Nodes with cuda-only wheel
-    deps (flash_attn, sageattention, cumesh) will need explicit
-    ``comfy-env install`` to provision them.
+    workspace-wide decision that needs every env's configs together. Nodes
+    with cuda-only wheel deps (flash_attn, sageattention, cumesh) get their
+    wheels on the next explicit ``comfy-env install`` (the differing
+    derivation identity triggers it).
     """
     from ..config import load_config
     from ..packages.toml_generator import write_env_pixi_toml
-    from ..install.workspace import _resolve_workspace_torch
+    from ..install.workspace import _bootstrap_torch_pin, _resolve_workspace_torch
 
     log(f"[comfy-env] Generating manifest for `{env_name}` at {env_manifest_dir}/pixi.toml")
     cfg = load_config(config_path)
     (
         torch_index, _cuda_version, _cuda_major, bootstrap_python, bootstrap_torch,
     ) = _resolve_workspace_torch(log)
-    torch_pin = f"=={bootstrap_torch}" if bootstrap_torch else None
-    write_env_pixi_toml(
+    torch_pin = _bootstrap_torch_pin(bootstrap_torch)
+    manifest = write_env_pixi_toml(
         env_manifest_dir=env_manifest_dir,
         env_name=env_name,
         cfg=cfg,
@@ -247,6 +268,7 @@ def _generate_env_manifest(
         torch_pin=torch_pin,
         log=log,
     )
+    return manifest, torch_pin
 
 
 def _run_pixi_install(
