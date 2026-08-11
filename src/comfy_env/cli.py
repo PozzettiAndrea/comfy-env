@@ -85,15 +85,15 @@ def main(args: Optional[List[str]] = None) -> int:
 
 
 ROOT_DEFAULT_CONFIG = """\
-# comfy-env-root.toml - Main node config
-# [dependencies] = conda packages for the main ComfyUI env
-# [node_reqs] = other custom nodes this node depends on
-
-[dependencies]
-# ffmpeg = "*"  # needed by av on macOS
+# comfy-env-root.toml - pack-level config. Carries [node_reqs] and
+# [settings] ONLY; env definitions (dependencies, cuda, env_vars, ...)
+# go in a subdirectory comfy-env.toml.
 
 [node_reqs]
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"
+
+# [settings]
+# isolate = true
 """
 
 ISOLATED_DEFAULT_CONFIG = """\

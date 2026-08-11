@@ -25,10 +25,32 @@ class ComfyEnvConfig(dict):
             or self.get("pixi_passthrough", {}).get("pypi-dependencies")
         )
 
+# Role schema: the root file carries pack-level declarations only. Anything
+# else -- dead legacy keys, typos, sections that belong in an env file -- is
+# rejected at parse time rather than silently ignored (that's how a no-op
+# [env_vars] shipped in the flagship pack for months).
+ROOT_ALLOWED_SECTIONS = {"node_reqs", "settings"}
+
+
 def load_config(path):
-    """Load a comfy-env TOML file. Returns a ComfyEnvConfig."""
+    """Load a comfy-env TOML file. Returns a ComfyEnvConfig.
+
+    The filename determines the role: comfy-env-root.toml is validated
+    against the root role schema (ROOT_ALLOWED_SECTIONS).
+    """
+    path = Path(path)
     with open(path, "rb") as f:
-        return parse_config(tomli.load(f))
+        data = tomli.load(f)
+    if path.name == ROOT_CONFIG_FILE_NAME:
+        unknown = sorted(set(data) - ROOT_ALLOWED_SECTIONS)
+        if unknown:
+            raise ValueError(
+                f"{path}: unsupported section(s) "
+                f"{', '.join('[' + s + ']' for s in unknown)} -- "
+                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs] and [settings] "
+                f"only. Env definitions (dependencies, cuda, env_vars, ...) "
+                f"go in a subdirectory {CONFIG_FILE_NAME}.")
+    return parse_config(data)
 
 
 def discover_config(node_dir, root=True):
