@@ -16,7 +16,7 @@ def test_unknown_keys_pass_through_to_pixi():
 
 def test_known_sections_are_extracted_not_passed_through():
     cfg = parse_config({
-        "python": 3.11,
+        "python": "3.11",
         "cuda": {"packages": ["nvdiffrast"]},
         "env_vars": {"FOO": 1},
         "settings": {"isolate": False},

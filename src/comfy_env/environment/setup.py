@@ -16,7 +16,19 @@ def is_comfy_env_enabled():
 
 def _find_env_dirs(node_dir):
     """Recursively find comfy-env.toml files under node_dir (for debug info only)."""
-    return sorted(str(p.parent) for p in Path(node_dir).rglob("comfy-env.toml"))
+    # Same two shapes the binder supports (nodes/ and nodes/<subdir>) --
+    # kept consistent with install discovery; no recursive walk.
+    node_dir = Path(node_dir)
+    out = []
+    nodes_dir = node_dir / "nodes"
+    if nodes_dir.is_dir():
+        if (nodes_dir / "comfy-env.toml").is_file():
+            out.append(str(nodes_dir))
+        for child in sorted(nodes_dir.iterdir()):
+            if (child.is_dir() and not child.name.startswith((".", "_"))
+                    and (child / "comfy-env.toml").is_file()):
+                out.append(str(child))
+    return out
 
 
 def _ensure_base_directory():

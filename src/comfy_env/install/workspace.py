@@ -128,11 +128,42 @@ def _resolve_workspace_torch(
     return torch_index, cuda_version, cuda_major, python_version, torch_version
 
 
+def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
+    """The ONLY locations the runtime binder supports: `nodes/comfy-env.toml`
+    and `nodes/<subdir>/comfy-env.toml` (isolation/wrap.py pattern 1 and 2).
+
+    Discovery enumerates exactly these shapes -- deliberately NOT a recursive
+    glob. A config anywhere else (pack root, deeper nesting, vendored trees)
+    could be materialized but never bound, silently wasting gigabytes; by
+    matching discovery to binding, that whole class cannot occur.
+    """
+    nodes_dir = plugin_dir / "nodes"
+    if not nodes_dir.is_dir():
+        return []
+    out = []
+    root_cf = nodes_dir / CONFIG_FILE_NAME
+    if root_cf.is_file():
+        out.append(root_cf)
+    for child in sorted(nodes_dir.iterdir()):
+        if child.is_dir() and not child.name.startswith((".", "_")):
+            cf = child / CONFIG_FILE_NAME
+            if cf.is_file():
+                out.append(cf)
+    return out
+
+
 def _discover_node_configs(
     comfyui_dir: Path,
     log: Callable[[str], None] = print,
 ) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
-    """Find every comfy-env.toml under custom_nodes/ and pair with (env_name, plugin_dir, config_path, cfg).
+    """Find bindable comfy-env.toml configs under custom_nodes/ and pair
+    with (env_name, plugin_dir, config_path, cfg).
+
+    Only the shapes the runtime can bind are discovered (see
+    `_bindable_config_paths`). Duplicate env names across configs are a
+    hard error: proceeding would make both configs share one env dir and
+    overwrite each other's install hash -- a permanent multi-GB rebuild
+    loop with no diagnostic (the 2026-08 review's collision-thrash defect).
 
     Logs the scan loudly so failed parses don't silently produce an empty result.
     """
@@ -143,6 +174,7 @@ def _discover_node_configs(
 
     log(f"[comfy-env] _discover: scanning {custom_nodes}")
     out: List[Tuple[str, Path, Path, ComfyEnvConfig]] = []
+    seen: Dict[str, Path] = {}
     for plugin_dir in sorted(custom_nodes.iterdir()):
         if not plugin_dir.is_dir():
             continue
@@ -155,10 +187,9 @@ def _discover_node_configs(
         if plugin_dir.name.endswith((".disabled", "._disabled")):
             log(f"[comfy-env] _discover: skip {plugin_dir.name} (quarantine suffix)")
             continue
-        toml_files = [cf for cf in sorted(plugin_dir.rglob(CONFIG_FILE_NAME))
-                      if cf.name != ROOT_CONFIG_FILE_NAME]
+        toml_files = _bindable_config_paths(plugin_dir)
         if not toml_files:
-            log(f"[comfy-env] _discover: {plugin_dir.name}: no {CONFIG_FILE_NAME} found")
+            log(f"[comfy-env] _discover: {plugin_dir.name}: no bindable {CONFIG_FILE_NAME}")
             continue
         for cf in toml_files:
             try:
@@ -170,6 +201,15 @@ def _discover_node_configs(
                 )
                 continue
             env_name = get_env_name(plugin_dir, cf)
+            if env_name in seen:
+                raise ValueError(
+                    f"env name '{env_name}' is derived from BOTH "
+                    f"{seen[env_name]} and {cf}. Two configs sharing one env "
+                    f"name would share one env directory and permanently "
+                    f"rebuild over each other. Rename one of the "
+                    f"directories so the derived names differ."
+                )
+            seen[env_name] = cf
             log(f"[comfy-env] _discover: {plugin_dir.name} -> {env_name} ({cf.relative_to(comfyui_dir)})")
             out.append((env_name, plugin_dir, cf, cfg))
     return out

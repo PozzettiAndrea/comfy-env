@@ -82,6 +82,14 @@ def parse_config(data):
 
     python = data.pop("python", None)
     if python is not None:
+        # TOML gotcha: unquoted `python = 3.10` is a FLOAT and becomes 3.1
+        # (3.11/3.12 unquoted survive by luck, which is what makes this a
+        # landmine). Require a string.
+        if not isinstance(python, str):
+            raise ValueError(
+                f'python = {python} is not a string (unquoted TOML numbers '
+                f'lose trailing zeros: 3.10 becomes 3.1). Quote it: '
+                f'python = "{python}"')
         python = str(python)
 
     cuda = data.pop("cuda", {})

@@ -272,10 +272,11 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         return None
 
     if config_path is None:
-        for cand in ("comfy-env.toml", "comfy-env-root.toml"):
-            if (node_dir / cand).exists():
-                config_path = node_dir / cand
-                break
+        # Only comfy-env.toml names an env. The root file was once a
+        # fallback candidate here -- an identity for an env that install
+        # never creates (2026-08 review wart, removed).
+        if (node_dir / "comfy-env.toml").exists():
+            config_path = node_dir / "comfy-env.toml"
         if config_path is None:
             _log(
                 f"[comfy-env] isolation env not found: no comfy-env.toml in {node_dir}; "
@@ -765,9 +766,21 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         _log(f"[comfy-env] No '{nodes_package}/' directory in {pkg_dir}")
         return {}, {}
 
-    # Discover isolation configs
+    # Discover isolation configs. Discovery matches the binder EXACTLY:
+    # <nodes_package>/comfy-env.toml and <nodes_package>/<subdir>/ only --
+    # the two shapes pattern 1/2 below can bind. Deliberately not a
+    # recursive glob: a config anywhere else could be scanned but never
+    # bound (and rglob walked .git/assets on every boot).
     isolation_envs = {}  # {resolved_dir: env_config}
-    config_files = list(pkg_dir.rglob("comfy-env.toml"))
+    config_files = []
+    _root_cf = nodes_dir / "comfy-env.toml"
+    if _root_cf.is_file():
+        config_files.append(_root_cf)
+    for _child in sorted(nodes_dir.iterdir()):
+        if _child.is_dir() and not _child.name.startswith((".", "_")):
+            _cf = _child / "comfy-env.toml"
+            if _cf.is_file():
+                config_files.append(_cf)
 
     from ..environment.cache import find_comfyui_source_dir
     comfyui_base = find_comfyui_source_dir(pkg_dir)
@@ -778,8 +791,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         _log("[comfy-env] ComfyUI source dir not found")
 
     for cf in config_files:
-        if cf.name == "comfy-env-root.toml":
-            continue
         env_dir = _find_env_dir(cf.parent, config_path=cf)
         if not env_dir:
             continue
@@ -1062,8 +1073,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     # Report skipped isolation dirs (no _env_* installed)
     for cf in config_files:
-        if cf.name == "comfy-env-root.toml":
-            continue
         if cf.parent.resolve() not in isolation_envs:
             env_dir = _find_env_dir(cf.parent)
             if not env_dir:
