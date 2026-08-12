@@ -704,9 +704,10 @@ class SubprocessWorker(Worker):
 
                 # Send request with shared memory metadata
                 self._call_counter += 1
+                call_id = self._call_counter
                 request = {
                     "type": "call_method",
-                    "call_id": self._call_counter,
+                    "call_id": call_id,
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
@@ -730,19 +731,33 @@ class SubprocessWorker(Worker):
 
                 # Reconstruct result from shared memory
                 result_meta = response.get("result")
+                result = None
                 if result_meta is not None:
                     _ipc_parent._active_worker_pool = self._worker_pool
                     try:
-                        return _from_shm(result_meta)
+                        result = _from_shm(result_meta)
                     finally:
                         _ipc_parent._active_worker_pool = None
-                return None
+                self._send_consumed(call_id)
+                return result
 
             finally:
                 _ipc_parent._gpu_zero_copy_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
+
+    def _send_consumed(self, call_id: int) -> None:
+        """One-way ack: every frame of the worker's reply for `call_id` has
+        been read or copied into parent-owned memory. The worker frees that
+        call's keeper entries immediately instead of guessing with a TTL
+        (which can't cover suspend/resume, nested long calls mid-read, or
+        slow multi-output serialization). Best-effort: if the transport is
+        gone, the worker's TTL sweep or restart cleans up."""
+        try:
+            self._transport.send({"type": "consumed", "call_id": call_id})
+        except Exception:
+            pass
 
     def call_module(
         self,
@@ -763,9 +778,10 @@ class SubprocessWorker(Worker):
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
 
                 self._call_counter += 1
+                call_id = self._call_counter
                 request = {
                     "type": "call_module",
-                    "call_id": self._call_counter,
+                    "call_id": call_id,
                     "module": module,
                     "func": func,
                     "kwargs": kwargs_meta,
@@ -779,13 +795,15 @@ class SubprocessWorker(Worker):
                     )
 
                 result_meta = response.get("result")
+                result = None
                 if result_meta is not None:
                     _ipc_parent._active_worker_pool = self._worker_pool
                     try:
-                        return _from_shm(result_meta)
+                        result = _from_shm(result_meta)
                     finally:
                         _ipc_parent._active_worker_pool = None
-                return None
+                self._send_consumed(call_id)
+                return result
 
             finally:
                 _ipc_parent._gpu_zero_copy_demoted = False
@@ -807,7 +825,8 @@ class SubprocessWorker(Worker):
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else {}
                 self._call_counter += 1
-                request = {"type": "echo", "call_id": self._call_counter,
+                call_id = self._call_counter
+                request = {"type": "echo", "call_id": call_id,
                            "kwargs": kwargs_meta}
                 response = self._send_request(request, timeout=120.0)
                 if response.get("status") == "error":
@@ -815,6 +834,7 @@ class SubprocessWorker(Worker):
                                       traceback=response.get("traceback"))
                 result_meta = response.get("result")
                 result = _from_shm(result_meta) if result_meta is not None else None
+                self._send_consumed(call_id)
                 return result, response.get("torch_version")
             finally:
                 _ipc_parent._gpu_zero_copy_demoted = False

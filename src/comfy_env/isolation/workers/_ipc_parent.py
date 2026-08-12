@@ -43,6 +43,7 @@ from ._ipc_shared import (
     _evict_cache_if_needed,
     _to_shm_generic,
     deserialize_custom,
+    loads_or_opaque,
 )
 
 # Debug logging -- imported by subprocess.py, passed through here
@@ -658,9 +659,10 @@ def _from_shm(obj, unlink=True):
             "feats": feats,
         }
 
-    # generic pickled object (VideoFromFile, etc.)
+    # generic pickled object (VideoFromFile, etc.). loads_or_opaque holds
+    # the bytes as OpaquePickle when this env lacks the class -- the bare
+    # host (only comfy-env installed) can hold and forward any pack type.
     if "__shm_pickle__" in obj:
-        import pickle
         if "fd" in obj:
             obj_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
         else:
@@ -669,7 +671,7 @@ def _from_shm(obj, unlink=True):
             block.close()
             if unlink:
                 block.unlink()
-        return pickle.loads(obj_bytes)
+        return loads_or_opaque(obj_bytes)
 
     # V3 NodeOutput -> reconstruct
     if "__node_output__" in obj:

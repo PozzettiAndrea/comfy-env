@@ -380,8 +380,10 @@ def register_serializer(type_name, serialize, deserialize=None, tag=None):
 class OpaquePayload:
     """A custom-tagged value this process cannot reconstruct.
 
-    Holds the wire payload verbatim; re-serializing emits the identical
-    frame, so the value survives pass-through untouched.
+    The payload is MATERIALIZED on receipt (see deserialize_custom): every
+    frame is deserialized into objects this process owns, so the held value
+    no longer references the sender's shared memory. Re-serializing walks
+    those objects and emits fresh frames backed by this process's memory.
     """
 
     def __init__(self, tag, payload):
@@ -392,18 +394,64 @@ class OpaquePayload:
         return f"OpaquePayload(tag={self.tag!r})"
 
 
+class OpaquePickle:
+    """Pickled bytes this process cannot unpickle (class's module not
+    installed here -- e.g. a bare ComfyUI host env that installs only
+    comfy-env). Owns the bytes, so the value survives sender restarts;
+    re-serializing writes a fresh __shm_pickle__ block for the next hop.
+    """
+
+    def __init__(self, data):
+        self.data = bytes(data)
+
+    def __repr__(self):
+        return f"OpaquePickle({len(self.data)} bytes)"
+
+
+def loads_or_opaque(obj_bytes):
+    """pickle.loads that degrades to OpaquePickle when this side lacks the
+    class. AttributeError covers version-skewed modules missing the name;
+    ModuleNotFoundError subclasses ImportError. Either way the value stays
+    forwardable instead of killing the request."""
+    import pickle
+    try:
+        return pickle.loads(obj_bytes)
+    except (ImportError, AttributeError):
+        return OpaquePickle(obj_bytes)
+
+
+def _own_tree(value):
+    """Ensure no node of a materialized payload borrows the sender's
+    buffers: numpy arrays that are views (the worker-side _from_shm maps
+    arrays directly into the sender's blocks) are copied. Tensors from
+    TensorRef own their storage mapping and survive the sender."""
+    if type(value).__name__ == "ndarray" and getattr(value, "base", None) is not None:
+        return value.copy()
+    if isinstance(value, dict):
+        return {k: _own_tree(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_own_tree(v) for v in value]
+    return value
+
+
 def deserialize_custom(obj, recurse):
     """Handle a {"__shm_custom__": tag, "payload": ...} frame.
 
-    Called by both sides' _from_shm. Unknown tags become OpaquePayload.
-    Note: payload contents are passed to the deserializer RAW -- the
-    deserializer's own `recurse` calls decide which nested parts to
-    reconstruct (so it can skip or transform sections deliberately).
+    Called by both sides' _from_shm. With a registered deserializer the
+    payload is passed RAW -- its own `recurse` calls decide which nested
+    parts to reconstruct (so it can skip or transform sections).
+
+    Without one (this side lacks the pack's libs), every frame in the
+    payload is materialized into objects THIS process owns before wrapping
+    in OpaquePayload: a held receipt must not reference the sender's shared
+    memory, which the sender frees on ack/TTL/restart. Holding raw frames
+    was the root cause of FileNotFoundError on dead shm names when a
+    lib-less host forwarded a mesh after its worker restarted.
     """
     tag = obj["__shm_custom__"]
     deser = REGISTRY.lookup_deserializer(tag)
     if deser is None:
-        return OpaquePayload(tag, obj["payload"])
+        return OpaquePayload(tag, _own_tree(recurse(obj["payload"])))
     return deser(obj["payload"], recurse)
 
 
@@ -456,22 +504,28 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
 
     t = type(obj).__name__
 
-    # Opaque pass-through: a custom value this process couldn't reconstruct
-    # re-serializes to its original wire form, untouched.
+    def _recurse(v):
+        return _to_shm_generic(v, registry, visited,
+                               tensor_serializer=tensor_serializer,
+                               node_output_serializer=node_output_serializer)
+
+    # Opaque re-emit: the payload was materialized into owned objects on
+    # receipt, so serialize those afresh -- the next hop gets frames backed
+    # by THIS process's memory, not the (possibly dead) original sender's.
     if isinstance(obj, OpaquePayload):
-        return {"__shm_custom__": obj.tag, "payload": obj.payload}
+        return {"__shm_custom__": obj.tag, "payload": _recurse(obj.payload)}
+
+    # Held pickled bytes (class not importable here) -> fresh pickle block.
+    if isinstance(obj, OpaquePickle):
+        result = _pickle_frame(obj.data, registry)
+        visited[obj_id] = result
+        return result
 
     # Registered custom types take precedence over the built-in branches so
     # a pack may deliberately override handling of a named type.
     entry = REGISTRY.lookup_serializer(obj)
     if entry is not None:
         tag, serialize = entry
-
-        def _recurse(v):
-            return _to_shm_generic(v, registry, visited,
-                                   tensor_serializer=tensor_serializer,
-                                   node_output_serializer=node_output_serializer)
-
         result = {"__shm_custom__": tag, "payload": serialize(obj, _recurse)}
         visited[obj_id] = result
         return result
@@ -574,17 +628,21 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     import pickle
     try:
         obj_bytes = pickle.dumps(obj)
-        if _USE_MEMFD:
-            fd, size = _memfd_write(obj_bytes)
-            registry.append(fd)
-            result = {"__shm_pickle__": True, "fd": fd, "pid": os.getpid(), "size": size}
-        else:
-            from multiprocessing import shared_memory as shm
-            block = shm.SharedMemory(create=True, size=len(obj_bytes))
-            block.buf[:len(obj_bytes)] = obj_bytes
-            registry.append(block)
-            result = {"__shm_pickle__": True, "name": block.name, "size": len(obj_bytes)}
+        result = _pickle_frame(obj_bytes, registry)
         visited[obj_id] = result
         return result
     except Exception:
         return obj
+
+
+def _pickle_frame(obj_bytes, registry):
+    """Write pickled bytes to a shm block/memfd; return the wire frame."""
+    if _USE_MEMFD:
+        fd, size = _memfd_write(obj_bytes)
+        registry.append(fd)
+        return {"__shm_pickle__": True, "fd": fd, "pid": os.getpid(), "size": size}
+    from multiprocessing import shared_memory as shm
+    block = shm.SharedMemory(create=True, size=len(obj_bytes))
+    block.buf[:len(obj_bytes)] = obj_bytes
+    registry.append(block)
+    return {"__shm_pickle__": True, "name": block.name, "size": len(obj_bytes)}

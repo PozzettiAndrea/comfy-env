@@ -38,3 +38,29 @@ def bump_worker_only(value=None):
     from worker_only_type import WorkerOnly
     assert isinstance(value, WorkerOnly), f"got {type(value).__name__}"
     return value.secret + 1
+
+
+def make_worker_only_arr(n=64):
+    import numpy as np
+    from worker_only_arr import WorkerOnlyArr
+    return WorkerOnlyArr(np.arange(n, dtype=np.float32))
+
+
+def sum_worker_only_arr(value=None):
+    """Assert the array-bearing opaque payload reconstructs here."""
+    import numpy as np
+    from worker_only_arr import WorkerOnlyArr
+    assert isinstance(value, WorkerOnlyArr), f"got {type(value).__name__}"
+    return float(np.asarray(value.data).sum())
+
+
+def make_pickle_only(n=7):
+    from pickle_only_type import PickleOnly
+    return PickleOnly(n)
+
+
+def bump_pickle_only(value=None):
+    """Assert the held pickle bytes unpickled back into the real class."""
+    from pickle_only_type import PickleOnly
+    assert isinstance(value, PickleOnly), f"got {type(value).__name__}"
+    return value.n + 1

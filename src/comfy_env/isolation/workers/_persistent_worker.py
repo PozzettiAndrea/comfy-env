@@ -212,26 +212,47 @@ if _affinity_pinned:
         pass
 
 
+# Call id of the response currently being serialized. Set by the main loop
+# before _to_shm(result, ...) so keeper entries can be released the moment
+# the parent acks that call with {"type": "consumed"} instead of waiting
+# out the TTL. The TTL survives only as the fallback for a parent that
+# died before acking.
+_serializing_call_id = None
+
+
 # Tensor keeper - holds tensor references to prevent GC before parent reads shared memory
 class TensorKeeper:
-    """Keep tensors alive for a retention period to prevent shared memory deletion.
-
-    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py -- the parent holds
-    its references for the same window; an asymmetric (shorter) worker window
-    lets the worker free memory the parent may not have mapped yet.
+    """Keep tensors alive until the parent acks the call (release()), with
+    a TTL sweep as the crash fallback. A timer alone is a guess: parent
+    sleeps/suspends, nested calls mid-read, or slow multi-output
+    serialization can all outlive any fixed window.
     """
     def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
-        self._keeper = collections.deque()
+        self._keeper = collections.deque()  # (time, call_id, tensor)
         self._lock = threading.Lock()
 
     def keep(self, t):
         now = time.time()
         with self._lock:
-            self._keeper.append((now, t))
-            # Cleanup old entries
+            self._keeper.append((now, _serializing_call_id, t))
+            # TTL sweep (fallback only -- release() is the real path)
             while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
                 self._keeper.popleft()
+
+    def release(self, call_id):
+        """Drop every entry kept for `call_id` -- the parent confirmed it
+        has read (or now owns) all frames of that call's response."""
+        if call_id is None:
+            return
+        with self._lock:
+            kept = [e for e in self._keeper if e[1] != call_id]
+            self._keeper.clear()
+            self._keeper.extend(kept)
+
+    def count(self):
+        with self._lock:
+            return len(self._keeper)
 
 _tensor_keeper = TensorKeeper()
 
@@ -681,7 +702,9 @@ def _from_shm(obj, _depth=0, _key="root"):
                 pass
             obj_bytes = bytes(block.buf[:obj["size"]])
             block.close()
-        return pickle.loads(obj_bytes)
+        # Degrades to OpaquePickle when this env lacks the class (e.g. a
+        # cross-pack type this worker only forwards) -- see _ipc_shared.
+        return _ipc_shared.loads_or_opaque(obj_bytes)
 
     # Dict - recurse with key names for debugging
     if _depth == 0:
@@ -702,25 +725,53 @@ def _cleanup_shm(registry):
 
 # Shared memory keeper - holds references to prevent premature GC
 class ShmKeeper:
-    """Keep shm blocks alive for a retention period to prevent race conditions.
-
-    Default matches TENSOR_KEEPER_TTL in _ipc_shared.py (see TensorKeeper).
+    """Keep shm blocks alive until the parent acks the call (release()),
+    with a TTL sweep as the crash fallback (see TensorKeeper).
     """
     def __init__(self, retention_seconds=_ipc_shared.TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
-        self._keeper = collections.deque()
+        self._keeper = collections.deque()  # (time, call_id, blocks)
         self._lock = threading.Lock()
 
-    def keep(self, blocks):
+    def keep(self, blocks, call_id=None):
         now = time.time()
         with self._lock:
-            self._keeper.append((now, list(blocks)))  # Copy the list
-            # Cleanup old entries
+            self._keeper.append((now, call_id, list(blocks)))  # Copy the list
+            # TTL sweep (fallback only -- release() is the real path)
             while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
-                old_time, old_blocks = self._keeper.popleft()
+                _old_time, _old_id, old_blocks = self._keeper.popleft()
                 _cleanup_shm(old_blocks)
 
+    def release(self, call_id):
+        """Free every block kept for `call_id` -- parent acked the call."""
+        if call_id is None:
+            return
+        to_free = []
+        with self._lock:
+            kept = []
+            for entry in self._keeper:
+                if entry[1] == call_id:
+                    to_free.append(entry[2])
+                else:
+                    kept.append(entry)
+            self._keeper.clear()
+            self._keeper.extend(kept)
+        for blocks in to_free:
+            _cleanup_shm(blocks)
+
+    def count(self):
+        with self._lock:
+            return len(self._keeper)
+
 _shm_keeper = ShmKeeper()
+
+
+def _release_consumed(call_id):
+    """Parent sent {"type": "consumed", "call_id": N}: every frame of call
+    N's response has been read or copied into parent-owned memory. Free
+    that call's keeper entries now instead of waiting out the TTL."""
+    _tensor_keeper.release(call_id)
+    _shm_keeper.release(call_id)
 
 _input_shm_blocks = []  # Keep parent->worker shm blocks alive during request processing
 _input_torch_storages = []  # Track parent-owned torch storages to balance _shared_incref
@@ -937,7 +988,7 @@ def main():
     sock = _connect(socket_addr)
     transport = SocketTransport(sock)
     # Give the VRAM poller access to transport for sending log messages to parent
-    global _vram_poll_transport
+    global _vram_poll_transport, _serializing_call_id
     _vram_poll_transport = transport
     wlog("[worker] Connected, waiting for config...")
 
@@ -1254,6 +1305,11 @@ def main():
             if response.get("method") == "list_models":
                 transport.send({"status": "ok", "call_id": response.get("call_id"), "models": _model_registry_meta})
                 continue
+            if response.get("type") == "consumed":
+                # Ack for an earlier call arriving while we wait -- handle
+                # here too so it is never mistaken for a callback_response.
+                _release_consumed(response.get("call_id"))
+                continue
             if response.get("method") == "shutdown":
                 raise RuntimeError("Shutdown requested during callback")
             # Check for actual callback_response
@@ -1478,8 +1534,17 @@ def main():
             break
 
         if request.get("method") == "ping":
-            # Health check - respond immediately
-            transport.send({"status": "pong", "call_id": _current_call_id})
+            # Health check - respond immediately. Keeper counts ride along
+            # for tests/doctor (how many un-acked calls still pin memory).
+            transport.send({"status": "pong", "call_id": _current_call_id,
+                            "keepers": {"tensors": _tensor_keeper.count(),
+                                        "shm": _shm_keeper.count()}})
+            continue
+
+        if request.get("type") == "consumed":
+            # One-way ack from the parent: it finished reading (or copied)
+            # every frame of that call's response. No reply expected.
+            _release_consumed(request.get("call_id"))
             continue
 
         if request.get("method") == "model_to_device":
@@ -1533,6 +1598,7 @@ def main():
             try:
                 payload = _from_shm(request.get("kwargs") or {})
                 payload = _deserialize_input(payload)
+                _serializing_call_id = _current_call_id
                 result_meta = _to_shm(payload, shm_registry)
                 try:
                     import torch as _echo_torch
@@ -1541,7 +1607,7 @@ def main():
                     _echo_tv = None
                 transport.send({"status": "ok", "call_id": _current_call_id,
                                 "result": result_meta, "torch_version": _echo_tv})
-                _shm_keeper.keep(shm_registry)
+                _shm_keeper.keep(shm_registry, _current_call_id)
             except Exception as e:
                 _cleanup_shm(shm_registry)
                 transport.send({"status": "error", "call_id": _current_call_id,
@@ -1611,6 +1677,7 @@ def main():
 
             # Serialize result to shared memory
             wlog(f"[worker] Serializing result to shm...")
+            _serializing_call_id = _current_call_id
             result_meta = _to_shm(result, shm_registry)
             wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
@@ -1631,7 +1698,8 @@ def main():
                         _nme["device"] = "cpu"
                 response["_new_models"] = list(_new_models_this_call)
             transport.send(response)
-            _shm_keeper.keep(shm_registry)  # Keep alive for 30s until host reads
+            # Kept until the parent's "consumed" ack (TTL is the fallback)
+            _shm_keeper.keep(shm_registry, _current_call_id)
 
         except Exception as e:
             # Cleanup shm on error since host won't read it
