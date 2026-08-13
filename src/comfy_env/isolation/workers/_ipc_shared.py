@@ -521,26 +521,34 @@ def load_serializer_files(spec, log=None):
 # =============================================================================
 
 def _encode_np_dtype(dt):
-    """JSON round-trippable numpy dtype. str(dtype) is NOT enough: for a
-    structured/record dtype str() yields "[('x', '<f4'), ...]" which
-    np.dtype() cannot parse back (observed: PLY point clouds with per-vertex
-    fields crash on deserialize). dtype_to_descr gives a plain string for
-    simple dtypes and a field descr (list) for structured ones -- both
-    JSON-safe and reversible by _decode_np_dtype."""
-    from numpy.lib import format as _npf
-    return _npf.dtype_to_descr(dt)
+    """JSON round-trippable numpy dtype.
+
+    Simple dtypes -> their type string (e.g. '<f4'): small, readable, and
+    what legacy frames already carried. Structured / subarray dtypes -> a
+    pickled blob, because their field descr does NOT survive a JSON round-trip
+    -- JSON collapses the tuple-vs-list distinction the descr format depends
+    on, and numpy's descr_to_dtype then misreads it (the failure even varies
+    by numpy version: a PLY record dtype crashed on np.dtype() one way and on
+    descr_to_dtype another). A dtype pickles safely -- numpy only, no arbitrary
+    code -- and it is a few bytes of metadata, consistent with the transport's
+    existing pickle rung."""
+    import base64
+    import pickle
+    if dt.fields is None and dt.subdtype is None:
+        return dt.str
+    return {"__pickle_dtype__": base64.b64encode(pickle.dumps(dt)).decode("ascii")}
 
 
 def _decode_np_dtype(enc):
-    """Inverse of _encode_np_dtype. JSON turned the descr's tuples (including
-    nested subarray shapes) into lists, so coerce them back before numpy sees
-    them. Also accepts a bare dtype string (simple dtypes / legacy frames)."""
-    from numpy.lib import format as _npf
-    if not isinstance(enc, list):
-        return _npf.descr_to_dtype(enc)
-    def _tuplify(x):
-        return tuple(_tuplify(i) for i in x) if isinstance(x, list) else x
-    return _npf.descr_to_dtype([_tuplify(field) for field in enc])
+    """Inverse of _encode_np_dtype. A dict is a pickled structured dtype; a
+    string is a simple dtype (also accepts a legacy str(dtype) for simple
+    dtypes, which np.dtype parses)."""
+    import numpy as np
+    if isinstance(enc, dict):
+        import base64
+        import pickle
+        return pickle.loads(base64.b64decode(enc["__pickle_dtype__"]))
+    return np.dtype(enc)
 
 
 def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_serializer=None):
