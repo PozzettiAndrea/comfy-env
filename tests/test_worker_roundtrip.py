@@ -55,6 +55,22 @@ def test_worker_error_propagates(worker):
         worker.call_module(module="echo_node", func="no_such_function")
 
 
+def test_serialize_failure_is_loud(worker):
+    # A result pickle can't handle (lambda) must produce a named error
+    # pointing at the type -- never leak the raw object into the JSON
+    # message (the old fallback crashed two layers away with
+    # "not JSON serializable").
+    from comfy_env.isolation.workers import WorkerError
+    with pytest.raises(WorkerError, match="cannot serialize"):
+        worker.call_module(module="echo_node", func="make_unpicklable")
+
+
+def test_parent_serialize_failure_is_loud():
+    from comfy_env.isolation.workers.subprocess import _to_shm
+    with pytest.raises(TypeError, match="cannot serialize 'function'"):
+        _to_shm(lambda: 1, [])
+
+
 def test_crash_is_loud(worker):
     with pytest.raises(RuntimeError, match="died|closed"):
         worker.call_module(module="echo_node", func="crash")

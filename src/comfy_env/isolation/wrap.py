@@ -790,6 +790,47 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     else:
         _log("[comfy-env] ComfyUI source dir not found")
 
+    # Root config (comfy-env-root.toml): loaded once, used for [types]
+    # here and [settings] below.
+    root_cfg = None
+    try:
+        from ..config import discover_config
+        root_cfg = discover_config(pkg_dir, root=True)
+    except Exception as e:
+        _log(f"[comfy-env] Failed to load root config: {e}")
+
+    # [types] (ADR-0015): "custom" sockets require <pack>/serialization.py.
+    # Load it parent-side by file path (mangled module name -- no
+    # sys.modules collisions between packs) and validate LOUDLY: a
+    # declared-custom pack whose serializer file is missing, does not
+    # import, or registers nothing is a broken contract, not a warning.
+    _serializer_file = None
+    _custom_sockets = sorted(
+        s for s, mode in (root_cfg.types if root_cfg else {}).items()
+        if mode == "custom")
+    if _custom_sockets:
+        _ser_path = pkg_dir / "serialization.py"
+        if not _ser_path.is_file():
+            raise ValueError(
+                f"{pkg_dir.name}: [types] declares custom socket(s) "
+                f"{', '.join(_custom_sockets)} but {_ser_path} does not "
+                f"exist.")
+        from .workers._ipc_shared import (
+            load_serializer_files,
+            registration_count,
+        )
+        _before = registration_count()
+        load_serializer_files(str(_ser_path), log=_log)
+        if registration_count() == _before:
+            raise ValueError(
+                f"{pkg_dir.name}: [types] declares custom socket(s) "
+                f"{', '.join(_custom_sockets)} but serialization.py "
+                f"registered no serializers. Either it failed to import "
+                f"(top-level imports must be stdlib/numpy/comfy_env only "
+                f"-- heavy deps go inside the functions) or it never "
+                f"calls register_serializer().")
+        _serializer_file = str(_ser_path)
+
     for cf in config_files:
         env_dir = _find_env_dir(cf.parent, config_path=cf)
         if not env_dir:
@@ -815,34 +856,12 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             if cfg.cuda_packages:
                 env_vars["COMFY_ENV_ACCEL_PKGS"] = ",".join(
                     str(p) for p in cfg.cuda_packages)
-            # Custom serializer modules ([serializers].modules): forward to
-            # the worker AND load in this (parent) process so both sides
-            # register the same transport rules. Parent-side import
-            # failures are fine -- those types pass through as
-            # OpaquePayload here. ([serializers] stays out of generated
-            # manifests via toml_generator._HANDLED_PASSTHROUGH.)
-            _ser_mods = cfg.pixi_passthrough.get(
-                "serializers", {}).get("modules", [])
-            if isinstance(_ser_mods, str):
-                _ser_mods = [_ser_mods]
-            if _ser_mods:
-                _spec = ",".join(str(m) for m in _ser_mods)
-                env_vars["COMFY_ENV_SERIALIZER_MODULES"] = _spec
-                from .workers._ipc_shared import load_serializer_modules
-                _pkg_root = str(pkg_dir)
-                _added = _pkg_root not in sys.path
-                if _added:
-                    sys.path.insert(0, _pkg_root)
-                try:
-                    load_serializer_modules(_spec, log=_log)
-                finally:
-                    if _added:
-                        try:
-                            sys.path.remove(_pkg_root)
-                        except ValueError:
-                            pass
         except Exception as e:
             _log(f"[comfy-env] Failed to parse {cf}: {e}")
+        # [types] custom serializers (root-level, ADR-0015): workers load
+        # the same serialization.py by file path at startup.
+        if _serializer_file:
+            env_vars["COMFY_ENV_SERIALIZER_FILES"] = _serializer_file
         if comfyui_base:
             env_vars["COMFYUI_BASE"] = str(comfyui_base)
         # On Desktop app, folder_paths needs the user data dir for input/output/models
@@ -871,18 +890,12 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     all_mappings = {}
     all_display = {}
 
-    # Load per-node settings from comfy-env-root.toml (if present)
+    # Per-node settings from the root config loaded above
     node_settings = None
-    try:
-        from ..config import discover_config
-        root_cfg = discover_config(pkg_dir, root=True)
-        if root_cfg and root_cfg.settings:
-            node_settings = root_cfg.settings
-            if _DBG_WORKER:
-                _log(f"[comfy-env] Per-node settings from {pkg_dir}: {node_settings}")
-    except Exception as e:
+    if root_cfg and root_cfg.settings:
+        node_settings = root_cfg.settings
         if _DBG_WORKER:
-            _log(f"[comfy-env] Failed to load root config settings: {e}")
+            _log(f"[comfy-env] Per-node settings from {pkg_dir}: {node_settings}")
 
     from ..settings import resolve_bool, resolve_numeric, GENERAL_DEFAULTS, SETTINGS_KEY_MAP
     enabled = resolve_bool("COMFY_ENV_ISOLATE", node_settings, GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"]) \

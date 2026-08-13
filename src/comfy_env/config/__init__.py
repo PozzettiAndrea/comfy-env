@@ -32,8 +32,8 @@ class ComfyEnvConfig(dict):
 # Anything role-inappropriate -- dead legacy keys, typos, misplaced sections
 # -- is rejected at parse time rather than silently ignored (that's how a
 # no-op [env_vars] shipped in the flagship pack for months).
-ROOT_ALLOWED_SECTIONS = {"node_reqs", "settings"}
-ROOT_ONLY_SECTIONS = {"node_reqs", "settings"}
+ROOT_ALLOWED_SECTIONS = {"node_reqs", "settings", "types"}
+ROOT_ONLY_SECTIONS = {"node_reqs", "settings", "types"}
 
 # Comfy-env-owned sections of the ENV file and their known keys: the one
 # place pixi cannot validate for us, so unrecognized keys warn (a typo'd
@@ -42,7 +42,6 @@ ROOT_ONLY_SECTIONS = {"node_reqs", "settings"}
 _OWNED_SECTION_KEYS = {
     "cuda": {"packages"},
     "options": {"health_check_timeout"},
-    "serializers": {"modules"},
 }
 
 
@@ -66,6 +65,13 @@ def load_config(path):
                 f"only. Env definitions (dependencies, cuda, env_vars, ...) "
                 f"go in a subdirectory {CONFIG_FILE_NAME}.")
     elif path.name == CONFIG_FILE_NAME:
+        if "serializers" in data:
+            raise ValueError(
+                f"{path}: [serializers] was replaced by [types] in "
+                f"{ROOT_CONFIG_FILE_NAME} at the pack root (comfy-env "
+                f"0.4.16, ADR-0015). Declare each socket as \"builtin\" or "
+                f"\"custom\" and put custom serializers in "
+                f"<pack>/serialization.py.")
         misplaced = sorted(ROOT_ONLY_SECTIONS & set(data))
         if misplaced:
             raise ValueError(
@@ -149,6 +155,16 @@ def parse_config(data):
     options = data.pop("options", {})
     settings = data.pop("settings", {})
 
+    # [types] (ADR-0015): SOCKET = "builtin" | "custom". Closed vocabulary
+    # -- anything else is a typo'd contract and fails at parse time.
+    types = data.pop("types", {})
+    for socket, mode in types.items():
+        if mode not in ("builtin", "custom"):
+            raise ValueError(
+                f'[types] {socket} = "{mode}" is not valid -- use "builtin" '
+                f'(automatic transport) or "custom" (serialize/deserialize '
+                f'functions in <pack>/serialization.py).')
+
     return ComfyEnvConfig(
         python=python,
         cuda_packages=cuda_packages,
@@ -156,6 +172,7 @@ def parse_config(data):
         node_reqs=node_reqs,
         options={"health_check_timeout": float(options.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))},
         settings=settings,
+        types={str(k): str(v) for k, v in types.items()},
         pixi_passthrough=data,
     )
 

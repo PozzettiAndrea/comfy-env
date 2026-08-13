@@ -1004,11 +1004,12 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
-    # Load pack-declared custom serializers ([serializers].modules in
-    # comfy-env.toml, forwarded as an env var). Runs after sys.path setup so
-    # pack modules resolve; failures are non-fatal (types stay opaque).
-    _ipc_shared.load_serializer_modules(
-        os.environ.get("COMFY_ENV_SERIALIZER_MODULES"), log=wlog)
+    # Load pack-declared custom serializers ([types] "custom" entries in
+    # comfy-env-root.toml, forwarded as serialization.py file paths --
+    # ADR-0015). Runs after sys.path setup so lazy imports inside the
+    # functions resolve; failures are non-fatal (types stay opaque).
+    _ipc_shared.load_serializer_files(
+        os.environ.get("COMFY_ENV_SERIALIZER_FILES"), log=wlog)
 
     # Apply the parent process's folder_paths state so this worker's
     # folder_paths module (a separate import in this subprocess) resolves

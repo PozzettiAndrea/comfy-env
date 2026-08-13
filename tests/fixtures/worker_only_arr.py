@@ -1,9 +1,9 @@
-"""Fixture serializer module the PARENT deliberately never imports.
+"""Fixture serializer file for the array-bearing worker-only type.
 
-Unlike worker_only_type (primitive payload), this type carries a numpy
-array through recurse -- so the parent's held OpaquePayload contains a
-real shared-memory frame that must be MATERIALIZED (copied/owned) to
-survive the worker restarting or freeing its blocks.
+Unlike WorkerOnly (primitive payload), WorkerOnlyArr carries a numpy
+array through recurse -- so a parent without the class holds an
+OpaquePayload containing a real shared-memory frame that must be
+MATERIALIZED (copied/owned) to survive the worker restarting.
 """
 
 try:
@@ -12,13 +12,19 @@ except ImportError:
     import _ipc_shared as ipc
 
 
-class WorkerOnlyArr:
-    def __init__(self, data):
-        self.data = data  # numpy array
+def _serialize(obj, recurse):
+    return {"data": recurse(obj.data)}
 
 
-ipc.register_serializer(
-    "WorkerOnlyArr",
-    lambda obj, recurse: {"data": recurse(obj.data)},
-    lambda payload, recurse: WorkerOnlyArr(recurse(payload["data"])),
-)
+def _deserialize(payload, recurse):
+    from worker_only_class import WorkerOnlyArr
+    return WorkerOnlyArr(recurse(payload["data"]))
+
+
+try:  # register deserialize only where the class resolves
+    from worker_only_class import WorkerOnlyArr  # noqa: F401
+    _DESER = _deserialize
+except ImportError:
+    _DESER = None
+
+ipc.register_serializer("WorkerOnlyArr", _serialize, _DESER)

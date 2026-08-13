@@ -22,7 +22,10 @@ def worker():
     w = SubprocessWorker(
         python=sys.executable,
         working_dir=FIXTURES,
-        env={"COMFY_ENV_SERIALIZER_MODULES": "custom_type_mod,worker_only_type"},
+        env={"COMFY_ENV_SERIALIZER_FILES": ",".join([
+            str(FIXTURES / "custom_type_mod.py"),
+            str(FIXTURES / "worker_only_type.py"),
+        ])},
         name="registry-worker",
     )
     yield w

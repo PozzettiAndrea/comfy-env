@@ -303,12 +303,16 @@ def _evict_cache_if_needed(cache_dict):
 # the worker imports the copy placed next to it), so a serializer module
 # imported on both sides registers identical rules by construction.
 #
-# A serializer module is declared in comfy-env.toml:
+# A pack declares its wire types in comfy-env-root.toml (ADR-0015):
 #
-#     [serializers]
-#     modules = ["mypack.ipc_types"]
+#     [types]
+#     TRIMESH = "custom"      # code in <pack>/serialization.py
+#     SKELETON = "builtin"    # automatic transport, listed for humans/tests
 #
-# and looks like:
+# <pack>/serialization.py is loaded by FILE PATH under a mangled per-pack
+# module name on BOTH sides (parent + worker), must keep its top-level
+# imports to stdlib/numpy/comfy_env (heavy deps inside the functions), and
+# looks like:
 #
 #     try:  # parent process
 #         from comfy_env.isolation.workers import _ipc_shared as ipc
@@ -319,18 +323,30 @@ def _evict_cache_if_needed(cache_dict):
 #         return {"verts": recurse(obj.vertices), "id": obj.id}
 #
 #     def _deser(payload, recurse):
+#         from mymeshlib import MyMesh
 #         return MyMesh(recurse(payload["verts"]), payload["id"])
 #
-#     ipc.register_serializer("MyMesh", _ser, _deser)
+#     try:  # register deserialize only where the library exists; a side
+#         import mymeshlib  # noqa: F401  -- without it holds materialized
+#         _DESER = _deser   #                OpaquePayload receipts instead
+#     except ImportError:
+#         _DESER = None
+#
+#     ipc.register_serializer("MyMesh", _ser, _DESER, tag="mymeshlib.MyMesh")
+#
+# Tag convention (ADR-0015): shared library types tag by TYPE IDENTITY
+# ("mymeshlib.MyMesh") so independent packs interoperate; pack-private
+# types tag with a pack prefix.
 #
 # `recurse` routes nested values through the normal transport, so tensors
 # inside a custom payload keep their zero-copy paths.
 #
 # If the RECEIVING side has no deserializer for a tag (typical for the parent,
-# whose env deliberately lacks the pack's classes), the value arrives as an
-# OpaquePayload -- an inert container that re-serializes back to the identical
-# wire form. Custom objects therefore survive worker -> parent -> worker
-# round trips without the parent understanding them.
+# whose env deliberately lacks the pack's classes), the value arrives as a
+# MATERIALIZED OpaquePayload -- receiver-owned objects that re-serialize to
+# fresh frames. Custom objects therefore survive worker -> parent -> worker
+# round trips, worker restarts included, without the parent understanding
+# them.
 
 
 class SerializerRegistry:
@@ -455,26 +471,49 @@ def deserialize_custom(obj, recurse):
     return deser(obj["payload"], recurse)
 
 
-def load_serializer_modules(spec, log=None):
-    """Import comma-separated serializer modules (COMFY_ENV_SERIALIZER_MODULES).
+def registration_count():
+    """Number of registered type serializers (validation hook, ADR-0015)."""
+    return len(REGISTRY._by_type)
 
-    Import errors are reported, not raised: a side that cannot import a
-    pack's module (e.g. the parent env lacking the pack's deps) still works
-    -- that side just handles the types as OpaquePayload.
+
+def load_serializer_files(spec, log=None):
+    """Load comma-separated serializer FILES (COMFY_ENV_SERIALIZER_FILES).
+
+    Each file executes under a mangled per-pack module name, so every pack
+    can ship a plain `serialization.py` without colliding in sys.modules
+    (plain module-name loading did collide: first import won and the second
+    pack's serializers silently never registered -- ADR-0015).
+
+    Serializer files must be self-contained: top-level imports limited to
+    stdlib/numpy/comfy_env, heavy deps imported inside the functions.
+    Import errors are reported, not raised, here -- the parent applies the
+    loud [types] validation separately.
     """
-    import importlib
-    for name in (spec or "").split(","):
-        name = name.strip()
-        if not name:
+    import importlib.util
+    import os as _os
+    import re as _re
+    import sys as _sys
+    for raw in (spec or "").split(","):
+        raw = raw.strip()
+        if not raw:
             continue
+        pack = _os.path.basename(_os.path.dirname(raw)) or "pack"
+        stem = _os.path.splitext(_os.path.basename(raw))[0]
+        mod_name = "_comfy_env_ser__" + _re.sub(r"\W+", "_", f"{pack}_{stem}")
+        if mod_name in _sys.modules:
+            continue  # already loaded (same pack, several envs)
         try:
-            importlib.import_module(name)
+            file_spec = importlib.util.spec_from_file_location(mod_name, raw)
+            module = importlib.util.module_from_spec(file_spec)
+            _sys.modules[mod_name] = module
+            file_spec.loader.exec_module(module)
             if log:
-                log(f"[comfy-env] serializers loaded from {name}")
+                log(f"[comfy-env] serializers loaded from {raw}")
         except Exception as e:
+            _sys.modules.pop(mod_name, None)
             if log:
-                log(f"[comfy-env] serializer module {name} not importable "
-                    f"here ({e}); its types pass through as opaque")
+                log(f"[comfy-env] serializer file {raw} not importable "
+                    f"here ({e}); its types are held opaquely")
 
 
 # =============================================================================
@@ -624,15 +663,26 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
 
-    # Fallback: pickle any remaining object to shared memory
+    # Fallback: pickle any remaining object to shared memory. A pickle
+    # failure is a LOUD error naming the type and cause -- the old
+    # `return obj` fallback leaked the raw object into the JSON message
+    # and crashed two layers away with "not JSON serializable"
+    # (demonstrated: pickling a textured Trimesh imports PIL at
+    # serialize time; without PIL the bytes are never produced).
     import pickle
     try:
         obj_bytes = pickle.dumps(obj)
-        result = _pickle_frame(obj_bytes, registry)
-        visited[obj_id] = result
-        return result
-    except Exception:
-        return obj
+    except Exception as e:
+        raise TypeError(
+            f"comfy-env transport cannot serialize "
+            f"{type(obj).__name__!r}: pickle failed ({e}). Register a "
+            f"serializer for this type in your pack's serialization.py "
+            f"([types] socket = \"custom\", ADR-0015), or install the "
+            f"missing dependency in this environment."
+        ) from e
+    result = _pickle_frame(obj_bytes, registry)
+    visited[obj_id] = result
+    return result
 
 
 def _pickle_frame(obj_bytes, registry):

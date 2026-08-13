@@ -239,8 +239,9 @@ def _strip_torch_family(
 #
 # _HANDLED_PASSTHROUGH: tables the compiler already places/transforms itself
 #   (torch-family REWRITE inside dependencies/pypi-dependencies; [activation]
-#   MERGE; workspace.channels forwarding). "serializers" is comfy-env-owned
-#   config that must never reach a pixi manifest.
+#   MERGE; workspace.channels forwarding). ([serializers] was removed in
+#   0.4.16 -- wire types now declare in comfy-env-root.toml [types],
+#   ADR-0015; the env-file parser rejects the old section.)
 # _DENIED_PASSTHROUGH / _DENIED_WORKSPACE_KEYS: compiler-owned, hard error --
 #   the single-feature/single-env manifest shape IS ADR-0007, and platforms/
 #   name/version are host-derived identity.
@@ -249,7 +250,7 @@ def _strip_torch_family(
 # ---------------------------------------------------------------------------
 _HANDLED_PASSTHROUGH = {
     "dependencies", "pypi-dependencies", "target", "pypi-options",
-    "system-requirements", "activation", "workspace", "serializers",
+    "system-requirements", "activation", "workspace",
 }
 _DENIED_PASSTHROUGH = {"environments", "feature"}
 _DENIED_WORKSPACE_KEYS = {"name", "version", "platforms"}

@@ -26,7 +26,10 @@ from comfy_env.isolation.workers.subprocess import SubprocessWorker
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
-_ENV = {"COMFY_ENV_SERIALIZER_MODULES": "worker_only_type,worker_only_arr"}
+_ENV = {"COMFY_ENV_SERIALIZER_FILES": ",".join([
+    str(FIXTURES / "worker_only_type.py"),
+    str(FIXTURES / "worker_only_arr.py"),
+])}
 
 
 def _spawn(name):

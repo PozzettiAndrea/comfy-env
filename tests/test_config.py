@@ -55,3 +55,67 @@ def test_node_reqs_string_and_table_forms():
     assert by_name["OtherPack"]["registry"] == "other-pack"
     assert by_name["OtherPack"]["version"] == "1.2.3"
     assert cfg.has_dependencies
+
+
+def test_types_table_parses_and_validates():
+    # ADR-0015: [types] is a closed vocabulary -- builtin | custom.
+    cfg = parse_config({"types": {"TRIMESH": "custom", "SKELETON": "builtin"}})
+    assert cfg.types == {"TRIMESH": "custom", "SKELETON": "builtin"}
+
+    import pytest
+    with pytest.raises(ValueError, match="TRIMESH.*not valid"):
+        parse_config({"types": {"TRIMESH": "cusotm"}})
+
+
+def test_serializers_section_rejected_with_migration_message(tmp_path):
+    # [serializers] was replaced by [types] (ADR-0015, no backcompat) --
+    # the env-file parser must say so instead of silently forwarding it.
+    import pytest
+    from comfy_env.config import load_config
+    cf = tmp_path / "comfy-env.toml"
+    cf.write_text('[serializers]\nmodules = ["my_wire_types"]\n')
+    with pytest.raises(ValueError, match=r"\[types\]"):
+        load_config(cf)
+
+
+def _run_register_nodes_in(pack_dir):
+    """Call register_nodes() with pack_dir as the caller's package dir."""
+    shim = pack_dir / "shim.py"
+    shim.write_text(
+        "from comfy_env import register_nodes\n"
+        "MAPPINGS = register_nodes()\n")
+    import runpy
+    return runpy.run_path(str(shim))
+
+
+def test_types_custom_without_serialization_py_fails_loudly(tmp_path):
+    # ADR-0015 teeth: declaring a custom socket without shipping the code
+    # is a broken contract -- register_nodes must refuse, loudly.
+    import pytest
+    (tmp_path / "comfy-env-root.toml").write_text('[types]\nTRIMESH = "custom"\n')
+    (tmp_path / "nodes").mkdir()
+    with pytest.raises(ValueError, match="serialization.py"):
+        _run_register_nodes_in(tmp_path)
+
+
+def test_types_custom_loads_serialization_py(tmp_path):
+    # The happy path: [types] custom + serialization.py that registers.
+    (tmp_path / "comfy-env-root.toml").write_text('[types]\nWIDGET = "custom"\n')
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "serialization.py").write_text(
+        "from comfy_env.isolation.workers._ipc_shared import register_serializer\n"
+        "register_serializer('TmpWidget', lambda o, r: {'v': o.v})\n")
+    result = _run_register_nodes_in(tmp_path)
+    assert result["MAPPINGS"] == ({}, {})  # no nodes, but no refusal
+    from comfy_env.isolation.workers._ipc_shared import REGISTRY
+    assert REGISTRY.lookup_deserializer("TmpWidget") is None  # serialize-only
+    assert "TmpWidget" in REGISTRY._by_type
+
+
+def test_types_custom_registering_nothing_fails_loudly(tmp_path):
+    import pytest
+    (tmp_path / "comfy-env-root.toml").write_text('[types]\nWIDGET = "custom"\n')
+    (tmp_path / "nodes").mkdir()
+    (tmp_path / "serialization.py").write_text("# forgot to register\n")
+    with pytest.raises(ValueError, match="registered no serializers"):
+        _run_register_nodes_in(tmp_path)
