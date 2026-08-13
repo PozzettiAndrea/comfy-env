@@ -649,7 +649,7 @@ def _from_shm(obj, _depth=0, _key="root"):
     # __shm_np__ -> numpy array via shared memory (fallback when torch unavailable)
     if "__shm_np__" in obj:
         shape = tuple(obj["shape"])
-        dtype = np.dtype(obj["dtype"])
+        dtype = _ipc_shared._decode_np_dtype(obj["dtype"])
         if "fd" in obj:
             wlog(f"[_from_shm] {_key}: numpy memfd pid={obj['pid']} fd={obj['fd']} shape={shape}")
             data = _memfd_read(obj["pid"], obj["fd"], obj["size"])

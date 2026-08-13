@@ -520,6 +520,29 @@ def load_serializer_files(spec, log=None):
 # Generic shared memory serialization (_to_shm)
 # =============================================================================
 
+def _encode_np_dtype(dt):
+    """JSON round-trippable numpy dtype. str(dtype) is NOT enough: for a
+    structured/record dtype str() yields "[('x', '<f4'), ...]" which
+    np.dtype() cannot parse back (observed: PLY point clouds with per-vertex
+    fields crash on deserialize). dtype_to_descr gives a plain string for
+    simple dtypes and a field descr (list) for structured ones -- both
+    JSON-safe and reversible by _decode_np_dtype."""
+    from numpy.lib import format as _npf
+    return _npf.dtype_to_descr(dt)
+
+
+def _decode_np_dtype(enc):
+    """Inverse of _encode_np_dtype. JSON turned the descr's tuples (including
+    nested subarray shapes) into lists, so coerce them back before numpy sees
+    them. Also accepts a bare dtype string (simple dtypes / legacy frames)."""
+    from numpy.lib import format as _npf
+    if not isinstance(enc, list):
+        return _npf.descr_to_dtype(enc)
+    def _tuplify(x):
+        return tuple(_tuplify(i) for i in x) if isinstance(x, list) else x
+    return _npf.descr_to_dtype([_tuplify(field) for field in enc])
+
+
 def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_serializer=None):
     """
     Serialize object to shared memory. Returns JSON-safe metadata.
@@ -591,13 +614,14 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                 fd, size = _memfd_write(arr_bytes)
                 registry.append(fd)
                 result = {"__shm_np__": True, "fd": fd, "pid": os.getpid(),
-                          "shape": list(arr.shape), "dtype": str(arr.dtype), "size": size}
+                          "shape": list(arr.shape), "dtype": _encode_np_dtype(arr.dtype), "size": size}
             else:
                 from multiprocessing import shared_memory as shm
                 block = shm.SharedMemory(create=True, size=arr.nbytes)
                 np.ndarray(arr.shape, arr.dtype, buffer=block.buf)[:] = arr
                 registry.append(block)
-                result = {"__shm_np__": block.name, "shape": list(arr.shape), "dtype": str(arr.dtype)}
+                result = {"__shm_np__": block.name, "shape": list(arr.shape),
+                          "dtype": _encode_np_dtype(arr.dtype)}
         visited[obj_id] = result
         return result
 

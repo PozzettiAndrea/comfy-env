@@ -42,6 +42,7 @@ from ._ipc_shared import (
     _cleanup_shm,
     _evict_cache_if_needed,
     _to_shm_generic,
+    _decode_np_dtype,
     deserialize_custom,
     loads_or_opaque,
 )
@@ -631,7 +632,7 @@ def _from_shm(obj, unlink=True):
     # numpy array via shared memory (fallback when torch unavailable)
     if "__shm_np__" in obj:
         shape = tuple(obj["shape"])
-        dtype = np.dtype(obj["dtype"])
+        dtype = _decode_np_dtype(obj["dtype"])
         if "fd" in obj:
             data = _memfd_read(obj["pid"], obj["fd"], obj["size"])
             return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
