@@ -2,95 +2,78 @@
 
 ## Project Overview
 
-**comfy-env** is a dependency isolation system for ComfyUI custom nodes. It runs each custom node's code in a separate subprocess with its own virtual environment (venv/pixi), communicating via socket-based IPC with shared memory for zero-copy tensor transfer.
+**comfy-env** is a dependency isolation system for ComfyUI custom node
+packs. Each pack's nodes run in a persistent subprocess with its own
+pixi-managed environment; the parent talks to synthesized proxy classes
+over socket IPC with shared memory for bulk data. Architecture docs and
+ADRs live in the separate `comfy-forge-docs` repo (published at
+pozzettiandrea.github.io/comfy-forge-docs/) -- **the ADRs are the
+authoritative "why"; this file is just orientation.**
 
-## Key Architecture
+## Layout (isolation side)
 
-### Process Model
-- **Parent process**: ComfyUI main process. Runs `comfy.model_management`, dispatches node execution to workers.
-- **Worker subprocess**: Isolated Python process with its own venv. Runs custom node code. Connected to parent via Unix domain socket (AF_UNIX) with length-prefixed JSON messages.
-- **Tensor transfer**: Large data (tensors, arrays, meshes) goes through shared memory (/dev/shm). JSON messages carry metadata only.
+- `src/comfy_env/isolation/wrap.py` -- `register_nodes()`: config
+  discovery, metadata scan, proxy synthesis, worker pool (one worker per
+  env, generation counter on restart), VRAM budget negotiation,
+  `[types]` validation + serializer loading (ADR-0015).
+- `src/comfy_env/isolation/workers/subprocess.py` -- parent-side
+  `SubprocessWorker`: spawn, health check, `call_module`/`call_method`
+  (600 s default timeout -- see ADR-0018), consumed-ack after each read.
+- `src/comfy_env/isolation/workers/_ipc_parent.py` -- parent transport
+  internals: `SocketTransport`, tensor strategies, `_from_shm`.
+- `src/comfy_env/isolation/workers/_persistent_worker.py` -- the worker
+  program. Never imported by the parent: read as text and run by the
+  isolated interpreter (ADR-0006), with `_ipc_shared.py` copied
+  alongside. Must stay parseable by the OLDEST worker-env Python (3.9).
+- `src/comfy_env/isolation/workers/_ipc_shared.py` -- the shared
+  serialization core both sides import: `_to_shm_generic` walker,
+  serializer registry (`register_serializer`), `OpaquePayload`/
+  `OpaquePickle` (materialize-on-receipt, 0.4.15), pickle-frame helpers,
+  `load_serializer_files`.
 
-### Critical File: `src/comfy_env/isolation/workers/subprocess.py`
-This is the core of the IPC system (~2500 lines). It contains:
-- **Parent-side code** (module level): `SocketTransport`, `_to_shm()`, `_from_shm()`, `_serialize_cuda_ipc()`, `_deserialize_cuda_ipc()`, `_probe_cuda_ipc()`, `SubprocessWorker` class
-- **Worker-side code** (embedded as `_PERSISTENT_WORKER_SCRIPT` string): Duplicates of the serialization functions, worker main loop, ComfyUI integration patches
+Install side: `config/` (toml parsing incl. root `[types]`),
+`packages/` (pixi bootstrap -- pinned + sha256, `toml_generator.py`
+manifest compiler, CUDA wheels, node deps), `install/` (workspace
+materialization), `environment/`, `detection/`.
 
-Both sides have their own copies of serialization logic because the worker runs in a separate Python process with potentially different packages.
+## Serialization ladder (ADR-0005)
 
-### Tensor Serialization Strategies (priority order)
-1. **CUDA IPC** -- `CudaIPC` type, uses `reduce_tensor()` / `rebuild_cuda_tensor()`, zero-copy GPU (Linux only)
-2. **Pool IPC** -- `PoolIPC` type (**IN PROGRESS**, see below), uses `cudaMemPoolExportPointer`, zero-copy GPU
-3. **PyTorch shared memory** -- `TensorRef` type, uses `file_system` sharing strategy (/dev/shm), zero-copy CPU
-4. **NumPy** -- converted to PyTorch tensor, uses strategy 3
-5. **Trimesh/Pickle** -- pickled to `SharedMemory` block
-6. **Primitives** -- inline in JSON
+CudaIPC (Linux GPU) > PoolIPC (cudaMallocAsync-safe GPU, default-off) >
+TensorRef (torch shm, CPU) > numpy-via-torch > pickle block (loud
+TypeError if pickling fails -- never leaks raw objects) > JSON
+primitives. Pack types bypass pickle via the registry: `[types]` in
+`comfy-env-root.toml` + `serialization.py` (ADR-0014/0015). A side that
+cannot reconstruct a type holds a MATERIALIZED receipt (owned bytes,
+survives worker restarts). A canary echo verifies the production
+transport per worker at startup; probes fail closed.
 
-### Supporting Files
-- `src/comfy_env/isolation/tensor_utils.py` -- `TensorKeeper` (prevents GC of shared tensors), `prepare_tensor_for_ipc()`, `release_tensor()` (madvise DONTNEED)
-- `src/comfy_env/isolation/workers/subprocess.py` lines 275-280 -- IPC handle forwarding cache (`_cuda_ipc_metadata_cache`) for zero-copy Worker A -> Parent -> Worker B chains
-- `docs/worker-serialization.md` -- Detailed docs on the serialization system
+## Lifetime protocol (0.4.15)
+
+Worker keeps a call's shm blocks/tensors until the parent sends
+`{"type": "consumed", "call_id": N}` after reading the reply;
+`TENSOR_KEEPER_TTL` (60 s) survives only as the crash fallback. Do not
+reintroduce timer-based correctness.
 
 ## Development
 
-```bash
-cd /home/shadeform/utils/comfy-env
-pip install -e ".[dev]"
+```powershell
+cd D:\utils\comfy-env          # this machine; repo is cross-platform
+./.venv-test/Scripts/python.exe -m pytest tests/ -q
 ```
 
-ComfyUI lives at `~/geometrypack/ComfyUI/` (or `~/ComfyUI/`). Workers find it via `COMFYUI_BASE` env var or by walking up from `working_dir`.
+Tests spawn REAL workers with `sys.executable` (no pixi needed) --
+`tests/test_worker_roundtrip.py`, `test_serializer_registry.py`,
+`test_transport_lifetime.py` are the transport contract. CI: 3-OS x
+2-Python matrix; publish to PyPI is gated on green (pushes go to main).
 
-## Current Work: Shareable CUDA Memory Pool IPC
+## House rules
 
-### The Problem
-
-ComfyUI's `cuda_malloc.py` (at `~/geometrypack/ComfyUI/cuda_malloc.py`) sets:
-```
-PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
-```
-
-This propagates to worker subprocesses and **completely breaks legacy CUDA IPC**:
-- `reduce_tensor()` throws: `RuntimeError: cudaMallocAsync does not yet support shareIpcHandle`
-- Both parent and worker `_probe_cuda_ipc()` functions are **buggy** -- they test `Event` + tensor allocation but never test `reduce_tensor()`, so they return `True` even though IPC is broken
-- Result: CUDA tensor serialization crashes, or silently falls back to CPU shared memory (2 copies)
-
-### The Solution (approved, implementation in progress)
-
-**Workers only** -- create a shareable CUDA memory pool and use pool-based IPC instead of legacy IPC. No changes to the parent/ComfyUI process.
-
-| Direction | Mechanism | Cost |
-|-----------|-----------|------|
-| Worker -> Parent | `cudaMemPoolExportPointer` -> `cudaMemPoolImportPointer` | Zero-copy |
-| Worker -> Worker | Pool handle forwarding via parent | Zero-copy (v2, CPU fallback in v1) |
-| Parent -> Worker | CPU shared memory (existing TensorRef path) | 2 copies |
-
-#### Implementation Plan (10 phases)
-
-1. **ctypes bindings** -- Wrap 6 CUDA runtime functions: `cudaMemPoolCreate`, `cudaMemPoolExportToShareableHandle`, `cudaDeviceSetMemPool`, `cudaMemPoolExportPointer`, `cudaMemPoolImportPointer`, `cudaMemPoolImportFromShareableHandle`
-2. **FD passing** -- `SCM_RIGHTS` over the existing AF_UNIX socket for pool handle exchange
-3. **Fix `_probe_cuda_ipc()`** -- Add `reduce_tensor()` test on both parent and worker sides. Parent probe returns `False` under `cudaMallocAsync` (triggers CPU fallback, which is correct)
-4. **Worker pool creation** -- After torch import in worker script (~line 912), create shareable pool with `cudaMemHandleTypePosixFileDescriptor`, set as current device pool via `cudaDeviceSetMemPool`
-5. **Pool FD exchange** -- Worker exports pool FD after `{"status": "ready"}`, parent imports it in `_ensure_started()`
-6. **Pool serialization** -- New `PoolIPC` type in `_serialize_pool_ipc()` / `_deserialize_pool_ipc()` on both sides
-7. **Wire into `_to_shm()` / `_from_shm()`** -- Worker uses `PoolIPC` for CUDA tensors when pool available; parent handles `PoolIPC` in deserialization
-8. **Worker patches** -- `torch.cuda.empty_cache()` patched to also trim shareable pool (`cudaMemPoolTrimTo`)
-9. **Documentation** -- `docs/ipc.md`
-10. **Testing** -- End-to-end verification
-
-#### Key Technical Details
-
-- `cudaMemPoolExportPointer` produces a 64-byte opaque `cudaMemPoolPtrExportData` struct -> base64-encoded in JSON
-- Parent needs the worker's pool handle to import pointers -> exchanged via FD passing at connection time
-- `_from_shm()` is module-level but needs worker pool handle -> use module-level `_active_worker_pool` set by `SubprocessWorker.call_method()`/`call_module()` before calling `_from_shm()`
-- PyTorch's `cudaMallocAsync` backend uses `cudaMallocAsync(ptr, size, stream)` (3-arg form) which allocates from the **current** device pool -- so `cudaDeviceSetMemPool` redirects all PyTorch allocations
-- PyTorch's `empty_cache()` and `memory_stats()` query the **default** pool (bug in PyTorch's `CUDAMallocAsyncAllocator.cpp` -- uses `cudaDeviceGetDefaultMemPool` instead of `cudaDeviceGetMemPool`). Worker patch handles `empty_cache`; `memory_stats` is left as-is (conservative undercount is safe)
-- `tensor_utils.py` `prepare_tensor_for_ipc()` also needs `cudaMallocAsync` error handling
-
-#### What NOT to Change
-- **No monkey-patching ComfyUI** -- all changes are in comfy-env workers
-- **No changes to parent's allocator** -- parent keeps `cudaMallocAsync`, uses CPU fallback for parent->worker
-- **No changes to `SocketTransport`** -- FD passing uses raw socket directly
-
-### Related Discovery: pyisolate Has the Same Bug
-
-`/home/shadeform/pyisolate/pyisolate/_internal/tensor_serializer.py` line 316 and `torch_utils.py` line 28-51 have identical bugs -- `reduce_tensor()` call with incomplete error handling, probe that doesn't test `reduce_tensor()`.
+- Pre-1.0: no backward compatibility (ADR-0017) -- breaking changes
+  remove the old way in the same release; comfy-env + affected packs
+  ship together ("barrage"). Ends at the slow-rollout tripwire.
+- Host-env principle: the ComfyUI env installs comfy-env and NOTHING
+  else. The parent must never need a pack's libraries.
+- Degrade on availability (missing env/GPU -> slower correct path),
+  fail loudly on correctness (bad payloads, corrupt transport) --
+  ADR-0008 as amended.
+- No Co-Authored-By trailers in commits.

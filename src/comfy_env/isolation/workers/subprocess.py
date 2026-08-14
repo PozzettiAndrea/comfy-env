@@ -120,7 +120,9 @@ class SubprocessWorker(Worker):
     Benefits:
     - Works on Windows with different venv Python (full isolation)
     - Compiled CUDA extensions load correctly in the venv
-    - ~50-100ms per call (persistent subprocess avoids spawn overhead)
+    - Warm calls cost milliseconds (measured 2026-08: 2.4 ms echo floor,
+      ~30 ms including the per-call health ping; persistent subprocess
+      avoids the ~2.4 s spawn+import cost per call)
     - Tensor transfer via shared memory files
     - Immune to stdout pollution from C libraries
 
