@@ -881,28 +881,42 @@ def _deserialize_input(obj):
 
 
 class SocketTransport:
-    """Length-prefixed JSON transport."""
+    """Length-prefixed JSON transport.
+
+    send() MUST be locked: the worker routes print()/logging into
+    transport.send, and pack code prints from threads it spawns -- an
+    unlocked send interleaves partial writes from two threads and
+    permanently desyncs the length-prefixed stream. Mirrors the parent's
+    SocketTransport (_ipc_parent.py), including the MAX_MESSAGE_SIZE
+    check the worker copy previously lacked.
+    """
     def __init__(self, sock):
         self._sock = sock
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.Lock()
 
     def send(self, obj):
         data = json.dumps(obj).encode("utf-8")
         msg = struct.pack(">I", len(data)) + data
-        self._sock.sendall(msg)
+        with self._send_lock:
+            self._sock.sendall(msg)
 
     def recv(self, timeout=None):
-        if timeout is not None:
-            self._sock.settimeout(timeout)
-        try:
-            raw_len = self._recvall(4)
-            if not raw_len:
-                return None
-            msg_len = struct.unpack(">I", raw_len)[0]
-            data = self._recvall(msg_len)
-            return json.loads(data.decode("utf-8"))
-        finally:
+        with self._recv_lock:
             if timeout is not None:
-                self._sock.settimeout(None)
+                self._sock.settimeout(timeout)
+            try:
+                raw_len = self._recvall(4)
+                if not raw_len:
+                    return None
+                msg_len = struct.unpack(">I", raw_len)[0]
+                if msg_len > _ipc_shared.MAX_MESSAGE_SIZE:
+                    raise ValueError(f"Message too large: {msg_len} bytes")
+                data = self._recvall(msg_len)
+                return json.loads(data.decode("utf-8"))
+            finally:
+                if timeout is not None:
+                    self._sock.settimeout(None)
 
     def _recvall(self, n):
         data = bytearray()
@@ -977,16 +991,21 @@ def _deserialize_isolated_objects(obj):
 
 def main():
     wlog("[worker] Starting...")
-    # Get socket address from command line
-    if len(sys.argv) < 2:
-        wlog("Usage: worker.py <socket_addr>")
+    # Socket address and auth token arrive via the ENVIRONMENT, never argv
+    # (argv is world-readable through /proc/<pid>/cmdline).
+    socket_addr = os.environ.get("COMFY_ENV_IPC_ADDR")
+    authkey = os.environ.get("COMFY_ENV_IPC_AUTHKEY", "")
+    if not socket_addr:
+        wlog("[worker] COMFY_ENV_IPC_ADDR not set, exiting")
         sys.exit(1)
-    socket_addr = sys.argv[1]
     wlog(f"[worker] Connecting to {socket_addr}...")
 
     # Connect to host process
     sock = _connect(socket_addr)
     transport = SocketTransport(sock)
+    # First frame MUST be the auth token: the parent refuses to speak the
+    # protocol (which carries pickled payloads) to an unauthenticated peer.
+    transport.send({"authkey": authkey})
     # Give the VRAM poller access to transport for sending log messages to parent
     global _vram_poll_transport, _serializing_call_id
     _vram_poll_transport = transport
@@ -1492,6 +1511,14 @@ def main():
                 transport.send({"type": "pool_fd_sent", "device": device})
                 _pool_ipc_ok = True
                 wlog("[worker] Pool IPC: handshake complete")
+                print(
+                    "[comfy-env] WARNING: Pool IPC is EXPERIMENTAL and has "
+                    "known lifetime hazards (imported pointers are never "
+                    "freed; exporter-side cache eviction can free memory "
+                    "under a live parent alias; no cross-process sync "
+                    "protocol). Known-unsound until the pluggable-allocator "
+                    "redesign (ADR-0010 v2 item 6) -- do not enable outside "
+                    "experiments.", file=sys.stderr, flush=True)
         except Exception as e:
             wlog(f"[worker] Pool IPC setup failed: {e}, using CPU shm fallback")
             _pool_ipc_ok = False

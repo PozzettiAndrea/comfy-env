@@ -62,13 +62,15 @@ def test_demotion_flag_routes_cuda_tensors_to_cpu_path():
         def detach(self):
             return torch.arange(4, dtype=torch.float32)
 
-    old = ipc_parent._gpu_zero_copy_demoted
-    ipc_parent._gpu_zero_copy_demoted = True
+    # Demotion is thread-local per-call state (was a module global before
+    # the 2026-08 concurrency fix).
+    old = ipc_parent._is_gpu_demoted()
+    ipc_parent._call_state.gpu_demoted = True
     registry = []
     try:
         meta = ipc_parent._parent_tensor_serializer(FakeCudaTensor(), registry, set())
         # CPU path produces a TensorRef-style payload, never CudaIPC/PoolIPC.
         assert meta.get("__type__") not in ("CudaIPC", "PoolIPC")
     finally:
-        ipc_parent._gpu_zero_copy_demoted = old
+        ipc_parent._call_state.gpu_demoted = old
         ipc_parent._cleanup_shm(registry) if hasattr(ipc_parent, "_cleanup_shm") else None

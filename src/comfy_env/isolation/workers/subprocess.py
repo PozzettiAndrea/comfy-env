@@ -3,9 +3,8 @@ SubprocessWorker - Cross-venv isolation using persistent subprocess + socket IPC
 
 This worker supports calling functions in a different Python environment:
 - Uses a persistent subprocess to avoid spawn overhead
-- Socket-based IPC for commands/responses
-- Transfers tensors via torch.save/load over socket
-- ~50-100ms overhead per call
+- Socket-based IPC for commands/responses; bulk tensors ride shared memory
+- Warm calls cost milliseconds (2.4 ms echo floor measured 2026-08)
 
 Use this when you need:
 - Different PyTorch version
@@ -28,12 +27,14 @@ Example:
 """
 
 import os
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -108,6 +109,11 @@ import comfy_env.isolation.workers._ipc_parent as _ipc_parent
 _WORKER_SCRIPT_PATH = Path(__file__).parent / "_persistent_worker.py"
 _PERSISTENT_WORKER_SCRIPT = _WORKER_SCRIPT_PATH.read_text(encoding="utf-8")
 
+# How long a worker may sit idle before the next call re-verifies the socket
+# with a health ping. Within this window a successful round-trip is the
+# health check -- no per-call ping (it cost a full round-trip per call).
+_HEALTH_PING_IDLE_SECONDS = 60.0
+
 
 class SubprocessWorker(Worker):
     """
@@ -167,6 +173,8 @@ class SubprocessWorker(Worker):
         self._last_new_models = []  # Auto-detected models from last call
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
+        self._last_ok = 0.0  # time of last successful round-trip (gates the health ping)
+        self._authkey = None  # per-spawn IPC auth token (set in _ensure_started)
         self._on_restart = None  # Called when worker process is replaced (stale model cleanup)
 
         # Socket IPC
@@ -211,17 +219,23 @@ class SubprocessWorker(Worker):
         return None
 
     def _check_socket_health(self) -> bool:
-        """Check if socket connection is healthy using a quick ping."""
+        """Check if socket connection is healthy using a quick ping.
+
+        Not on the hot path: called only for idle/stale workers (see
+        _HEALTH_PING_IDLE_SECONDS) and explicit health checks.
+        """
         if not self._transport:
-            print(f"[{self.name}] Health check: no transport", file=sys.stderr, flush=True)
+            if _DBG_WORKER:
+                print(f"[{self.name}] Health check: no transport", file=sys.stderr, flush=True)
             return False
         try:
-            # Send a ping request with configurable timeout
-            print(f"[{self.name}] Health check: ping (timeout={self.health_check_timeout}s)...", file=sys.stderr, flush=True)
+            if _DBG_WORKER:
+                print(f"[{self.name}] Health check: ping (timeout={self.health_check_timeout}s)...", file=sys.stderr, flush=True)
             self._transport.send({"method": "ping"})
             response = self._transport.recv(timeout=self.health_check_timeout)
             ok = response is not None and response.get("status") == "pong"
-            print(f"[{self.name}] Health check: {'ok' if ok else 'failed'}", file=sys.stderr, flush=True)
+            if _DBG_WORKER or not ok:
+                print(f"[{self.name}] Health check: {'ok' if ok else 'failed'}", file=sys.stderr, flush=True)
             return ok
         except Exception as e:
             print(f"[{self.name}] Socket health check exception: {e}", file=sys.stderr, flush=True)
@@ -300,8 +314,15 @@ class SubprocessWorker(Worker):
             raise RuntimeError(f"{self.name}: Worker has been shut down")
 
         if self._process is not None and self._process.poll() is None:
-            # Process is running, but check if socket is healthy
+            # Process is running. A recent successful round-trip proves the
+            # socket works -- skip the health-check ping on the hot path
+            # (it was a full round-trip paid on EVERY call, ADR-0010 defect
+            # list). The ping still runs for idle/stale workers, where it
+            # catches process-alive-but-socket-dead before a real call.
+            if self._transport and (time.time() - self._last_ok) < _HEALTH_PING_IDLE_SECONDS:
+                return
             if self._transport and self._check_socket_health():
+                self._last_ok = time.time()
                 return  # All good
             # Socket is dead/unhealthy - restart worker
             print(f"[{self.name}] Socket unhealthy, restarting worker...", file=sys.stderr, flush=True)
@@ -333,9 +354,19 @@ class SubprocessWorker(Worker):
         # Create server socket for IPC
         self._server_socket, self._socket_addr = _create_server_socket()
 
+        # Per-spawn auth token. The socket surface is reachable by any
+        # local process (abstract sockets have no filesystem permissions;
+        # the Windows fallback is TCP loopback), and the channel carries
+        # pickled payloads -- so the first frame the worker sends must
+        # prove it is OUR worker. Token and address travel via the
+        # worker's environment, never argv (argv is world-readable).
+        self._authkey = secrets.token_hex(32)
+
         # Set up environment (shared with metadata scan)
         from ..wrap import build_isolation_env
         env = build_isolation_env(self.python, self.extra_env)
+        env["COMFY_ENV_IPC_ADDR"] = self._socket_addr
+        env["COMFY_ENV_IPC_AUTHKEY"] = self._authkey
 
         # Propagate --cpu flag to subprocess so get_torch_device() returns cpu there too
         try:
@@ -392,11 +423,11 @@ class SubprocessWorker(Worker):
                 PIXI, "run", "--as-is",
                 "--manifest-path", str(manifest_path),
                 "-e", env_pixi_name,
-                "python", str(self._worker_script), self._socket_addr,
+                "python", str(self._worker_script),
             ]
             launch_env = env
         else:
-            cmd = [str(self.python), str(self._worker_script), self._socket_addr]
+            cmd = [str(self.python), str(self._worker_script)]
             launch_env = env
 
         if _DBG_WORKER:
@@ -437,7 +468,35 @@ class SubprocessWorker(Worker):
         finally:
             self._server_socket.settimeout(None)
 
+        # Verify the peer before speaking the protocol: same-uid check
+        # where the OS can prove it, then the authkey as the first frame.
+        # A wrong or missing key means SOMETHING ELSE connected to our
+        # socket -- kill everything loudly; never feed its bytes to the
+        # deserializer.
+        if hasattr(socket, "SO_PEERCRED"):  # Linux AF_UNIX
+            try:
+                import struct as _struct
+                creds = client_sock.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, _struct.calcsize("3i"))
+                _pid, _uid, _gid = _struct.unpack("3i", creds)
+                if _uid != os.getuid():
+                    client_sock.close()
+                    self._kill_worker()
+                    raise RuntimeError(
+                        f"{self.name}: IPC connection from foreign uid {_uid} "
+                        f"rejected (expected {os.getuid()}).")
+            except OSError:
+                pass  # non-AF_UNIX fallback socket; authkey still gates below
+
         self._transport = SocketTransport(client_sock)
+        auth = self._transport.recv(timeout=SOCKET_ACCEPT_TIMEOUT)
+        if not (isinstance(auth, dict) and auth.get("authkey") == self._authkey):
+            self._transport.close()
+            self._transport = None
+            self._kill_worker()
+            raise RuntimeError(
+                f"{self.name}: IPC handshake failed -- peer did not present "
+                f"the expected authkey. Refusing the connection.")
 
         # Send config to the worker. Include the main process's currently-
         # resolved folder_paths values so the worker's separate folder_paths
@@ -513,8 +572,12 @@ class SubprocessWorker(Worker):
                 if confirm and confirm.get("type") == "pool_fd_sent":
                     self._worker_pool = _import_pool_from_fd(worker_fd)
                     os.close(worker_fd)
-                    if _DBG_IPC:
-                        print(f"[{self.name}] Pool IPC: imported worker pool", file=sys.stderr, flush=True)
+                    print(
+                        f"[{self.name}] WARNING: Pool IPC enabled -- "
+                        f"EXPERIMENTAL, known lifetime hazards (see ADR-0005/"
+                        f"ADR-0010; unsound until the pluggable-allocator "
+                        f"redesign). Do not use outside experiments.",
+                        file=sys.stderr, flush=True)
                 else:
                     os.close(worker_fd)
             except Exception as e:
@@ -649,6 +712,7 @@ class SubprocessWorker(Worker):
             self._shutdown = True
             raise TimeoutError(f"{self.name}: call_id={call_id} timed out after {timeout}s")
 
+        self._last_ok = time.time()
         return response
 
     def call_method(
@@ -687,7 +751,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
-            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
 
             try:
                 # Serialize kwargs to shared memory
@@ -735,16 +799,16 @@ class SubprocessWorker(Worker):
                 result_meta = response.get("result")
                 result = None
                 if result_meta is not None:
-                    _ipc_parent._active_worker_pool = self._worker_pool
+                    _ipc_parent._call_state.worker_pool = self._worker_pool
                     try:
                         result = _from_shm(result_meta)
                     finally:
-                        _ipc_parent._active_worker_pool = None
+                        _ipc_parent._call_state.worker_pool = None
                 self._send_consumed(call_id)
                 return result
 
             finally:
-                _ipc_parent._gpu_zero_copy_demoted = False
+                _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
@@ -774,7 +838,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
-            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
 
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
@@ -799,16 +863,16 @@ class SubprocessWorker(Worker):
                 result_meta = response.get("result")
                 result = None
                 if result_meta is not None:
-                    _ipc_parent._active_worker_pool = self._worker_pool
+                    _ipc_parent._call_state.worker_pool = self._worker_pool
                     try:
                         result = _from_shm(result_meta)
                     finally:
-                        _ipc_parent._active_worker_pool = None
+                        _ipc_parent._call_state.worker_pool = None
                 self._send_consumed(call_id)
                 return result
 
             finally:
-                _ipc_parent._gpu_zero_copy_demoted = False
+                _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
@@ -822,7 +886,7 @@ class SubprocessWorker(Worker):
         """
         with self._lock:
             self._ensure_started()
-            _ipc_parent._gpu_zero_copy_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
             shm_registry = []
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else {}
@@ -839,7 +903,7 @@ class SubprocessWorker(Worker):
                 self._send_consumed(call_id)
                 return result, response.get("torch_version")
             finally:
-                _ipc_parent._gpu_zero_copy_demoted = False
+                _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
                 _cleanup_parent_fds(_parent_fd_registry)
 

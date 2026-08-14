@@ -428,8 +428,22 @@ _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "t
 
 _pool_ipc_metadata_cache: Dict[int, dict] = {}
 _pool_ipc_cache_tensors: Dict[int, Any] = {}
-_active_worker_pool = None  # set per-call before _from_shm
 _parent_shareable_pool = None  # set once if PATCH_SHAREABLE_POOL is enabled
+
+# Per-CALL state, set by SubprocessWorker around each call. THREAD-LOCAL
+# on purpose: module globals here raced when two workers were driven from
+# different threads (executor call in one, aiohttp route in another) --
+# worker B's call could read worker A's pool handle or demotion flag.
+# (2026-08 review finding; the RLock serializes per-worker, not globally.)
+_call_state = threading.local()  # attrs: worker_pool, gpu_demoted
+
+
+def _get_active_worker_pool():
+    return getattr(_call_state, "worker_pool", None)
+
+
+def _is_gpu_demoted():
+    return getattr(_call_state, "gpu_demoted", False)
 
 
 def _pool_ipc_available() -> bool:
@@ -507,21 +521,15 @@ def _serialize_pool_ipc_parent(t):
 # Shared memory serialization (parent -> worker)
 # =============================================================================
 
-# Set by SubprocessWorker around each call. True = the startup canary
-# handshake failed a GPU zero-copy round-trip for the target worker, so
-# CUDA tensors take the CPU shared-memory path for that worker instead of
-# risking a silently-wrong transfer across torch's private reduction ABI.
-_gpu_zero_copy_demoted = False
-
-
 def _parent_tensor_serializer(obj, registry, visited):
     """Parent-side tensor serialization strategy.
 
     Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory. GPU
     zero-copy tiers are skipped when the canary handshake demoted them for
-    the current worker (_gpu_zero_copy_demoted).
+    the current worker (thread-local _call_state.gpu_demoted, set by
+    SubprocessWorker around each call).
     """
-    if obj.is_cuda and not _gpu_zero_copy_demoted:
+    if obj.is_cuda and not _is_gpu_demoted():
         if _parent_shareable_pool is not None:
             return _serialize_pool_ipc_parent(obj)
         if _probe_cuda_ipc():
@@ -613,8 +621,9 @@ def _from_shm(obj, unlink=True):
 
     # PoolIPC -> zero-copy CUDA tensor via shareable pool (worker -> parent)
     if obj.get("__type__") == "PoolIPC":
-        if _active_worker_pool is not None:
-            return _deserialize_pool_ipc(obj, _active_worker_pool)
+        _pool = _get_active_worker_pool()
+        if _pool is not None:
+            return _deserialize_pool_ipc(obj, _pool)
         raise RuntimeError("PoolIPC received but no worker pool handle available")
 
     # CudaIPC -> zero-copy CUDA tensor deserialization

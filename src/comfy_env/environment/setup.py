@@ -62,19 +62,43 @@ def _register_shareable_pool_hook():
         return
 
     class _ShareablePoolHook:
+        # find_spec/exec_module wrapping, NOT the legacy find_module/
+        # load_module pair: the import system stopped calling the legacy
+        # API in Python 3.12, so the old hook silently never fired there
+        # (2026-08 review finding).
 
-        def find_module(self, fullname, path=None):
-            if fullname == "comfy.model_management" and not _shareable_pool_applied:
-                return self
-            return None
+        _in_find = False
 
-        def load_module(self, fullname):
-            sys.meta_path.remove(self)
-            import importlib
-            mod = importlib.import_module(fullname)
-            sys.modules[fullname] = mod
-            self._apply(mod)
-            return mod
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname != "comfy.model_management" or _shareable_pool_applied:
+                return None
+            if self._in_find:
+                return None  # recursion guard: we are the ones asking
+            import importlib.util
+            self._in_find = True
+            try:
+                spec = importlib.util.find_spec(fullname)
+            finally:
+                self._in_find = False
+            if spec is None or spec.loader is None:
+                return None
+            hook = self
+            orig_exec = spec.loader.exec_module
+
+            class _WrappingLoader:
+                def create_module(self, s):
+                    return None
+
+                def exec_module(self, module):
+                    orig_exec(module)
+                    try:
+                        sys.meta_path.remove(hook)
+                    except ValueError:
+                        pass
+                    hook._apply(module)
+
+            spec.loader = _WrappingLoader()
+            return spec
 
         def _apply(self, mm):
             global _shareable_pool_applied
