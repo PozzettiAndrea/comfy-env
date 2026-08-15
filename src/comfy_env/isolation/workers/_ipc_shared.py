@@ -286,6 +286,17 @@ def _cleanup_shm(registry):
 # IPC cache management
 # =============================================================================
 
+# IPC handle forwarding cache: avoids cloning when re-sharing CUDA tensors
+# received via IPC from another worker (Worker A -> Parent -> Worker B).
+# Keyed by id(storage). Lives HERE, in the only comfy_env-import-free leaf
+# module, so the tensor leaf (tensor_utils) can read it at module top level
+# without a package-init import cycle -- and so the container sits next to
+# the eviction policy that bounds it. Both the parent transport
+# (_ipc_parent) and the worker (_persistent_worker) share this one copy.
+_cuda_ipc_metadata_cache = {}   # id(storage) -> ipc metadata dict
+_cuda_ipc_cache_tensors = {}    # id(storage) -> tensor ref, keeps storage IDs stable
+
+
 def _evict_cache_if_needed(cache_dict):
     """Evict oldest half of cache if it exceeds MAX_IPC_CACHE_SIZE."""
     if len(cache_dict) > MAX_IPC_CACHE_SIZE:

@@ -97,6 +97,11 @@ from ._ipc_parent import (
     _get_shm_dir,
 )
 
+# Launch-env builder: a leaf module (isolation/subenv.py), imported DOWNWARD.
+# Was a function-body `from ..wrap import ...` to dodge a cycle; the extraction
+# made it an ordinary top-level import.
+from ..subenv import build_isolation_env
+
 # Module-level state that SubprocessWorker accesses directly
 import comfy_env.isolation.workers._ipc_parent as _ipc_parent
 # Module-level mutable state aliases -- SubprocessWorker sets these before
@@ -364,7 +369,6 @@ class SubprocessWorker(Worker):
         self._authkey = secrets.token_hex(32)
 
         # Set up environment (shared with metadata scan)
-        from ..wrap import build_isolation_env
         env = build_isolation_env(self.python, self.extra_env)
         env["COMFY_ENV_IPC_ADDR"] = self._socket_addr
         env["COMFY_ENV_IPC_AUTHKEY"] = self._authkey

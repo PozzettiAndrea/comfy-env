@@ -1,0 +1,67 @@
+# import-linter contracts -- the Python analog of a build-graph "no cycles"
+# + visibility rule. Guards the layering established when the three
+# lazy-import cycles were removed (build_isolation_env -> subenv, the CUDA
+# IPC cache -> _ipc_shared, the worker pool -> pool). Run: `lint-imports`.
+#
+# IMPORTANT: keep this passing WITHOUT relying on function-body imports as an
+# escape. A cycle re-broken by moving an import into a function body is still
+# a cycle -- fix the layering instead. (import-linter analyses top-level
+# imports; a reviewer must reject new in-function cross-module imports.)
+
+[importlinter]
+root_package = comfy_env
+
+[importlinter:contract:isolation-acyclic]
+name = isolation modules form no import cycles
+type = independence
+# These modules must not import each other in a way that forms a cycle.
+# Stated as independence between the leaves and the layers above them.
+modules =
+    comfy_env.isolation.subenv
+    comfy_env.isolation.tensor_utils
+
+[importlinter:contract:nothing-imports-wrap]
+name = wrap is the top orchestrator -- nothing under isolation imports it
+type = forbidden
+source_modules =
+    comfy_env.isolation.pool
+    comfy_env.isolation.metadata
+    comfy_env.isolation.subenv
+    comfy_env.isolation.tensor_utils
+    comfy_env.isolation.workers.subprocess
+    comfy_env.isolation.workers._ipc_parent
+    comfy_env.isolation.workers._ipc_shared
+forbidden_modules =
+    comfy_env.isolation.wrap
+# The public facade (isolation/__init__ re-exports register_nodes from wrap)
+# is the ONE legitimate top-level reference; exempt it so the contract
+# checks DIRECT module imports, not the package-init re-export chain.
+ignore_imports =
+    comfy_env.isolation -> comfy_env.isolation.wrap
+
+[importlinter:contract:transport-leaf]
+name = the transport leaf (_ipc_shared) imports nothing from comfy_env
+type = forbidden
+source_modules =
+    comfy_env.isolation.workers._ipc_shared
+forbidden_modules =
+    comfy_env.isolation.wrap
+    comfy_env.isolation.pool
+    comfy_env.isolation.metadata
+    comfy_env.isolation.workers.subprocess
+    comfy_env.isolation.workers._ipc_parent
+    comfy_env.isolation.tensor_utils
+
+[importlinter:contract:layers]
+name = isolation dependency layers point one way
+type = layers
+# Top imports down; never the reverse.
+layers =
+    comfy_env.isolation.wrap
+    comfy_env.isolation.metadata
+    comfy_env.isolation.pool
+    comfy_env.isolation.workers.subprocess
+    comfy_env.isolation.workers._ipc_parent
+    comfy_env.isolation.workers._ipc_shared
+ignore_imports =
+    comfy_env.isolation -> comfy_env.isolation.wrap

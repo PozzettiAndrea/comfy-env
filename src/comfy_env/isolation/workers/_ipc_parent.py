@@ -41,6 +41,8 @@ from ._ipc_shared import (
     _export_pointer,
     _cleanup_shm,
     _evict_cache_if_needed,
+    _cuda_ipc_metadata_cache,
+    _cuda_ipc_cache_tensors,
     _to_shm_generic,
     _decode_np_dtype,
     deserialize_custom,
@@ -295,10 +297,10 @@ def _serialize_tensor_native_parent(t, registry):
 
 _cuda_ipc_supported: Optional[bool] = None
 
-# IPC handle forwarding cache: avoids cloning when re-sharing CUDA tensors
-# that were received via IPC from another worker. Keyed by id(storage).
-_cuda_ipc_metadata_cache: Dict[int, dict] = {}
-_cuda_ipc_cache_tensors: Dict[int, Any] = {}  # hold tensor refs to keep storage IDs stable
+# The IPC handle forwarding cache (_cuda_ipc_metadata_cache /
+# _cuda_ipc_cache_tensors) is imported from _ipc_shared above -- it lives in
+# the standalone leaf so tensor_utils can read it without a cycle, and so it
+# sits next to _evict_cache_if_needed / MAX_IPC_CACHE_SIZE that bound it.
 
 
 def _probe_cuda_ipc() -> bool:

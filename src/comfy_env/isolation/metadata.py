@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
+from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
 _CACHE_VERSION = "12"  # Bump when _METADATA_SCRIPT or cache format changes
@@ -351,7 +352,6 @@ def fetch_metadata(
             pass  # Corrupted cache, fall through to scan
 
     # Build proper subprocess environment (DLL paths, library paths, etc.)
-    from .wrap import build_isolation_env
     scan_env = build_isolation_env(python, env_vars)
 
     # Write script and allocate a dedicated payload file. The worker dumps the
@@ -721,7 +721,7 @@ def _build_v3_proxy_class(
 
     def _make_v3_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, nn):
         def proxy(cls, **kwargs):
-            from .wrap import (_get_or_create_worker, _remove_worker,
+            from .pool import (_get_or_create_worker, _remove_worker,
                                _register_new_patchers)
 
             # I/O + VRAM logging (before call)
@@ -1026,7 +1026,7 @@ def build_proxy_class(
     # Proxy FUNCTION method -- reuses persistent worker across calls
     def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn, hsk):
         def proxy(self, **kwargs):
-            from .wrap import (_get_or_create_worker, _remove_worker,
+            from .pool import (_get_or_create_worker, _remove_worker,
                                _register_new_patchers)
 
             # Strip hidden kwargs that V3 execute() doesn't expect
