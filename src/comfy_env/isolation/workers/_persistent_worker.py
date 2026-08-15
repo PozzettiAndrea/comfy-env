@@ -1244,6 +1244,87 @@ def main():
     # ---------------------------------------------------------------
     _current_call_id = None  # Tracks call_id of the request being processed
 
+    def _find_loaded_model(_model):
+        """The worker's own ComfyUI LoadedModel wrapping this module, if any."""
+        try:
+            import comfy.model_management as _cmm_f
+            for _lm in list(_cmm_f.current_loaded_models):
+                if _lm.model is not None and _lm.model.model is _model:
+                    return _lm
+        except Exception:
+            pass
+        return None
+
+    def _handle_model_partial(request):
+        """Byte-quantized partial load/unload against the REAL ModelPatcher.
+
+        The parent's proxy has no weights and cannot do partial residency, so
+        it asks for bytes and we answer with bytes ACTUALLY moved -- the parent
+        must never guess. Falls back to a whole-model move when this module is
+        not under a ComfyUI patcher (a plain nn.Module a pack moved itself).
+        """
+        _mid = request.get("model_id")
+        _req_call_id = request.get("call_id", _current_call_id)
+        _partial_unload = request.get("method") == "model_partial_unload"
+        _model = _model_registry.get(_mid)
+        if _model is None:
+            transport.send({"status": "error", "call_id": _req_call_id,
+                            "error": f"Model '{_mid}' not registered"})
+            return
+        try:
+            import torch as _torch
+            _lm = _find_loaded_model(_model)
+            _resident_of = (lambda: int(_lm.model.loaded_size())) if _lm is not None else None
+
+            if _lm is not None:
+                _before = _resident_of()
+                if _partial_unload:
+                    _want = int(request.get("bytes_to_free", 0)) or _before
+                    _lm.model.partially_unload(_lm.model.offload_device, _want)
+                    # MANDATORY: bytes must reach the driver, or the parent
+                    # (which decides admission from device-wide free) cannot
+                    # see them and will keep evicting.
+                    if _torch.cuda.is_available():
+                        _torch.cuda.empty_cache()
+                    _after = _resident_of()
+                    _moved = max(0, _before - _after)
+                else:
+                    _extra = int(request.get("extra_bytes", 0))
+                    _lm.model.partially_load(_lm.model.load_device, _extra)
+                    _after = _resident_of()
+                    _moved = max(0, _after - _before)
+                transport.send({"status": "ok", "call_id": _req_call_id,
+                                "freed" if _partial_unload else "loaded": _moved,
+                                "resident": _after})
+                return
+
+            # No patcher: plain module. Whole-model move, report honestly.
+            _meta = _model_registry_meta.get(_mid, {})
+            _size = int(_meta.get("size", 0))
+            _cur = next(_model.parameters(), None)
+            _on_cuda = _cur is not None and _cur.device.type == "cuda"
+            if _partial_unload:
+                if not _on_cuda:
+                    transport.send({"status": "ok", "call_id": _req_call_id,
+                                    "freed": 0, "resident": 0})
+                    return
+                _model.to(_torch.device("cpu"))
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                transport.send({"status": "ok", "call_id": _req_call_id,
+                                "freed": _size, "resident": 0})
+            else:
+                if _on_cuda:
+                    transport.send({"status": "ok", "call_id": _req_call_id,
+                                    "loaded": 0, "resident": _size})
+                    return
+                _model.to(_torch.device(request.get("device", "cuda")))
+                transport.send({"status": "ok", "call_id": _req_call_id,
+                                "loaded": _size, "resident": _size})
+        except Exception as _e:
+            wlog(f"[worker] model_partial error: {_e}")
+            transport.send({"status": "error", "call_id": _req_call_id, "error": str(_e)})
+
     def _handle_model_to_device(request):
         """Handle a model_to_device command. Can be called from main loop or _call_parent."""
         _mid = request.get("model_id")
@@ -1318,6 +1399,9 @@ def main():
             # Handle interleaved management commands
             if response.get("method") == "model_to_device":
                 _handle_model_to_device(response)
+                continue
+            if response.get("method") in ("model_partial_unload", "model_partial_load"):
+                _handle_model_partial(response)
                 continue
             if response.get("method") == "ping":
                 transport.send({"status": "pong", "call_id": response.get("call_id")})
@@ -1412,6 +1496,28 @@ def main():
                 # Propagate parent's VRAM constraints to subprocess
                 if result:
                     extra_reserved = result.get("extra_reserved_vram")
+
+                    # Correct OUR OWN blindness. get_free_memory() here reports
+                    # this process's budget on WDDM -- it cannot see the parent
+                    # or sibling workers, so the real load_models_gpu below
+                    # would size lowvram_model_memory against a card it thinks
+                    # is empty and OVER-load into driver sysmem fallback (the
+                    # unexplained 10x slowdowns). The parent measured true
+                    # device-wide free; the difference is exactly what everyone
+                    # else holds, so reserving it makes our view honest.
+                    _dev_free = result.get("device_free_bytes")
+                    if _dev_free is not None:
+                        try:
+                            _my_blind = _cmm.get_free_memory(_cmm.get_torch_device())
+                            _others = max(0, int(_my_blind) - int(_dev_free))
+                            extra_reserved = max(int(extra_reserved or 0), _others)
+                            wlog(f"[worker] blindness correction: my_free="
+                                 f"{_my_blind / 1e9:.2f}GB device_free="
+                                 f"{_dev_free / 1e9:.2f}GB -> reserve "
+                                 f"{_others / 1e9:.2f}GB for other processes")
+                        except Exception as _be:
+                            wlog(f"[worker] blindness correction skipped: {_be}")
+
                     if extra_reserved is not None:
                         _cmm.EXTRA_RESERVED_VRAM = extra_reserved
                         wlog(f"[worker] Set EXTRA_RESERVED_VRAM = {extra_reserved / 1e9:.2f} GB")
@@ -1577,6 +1683,10 @@ def main():
 
         if request.get("method") == "model_to_device":
             _handle_model_to_device(request)
+            continue
+
+        if request.get("method") in ("model_partial_unload", "model_partial_load"):
+            _handle_model_partial(request)
             continue
 
         if request.get("method") == "list_models":

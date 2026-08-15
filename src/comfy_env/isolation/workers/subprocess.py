@@ -690,6 +690,16 @@ class SubprocessWorker(Worker):
             raise TimeoutError(f"{self.name}: call_id={call_id} timed out after {timeout}s")
 
         self._last_ok = time.time()
+        # Capture auto-registered models on EVERY request path, before any
+        # status check. Capturing only in call_method's success branch meant a
+        # model loaded during an API-route call (call_module) or during a call
+        # that then raised was GPU-resident with no ledger entry -- unbudgeted
+        # and un-evictable for the life of the process. Accumulate rather than
+        # replace, so an interleaved ping/command cannot wipe pending
+        # registrations; _register_new_patchers drains this list.
+        _new = response.get("_new_models")
+        if _new:
+            self._last_new_models.extend(_new)
         return response
 
     def call_method(
@@ -769,8 +779,8 @@ class SubprocessWorker(Worker):
                         traceback=response.get("traceback"),
                     )
 
-                # Store newly auto-registered models (for proxy to create patchers)
-                self._last_new_models = response.get("_new_models", [])
+                # (auto-registered models are captured in _send_request, on
+                # every path -- including error responses)
 
                 # Reconstruct result from shared memory
                 result_meta = response.get("result")
@@ -990,13 +1000,29 @@ class SubprocessWorker(Worker):
                       f"shared-memory path.", file=sys.stderr, flush=True)
         return ok
 
+    #: Seconds to wait for a worker's lock before giving up on a management
+    #: command. Eviction runs INSIDE ComfyUI's free_memory loop, and a VRAM
+    #: callback on worker A can be asked to evict from worker B while B's own
+    #: callback is evicting from A -- an AB-BA cycle. The RLock only protects
+    #: same-thread re-entry, and every existing timeout is on transport.recv,
+    #: not on lock acquisition, so such a cycle would hang ComfyUI forever with
+    #: nothing firing. Bounding the wait converts a deadlock into a failed
+    #: eviction, which callers already handle.
+    _COMMAND_LOCK_TIMEOUT = 30.0
+
     def send_command(self, method, **params):
         """Send a management command to the worker (model device moves, etc.).
 
         Uses the same socket transport as call_method but expects a simple
         JSON response (no shared-memory result).
         """
-        with self._lock:
+        if not self._lock.acquire(timeout=self._COMMAND_LOCK_TIMEOUT):
+            raise RuntimeError(
+                f"{self.name}: timed out after {self._COMMAND_LOCK_TIMEOUT}s waiting "
+                f"for the worker lock to send '{method}'. Another thread is mid-call "
+                f"on this worker; treating as a failed eviction rather than blocking "
+                f"ComfyUI indefinitely.")
+        try:
             self._ensure_started()
             self._call_counter += 1
             request = {"method": method, "call_id": self._call_counter, **params}
@@ -1007,6 +1033,8 @@ class SubprocessWorker(Worker):
                     f"{response.get('error', 'Unknown error')}"
                 )
             return response
+        finally:
+            self._lock.release()
 
     def shutdown(self) -> None:
         """Shut down the persistent worker."""

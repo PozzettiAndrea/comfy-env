@@ -1,21 +1,42 @@
-"""Proxy ModelPatcher for subprocess-isolated models.
+"""Duck-typed proxy presenting subprocess models to ComfyUI's memory manager.
 
-SubprocessModelPatcher registers subprocess GPU models with ComfyUI's memory
-manager so they participate in VRAM eviction. When ComfyUI needs VRAM, it
-calls unpatch_model() which sends an IPC command to move the model to CPU.
-When the model is needed again, patch_model() sends it back to GPU.
+A worker-resident GPU model is registered in ComfyUI's ``current_loaded_models``
+as a ``SubprocessModelPatcher`` so it participates in normal VRAM eviction:
+ComfyUI decides *when* to evict, comfy-env decides *how* (an IPC command that
+moves the real weights inside the worker).
 
-Models are auto-detected: the worker hooks Module.to() and .cuda() to catch
-any nn.Module that lands on CUDA. Zero per-repo changes needed.
+Deliberately **not** a ``comfy.model_patcher.ModelPatcher`` subclass.
+Subclassing inherited ~120 members -- ``add_patches``, ``load``,
+``apply_hooks``, ``pinned_memory_size`` and friends -- every one of which is
+wrong for an object that holds no weights, and none of which were disabled.
+The failure mode of that design is *silent*: upstream adds a field or changes a
+contract, an inherited method runs against a fake model, and the result is a
+wrong number rather than an exception.
+
+This class implements only what ComfyUI actually touches (verified against
+``model_management.py`` call sites; see ``tests/test_model_patcher_surface.py``,
+which fails when that set changes). Everything else hits ``__getattr__`` and
+raises **naming the attribute**, turning future upstream drift into a pointed
+traceback instead of silent corruption.
+
+Two honesty rules the old proxy broke:
+
+* **Never lie about bytes.** ``partially_unload`` returns what the worker
+  actually freed. Returning a too-large number defeats ComfyUI's escalation
+  ladder: ``LoadedModel.model_unload`` compares ``freed >= memory_to_free`` and,
+  on a short return, falls through to ``detach()`` and full eviction by itself.
+* **Never raise inside someone else's loop.** Eviction paths
+  (``partially_unload`` / ``detach``) treat a dead or restarted worker as
+  "already offloaded". A raise there propagates out of ``free_memory`` and
+  poisons every subsequent load for the life of the process.
 """
 
 import logging
 import sys
 
-import comfy.model_patcher
 import comfy.model_management
 
-from ..debug import VRAM as _DBG_VRAM, MODELS as _DBG_MODELS
+from ..debug import VRAM as _DBG_VRAM, MODELS as _DBG_MODELS  # noqa: F401
 
 log = logging.getLogger("comfy_env.model_patcher")
 
@@ -37,11 +58,11 @@ def _log_vram(label: str) -> None:
 
 
 class SubprocessModel:
-    """Lightweight proxy standing in for ModelPatcher's .model attribute.
+    """Stand-in for a patcher's ``.model`` (the inner nn.Module).
 
-    Tracks device/memory state without holding actual weights -- the real
-    weights live in the subprocess.  ComfyUI's ModelPatcher constructor and
-    LoadedModel read several attributes off .model; we provide them all here.
+    Holds no weights -- the real module lives in the worker. MUST stay a plain
+    class: ``LoadedModel.model_load`` takes a ``weakref.finalize`` on this
+    object, so it has to be weak-referenceable.
     """
 
     def __init__(self, size_bytes, device):
@@ -53,161 +74,204 @@ class SubprocessModel:
         self.model_offload_buffer_memory = 0
         self._size = size_bytes
 
-    def to(self, *args, **kwargs):
-        # No-op -- actual device move happens via IPC
-        return self
 
-    def state_dict(self):
-        return {}  # No local weights
+class SubprocessModelPatcher:
+    """Standalone duck-type for a worker-resident model.
 
-    def modules(self):
-        return iter([])  # No submodules to iterate
-
-    def parameters(self):
-        return iter([])  # No local parameters
-
-    def __class_name__(self):
-        return "SubprocessModel"
-
-
-class SubprocessModelPatcher(comfy.model_patcher.ModelPatcher):
-    """ModelPatcher that proxies device moves to a subprocess worker via IPC.
-
-    The patcher is keyed to a specific worker generation so that stale patchers
-    (from a crashed/restarted worker) raise a clean error instead of silently
-    failing.
+    Keyed to a worker generation: a patcher left over from a crashed or
+    restarted worker reports itself as already offloaded rather than failing.
     """
+
+    #: Everything ComfyUI reads off ``LoadedModel.model``. Kept in sync by
+    #: tests/test_model_patcher_surface.py, which greps ComfyUI for the real
+    #: access sites and fails when upstream starts touching something new.
+    COMFY_SURFACE = frozenset({
+        # attributes
+        "load_device", "offload_device", "parent", "model", "clone_base_uuid",
+        # methods
+        "model_size", "loaded_size", "current_loaded_device", "model_dtype",
+        "model_patches_to", "model_patches_models", "partially_load",
+        "partially_unload", "detach", "lowvram_patch_counter", "is_dynamic",
+        "is_clone", "get_nested_additional_models",
+    })
 
     def __init__(self, worker, worker_generation, model_id, model_size,
                  load_device, offload_device, kind="other"):
-        proxy_model = SubprocessModel(model_size, offload_device)
-        super().__init__(proxy_model, load_device, offload_device, size=model_size)
+        self.load_device = load_device
+        self.offload_device = offload_device
+        # ComfyUI's LoadedModel._set_model reads .parent; clone chains do not
+        # exist for subprocess models, so it is always None.
+        self.parent = None
+        self.clone_base_uuid = None
+        self.size = model_size
+        self.model = SubprocessModel(model_size, offload_device)
         self._worker = worker
         self._worker_generation = worker_generation
         self._model_id = model_id
         self._kind = kind  # "unet", "clip", "vae", "other"
 
-    def _check_worker(self):
-        """Raise if the worker has been replaced since this patcher was created."""
-        if not self._worker.is_alive():
-            raise RuntimeError(
-                f"Subprocess worker died; model '{self._model_id}' is no longer available. "
-                f"Please reload the model node."
-            )
+    # ------------------------------------------------------------------
+    # IPC
+    # ------------------------------------------------------------------
 
-    def _send_device_command(self, device_str):
-        """Send model_to_device IPC command."""
-        self._check_worker()
-        try:
-            self._worker.send_command(
-                "model_to_device",
-                model_id=self._model_id,
-                device=device_str,
-            )
-        except RuntimeError as e:
-            if "not registered" in str(e):
-                # Worker was restarted -- model no longer exists in subprocess.
-                # For offload: model is already gone from VRAM, just update state.
-                log.warning("Model '%s' gone from worker (restarted?), treating as offloaded",
-                            self._model_id)
-                self.model.device = self.offload_device
-                self.model.model_loaded_weight_memory = 0
-                self.model.model_offload_buffer_memory = 0
-                return
-            raise
+    def _worker_gone(self):
+        return not self._worker.is_alive()
 
-    # -- ModelPatcher overrides --
-
-    def patch_model(self, device_to=None, lowvram_model_memory=0,
-                    load_weights=True, force_patch_weights=False):
-        """Load model to GPU in subprocess."""
-        device_to = device_to or self.load_device
-        size_mb = self.size // (1024 * 1024)
-        _log_vram(f"Before load '{self._model_id}' ({size_mb} MB) -> {device_to}")
-        self._send_device_command(str(device_to))
-        self.model.device = device_to
-        self.model.model_loaded_weight_memory = self.size
-        _log_vram(f"After load '{self._model_id}' ({size_mb} MB)")
-        return self.model
-
-    def unpatch_model(self, device_to=None, unpatch_weights=True):
-        """Offload model to CPU in subprocess."""
-        device_to = device_to or self.offload_device
-        size_mb = self.size // (1024 * 1024)
-        _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB) -> {device_to}")
-        self._send_device_command(str(device_to))
-        self.model.device = device_to
+    def _mark_offloaded(self):
+        """Local bookkeeping for 'the weights are not on the GPU any more'."""
+        self.model.device = self.offload_device
         self.model.model_loaded_weight_memory = 0
         self.model.model_offload_buffer_memory = 0
-        _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
 
-    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        """Full load (no partial loading for subprocess models)."""
-        self.patch_model(device_to, load_weights=True)
+    def _send(self, command, *, quiet_on_loss, **kwargs):
+        """Send an IPC command.
+
+        quiet_on_loss=True (eviction paths): a dead/restarted worker means the
+        VRAM is already gone, so report success instead of raising -- raising
+        here would escape into ComfyUI's free_memory loop.
+        quiet_on_loss=False (load paths): failing loudly is correct.
+        """
+        if self._worker_gone():
+            if quiet_on_loss:
+                log.warning("Worker for model '%s' is gone; treating as offloaded",
+                            self._model_id)
+                self._mark_offloaded()
+                return None
+            raise RuntimeError(
+                f"Subprocess worker died; model '{self._model_id}' is no longer "
+                f"available. Please reload the model node.")
+        try:
+            return self._worker.send_command(command, model_id=self._model_id, **kwargs)
+        except Exception as e:
+            if quiet_on_loss:
+                log.warning("Model '%s': %s failed (%s); treating as offloaded",
+                            self._model_id, command, e)
+                self._mark_offloaded()
+                return None
+            raise
+
+    # ------------------------------------------------------------------
+    # The surface ComfyUI actually uses
+    # ------------------------------------------------------------------
+
+    def model_size(self):
         return self.size
 
-    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        """Full unload."""
-        self.unpatch_model(device_to)
-        return self.size
-
-    def partially_unload_ram(self, ram_to_unload):
-        pass
-
-    def detach(self, unpatch_all=True):
-        self.unpatch_model(self.offload_device)
-        return self.model
-
-    def clone(self):
-        n = SubprocessModelPatcher(
-            self._worker, self._worker_generation, self._model_id,
-            self.size, self.load_device, self.offload_device, self._kind,
-        )
-        n.model.device = self.model.device
-        n.model.model_loaded_weight_memory = self.model.model_loaded_weight_memory
-        return n
-
-    def cleanup(self):
-        pass  # Worker stays alive
-
-    def model_patches_to(self, *args, **kwargs):
-        pass  # No local patches to move
-
-    def model_patches_models(self):
-        return []  # No sub-models
-
-    def is_clone(self, other):
-        if isinstance(other, SubprocessModelPatcher):
-            return (self._worker is other._worker
-                    and self._model_id == other._model_id)
-        return False
+    def loaded_size(self):
+        return self.model.model_loaded_weight_memory
 
     def current_loaded_device(self):
         return self.model.device
 
     def model_dtype(self):
-        return None  # Subprocess handles dtype internally
+        return None  # dtype is the worker's business
 
-    def model_state_dict(self, filter_prefix=None):
-        return {}
+    def model_patches_to(self, *args, **kwargs):
+        return None  # no local patches to move
+
+    def model_patches_models(self):
+        return []
 
     def get_nested_additional_models(self):
         return []
 
-    def inject_model(self):
-        pass
-
-    def eject_model(self):
-        pass
-
-    def pre_run(self):
-        pass
+    def lowvram_patch_counter(self):
+        return 0
 
     def is_dynamic(self):
+        # False excludes this object from every dynamic-pin path
+        # (dynamic_pins, loaded_ram_size, pinned_memory_size,
+        # models_for_pin_eviction) -- where most upstream churn lives.
         return False
 
-    def get_all_callbacks(self, *args, **kwargs):
-        return []
+    def is_clone(self, other):
+        return (isinstance(other, SubprocessModelPatcher)
+                and self._worker is other._worker
+                and self._model_id == other._model_id)
 
-    def get_ram_usage(self):
-        return self.model_size()
+    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        """Load up to ``extra_memory`` more bytes; return bytes actually loaded.
+
+        ComfyUI passes 1e32 to mean "as much as fits"; clamp so the wire carries
+        a sane integer. The worker runs the REAL ModelPatcher.partially_load.
+        """
+        want = int(min(float(extra_memory), float(self.size))) if extra_memory else 0
+        if want <= 0:
+            want = self.size
+        size_mb = self.size // (1024 * 1024)
+        _log_vram(f"Before load '{self._model_id}' ({size_mb} MB) -> {device_to}")
+        r = self._send("model_partial_load", quiet_on_loss=False,
+                       extra_bytes=want, device=str(device_to))
+        loaded = int((r or {}).get("loaded", 0))
+        resident = int((r or {}).get("resident", loaded))
+        self.model.model_loaded_weight_memory = resident
+        if resident > 0:
+            self.model.device = device_to
+        _log_vram(f"After load '{self._model_id}' (+{loaded // (1024 * 1024)} MB)")
+        return loaded
+
+    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        """Free up to ``memory_to_free`` bytes; return bytes ACTUALLY freed.
+
+        A short return is the designed path, not a failure: ComfyUI compares
+        ``freed >= memory_to_free`` and escalates to ``detach()`` itself.
+        """
+        resident_before = self.model.model_loaded_weight_memory
+        if resident_before <= 0:
+            return 0
+        want = int(memory_to_free) if memory_to_free else resident_before
+        _log_vram(f"Before partial offload '{self._model_id}' (-{want // (1024 * 1024)} MB)")
+        r = self._send("model_partial_unload", quiet_on_loss=True, bytes_to_free=want)
+        if r is None:
+            # Worker gone: the VRAM went with the process. Everything that was
+            # resident is genuinely freed.
+            return resident_before
+        freed = int(r.get("freed", 0))
+        resident = int(r.get("resident", max(0, resident_before - freed)))
+        self.model.model_loaded_weight_memory = resident
+        if resident <= 0:
+            self.model.device = self.offload_device
+        _log_vram(f"After partial offload '{self._model_id}' (-{freed // (1024 * 1024)} MB)")
+        return freed
+
+    def detach(self, unpatch_all=True):
+        """Full unload. Idempotent, and never raises -- runs inside free_memory."""
+        if self.model.model_loaded_weight_memory <= 0 and \
+                self.model.device == self.offload_device:
+            return self.model  # already off the GPU; skip the round trip
+        size_mb = self.size // (1024 * 1024)
+        _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB)")
+        self._send("model_to_device", quiet_on_loss=True, device=str(self.offload_device))
+        self._mark_offloaded()
+        _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
+        return self.model
+
+    # ------------------------------------------------------------------
+    # Explicitly unsupported (reachable only if a pack ever returns a MODEL)
+    # ------------------------------------------------------------------
+
+    def add_patches(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"Model '{self._model_id}' lives in a subprocess and cannot be "
+            f"patched in-process. Weight patches (LoRA etc.) must be applied "
+            f"inside the pack's own environment, where a real ModelPatcher "
+            f"holds the weights. Silently storing patches that never apply "
+            f"would produce wrong output with no error.")
+
+    add_hook_patches = add_patches
+
+    def clone(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"Model '{self._model_id}' is a subprocess proxy and cannot be "
+            f"cloned: a clone would share a worker-side model while ComfyUI "
+            f"treated the copies as independent. Clone inside the pack instead.")
+
+    def __getattr__(self, name):
+        # Only reached when normal lookup fails.
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)  # let copy/pickle/weakref protocols probe
+        raise AttributeError(
+            f"SubprocessModelPatcher has no {name!r}. ComfyUI touched a "
+            f"ModelPatcher member this proxy does not implement, which means "
+            f"the upstream contract changed. Implement it here and add it to "
+            f"COMFY_SURFACE -- do not inherit ModelPatcher to make it go away.")

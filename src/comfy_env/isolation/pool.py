@@ -175,12 +175,94 @@ def _handle_progress(request: dict) -> dict:
     return {}
 
 
+#: Fixed VRAM cost of an extra CUDA-using process that ComfyUI's ledger never
+#: sees: CUDA context (~160 MB) + cuBLAS/cuDNN handles (~55 MB). Measured on
+#: RTX 4060 Ti / driver 581.57 / torch 2.10+cu128. Additive per live worker --
+#: unlike the model-size headroom, which is multiplicative.
+_WORKER_FIXED_VRAM_COST = 250 * 1024 * 1024
+
+#: Multiplicative slack on the requested model bytes (allocator rounding).
+#: Small because cudaMallocAsync (the default backend) keeps slack near 1%;
+#: the dominant hidden cost is the per-process constant above.
+_REQUEST_SLACK = 1.02
+
+
+def _true_device_free(device) -> "int | None":
+    """Device-wide free VRAM, across processes. None if unobtainable.
+
+    `torch.cuda.mem_get_info` -- which ComfyUI's get_free_memory relies on --
+    reports the CALLING PROCESS's budget on Windows/WDDM, not the device total.
+    Measured: a sibling process allocated 13.0 GiB; nvidia-smi free fell
+    13,443 MB while the parent's mem_get_info fell 75 MB. Every admission
+    decision made from that number is fiction on the majority platform.
+
+    Ladder: pynvml -> nvidia-smi -> None (caller falls back to its own ledger).
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            idx = device.index if getattr(device, "index", None) is not None else 0
+            h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            return int(pynvml.nvmlDeviceGetMemoryInfo(h).free)
+        finally:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import subprocess as _sp
+        idx = device.index if getattr(device, "index", None) is not None else 0
+        out = _sp.run(
+            ["nvidia-smi", f"--id={idx}", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(float(out.stdout.strip().splitlines()[0])) * 1024 * 1024
+    except Exception:
+        pass
+    return None
+
+
+def _worker_held_bytes() -> int:
+    """Bytes this process's workers hold on the GPU, from comfy-env's own books.
+
+    Zero-dependency fallback for `_true_device_free`: comfy-env already knows
+    every worker model's size and residency, so it can reconstruct what
+    ComfyUI's view is missing without NVML. Undercounts allocations the
+    Module.to()/.cuda() hooks never saw (ADR-0025 records that gap).
+    """
+    held = 0
+    n_workers = 0
+    for _key, patchers in _WORKER_PATCHERS.items():
+        if patchers:
+            n_workers += 1
+        for p in patchers.values():
+            try:
+                held += int(p.loaded_size())
+            except Exception:
+                pass
+    return held + n_workers * _WORKER_FIXED_VRAM_COST
+
+
 def _handle_vram_budget(request: dict) -> dict:
     """Parent-side callback: free VRAM for subprocess model loading.
 
     Called when the worker's shimmed load_models_gpu() needs to load models.
-    The parent evicts its own models (via free_memory) so the subprocess's
-    real load_models_gpu() sees enough free VRAM via get_free_memory().
+
+    The parent cannot simply ask ComfyUI to free N bytes: ComfyUI decides how
+    much to evict from `memory_required - get_free_memory(device)`, and on
+    WDDM that free number cannot see worker memory at all -- it stays near
+    full-card, the difference goes negative, and `free_memory` evicts NOTHING.
+    So we PRE-COMPENSATE: add the parent's over-report to the target we pass.
+
+    The compensation is exact rather than a fudge: the offset is worker-held
+    memory, which is constant across the eviction loop, and every parent-side
+    unload moves the blind number and the true number by the same amount. So
+    ComfyUI's internal comparison evaluates as if it could see the whole
+    device, and the loop still self-terminates at the minimum eviction.
     """
     try:
         import comfy.model_management as mm
@@ -190,17 +272,41 @@ def _handle_vram_budget(request: dict) -> dict:
     total_requested = request.get("total_size", 0)
     device = mm.get_torch_device()
 
-    if _DBG_MODELS:
-        free_before = mm.get_free_memory(device)
-        _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB, "
-             f"free before eviction: {free_before / 1e9:.2f}GB")
+    blind_free = mm.get_free_memory(device)
+    true_free = _true_device_free(device)
+    if true_free is None:
+        # No NVML/nvidia-smi: reconstruct from comfy-env's own ledger.
+        true_free = max(0, blind_free - _worker_held_bytes())
+        offset_source = "ledger"
+    else:
+        offset_source = "nvml"
+    offset = max(0, blind_free - true_free)
 
-    # Evict parent-side models to make room (with 10% headroom)
-    mm.free_memory(total_requested * 1.1, device)
+    # Headroom shaped to the real costs: multiplicative slack on the weights,
+    # plus the per-process constant, plus the inference reserve ComfyUI would
+    # have applied to an equivalent in-process load (mm.free_memory's callers
+    # add it; our callback previously did not, so worker loads got ~1GB less
+    # headroom than identical host loads).
+    try:
+        min_inference = mm.minimum_inference_memory()
+    except Exception:
+        min_inference = 0
+    need = int(total_requested * _REQUEST_SLACK) + _WORKER_FIXED_VRAM_COST + min_inference
 
     if _DBG_MODELS:
-        free_after = mm.get_free_memory(device)
-        _log(f"[comfy-env] VRAM after eviction: {free_after / 1e9:.2f}GB")
+        _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB | "
+             f"free: blind={blind_free / 1e9:.2f}GB true={true_free / 1e9:.2f}GB "
+             f"offset={offset / 1e9:.2f}GB ({offset_source}) | "
+             f"need={need / 1e9:.2f}GB -> asking free_memory for "
+             f"{(need + offset) / 1e9:.2f}GB")
+
+    # Offset-compensated target: makes ComfyUI's own arithmetic behave as if
+    # get_free_memory were device-wide.
+    mm.free_memory(need + offset, device)
+
+    if _DBG_MODELS:
+        _log(f"[comfy-env] VRAM after eviction: "
+             f"blind={mm.get_free_memory(device) / 1e9:.2f}GB")
 
     # If a worker VRAM budget is configured, override vram_state and reserved
     # so the subprocess gets NORMAL_VRAM with a capped budget instead of NO_VRAM.
@@ -226,10 +332,17 @@ def _handle_vram_budget(request: dict) -> dict:
             _log(f"[comfy-env] Worker VRAM budget: {worker_vram_budget}GB "
                  f"(reserve={extra_reserved / 1e9:.2f}GB, state={vram_state_name})")
 
+    # Re-measure after eviction: the worker corrects its own blind view from
+    # this (its get_free_memory - device_free = what everyone else holds).
+    post_true_free = _true_device_free(device)
+    if post_true_free is None:
+        post_true_free = max(0, mm.get_free_memory(device) - _worker_held_bytes())
+
     return {
         "device": str(device),
         "extra_reserved_vram": extra_reserved,
         "vram_state": vram_state_name,
+        "device_free_bytes": int(post_true_free),
     }
 
 
@@ -434,7 +547,13 @@ def _register_new_patchers(env_dir, worker, generation):
     # because we're outside free_memory's iteration loop.
     _STALE_PATCHERS.clear()
 
-    new_models = getattr(worker, '_last_new_models', [])
+    # Drain: _send_request ACCUMULATES registrations (so no path drops them and
+    # no interleaved command wipes them); this is the single consumer.
+    new_models = list(getattr(worker, '_last_new_models', []))
+    try:
+        worker._last_new_models = []
+    except Exception:
+        pass
     if not new_models:
         return
 

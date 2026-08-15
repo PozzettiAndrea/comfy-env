@@ -740,23 +740,29 @@ def _build_v3_proxy_class(
                 except ImportError:
                     pass
 
-                result = worker.call_method(
-                    module_name=mod,
-                    class_name=cn,
-                    method_name=fn,
-                    self_state=None,
-                    kwargs=kwargs,
-                    timeout=600.0,
-                )
+                try:
+                    result = worker.call_method(
+                        module_name=mod,
+                        class_name=cn,
+                        method_name=fn,
+                        self_state=None,
+                        kwargs=kwargs,
+                        timeout=600.0,
+                    )
+                finally:
+                    # Register auto-detected models even when the call RAISED:
+                    # the weights are on the GPU either way, and a model with
+                    # no ledger entry can never be evicted.
+                    try:
+                        _register_new_patchers(ed, worker, gen)
+                    except Exception as _re:
+                        _log(f"[comfy-env] patcher registration failed: {_re}")
 
                 try:
                     from .tensor_utils import prepare_for_ipc_recursive
                     result = prepare_for_ipc_recursive(result)
                 except ImportError:
                     pass
-
-                # Create patchers for any models auto-detected during this call
-                _register_new_patchers(ed, worker, gen)
 
                 # I/O + VRAM logging (after call)
                 if _DBG_IO:
@@ -1066,23 +1072,27 @@ def build_proxy_class(
                 except ImportError:
                     pass
 
-                result = worker.call_method(
-                    module_name=mod,
-                    class_name=cn,
-                    method_name=fn,
-                    self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
-                    kwargs=kwargs,
-                    timeout=600.0,
-                )
+                try:
+                    result = worker.call_method(
+                        module_name=mod,
+                        class_name=cn,
+                        method_name=fn,
+                        self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
+                        kwargs=kwargs,
+                        timeout=600.0,
+                    )
+                finally:
+                    # Register even on failure -- see the V3 proxy above.
+                    try:
+                        _register_new_patchers(ed, worker, gen)
+                    except Exception as _re:
+                        _log(f"[comfy-env] patcher registration failed: {_re}")
 
                 try:
                     from .tensor_utils import prepare_for_ipc_recursive
                     result = prepare_for_ipc_recursive(result)
                 except ImportError:
                     pass
-
-                # Create patchers for any models auto-detected during this call
-                _register_new_patchers(ed, worker, gen)
 
                 # I/O + VRAM logging (after call)
                 if _DBG_IO:
