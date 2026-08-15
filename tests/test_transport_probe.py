@@ -74,3 +74,19 @@ def test_demotion_flag_routes_cuda_tensors_to_cpu_path():
     finally:
         ipc_parent._call_state.gpu_demoted = old
         ipc_parent._cleanup_shm(registry) if hasattr(ipc_parent, "_cleanup_shm") else None
+
+
+def test_device_uuid_agreement_logic():
+    """The pure device-identity check: demote only on a DEFINITE mismatch,
+    never on a missing UUID (cannot-verify defers to the canary)."""
+    from comfy_env.isolation.workers.subprocess import SubprocessWorker
+    agree = SubprocessWorker._uuids_agree
+    # definite mismatch -> not ok (would be a wrong-device import)
+    assert agree("GPU-aaa", "GPU-bbb") is False
+    # match -> ok
+    assert agree("GPU-aaa", "GPU-aaa") is True
+    # missing on either side -> cannot verify, treat as ok (defer to canary)
+    assert agree(None, "GPU-aaa") is True
+    assert agree("GPU-aaa", None) is True
+    assert agree(None, None) is True
+    assert agree("", "GPU-aaa") is True

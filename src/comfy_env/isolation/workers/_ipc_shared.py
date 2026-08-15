@@ -471,6 +471,26 @@ def deserialize_custom(obj, recurse):
     return deser(obj["payload"], recurse)
 
 
+def _cuda_device_uuid():
+    """UUID string of torch's CURRENT CUDA device, or None if no CUDA.
+
+    Identity-not-index: `device_idx` in the zero-copy frames means nothing
+    across the boundary if the two sides enumerate GPUs differently (a pack
+    env with its own CUDA_VISIBLE_DEVICES). The parent compares this against
+    its own current-device UUID and demotes zero-copy on mismatch rather
+    than importing a handle onto the wrong physical GPU. Best-effort: any
+    failure returns None (treated as "cannot verify", not "mismatch").
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        return str(torch.cuda.get_device_properties(
+            torch.cuda.current_device()).uuid)
+    except Exception:
+        return None
+
+
 def registration_count():
     """Number of registered type serializers (validation hook, ADR-0015)."""
     return len(REGISTRY._by_type)

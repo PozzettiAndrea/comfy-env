@@ -1633,8 +1633,15 @@ def main():
                     _echo_tv = getattr(_echo_torch, "__version__", None)
                 except ImportError:
                     _echo_tv = None
+                # CUDA device UUID of the worker's CURRENT device -- lets the
+                # parent detect enumeration skew (a pack env that set its own
+                # CUDA_VISIBLE_DEVICES makes device_idx=0 a DIFFERENT physical
+                # GPU on each side, which would be a silent wrong-device
+                # import on the zero-copy tiers). None when no CUDA.
+                _echo_uuid = _ipc_shared._cuda_device_uuid()
                 transport.send({"status": "ok", "call_id": _current_call_id,
-                                "result": result_meta, "torch_version": _echo_tv})
+                                "result": result_meta, "torch_version": _echo_tv,
+                                "cuda_device_uuid": _echo_uuid})
                 _shm_keeper.keep(shm_registry, _current_call_id)
             except Exception as e:
                 _cleanup_shm(shm_registry)

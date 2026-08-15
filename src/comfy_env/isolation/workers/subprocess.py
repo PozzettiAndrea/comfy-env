@@ -174,6 +174,7 @@ class SubprocessWorker(Worker):
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
         self._last_ok = 0.0  # time of last successful round-trip (gates the health ping)
+        self._last_echo_meta = None  # last echo() response (carries worker CUDA device UUID)
         self._authkey = None  # per-spawn IPC auth token (set in _ensure_started)
         self._on_restart = None  # Called when worker process is replaced (stale model cleanup)
 
@@ -901,6 +902,7 @@ class SubprocessWorker(Worker):
                 result_meta = response.get("result")
                 result = _from_shm(result_meta) if result_meta is not None else None
                 self._send_consumed(call_id)
+                self._last_echo_meta = response
                 return result, response.get("torch_version")
             finally:
                 _ipc_parent._call_state.gpu_demoted = False
@@ -913,6 +915,29 @@ class SubprocessWorker(Worker):
         if not version:
             return None
         return ".".join(version.split("+")[0].split(".")[:2])
+
+    @staticmethod
+    def _uuids_agree(parent_uuid, worker_uuid) -> bool:
+        """True unless BOTH sides reported a UUID and they DIFFER. A missing
+        UUID on either side means 'cannot verify' -> not a mismatch (pure,
+        so the zero-copy device check is unit-testable without CUDA)."""
+        if not parent_uuid or not worker_uuid:
+            return True
+        return parent_uuid == worker_uuid
+
+    def _device_identity_ok(self, torch) -> bool:
+        """Do parent and worker agree on the current CUDA device? Best-effort:
+        any error answers True (defer to the canary), so this can only ever
+        demote on a DEFINITE UUID mismatch, never on uncertainty."""
+        try:
+            if not torch.cuda.is_available():
+                return True
+            parent_uuid = str(torch.cuda.get_device_properties(
+                torch.cuda.current_device()).uuid)
+            worker_uuid = (self._last_echo_meta or {}).get("cuda_device_uuid")
+            return self._uuids_agree(parent_uuid, worker_uuid)
+        except Exception:
+            return True
 
     def verify_transport(self) -> bool:
         """Canary handshake: verify each transport tier by round-tripping a
@@ -953,6 +978,23 @@ class SubprocessWorker(Worker):
                   f"{torch.__version__} vs worker {worker_torch}. Zero-copy "
                   f"transport is subject to canary verification.",
                   file=sys.stderr, flush=True)
+
+        # Device-identity check: if parent and worker enumerate GPUs
+        # differently (a pack env with its own CUDA_VISIBLE_DEVICES), a
+        # zero-copy handle carrying device_idx would import onto the WRONG
+        # physical GPU -- and the canary might not catch it. Compare current
+        # device UUIDs; on a definite mismatch, demote to the CPU path
+        # (loud) instead of risking a wrong-device import. Missing UUID on
+        # either side = cannot verify, not a mismatch: leave the canary to
+        # decide.
+        if not self._device_identity_ok(torch):
+            self.gpu_zero_copy_ok = False
+            print(f"[{self.name}] GPU zero-copy demoted: parent and worker "
+                  f"disagree on the current CUDA device (enumeration skew, "
+                  f"likely CUDA_VISIBLE_DEVICES in the pack env). CUDA "
+                  f"tensors will use the CPU shared-memory path.",
+                  file=sys.stderr, flush=True)
+            return False
 
         # GPU zero-copy tiers: verify only if the parent can produce a CUDA
         # canary. Failure here is DEMOTION, not an error -- the worker keeps
