@@ -387,7 +387,7 @@ def fetch_metadata(
         is_pixi = ".pixi" in str(python)
         if is_pixi:
             from ..environment.cache import resolve_pixi_manifest
-            from ..packages.pixi import PIXI
+            from ..pixi import PIXI
             # Per-env layout: python lives at
             #   <workspace>/envs/<name>/.pixi/envs/default/{bin,Scripts}/python
             # so the per-env manifest is at <workspace>/envs/<name>/pixi.toml

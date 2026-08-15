@@ -25,7 +25,7 @@ def test_pixi_envs_hardlink_identical_packages(tmp_path):
     """Two envs, same tiny conda python + pypi package: files must share
     inodes (one physical copy via the pixi/uv caches)."""
     from comfy_env.detection import get_pixi_platform
-    from comfy_env.packages.pixi import PIXI, ensure_pixi
+    from comfy_env.pixi import PIXI, ensure_pixi
 
     ensure_pixi()
     roots = []

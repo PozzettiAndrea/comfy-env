@@ -1,6 +1,6 @@
 """Packages layer - CUDA wheels, toml generation, node dependencies."""
 
-from .pixi import PIXI, ensure_pixi
+from ..pixi import PIXI, ensure_pixi
 from .cuda_wheels import (
     CUDA_WHEELS_INDEX,
     get_wheel_url,

@@ -7,7 +7,7 @@ import zipfile
 
 import pytest
 
-import comfy_env.packages.pixi as px
+import comfy_env.pixi as px
 
 
 def test_version_is_pinned_not_latest():

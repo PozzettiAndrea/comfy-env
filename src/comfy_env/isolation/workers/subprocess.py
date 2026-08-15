@@ -421,7 +421,7 @@ class SubprocessWorker(Worker):
                 pixi_env_root = self.python.parent.parent
 
             from ...environment.cache import resolve_pixi_manifest
-            from ...packages.pixi import PIXI
+            from ...pixi import PIXI
             manifest_path, env_pixi_name = resolve_pixi_manifest(pixi_env_root)
 
             cmd = [

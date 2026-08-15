@@ -576,7 +576,7 @@ def install_workspace(
 
     Returns the workspace directory on success, None if nothing to install.
     """
-    from ..packages.pixi import ensure_pixi, PIXI
+    from ..pixi import ensure_pixi, PIXI
     ensure_pixi()
     from ..environment.cache import (
         CE_WORKSPACE_DIR, get_workspace_dir, get_env_manifest_dir,

@@ -20,7 +20,7 @@ def detect_cuda_version() -> str | None:
 def _get_cuda_from_pixi() -> str | None:
     """Get CUDA version from pixi's virtual package detection."""
     try:
-        from ..packages.pixi import PIXI
+        from ..pixi import PIXI
         import json
         result = subprocess.run([PIXI, "info", "--json"], capture_output=True, text=True, timeout=10)
         if result.returncode != 0:

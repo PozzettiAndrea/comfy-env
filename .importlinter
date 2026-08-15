@@ -52,6 +52,36 @@ forbidden_modules =
     comfy_env.isolation.workers._ipc_parent
     comfy_env.isolation.tensor_utils
 
+[importlinter:contract:package-layers]
+name = comfy_env packages form a one-way dependency graph
+type = layers
+# Top imports down, never up. config / debug / settings / pixi are universal
+# leaves (imported everywhere) and are deliberately NOT listed -- the layers
+# contract only constrains the modules named here.
+layers =
+    comfy_env.isolation
+    comfy_env.install
+    comfy_env.packages
+    comfy_env.environment
+    comfy_env.detection
+ignore_imports =
+    # The root package __init__ is the public facade -- it re-exports from
+    # every subpackage, so `import comfy_env` anywhere routes through it.
+    # Exempt those facade edges so the contract checks DIRECT module imports,
+    # not facade-routed ones (the same reason isolation/__init__ -> wrap is
+    # exempt below).
+    comfy_env -> comfy_env.isolation
+    comfy_env -> comfy_env.install
+    comfy_env -> comfy_env.packages
+    comfy_env -> comfy_env.environment
+    # KNOWN remaining cycle, documented not hidden: environment/setup.py's
+    # shareable-pool hook (setup_env prestartup) reaches UP into the
+    # isolation transport for the CUDA pool ctypes helpers. It is part of
+    # the experimental, default-off Pool IPC (ADR-0030), which is slated for
+    # redesign -- fixing the layering now would be premature work on code
+    # being reworked. Exempted with a reason; revisit with the pool redesign.
+    comfy_env.environment.setup -> comfy_env.isolation.workers.subprocess
+
 [importlinter:contract:layers]
 name = isolation dependency layers point one way
 type = layers

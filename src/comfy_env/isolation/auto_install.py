@@ -284,7 +284,7 @@ def _run_pixi_install(
     logged by the caller is the user-facing progress signal.
     """
     import subprocess
-    from ..packages.pixi import PIXI, ensure_pixi
+    from ..pixi import PIXI, ensure_pixi
 
     ensure_pixi()
     pixi_env = dict(os.environ)
