@@ -74,13 +74,6 @@ ignore_imports =
     comfy_env -> comfy_env.install
     comfy_env -> comfy_env.packages
     comfy_env -> comfy_env.environment
-    # KNOWN remaining cycle, documented not hidden: environment/setup.py's
-    # shareable-pool hook (setup_env prestartup) reaches UP into the
-    # isolation transport for the CUDA pool ctypes helpers. It is part of
-    # the experimental, default-off Pool IPC (ADR-0030), which is slated for
-    # redesign -- fixing the layering now would be premature work on code
-    # being reworked. Exempted with a reason; revisit with the pool redesign.
-    comfy_env.environment.setup -> comfy_env.isolation.workers.subprocess
 
 [importlinter:contract:layers]
 name = isolation dependency layers point one way

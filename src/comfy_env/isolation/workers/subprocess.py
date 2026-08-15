@@ -51,10 +51,8 @@ _DEBUG = any((_DBG_SERIALIZE, _DBG_IPC, _DBG_WORKER, _DBG_MODELS))  # backward c
 # Shared IPC constants needed directly by SubprocessWorker
 from ._ipc_shared import (
     SOCKET_ACCEPT_TIMEOUT,
-    _export_pool_fd,
     _import_pool_from_fd,
     _recv_fd,
-    _send_fd,
     _cleanup_shm,
 )
 
@@ -65,33 +63,16 @@ from ._ipc_shared import (
 from ._ipc_parent import (
     # Socket utilities
     _has_af_unix,
-    _get_socket_dir,
     _create_server_socket,
-    _connect_to_socket,
     SocketTransport,
     # Tensor lifecycle
-    _TensorKeeper,
-    _parent_tensor_keeper,
     _parent_fd_registry,
     _cleanup_parent_fds,
-    _serialize_tensor_native_parent,
-    # CUDA IPC
-    _probe_cuda_ipc,
-    _serialize_cuda_ipc,
-    _deserialize_cuda_ipc,
-    _cuda_ipc_metadata_cache,
-    _cuda_ipc_cache_tensors,
-    # Pool IPC
-    _POOL_IPC_ENABLED,
     _pool_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
-    _deserialize_pool_ipc,
-    _serialize_pool_ipc_parent,
-    # Serialization
     _to_shm,
     _from_shm,
-    _deserialize_tensor_ref,
     _cleanup_ipc_cache,
     _serialize_for_ipc,
     _get_shm_dir,
@@ -590,22 +571,13 @@ class SubprocessWorker(Worker):
                     print(f"[{self.name}] Pool IPC handshake failed: {e}", file=sys.stderr, flush=True)
                 self._worker_pool = None
 
-        # --- Send parent's shareable pool FD to worker (for parent->worker zero-copy) ---
-        if _ipc_parent._parent_shareable_pool is not None and _has_af_unix():
-            try:
-                parent_pool_fd = _export_pool_fd(_ipc_parent._parent_shareable_pool)
-                self._transport.send({"type": "parent_pool_fd_sent"})
-                _send_fd(client_sock, parent_pool_fd)
-                os.close(parent_pool_fd)
-                if _DBG_IPC:
-                    print(f"[{self.name}] Pool IPC: sent parent pool FD to worker",
-                          file=sys.stderr, flush=True)
-            except Exception as e:
-                if _DBG_IPC:
-                    print(f"[{self.name}] Parent pool FD send failed: {e}",
-                          file=sys.stderr, flush=True)
-        else:
-            self._transport.send({"type": "no_parent_pool"})
+        # No parent-side shareable pool: the parent->worker zero-copy hook was
+        # removed in 0.4.21 (experimental, default-off, and the cause of an
+        # environment->isolation import cycle -- see ADR-0030 / the pool
+        # redesign). The parent still sends the handshake message the worker
+        # expects (protocol unchanged); parent->worker CUDA tensors take the
+        # CPU shared-memory path.
+        self._transport.send({"type": "no_parent_pool"})
 
     def call(
         self,

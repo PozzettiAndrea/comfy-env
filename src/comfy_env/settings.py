@@ -73,13 +73,13 @@ def get_numeric(var: str, default: float = 0) -> float:
 
 WORKER_VRAM_BUDGET = get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0)
 
-# Patches (monkey-patching ComfyUI internals)
-PATCH_SETTINGS = [
-    ("COMFY_ENV_PATCH_SHAREABLE_POOL", "CUDA shareable pool (full zero-copy IPC)"),
-]
-PATCH_DEFAULTS = {
-    "COMFY_ENV_PATCH_SHAREABLE_POOL": False,
-}
+# Patches (monkey-patching ComfyUI internals). Empty since 0.4.21 -- the
+# only entry, COMFY_ENV_PATCH_SHAREABLE_POOL (parent-side CUDA shareable
+# pool), was removed: experimental, default-off, and the cause of an
+# environment->isolation import cycle. Kept as empty containers so the CLI
+# settings surface stays stable.
+PATCH_SETTINGS = []
+PATCH_DEFAULTS = {}
 
 # Mapping from short TOML key names to env var names (for [settings] in comfy-env-root.toml)
 SETTINGS_KEY_MAP = {

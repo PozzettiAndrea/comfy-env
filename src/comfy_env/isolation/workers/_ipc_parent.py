@@ -23,23 +23,18 @@ import uuid
 from collections import deque as _deque
 from multiprocessing import shared_memory as shm
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
 from ._ipc_shared import (
     MAX_MESSAGE_SIZE,
-    MAX_IPC_CACHE_SIZE,
     TENSOR_KEEPER_TTL,
-    SOCKET_ACCEPT_TIMEOUT,
     SOCKET_ID_LENGTH,
-    _USE_MEMFD,
-    _memfd_write,
     _memfd_read,
     _PoolPtr,
     _import_pointer,
     _export_pointer,
-    _cleanup_shm,
     _evict_cache_if_needed,
     _cuda_ipc_metadata_cache,
     _cuda_ipc_cache_tensors,
@@ -51,8 +46,7 @@ from ._ipc_shared import (
 
 # Debug logging -- imported by subprocess.py, passed through here
 from ...debug import (
-    SERIALIZE as _DBG_SERIALIZE, IPC as _DBG_IPC,
-    WORKER as _DBG_WORKER, MODELS as _DBG_MODELS,
+    IPC as _DBG_IPC,
 )
 
 
@@ -243,8 +237,6 @@ def _serialize_tensor_native_parent(t, registry):
     the parent side; the worker opens it via /proc/<pid>/fd/<N>. This avoids
     torch's storage manager prematurely unlinking /dev/shm files (torch 2.8 bug).
     """
-    import torch
-    import torch.multiprocessing as mp
     import torch.multiprocessing.reductions as reductions
 
     # Keep tensor alive until worker finishes reading
@@ -430,7 +422,6 @@ _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "t
 
 _pool_ipc_metadata_cache: Dict[int, dict] = {}
 _pool_ipc_cache_tensors: Dict[int, Any] = {}
-_parent_shareable_pool = None  # set once if PATCH_SHAREABLE_POOL is enabled
 
 # Per-CALL state, set by SubprocessWorker around each call. THREAD-LOCAL
 # on purpose: module globals here raced when two workers were driven from
@@ -526,14 +517,12 @@ def _serialize_pool_ipc_parent(t):
 def _parent_tensor_serializer(obj, registry, visited):
     """Parent-side tensor serialization strategy.
 
-    Tries (in order): Pool IPC -> CUDA IPC -> CPU shared memory. GPU
-    zero-copy tiers are skipped when the canary handshake demoted them for
-    the current worker (thread-local _call_state.gpu_demoted, set by
-    SubprocessWorker around each call).
+    Tries (in order): CUDA IPC -> CPU shared memory. GPU zero-copy is
+    skipped when the canary handshake demoted it for the current worker
+    (thread-local _call_state.gpu_demoted, set by SubprocessWorker around
+    each call).
     """
     if obj.is_cuda and not _is_gpu_demoted():
-        if _parent_shareable_pool is not None:
-            return _serialize_pool_ipc_parent(obj)
         if _probe_cuda_ipc():
             return _serialize_cuda_ipc(obj)
     tensor = obj.detach().cpu().contiguous()
