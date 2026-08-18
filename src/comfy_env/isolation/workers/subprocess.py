@@ -71,6 +71,7 @@ from ._ipc_parent import (
     _pool_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
+    _probe_cuda_ipc,
     _to_shm,
     _from_shm,
     _cleanup_ipc_cache,
@@ -361,6 +362,19 @@ class SubprocessWorker(Worker):
                 env["COMFY_CPU"] = "1"
         except Exception:
             pass
+
+        # Tell the worker whether WE can import a CUDA IPC handle.
+        #
+        # CUDA IPC compatibility is a property of the pair, not of a process:
+        # the worker probing its own torch only answers "can I export?". The
+        # two ends routinely differ here -- ComfyUI appends
+        # backend:cudaMallocAsync to PYTORCH_CUDA_ALLOC_CONF (cuda_malloc.py),
+        # which cannot import handles, while a pack's comfy-env.toml commonly
+        # sets expandable_segments:True, which can export them. The worker then
+        # sends handles the parent cannot rebuild and the call dies on return
+        # with "cudaMallocAsync does not yet support getIpcDevPtr", after the
+        # node has already done all its work.
+        env["COMFY_ENV_PARENT_CUDA_IPC"] = "1" if _probe_cuda_ipc() else "0"
 
         # Find ComfyUI base and add to sys_path for real folder_paths/comfy modules
         # This works because comfy.options.args_parsing=False by default, so folder_paths

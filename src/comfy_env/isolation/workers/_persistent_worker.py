@@ -268,6 +268,16 @@ def _probe_cuda_ipc():
     if sys.platform != "linux":
         _cuda_ipc_supported = False
         return False
+    # An IPC handle is only useful if the other end can import it, and the two
+    # ends often run different allocators -- ComfyUI adds
+    # backend:cudaMallocAsync, which cannot import, while this worker's env may
+    # allow export. Exporting anyway means the failure lands on the parent's
+    # rebuild, after the node has finished its work. The parent tells us here.
+    if os.environ.get("COMFY_ENV_PARENT_CUDA_IPC") == "0":
+        _cuda_ipc_supported = False
+        wlog("[worker] CUDA IPC disabled: parent cannot import handles "
+             "(likely cudaMallocAsync); falling back to shared-memory copy")
+        return False
     try:
         import torch
         if not torch.cuda.is_available():
