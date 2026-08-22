@@ -22,7 +22,7 @@ from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_V
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "12"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "13"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -173,8 +173,58 @@ try:
 except Exception:
     _V3Base = None
 
+# --- Node discovery: V1 dict, else V3 comfy_entrypoint -------------------
+# Mirrors ComfyUI's load_custom_node (nodes.py). Upstream prefers the V1 dict
+# and only falls through to comfy_entrypoint when it is absent-or-None -- note
+# an EMPTY dict still wins there, so a pack exporting {} plus an entrypoint
+# registers nothing upstream. We treat empty-and-has-entrypoint as V3 instead,
+# because for an isolated pack the empty dict is our own scan result, not the
+# author's intent.
+_class_map = dict(getattr(module, "NODE_CLASS_MAPPINGS", None) or {})
+_display_v3 = {}
+_entrypoint = getattr(module, "comfy_entrypoint", None)
+_has_entrypoint = _entrypoint is not None
+_v3_error = None
+_discovery = "v1" if _class_map else "none"
+
+if not _class_map and _has_entrypoint:
+    if not callable(_entrypoint):
+        _v3_error = "comfy_entrypoint is not callable"
+    else:
+        try:
+            import asyncio as _asyncio
+            import inspect as _inspect
+
+            async def _await_if_needed(_v):
+                return await _v if _inspect.isawaitable(_v) else _v
+
+            async def _collect_v3(_ep):
+                _ext = await _await_if_needed(_ep())
+                if _ext is None:
+                    raise RuntimeError("comfy_entrypoint returned None")
+                _on_load = getattr(_ext, "on_load", None)
+                if callable(_on_load):
+                    await _await_if_needed(_on_load())
+                return await _await_if_needed(_ext.get_node_list())
+
+            _node_list = _asyncio.run(_collect_v3(_entrypoint))
+            if not isinstance(_node_list, list):
+                raise RuntimeError("get_node_list() did not return a list")
+            for _node_cls in _node_list:
+                _schema = _node_cls.GET_SCHEMA()
+                _class_map[_schema.node_id] = _node_cls
+                if getattr(_schema, "display_name", None) is not None:
+                    _display_v3[_schema.node_id] = _schema.display_name
+            _discovery = "v3"
+            print(f"[meta-scan] comfy_entrypoint: {len(_class_map)} node(s)",
+                  file=sys.stderr, flush=True)
+        except Exception as _e:
+            _v3_error = f"{type(_e).__name__}: {_e}"
+            print(f"[meta-scan] comfy_entrypoint failed: {_v3_error}",
+                  file=sys.stderr, flush=True)
+
 nodes = {}
-for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
+for name, cls in _class_map.items():
     meta = {
         "function": getattr(cls, "FUNCTION", None),
         "category": getattr(cls, "CATEGORY", ""),
@@ -216,7 +266,9 @@ for name, cls in getattr(module, "NODE_CLASS_MAPPINGS", {}).items():
 
     nodes[name] = meta
 
-display = getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", {})
+display = dict(getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", None) or {})
+for _k, _v in _display_v3.items():
+    display.setdefault(_k, _v)
 
 # Discover API routes declared via ROUTES convention (walk all imported submodules)
 routes = list(getattr(module, "ROUTES", []))
@@ -257,7 +309,10 @@ if _accel_pkgs:
     _accel_violations = sorted(set(_accel_violations))
 
 payload = {"nodes": nodes, "display": display, "routes": routes,
-           "accel_import_violations": _accel_violations}
+           "accel_import_violations": _accel_violations,
+           "discovery": _discovery,
+           "has_comfy_entrypoint": _has_entrypoint,
+           "v3_entrypoint_error": _v3_error}
 
 # Sanitize payload: coerce subclass instances (e.g. AnyType(str)) back to
 # plain built-in types so pickle doesn't embed module references that may
@@ -289,6 +344,34 @@ with open(output_path, "wb") as _f:
 # ---------------------------------------------------------------------------
 # Metadata fetching
 # ---------------------------------------------------------------------------
+
+def _warn_empty_v3_scan(package_name: str, payload: dict, node_count: int) -> None:
+    """Loud diagnostic when a pack has a V3 entrypoint but the scan found nothing.
+
+    Zero nodes from a pack that ships `comfy_entrypoint` is never a legitimate
+    result -- and it is invisible downstream, because ComfyUI's loader takes the
+    V1 branch on an empty-but-present NODE_CLASS_MAPPINGS, returns True, and
+    never reaches its own "lack of NODE_CLASS_MAPPINGS or comfy_entrypoint"
+    warning (nodes.py). So if we stay quiet here, nothing anywhere says a word.
+    """
+    if node_count > 0 or not payload.get("has_comfy_entrypoint"):
+        return
+    err = payload.get("v3_entrypoint_error")
+    print(
+        f"[comfy-env] WARNING: {package_name} declares comfy_entrypoint() but "
+        f"the metadata scan registered 0 nodes.",
+        file=sys.stderr, flush=True)
+    if err:
+        print(f"[comfy-env]   the entrypoint raised: {err}",
+              file=sys.stderr, flush=True)
+    else:
+        print("[comfy-env]   the entrypoint returned no nodes.",
+              file=sys.stderr, flush=True)
+    print(
+        "[comfy-env]   This pack's nodes will be MISSING from ComfyUI, and "
+        "nothing else will report it.",
+        file=sys.stderr, flush=True)
+
 
 def fetch_metadata(
     env_dir: Path,
@@ -459,6 +542,7 @@ def fetch_metadata(
         node_count = len(payload.get("nodes", {}))
         if _DEBUG or node_count > 0:
             print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)", file=sys.stderr, flush=True)
+        _warn_empty_v3_scan(package_name, payload, node_count)
 
         # --- Write cache ---
         try:

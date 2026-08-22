@@ -61,9 +61,9 @@ def load_config(path):
             raise ValueError(
                 f"{path}: unsupported section(s) "
                 f"{', '.join('[' + s + ']' for s in unknown)} -- "
-                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs] and [settings] "
-                f"only. Env definitions (dependencies, cuda, env_vars, ...) "
-                f"go in a subdirectory {CONFIG_FILE_NAME}.")
+                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs], [settings] "
+                f"and [types] only. Env definitions (dependencies, cuda, "
+                f"env_vars, ...) go in a subdirectory {CONFIG_FILE_NAME}.")
     elif path.name == CONFIG_FILE_NAME:
         if "serializers" in data:
             raise ValueError(
@@ -108,14 +108,6 @@ def parse_config(data):
         }
     """
     data = dict(data)  # shallow copy
-
-    # Schema version (ADR-0013): absent means 1. Exists so a future format
-    # change can dispatch migrations instead of guessing from key patterns.
-    schema = data.pop("schema", 1)
-    if schema != 1:
-        raise ValueError(
-            f"schema = {schema} is not supported by this comfy-env "
-            f"(known: 1). Upgrade comfy-env or fix the config.")
 
     # Typo guard for comfy-env-owned sections -- pixi validates everything
     # else, but these are ours (ADR-0013).

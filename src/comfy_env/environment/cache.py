@@ -575,16 +575,21 @@ def copy_files(src, dst, pattern="*", overwrite=False):
       - `"input/cad"`                → get_input_directory() / "cad"
       - `"user/default/workflows"`   → get_user_directory() / "default/workflows"
     """
-    caller_dir = None
+    # Resolve the caller's directory HERE, in the public function body, where
+    # depth 1 means "whoever called copy_files" -- a fact about the call
+    # contract. This used to live inside the nested helper below at depth 2,
+    # which encoded an INTERNAL structural fact (that a helper exists between
+    # the caller and the frame walk). Adding any frame -- a decorator, another
+    # helper, a deprecation shim -- shifted it silently: `__file__` on the
+    # wrong frame is still a valid path, so `src` resolved under comfy-env's
+    # own directory, `src.exists()` returned False, and the function returned
+    # 0 having copied nothing. No exception, no log, no thread to pull.
+    _frame_file = sys._getframe(1).f_globals.get("__file__")
+    caller_dir = Path(_frame_file).resolve().parent if _frame_file else Path.cwd()
+
     def _resolve_relative(p):
-        nonlocal caller_dir
         pp = Path(p)
-        if pp.is_absolute():
-            return pp
-        if caller_dir is None:
-            frame_file = sys._getframe(2).f_globals.get("__file__")
-            caller_dir = Path(frame_file).resolve().parent if frame_file else Path.cwd()
-        return caller_dir / pp
+        return pp if pp.is_absolute() else caller_dir / pp
 
     dst_smart = _resolve_dst_via_folder_paths(dst)
     dst = dst_smart if dst_smart is not None else _resolve_relative(dst)

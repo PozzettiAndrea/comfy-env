@@ -187,6 +187,19 @@ import _ipc_shared
 # must land on THIS instance -- two module instances would mean two
 # registries and silently unregistered types.
 sys.modules.setdefault("comfy_env.isolation.workers._ipc_shared", _ipc_shared)
+# Same defence for the SHORT spelling `from comfy_env import register_serializer`,
+# which is the documented one from comfy-env 1.0. Only when comfy_env is not
+# already importable here -- a real package must win, and we must never shadow
+# it with a stub, because node code may import comfy_env for other reasons.
+if "comfy_env" not in sys.modules:
+    try:
+        import comfy_env as _real_ce  # noqa: F401 -- probe only
+    except ImportError:
+        import types as _types
+        _ce_stub = _types.ModuleType("comfy_env")
+        _ce_stub.register_serializer = _ipc_shared.register_serializer
+        _ce_stub.__all__ = ["register_serializer"]
+        sys.modules["comfy_env"] = _ce_stub
 from _ipc_shared import (  # noqa: F401 -- re-exported names used below
     _USE_MEMFD,
     _memfd_write,

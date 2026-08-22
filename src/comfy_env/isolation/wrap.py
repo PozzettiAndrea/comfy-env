@@ -226,12 +226,26 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     # Root config (comfy-env-root.toml): loaded once, used for [types]
     # here and [settings] below.
+    # A config that exists but does not parse is a correctness fault, not an
+    # availability one, so it fails LOUDLY (ADR-0008 as amended). Failing
+    # here fails this pack only: ComfyUI's load_custom_node wraps the import,
+    # logs the traceback and boots without us -- "never break ComfyUI
+    # startup" is satisfied by the host's own per-pack isolation, not by us
+    # swallowing the error. This block used to `except Exception` into
+    # root_cfg=None, which silently emptied _custom_sockets below and so
+    # disabled the very [types] validation the next comment calls LOUD.
     root_cfg = None
     try:
         from ..config import discover_config
         root_cfg = discover_config(pkg_dir, root=True)
-    except Exception as e:
-        _log(f"[comfy-env] Failed to load root config: {e}")
+    except (ValueError, OSError) as e:
+        raise RuntimeError(
+            f"[comfy-env] {pkg_dir.name}: the root config exists but could "
+            f"not be read -- {type(e).__name__}: {e}. Fix it (or delete it "
+            f"if this pack no longer needs one); comfy-env will not run a "
+            f"pack from a half-read config, because [settings] and [types] "
+            f"would silently fall back to defaults."
+        ) from e
 
     # [types] (ADR-0015): "custom" sockets require <pack>/serialization.py.
     # Load it parent-side by file path (mangled module name -- no
@@ -251,11 +265,17 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 f"exist.")
         from .workers._ipc_shared import (
             load_serializer_files,
-            registration_count,
+            registration_calls,
         )
-        _before = registration_count()
-        load_serializer_files(str(_ser_path), log=_log)
-        if registration_count() == _before:
+        # Count register_serializer CALLS, not distinct registered types. Two
+        # packs sharing a wire tag on purpose (ADR-0015 type identity: TRIMESH
+        # across 3D-Pack and GeometryPack) register the same class name, so
+        # whichever loads second left the key count unchanged and was failed
+        # here for "registered no serializers" -- and which one that is depends
+        # on ComfyUI's unsorted os.listdir walk of custom_nodes.
+        _before = registration_calls()
+        _available, _executed = load_serializer_files(str(_ser_path), log=_log)
+        if _available and _executed and registration_calls() == _before:
             raise ValueError(
                 f"{pkg_dir.name}: [types] declares custom socket(s) "
                 f"{', '.join(_custom_sockets)} but serialization.py "
@@ -263,6 +283,12 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 f"(top-level imports must be stdlib/numpy/comfy_env only "
                 f"-- heavy deps go inside the functions) or it never "
                 f"calls register_serializer().")
+        if not _available:
+            raise ValueError(
+                f"{pkg_dir.name}: [types] declares custom socket(s) "
+                f"{', '.join(_custom_sockets)} but {_ser_path} failed to "
+                f"import -- top-level imports must be stdlib/numpy/comfy_env "
+                f"only; heavy deps go inside the functions.")
         _serializer_file = str(_ser_path)
 
     for cf in config_files:
@@ -290,8 +316,16 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             if cfg.cuda_packages:
                 env_vars["COMFY_ENV_ACCEL_PKGS"] = ",".join(
                     str(p) for p in cfg.cuda_packages)
-        except Exception as e:
-            _log(f"[comfy-env] Failed to parse {cf}: {e}")
+        except (ValueError, OSError) as e:
+            # Same rule as the root config above: binding an env from a
+            # config we could not read means env_vars silently empty and
+            # health_check_timeout silently default -- a worker configured
+            # differently from what the author wrote. Fail the pack.
+            raise RuntimeError(
+                f"[comfy-env] {pkg_dir.name}: {cf} exists but could not be "
+                f"read -- {type(e).__name__}: {e}. Fix the config; comfy-env "
+                f"will not bind an isolated env from a half-read file."
+            ) from e
         # [types] custom serializers (root-level, ADR-0015): workers load
         # the same serialization.py by file path at startup.
         if _serializer_file:

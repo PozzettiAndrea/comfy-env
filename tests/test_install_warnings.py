@@ -15,7 +15,9 @@ def _root(tmp_path, body):
 
 def test_root_rejects_unsupported_sections(tmp_path):
     p = _root(tmp_path, '[env_vars]\nFOO = "1"\n\n[cuda]\npackages = ["x"]\n')
-    with pytest.raises(ValueError, match=r"\[cuda\], \[env_vars\].*\[node_reqs\] and \[settings\] only"):
+    # Assert on the offending section names, not the prose -- the tail of this
+    # message is documentation and changes (it gained [types] in 0.4.23).
+    with pytest.raises(ValueError, match=r"unsupported section\(s\) \[cuda\], \[env_vars\]"):
         load_config(p)
 
 

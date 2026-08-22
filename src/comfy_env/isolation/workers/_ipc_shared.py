@@ -391,6 +391,15 @@ class SerializerRegistry:
 REGISTRY = SerializerRegistry()
 
 
+# Number of register_serializer() CALLS, not distinct registered types. Two
+# packs that deliberately share a wire tag (ADR-0015 type identity -- e.g.
+# TRIMESH across 3D-Pack and GeometryPack) register the same class name, so the
+# key count does not grow for the second one. Validation must ask "did this
+# file call register_serializer", which is this counter, not "did the registry
+# get bigger", which is registration_count().
+_REGISTER_CALLS = 0
+
+
 def register_serializer(type_name, serialize, deserialize=None, tag=None):
     """Register a custom type with the transport (see module comment above).
 
@@ -401,6 +410,8 @@ def register_serializer(type_name, serialize, deserialize=None, tag=None):
             that only forward the type (they get OpaquePayload instead).
         tag: wire tag; defaults to type_name.
     """
+    global _REGISTER_CALLS
+    _REGISTER_CALLS += 1
     REGISTRY.register(type_name, serialize, deserialize, tag)
 
 
@@ -507,6 +518,16 @@ def registration_count():
     return len(REGISTRY._by_type)
 
 
+def registration_calls():
+    """Number of register_serializer() calls made so far.
+
+    Use this, not registration_count(), to check that a serializer file did
+    its job: re-registering a tag another pack already declared is the
+    intended shared-identity case and leaves the count unchanged.
+    """
+    return _REGISTER_CALLS
+
+
 def load_serializer_files(spec, log=None):
     """Load comma-separated serializer FILES (COMFY_ENV_SERIALIZER_FILES).
 
@@ -519,11 +540,18 @@ def load_serializer_files(spec, log=None):
     stdlib/numpy/comfy_env, heavy deps imported inside the functions.
     Import errors are reported, not raised, here -- the parent applies the
     loud [types] validation separately.
+
+    Returns (available, executed): how many files are importable (now or from
+    an earlier call) and how many actually ran their module body this time.
+    The caller needs both to tell "failed to import" from "ran but registered
+    nothing" from "already loaded, so of course it registered nothing now".
     """
     import importlib.util
     import os as _os
     import re as _re
     import sys as _sys
+    available = 0   # files importable now or already in sys.modules
+    executed = 0    # files whose module body ran during THIS call
     for raw in (spec or "").split(","):
         raw = raw.strip()
         if not raw:
@@ -532,12 +560,15 @@ def load_serializer_files(spec, log=None):
         stem = _os.path.splitext(_os.path.basename(raw))[0]
         mod_name = "_comfy_env_ser__" + _re.sub(r"\W+", "_", f"{pack}_{stem}")
         if mod_name in _sys.modules:
-            continue  # already loaded (same pack, several envs)
+            available += 1   # already loaded (same pack, several envs)
+            continue
         try:
             file_spec = importlib.util.spec_from_file_location(mod_name, raw)
             module = importlib.util.module_from_spec(file_spec)
             _sys.modules[mod_name] = module
             file_spec.loader.exec_module(module)
+            available += 1
+            executed += 1
             if log:
                 log(f"[comfy-env] serializers loaded from {raw}")
         except Exception as e:
@@ -545,6 +576,7 @@ def load_serializer_files(spec, log=None):
             if log:
                 log(f"[comfy-env] serializer file {raw} not importable "
                     f"here ({e}); its types are held opaquely")
+    return available, executed
 
 
 # =============================================================================

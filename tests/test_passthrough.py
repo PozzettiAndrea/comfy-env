@@ -1,5 +1,5 @@
 """Contract: ADR-0013 -- honest passthrough with the deny/rewrite/merge table,
-owned-section typo warnings, schema key, env-role rejection, provenance header."""
+owned-section typo warnings, env-role rejection, provenance header."""
 
 import pytest
 import tomli
@@ -49,12 +49,6 @@ def test_owned_section_typos_warn(capsys):
     assert "unrecognized key 'pakages' in [cuda]" in capsys.readouterr().err
     parse_config({"settings": {"isolat": True}})
     assert "unrecognized key 'isolat' in [settings]" in capsys.readouterr().err
-
-
-def test_schema_version_key():
-    assert parse_config({"schema": 1}) is not None
-    with pytest.raises(ValueError, match="schema = 2 is not supported"):
-        parse_config({"schema": 2})
 
 
 def test_env_file_rejects_root_only_sections(tmp_path):

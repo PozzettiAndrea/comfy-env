@@ -155,6 +155,7 @@ def _bindable_config_paths(plugin_dir: Path) -> List[Path]:
 def _discover_node_configs(
     comfyui_dir: Path,
     log: Callable[[str], None] = print,
+    failures: Optional[List[Tuple[Path, Exception]]] = None,
 ) -> List[Tuple[str, Path, Path, ComfyEnvConfig]]:
     """Find bindable comfy-env.toml configs under custom_nodes/ and pair
     with (env_name, plugin_dir, config_path, cfg).
@@ -166,6 +167,14 @@ def _discover_node_configs(
     loop with no diagnostic (the 2026-08 review's collision-thrash defect).
 
     Logs the scan loudly so failed parses don't silently produce an empty result.
+
+    A config that does not parse is SKIPPED, not fatal: this sweep covers
+    every pack on the machine, and one pack's typo must not abort another
+    pack's install (the per-env isolation rule -- see ADR-0007). The
+    calling pack's OWN config is loaded unwrapped by `install()`, so an
+    author's own mistake still hard-errors where they can see it. Skipped
+    configs are appended to `failures` (when provided) so the caller can
+    report them instead of finishing with a silent success.
     """
     custom_nodes = comfyui_dir / "custom_nodes"
     if not custom_nodes.is_dir():
@@ -194,11 +203,23 @@ def _discover_node_configs(
         for cf in toml_files:
             try:
                 cfg = load_config(cf)
-            except Exception as e:
+            except (ValueError, OSError) as e:
+                # Data errors only (ValueError covers TOMLDecodeError and
+                # every schema rejection). Anything else -- AttributeError,
+                # KeyError, TypeError -- is a bug in the config layer, not a
+                # bad file, and must propagate instead of being relabelled
+                # as the user's fault.
                 log(
-                    f"[comfy-env] _discover: FAILED to load {cf}: "
+                    f"[comfy-env] WARNING: skipping {cf} -- "
                     f"{type(e).__name__}: {e}"
                 )
+                log(
+                    f"[comfy-env] WARNING: env for {plugin_dir.name} will NOT "
+                    f"be materialized; its isolated nodes will fail to load "
+                    f"until this config parses."
+                )
+                if failures is not None:
+                    failures.append((cf, e))
                 continue
             env_name = get_env_name(plugin_dir, cf)
             if env_name in seen:
@@ -586,7 +607,17 @@ def install_workspace(
     )
 
     comfyui_dir = Path(comfyui_dir).resolve()
-    discovered = _discover_node_configs(comfyui_dir, log=log)
+    config_failures: List[Tuple[Path, Exception]] = []
+    discovered = _discover_node_configs(
+        comfyui_dir, log=log, failures=config_failures)
+    if config_failures:
+        # Not fatal (one pack must not poison another), but the install is
+        # not a clean success either -- say so here rather than letting the
+        # skip surface days later as an ImportError with no visible cause.
+        log(f"[comfy-env] {len(config_failures)} config(s) did not parse and "
+            f"were skipped -- their envs are NOT installed:")
+        for cf, err in config_failures:
+            log(f"[comfy-env]   {cf}: {type(err).__name__}: {err}")
     if not discovered:
         log("[comfy-env] No custom-node comfy-env.toml files found -- skipping workspace install")
         return None
