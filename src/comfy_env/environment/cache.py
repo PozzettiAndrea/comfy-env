@@ -471,9 +471,14 @@ def find_comfyui_dir_from_node(node_dir=None):
     except ImportError:
         pass
 
-    # Walk up from node_dir
+    # Walk up from node_dir. abspath, NOT resolve(): a pack living behind a
+    # junction/symlink (custom_nodes/Pack -> elsewhere/Pack) must walk up
+    # through custom_nodes/ into the ComfyUI tree. resolve() follows the link
+    # to the physical location, where no ComfyUI root exists, and the walk
+    # returns None -- the out-of-process twin of the #8 identity bug (in-server
+    # callers never got here because the folder_paths import short-circuits).
     if node_dir is not None:
-        current = Path(node_dir).resolve()
+        current = Path(os.path.abspath(node_dir))
         for _ in range(10):
             # Standard: has main.py + comfy/ (source dir IS the data dir)
             if (current / "main.py").exists() and (current / "comfy").exists():
@@ -500,9 +505,10 @@ def find_comfyui_source_dir(node_dir=None):
     except ImportError:
         pass
 
-    # Walk up from node_dir — if we find main.py + comfy/, that's it
+    # Walk up from node_dir — if we find main.py + comfy/, that's it.
+    # abspath, not resolve(): see find_comfyui_dir_from_node above.
     if node_dir is not None:
-        current = Path(node_dir).resolve()
+        current = Path(os.path.abspath(node_dir))
         for _ in range(10):
             if (current / "main.py").exists() and (current / "comfy").exists():
                 return current

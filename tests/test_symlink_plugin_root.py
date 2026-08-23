@@ -103,3 +103,42 @@ def test_walk_miss_logs_loudly(tmp_path, monkeypatch, capsys):
     assert env == "nodes"  # the degraded name, still used for the lookup
     err = capsys.readouterr().err
     assert "plugin root not found" in err
+
+
+# --- the out-of-process twin: comfyui-root walks (CLI install, no folder_paths)
+
+
+def _assert_no_folder_paths():
+    """These tests exercise the WALK, which only runs when the in-server
+    short-circuit (import folder_paths) fails. Guard the assumption."""
+    try:
+        import folder_paths  # noqa: F401
+        pytest.skip("folder_paths importable in this env; walk never runs")
+    except ImportError:
+        pass
+
+
+def test_symlinked_pack_finds_comfyui_root_without_folder_paths(tmp_path):
+    """CLI context (`python install.py`): no folder_paths, only the walk.
+
+    resolve() followed the link to the physical location outside the ComfyUI
+    tree, where the walk finds no root and returns None -- so install located
+    no workspace for a symlinked pack.
+    """
+    _assert_no_folder_paths()
+    comfyui = _fake_comfyui(tmp_path)
+    real_pack = _fake_pack(tmp_path / "repo", "ComfyUI-FakePack")
+    link = comfyui / "custom_nodes" / "ComfyUI-FakePack"
+    os.symlink(real_pack, link, target_is_directory=True)
+
+    assert cache.find_comfyui_dir_from_node(link / "nodes") == comfyui
+    assert cache.find_comfyui_source_dir(link / "nodes") == comfyui
+
+
+def test_plain_pack_finds_comfyui_root_without_folder_paths(tmp_path):
+    _assert_no_folder_paths()
+    comfyui = _fake_comfyui(tmp_path)
+    pack = _fake_pack(comfyui / "custom_nodes", "ComfyUI-PlainPack")
+
+    assert cache.find_comfyui_dir_from_node(pack / "nodes") == comfyui
+    assert cache.find_comfyui_source_dir(pack / "nodes") == comfyui
