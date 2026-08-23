@@ -43,12 +43,26 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
 
     node_dir = Path(node_dir)
 
-    # Locate plugin root: walk up to the directory whose parent is `custom_nodes/`
+    # Locate plugin root: walk up to the directory whose parent is `custom_nodes/`.
+    # abspath, NOT resolve(): a pack installed as a junction/symlink
+    # (custom_nodes/Pack -> elsewhere/Pack) must keep its custom_nodes-side
+    # identity. resolve() follows the link, the walk then never sees
+    # `custom_nodes`, and the env name degrades to the subdir ("nodes") --
+    # while install enumerates custom_nodes/ UNRESOLVED and materializes the
+    # real name, so the two sides can never agree (#8). abspath absolutizes
+    # lexically without following links, on Windows junctions too.
     plugin_dir = node_dir
-    for parent in node_dir.resolve().parents:
+    for parent in Path(os.path.abspath(node_dir)).parents:
         if parent.parent and parent.parent.name == "custom_nodes":
             plugin_dir = parent
             break
+    else:
+        _log(
+            f"[comfy-env] plugin root not found: no `custom_nodes` ancestor above "
+            f"{node_dir}; deriving the env name from {node_dir.name!r} instead. "
+            f"If this pack lives under custom_nodes/ (possibly behind a "
+            f"junction/symlink), this is a bug -- please report it."
+        )
 
     # Find ComfyUI base
     try:
@@ -190,7 +204,9 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # Get caller info
     frame = inspect.stack()[1]
     caller_module = inspect.getmodule(frame.frame)
-    pkg_dir = Path(frame.filename).resolve().parent
+    # abspath, not resolve(): keep the caller's custom_nodes-side path when the
+    # pack is a junction/symlink -- see the plugin-root walk in _find_env_dir.
+    pkg_dir = Path(os.path.abspath(frame.filename)).parent
     caller_pkg_name = caller_module.__name__ if caller_module else None
 
     _log(f"[comfy-env] register_nodes: {pkg_dir.name}")
