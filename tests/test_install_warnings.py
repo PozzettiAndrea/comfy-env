@@ -1,5 +1,5 @@
 """Contract: the root role schema -- comfy-env-root.toml carries [node_reqs]
-and [settings] only; anything else is rejected at parse time, generically
+and [types] only; anything else is rejected at parse time, generically
 (no legacy keys are named anywhere in code)."""
 
 import pytest
@@ -31,9 +31,9 @@ def test_root_accepts_its_schema(tmp_path):
     cfg = load_config(_root(
         tmp_path,
         '[node_reqs]\nOtherPack = "https://github.com/x/OtherPack"\n\n'
-        "[settings]\npool_ipc = true\n"))
+        '[types]\nWIDGET = "builtin"\n'))
     assert cfg.node_reqs[0]["name"] == "OtherPack"
-    assert cfg.settings == {"pool_ipc": True}
+    assert cfg.types == {"WIDGET": "builtin"}
 
 
 def test_empty_root_is_fine(tmp_path):

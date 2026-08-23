@@ -32,8 +32,8 @@ class ComfyEnvConfig(dict):
 # Anything role-inappropriate -- dead legacy keys, typos, misplaced sections
 # -- is rejected at parse time rather than silently ignored (that's how a
 # no-op [env_vars] shipped in the flagship pack for months).
-ROOT_ALLOWED_SECTIONS = {"node_reqs", "settings", "types"}
-ROOT_ONLY_SECTIONS = {"node_reqs", "settings", "types"}
+ROOT_ALLOWED_SECTIONS = {"node_reqs", "types"}
+ROOT_ONLY_SECTIONS = {"node_reqs", "types"}
 
 # Comfy-env-owned sections of the ENV file and their known keys: the one
 # place pixi cannot validate for us, so unrecognized keys warn (a typo'd
@@ -61,9 +61,11 @@ def load_config(path):
             raise ValueError(
                 f"{path}: unsupported section(s) "
                 f"{', '.join('[' + s + ']' for s in unknown)} -- "
-                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs], [settings] "
-                f"and [types] only. Env definitions (dependencies, cuda, "
-                f"env_vars, ...) go in a subdirectory {CONFIG_FILE_NAME}.")
+                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs] and [types] "
+                f"only ([settings] was removed in 0.4.25 -- the surviving "
+                f"settings are machine-global env vars). Env definitions "
+                f"(dependencies, cuda, env_vars, ...) go in a subdirectory "
+                f"{CONFIG_FILE_NAME}.")
     elif path.name == CONFIG_FILE_NAME:
         if "serializers" in data:
             raise ValueError(
@@ -103,7 +105,6 @@ def parse_config(data):
             "env_vars": {str: str},
             "node_reqs": [{"name": str, "github": str|None, "tag": str|None, ...}],
             "options": {"health_check_timeout": float},
-            "settings": dict,
             "pixi_passthrough": dict,  # everything else goes straight to pixi.toml
         }
     """
@@ -112,30 +113,6 @@ def parse_config(data):
     # Typo guard for comfy-env-owned sections -- pixi validates everything
     # else, but these are ours (ADR-0013).
     owned = dict(_OWNED_SECTION_KEYS)
-    if "settings" in data:
-        from ..settings import SETTINGS_KEY_MAP
-        owned["settings"] = set(SETTINGS_KEY_MAP)
-    # [settings] keys removed in 0.4.25. Not routed through the typo guard:
-    # "unrecognized key" would mislabel a key that was recognized for years.
-    # A falsy value is written author intent ("run this un-isolated") that can
-    # no longer be honored -- running isolated against it silently is the
-    # silent-flip failure mode, so it is a hard error (which propagates to a
-    # visible IMPORT FAILED in ComfyUI's startup summary). A truthy value
-    # matches the only behavior that exists now -- and our own docs shipped
-    # `isolate = true` in the sample [settings] block -- so it only warns.
-    _REMOVED_SETTINGS = ("isolate", "install_isolated")
-    _settings_table = data.get("settings")
-    if isinstance(_settings_table, dict):
-        for _rk in _REMOVED_SETTINGS:
-            if _rk not in _settings_table:
-                continue
-            if not _settings_table.pop(_rk):
-                raise ValueError(
-                    f"[settings] {_rk} = false was removed in "
-                    f"comfy-env 0.4.25 -- isolation is always on and cannot "
-                    f"be disabled. Delete this line."
-                )
-            # Truthy matches current behavior: dropped silently.
     for section, known in owned.items():
         table = data.get(section)
         if isinstance(table, dict):
@@ -166,7 +143,6 @@ def parse_config(data):
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
     node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
     options = data.pop("options", {})
-    settings = data.pop("settings", {})
 
     # [types] (ADR-0015): SOCKET = "builtin" | "custom". Closed vocabulary
     # -- anything else is a typo'd contract and fails at parse time.
@@ -184,7 +160,6 @@ def parse_config(data):
         env_vars=env_vars,
         node_reqs=node_reqs,
         options={"health_check_timeout": float(options.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))},
-        settings=settings,
         types={str(k): str(v) for k, v in types.items()},
         pixi_passthrough=data,
     )

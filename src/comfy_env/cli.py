@@ -92,8 +92,6 @@ ROOT_DEFAULT_CONFIG = """\
 [node_reqs]
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 
-# [settings]
-# auto_install = true
 """
 
 ISOLATED_DEFAULT_CONFIG = """\

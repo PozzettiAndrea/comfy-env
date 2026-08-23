@@ -1,12 +1,11 @@
-"""Contract: the removed isolate/install_isolated settings tombstone correctly.
+"""Contract: leftovers of the removed settings fail or vanish correctly.
 
-Removed in 0.4.25 (pre-1.0, ADR-0017). Only a FALSY value tombstones -- it is
-a semantic inversion (the machine was told to run un-isolated and no longer
-will) and must fail loudly rather than silently flip. Everything else about
-the removed keys is SILENT by design: truthy values, keys the old settings
-TUI wrote into ~/.comfy-env/settings.env, and the removed numeric knob
-(worker_vram_budget, COMFY_ENV_TRANSPORT_PROBE) -- no warn-tier tombstones,
-no messages to maintain about features nobody used.
+The [settings] section itself was removed in 0.4.25 (pre-1.0, ADR-0017), so
+ANY [settings] table in a root config now hits the closed-schema error --
+which subsumes the earlier per-key tombstones. Env-var side: only a FALSY
+isolate/install_isolated fails loudly (semantic inversion -- the machine was
+told to run un-isolated and no longer will); truthy values and settings.env
+residue (the old TUI wrote every key on save) are ignored silently.
 
 These tests are scheduled for deletion together with the tombstones.
 """
@@ -26,22 +25,17 @@ def _root(tmp_path, body):
     return p
 
 
-def test_toml_falsy_isolate_is_a_hard_error(tmp_path):
-    with pytest.raises(ValueError, match="removed in comfy-env 0.4.25"):
-        load_config(_root(tmp_path, "[settings]\nisolate = false\n"))
-
-
-def test_toml_falsy_install_isolated_is_a_hard_error(tmp_path):
-    with pytest.raises(ValueError, match="removed in comfy-env 0.4.25"):
-        load_config(_root(tmp_path, "[settings]\ninstall_isolated = false\n"))
-
-
-def test_toml_truthy_isolate_is_silently_dropped(tmp_path, capsys):
-    cfg = load_config(_root(tmp_path, "[settings]\nisolate = true\n"))
-    err = capsys.readouterr().err
-    assert "isolate" not in (cfg.settings or {})
-    # Silent: no tombstone message, and NOT the misleading typo warning either.
-    assert "unrecognized key 'isolate'" not in err
+@pytest.mark.parametrize("body", [
+    "[settings]\nisolate = false\n",
+    "[settings]\ninstall_isolated = false\n",
+    "[settings]\nisolate = true\n",
+    "[settings]\npool_ipc = true\n",
+])
+def test_any_settings_table_hits_the_closed_schema(tmp_path, body):
+    """[settings] no longer exists; the closed root schema rejects the whole
+    table loudly, naming what IS allowed and where settings went."""
+    with pytest.raises(ValueError, match=r"unsupported section\(s\) \[settings\]"):
+        load_config(_root(tmp_path, body))
 
 
 def _run_with_env(var, value):

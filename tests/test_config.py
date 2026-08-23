@@ -19,12 +19,10 @@ def test_known_sections_are_extracted_not_passed_through():
         "python": "3.11",
         "cuda": {"packages": ["nvdiffrast"]},
         "env_vars": {"FOO": 1},
-        "settings": {"pool_ipc": False},
     })
     assert cfg.python == "3.11"
     assert cfg.cuda_packages == ["nvdiffrast"]
     assert cfg.env_vars == {"FOO": "1"}
-    assert cfg.settings == {"pool_ipc": False}
     assert cfg.pixi_passthrough == {}
 
 

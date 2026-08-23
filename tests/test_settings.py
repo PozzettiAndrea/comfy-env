@@ -14,13 +14,6 @@ def test_env_var_states(monkeypatch):
     assert resolve_bool("COMFY_ENV_POOL_IPC", None, True) is False
 
 
-def test_per_node_settings_take_priority(monkeypatch):
-    monkeypatch.setenv("COMFY_ENV_POOL_IPC", "1")
-    assert resolve_bool("COMFY_ENV_POOL_IPC", {"pool_ipc": False}, True) is False
-    monkeypatch.delenv("COMFY_ENV_POOL_IPC", raising=False)
-    assert resolve_bool("COMFY_ENV_POOL_IPC", {"pool_ipc": True}, False) is True
-
-
 def test_numeric_resolution(monkeypatch):
     monkeypatch.setenv("COMFY_ENV_TEST_NUMERIC", "8")
     assert get_numeric("COMFY_ENV_TEST_NUMERIC", 0) == 8.0

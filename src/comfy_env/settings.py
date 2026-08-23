@@ -1,14 +1,15 @@
 """General settings for comfy-env.
 
-Precedence (most specific wins -- a per-pack declaration is more specific
-than a global environment variable):
-  1. Per-pack `[settings]` in comfy-env-root.toml (via resolve_bool
-     with node_settings)
-  2. Environment variables (COMFY_ENV_*)
-  3. Persistent ~/.comfy-env/settings.env (loaded at import with
+Precedence (most specific wins):
+  1. Environment variables (COMFY_ENV_*)
+  2. Persistent ~/.comfy-env/settings.env (loaded at import with
      os.environ.setdefault -- it fills UNSET env vars, so it can never
      override an explicitly-set one)
-  4. Defaults
+  3. Defaults
+
+All settings are machine-global: the per-pack [settings] section was
+removed in 0.4.25 (its one wired key served an experiment that a global
+env var covers; its other key was parsed but never consulted).
 
 Workers can't import this module (different venv), so they parse env vars directly.
 """
@@ -112,19 +113,11 @@ def get_numeric(var: str, default: float = 0) -> float:
 PATCH_SETTINGS = []
 PATCH_DEFAULTS = {}
 
-# Mapping from short TOML key names to env var names (for [settings] in comfy-env-root.toml)
-SETTINGS_KEY_MAP = {
-    "auto_install": "COMFY_ENV_AUTO_INSTALL",
-    "pool_ipc": "COMFY_ENV_POOL_IPC",
-}
-_ENV_TO_SHORT = {v: k for k, v in SETTINGS_KEY_MAP.items()}
 
 
 def resolve_bool(var: str, node_settings: dict = None, default: bool = False) -> bool:
-    """Resolve a boolean setting with per-node override support."""
-    if node_settings:
-        short_key = _ENV_TO_SHORT.get(var)
-        if short_key and short_key in node_settings:
-            return bool(node_settings[short_key])
+    """Resolve a boolean setting. `node_settings` is vestigial (per-pack
+    [settings] removed 0.4.25) and ignored; kept only so call sites read
+    uniformly until the next signature sweep."""
     return _is_on(var, default)
 

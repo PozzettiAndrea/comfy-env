@@ -370,25 +370,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     all_display = {}
     import_failures = []  # (source, formatted traceback)
 
-    # Per-node settings from the root config loaded above
-    node_settings = None
-    if root_cfg and root_cfg.settings:
-        node_settings = root_cfg.settings
-        if _DBG_WORKER:
-            _log(f"[comfy-env] Per-node settings from {pkg_dir}: {node_settings}")
-
-    from ..settings import resolve_bool, GENERAL_DEFAULTS, SETTINGS_KEY_MAP
     # Worker reentry guard: inside an isolation worker, never isolate again.
     enabled = os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
-
-    # Propagate per-node settings as env vars so worker subprocesses can see them
-    if node_settings:
-        for short_key, env_var in SETTINGS_KEY_MAP.items():
-            if short_key not in node_settings:
-                continue
-            val = "1" if resolve_bool(env_var, node_settings, GENERAL_DEFAULTS.get(env_var, False)) else "0"
-            for env in isolation_envs.values():
-                env["env_vars"][env_var] = val
 
     # ==================================================================
     # Discover and import node sources
