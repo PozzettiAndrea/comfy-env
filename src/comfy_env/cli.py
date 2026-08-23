@@ -93,7 +93,7 @@ ROOT_DEFAULT_CONFIG = """\
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 
 # [settings]
-# isolate = true
+# auto_install = true
 """
 
 ISOLATED_DEFAULT_CONFIG = """\

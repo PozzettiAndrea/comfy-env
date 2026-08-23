@@ -377,8 +377,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _log(f"[comfy-env] Per-node settings from {pkg_dir}: {node_settings}")
 
     from ..settings import resolve_bool, resolve_numeric, GENERAL_DEFAULTS, SETTINGS_KEY_MAP
-    enabled = resolve_bool("COMFY_ENV_ISOLATE", node_settings, GENERAL_DEFAULTS["COMFY_ENV_ISOLATE"]) \
-        and os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
+    # Worker reentry guard: inside an isolation worker, never isolate again.
+    enabled = os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
 
     # Propagate per-node settings as env vars so worker subprocesses can see them
     if node_settings:

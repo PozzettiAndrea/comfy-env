@@ -10,7 +10,6 @@ from .cache import (
 )
 from .setup import (
     setup_env,
-    is_comfy_env_enabled,
     USE_COMFY_ENV_VAR,
 )
 from .libomp import (
@@ -24,7 +23,6 @@ __all__ = [
     "find_comfyui_dir_from_node",
     "copy_files",
     "setup_env",
-    "is_comfy_env_enabled",
     "USE_COMFY_ENV_VAR",
     "dedupe_libomp",
 ]

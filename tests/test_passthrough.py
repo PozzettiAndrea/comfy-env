@@ -47,13 +47,13 @@ def test_compiler_owned_tables_are_denied():
 def test_owned_section_typos_warn(capsys):
     parse_config({"cuda": {"pakages": ["cumesh"]}})
     assert "unrecognized key 'pakages' in [cuda]" in capsys.readouterr().err
-    parse_config({"settings": {"isolat": True}})
-    assert "unrecognized key 'isolat' in [settings]" in capsys.readouterr().err
+    parse_config({"settings": {"pool_ip": True}})
+    assert "unrecognized key 'pool_ip' in [settings]" in capsys.readouterr().err
 
 
 def test_env_file_rejects_root_only_sections(tmp_path):
     p = tmp_path / "comfy-env.toml"
-    p.write_text("[settings]\nisolate = true\n", encoding="utf-8")
+    p.write_text("[settings]\npool_ipc = true\n", encoding="utf-8")
     with pytest.raises(ValueError, match=r"\[settings\] belong in comfy-env-root.toml"):
         load_config(p)
     p.write_text('[node_reqs]\nX = "https://github.com/x/X"\n', encoding="utf-8")

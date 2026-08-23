@@ -83,22 +83,12 @@ def install(
     # `comfy-env==X` elsewhere can silently downgrade us after this install.
     check_sibling_comfy_env_pins(node_dir, log)
 
-    from ..settings import resolve_bool, GENERAL_DEFAULTS
-    node_settings = cfg.settings if cfg.settings else None
-    install_isolated = resolve_bool(
-        "COMFY_ENV_INSTALL_ISOLATED", node_settings,
-        GENERAL_DEFAULTS["COMFY_ENV_INSTALL_ISOLATED"],
-    )
-
-    if install_isolated:
-        from ..environment.cache import find_comfyui_dir_from_node as get_comfyui_dir
-        comfyui_dir = get_comfyui_dir(node_dir)
-        if comfyui_dir is None:
-            log("[comfy-env] WARNING: Could not locate ComfyUI base; skipping workspace install")
-        else:
-            install_workspace(comfyui_dir, log=log, dry_run=dry_run)
+    from ..environment.cache import find_comfyui_dir_from_node as get_comfyui_dir
+    comfyui_dir = get_comfyui_dir(node_dir)
+    if comfyui_dir is None:
+        log("[comfy-env] WARNING: Could not locate ComfyUI base; skipping workspace install")
     else:
-        log("\n[comfy-env] Isolated install disabled -- nothing to install")
+        install_workspace(comfyui_dir, log=log, dry_run=dry_run)
 
     log("\nInstallation complete!")
     return True

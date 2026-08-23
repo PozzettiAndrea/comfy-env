@@ -24,16 +24,16 @@ def test_root_rejects_unsupported_sections(tmp_path):
 def test_root_rejects_typos(tmp_path):
     # A typo'd section is an error, not a silent no-op.
     with pytest.raises(ValueError, match=r"\[setings\]"):
-        load_config(_root(tmp_path, "[setings]\nisolate = true\n"))
+        load_config(_root(tmp_path, "[setings]\npool_ipc = true\n"))
 
 
 def test_root_accepts_its_schema(tmp_path):
     cfg = load_config(_root(
         tmp_path,
         '[node_reqs]\nOtherPack = "https://github.com/x/OtherPack"\n\n'
-        "[settings]\nisolate = true\n"))
+        "[settings]\npool_ipc = true\n"))
     assert cfg.node_reqs[0]["name"] == "OtherPack"
-    assert cfg.settings == {"isolate": True}
+    assert cfg.settings == {"pool_ipc": True}
 
 
 def test_empty_root_is_fine(tmp_path):
@@ -51,7 +51,6 @@ def test_env_file_is_not_role_checked(tmp_path):
 
 
 def test_install_fails_on_bad_root_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("COMFY_ENV_INSTALL_ISOLATED", "0")
     pack = tmp_path / "custom_nodes" / "ComfyUI-X"
     pack.mkdir(parents=True)
     (pack / "comfy-env-root.toml").write_text('[env_vars]\nFOO = "1"\n', encoding="utf-8")

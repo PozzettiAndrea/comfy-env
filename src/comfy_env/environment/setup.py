@@ -9,11 +9,6 @@ from .libomp import dedupe_libomp
 USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
 
-def is_comfy_env_enabled():
-    from ..settings import ISOLATE
-    return ISOLATE
-
-
 def _find_env_dirs(node_dir):
     """Recursively find comfy-env.toml files under node_dir (for debug info only)."""
     # Same two shapes the binder supports (nodes/ and nodes/<subdir>) --
@@ -75,11 +70,6 @@ def setup_env(node_dir=None):
                 print(f"[comfy-env]     env: <resolution failed: {e}>", file=sys.stderr)
     else:
         print(f"[comfy-env] {node_name}: no isolation envs", file=sys.stderr)
-
-    if not is_comfy_env_enabled():
-        print("[comfy-env] prestartup complete (isolation disabled)",
-              file=sys.stderr, flush=True)
-        return
 
     dedupe_libomp()
 

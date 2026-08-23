@@ -115,6 +115,30 @@ def parse_config(data):
     if "settings" in data:
         from ..settings import SETTINGS_KEY_MAP
         owned["settings"] = set(SETTINGS_KEY_MAP)
+    # [settings] keys removed in 0.4.25. Not routed through the typo guard:
+    # "unrecognized key" would mislabel a key that was recognized for years.
+    # A falsy value is written author intent ("run this un-isolated") that can
+    # no longer be honored -- running isolated against it silently is the
+    # silent-flip failure mode, so it is a hard error (which propagates to a
+    # visible IMPORT FAILED in ComfyUI's startup summary). A truthy value
+    # matches the only behavior that exists now -- and our own docs shipped
+    # `isolate = true` in the sample [settings] block -- so it only warns.
+    _REMOVED_SETTINGS = ("isolate", "install_isolated")
+    _settings_table = data.get("settings")
+    if isinstance(_settings_table, dict):
+        for _rk in _REMOVED_SETTINGS:
+            if _rk not in _settings_table:
+                continue
+            if not _settings_table.pop(_rk):
+                raise ValueError(
+                    f"[settings] {_rk} = false was removed in "
+                    f"comfy-env 0.4.25 -- isolation is always on and cannot "
+                    f"be disabled. Delete this line."
+                )
+            print(
+                f"[comfy-env] WARNING: [settings] {_rk} was removed in "
+                f"0.4.25 and is ignored -- delete it.",
+                file=sys.stderr, flush=True)
     for section, known in owned.items():
         table = data.get(section)
         if isinstance(table, dict):
