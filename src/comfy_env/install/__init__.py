@@ -50,7 +50,10 @@ def install(
     workspace-wide `pixi install --all` covering every plugin in this ComfyUI install.
     """
     if node_dir is None:
-        node_dir = Path(inspect.stack()[1].filename).parent.resolve()
+        # abspath, not resolve(): a symlinked/junctioned pack's install.py must
+        # keep its custom_nodes-side spelling, or the comfyui-root walk starts
+        # from the physical location and finds nothing (#8, third entry point).
+        node_dir = Path(os.path.abspath(inspect.stack()[1].filename)).parent
 
     log = log_callback or print
 

@@ -591,7 +591,9 @@ def copy_files(src, dst, pattern="*", overwrite=False):
     # own directory, `src.exists()` returned False, and the function returned
     # 0 having copied nothing. No exception, no log, no thread to pull.
     _frame_file = sys._getframe(1).f_globals.get("__file__")
-    caller_dir = Path(_frame_file).resolve().parent if _frame_file else Path.cwd()
+    caller_dir = (  # abspath, not resolve(): keep symlink spelling (#8)
+        Path(os.path.abspath(_frame_file)).parent if _frame_file else Path.cwd()
+    )
 
     def _resolve_relative(p):
         pp = Path(p)
