@@ -1,12 +1,12 @@
 """Contract: the removed isolate/install_isolated settings tombstone correctly.
 
-Removed in 0.4.25 (pre-1.0, ADR-0017). The tombstones are value-sensitive by
-design: a FALSY value is a semantic inversion -- the machine was told to run
-un-isolated and no longer will -- and must fail loudly rather than silently
-flip. A TRUTHY value matches the only behavior that exists now (and our own
-docs shipped `isolate = true` in the sample [settings] block), so it warns.
-Keys in ~/.comfy-env/settings.env are residue: the TUI wrote EVERY settings
-key on save, so those never error and self-heal on the next save.
+Removed in 0.4.25 (pre-1.0, ADR-0017). Only a FALSY value tombstones -- it is
+a semantic inversion (the machine was told to run un-isolated and no longer
+will) and must fail loudly rather than silently flip. Everything else about
+the removed keys is SILENT by design: truthy values, keys the old settings
+TUI wrote into ~/.comfy-env/settings.env, and the removed numeric knob
+(worker_vram_budget, COMFY_ENV_TRANSPORT_PROBE) -- no warn-tier tombstones,
+no messages to maintain about features nobody used.
 
 These tests are scheduled for deletion together with the tombstones.
 """
@@ -18,9 +18,6 @@ from pathlib import Path
 import pytest
 
 from comfy_env.config import load_config
-
-
-# --- [settings] keys in comfy-env-root.toml --------------------------------
 
 
 def _root(tmp_path, body):
@@ -39,17 +36,12 @@ def test_toml_falsy_install_isolated_is_a_hard_error(tmp_path):
         load_config(_root(tmp_path, "[settings]\ninstall_isolated = false\n"))
 
 
-def test_toml_truthy_isolate_warns_and_is_dropped(tmp_path, capsys):
+def test_toml_truthy_isolate_is_silently_dropped(tmp_path, capsys):
     cfg = load_config(_root(tmp_path, "[settings]\nisolate = true\n"))
     err = capsys.readouterr().err
-    assert "removed in 0.4.25" in err
-    # Dropped, not forwarded: nothing downstream may see the removed key.
     assert "isolate" not in (cfg.settings or {})
-    # And NOT the misleading typo warning -- it was a recognized key for years.
+    # Silent: no tombstone message, and NOT the misleading typo warning either.
     assert "unrecognized key 'isolate'" not in err
-
-
-# --- env vars: checked in a subprocess, since settings.py acts at import ----
 
 
 def _run_with_env(var, value):
@@ -75,16 +67,16 @@ def test_falsy_env_var_fails_the_import(var):
 
 
 @pytest.mark.parametrize("var", ["COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED"])
-def test_truthy_env_var_warns_and_continues(var):
+def test_truthy_env_var_is_silently_ignored(var):
     r = _run_with_env(var, "1")
     assert r.returncode == 0
     assert "IMPORTED-OK" in r.stdout
-    assert "removed in 0.4.25" in r.stderr
+    assert "removed" not in r.stderr
 
 
 def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
     """TUI residue: a falsy key in settings.env must NOT brick the boot --
-    it is skipped before it can reach os.environ, with a cleanup hint."""
+    it is silently skipped before it can reach os.environ."""
     home = tmp_path / "home"
     (home / ".comfy-env").mkdir(parents=True)
     (home / ".comfy-env" / "settings.env").write_text(
@@ -105,20 +97,3 @@ def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "SKIPPED" in r.stdout          # removed key never enters os.environ
     assert "OTHERS-LOADED" in r.stdout    # surviving keys still load
-    assert "rerun `comfy-env settings`" in r.stderr
-
-
-def test_toml_worker_vram_budget_warns_any_value(tmp_path, capsys):
-    """Numeric key: no inversion value exists, so every value warns-and-drops
-    (0 already meant auto; a stale cap returns to negotiated behavior)."""
-    cfg = load_config(_root(tmp_path, "[settings]\nworker_vram_budget = 8\n"))
-    err = capsys.readouterr().err
-    assert "worker_vram_budget was removed in 0.4.25" in err
-    assert "worker_vram_budget" not in (cfg.settings or {})
-
-
-def test_env_worker_vram_budget_warns_and_continues():
-    r = _run_with_env("COMFY_ENV_WORKER_VRAM_BUDGET", "8")
-    assert r.returncode == 0
-    assert "IMPORTED-OK" in r.stdout
-    assert "removed in 0.4.25" in r.stderr

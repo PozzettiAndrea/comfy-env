@@ -27,22 +27,9 @@ SETTINGS_FILE = Path.home() / ".comfy-env" / "settings.env"
 # (the machine was told to run un-isolated and no longer will) and fails
 # loudly; a truthy one matches the only behavior that exists now and warns.
 _REMOVED_ENV_VARS = ("COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED")
-# Removed too, but warn-only for ANY value: a numeric cap has no
-# semantic-inversion value the way isolate=0 did -- 0 already meant "auto",
-# and a stale nonzero cap simply returns to negotiated behavior.
-_REMOVED_ENV_VARS_WARN = ("COMFY_ENV_WORKER_VRAM_BUDGET",)
 
 
 def _check_removed_env_vars():
-    import sys as _sys
-    for _var in _REMOVED_ENV_VARS_WARN:
-        if os.environ.get(_var) is not None:
-            print(
-                f"[comfy-env] WARNING: {_var} was removed in 0.4.25 and is "
-                f"ignored (the VRAM budget is negotiated automatically) -- "
-                f"unset it.",
-                file=_sys.stderr, flush=True,
-            )
     for _var in _REMOVED_ENV_VARS:
         _val = os.environ.get(_var)
         if _val is None:
@@ -56,11 +43,7 @@ def _check_removed_env_vars():
                 f"For containers, materialize envs at image build time -- see "
                 f"the 'Containers, CI & air-gapped' page in the docs."
             )
-        print(
-            f"[comfy-env] WARNING: {_var} was removed in 0.4.25 and is "
-            f"ignored (isolation is always on) -- unset it.",
-            file=_sys.stderr, flush=True,
-        )
+        # Truthy matches the only behavior that exists now: silent ignore.
 
 
 _check_removed_env_vars()
@@ -68,24 +51,15 @@ _check_removed_env_vars()
 # Load persistent settings (simple KEY=VALUE file) -- env vars always override
 if SETTINGS_FILE.exists():
     try:
-        _skipped_removed = False
         for line in SETTINGS_FILE.read_text().splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 k = k.strip()
-                if k in _REMOVED_ENV_VARS or k in _REMOVED_ENV_VARS_WARN:
-                    _skipped_removed = True  # TUI residue; next save drops it
-                    continue
+                if k in _REMOVED_ENV_VARS:
+                    continue  # TUI residue; next save drops it
+
                 os.environ.setdefault(k, v.strip())
-        if _skipped_removed:
-            import sys as _sys
-            print(
-                f"[comfy-env] Note: {SETTINGS_FILE} contains removed settings "
-                f"(isolate/install_isolated); rerun `comfy-env settings` to "
-                f"clean it up.",
-                file=_sys.stderr, flush=True,
-            )
     except RuntimeError:
         raise
     except Exception:

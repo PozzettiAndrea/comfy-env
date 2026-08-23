@@ -480,9 +480,10 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         # Canary handshake: verify each transport tier through the production
         # serialization path; demotes GPU zero-copy for this worker if its
         # round-trip fails. A CPU-tier failure raises (broken IPC).
-        from ..settings import _is_on
-        if _is_on("COMFY_ENV_TRANSPORT_PROBE", True):
-            worker.verify_transport()
+        # Unconditional -- a correctness check with an off switch is a
+        # doctrine with an asterisk (the old COMFY_ENV_TRANSPORT_PROBE=0
+        # opt-out meant "assume every tier works, unverified").
+        worker.verify_transport()
         _WORKER_POOL[key] = (worker, gen)
         return worker, gen
 
