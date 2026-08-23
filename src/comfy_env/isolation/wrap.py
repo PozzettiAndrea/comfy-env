@@ -368,6 +368,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
     all_mappings = {}
     all_display = {}
+    import_failures = []  # (source, formatted traceback)
 
     # Per-node settings from the root config loaded above
     node_settings = None
@@ -463,8 +464,18 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             all_mappings.update(mappings)
             all_display.update(display)
             _log(f"[comfy-env] Imported {nodes_package} root: {len(mappings)} nodes")
-        except Exception as e:
-            _log(f"[comfy-env] Failed to import {nodes_package} root: {e}")
+        except ModuleNotFoundError as e:
+            # The nodes package itself not existing is ABSENCE, not failure
+            # (types-only packs have no nodes package at all). A missing
+            # module INSIDE an existing package is a real import failure.
+            if e.name in (f"{caller_pkg_name}.{nodes_package}", nodes_package):
+                _log(f"[comfy-env] No {nodes_package} package to import (root)")
+            else:
+                import traceback
+                import_failures.append((f"{nodes_package} (root)", traceback.format_exc()))
+        except Exception:
+            import traceback
+            import_failures.append((f"{nodes_package} (root)", traceback.format_exc()))
 
     # --- Pattern 2: subdirectories (only if root yielded nothing) ---
     # Skip if root was an isolation env (even if scan returned 0 nodes) -- subdirs
@@ -497,8 +508,15 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 all_mappings.update(mappings)
                 all_display.update(display)
                 _log(f"[comfy-env] Imported {subdir.name}: {len(mappings)} nodes")
-            except Exception as e:
-                _log(f"[comfy-env] Failed to import {module_path}: {e}")
+            except ModuleNotFoundError as e:
+                if e.name == f"{caller_pkg_name}{module_path}":
+                    _log(f"[comfy-env] No importable package at {module_path}")
+                else:
+                    import traceback
+                    import_failures.append((module_path, traceback.format_exc()))
+            except Exception:
+                import traceback
+                import_failures.append((module_path, traceback.format_exc()))
 
         # Subprocess-scan isolation dirs (in parallel)
         if enabled and isolation_dirs:
@@ -568,6 +586,27 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             env_dir = _find_env_dir(cf.parent)
             if not env_dir:
                 _log(f"[comfy-env] No env for {cf.parent.name} -- run 'comfy-env install'")
+
+    # An in-process import failure means every node in that source silently
+    # vanishes -- historically the top "No Nodes Found" ticket class. Print
+    # the FULL traceback (a one-line str(e) hides the actual cause), and when
+    # NOTHING registered at all, raise: the exception propagates to ComfyUI's
+    # load_custom_node, which prints it and marks this pack IMPORT FAILED in
+    # the startup summary -- visible by construction instead of a green load
+    # with zero nodes.
+    if import_failures:
+        for _src, _tb in import_failures:
+            _log(f"[comfy-env] ERROR: failed to import {_src}:\n{_tb}")
+        if not all_mappings:
+            raise ImportError(
+                f"[comfy-env] all {len(import_failures)} node source(s) failed "
+                f"to import; first failure ({import_failures[0][0]}) above"
+            )
+        _log(
+            f"[comfy-env] WARNING: {len(import_failures)} node source(s) failed "
+            f"to import ({', '.join(s for s, _ in import_failures)}); their "
+            f"nodes are missing from this run"
+        )
 
     _log(f"[comfy-env] Registered {len(all_mappings)} total nodes")
 

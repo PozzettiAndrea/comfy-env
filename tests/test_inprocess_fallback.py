@@ -87,3 +87,41 @@ def test_plain_pack_imports_inprocess(tmp_path, monkeypatch):
     """No comfy-env.toml anywhere -> ordinary in-process import."""
     mod = _import_pack(tmp_path, monkeypatch, with_config=False)
     assert "FallbackNode" in mod.NODE_CLASS_MAPPINGS
+
+
+def test_all_sources_failing_raises_import_error(tmp_path, monkeypatch):
+    """A pack whose only source fails to import must go IMPORT FAILED in
+    ComfyUI's startup summary, not load green with zero nodes. The raise is
+    the mechanism: ComfyUI's load_custom_node catches it and marks the pack."""
+    import pytest
+    comfyui = tmp_path / "comfyui"
+    custom_nodes = comfyui / "custom_nodes"
+    custom_nodes.mkdir(parents=True)
+    (comfyui / "comfy").mkdir()
+    (comfyui / "main.py").write_text("", encoding="utf-8")
+    (comfyui / "folder_paths.py").write_text("", encoding="utf-8")
+    pack = custom_nodes / "ComfyUI-BrokenPack"
+    nodes = pack / "nodes"
+    nodes.mkdir(parents=True)
+    (pack / "__init__.py").write_text(
+        "from comfy_env import register_nodes\n"
+        "NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = register_nodes()\n",
+        encoding="utf-8")
+    (nodes / "__init__.py").write_text(
+        "import a_module_that_does_not_exist_anywhere\n", encoding="utf-8")
+
+    monkeypatch.setitem(
+        sys.modules, "folder_paths", types.SimpleNamespace(
+            base_path=str(comfyui), __file__=str(comfyui / "folder_paths.py")))
+    import importlib
+    spec = importlib.util.spec_from_file_location(
+        "ComfyUI_BrokenPack", pack / "__init__.py",
+        submodule_search_locations=[str(pack)])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["ComfyUI_BrokenPack"] = mod
+    try:
+        with pytest.raises(ImportError, match="all 1 node source"):
+            spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop("ComfyUI_BrokenPack", None)
+        sys.modules.pop("ComfyUI_BrokenPack.nodes", None)
