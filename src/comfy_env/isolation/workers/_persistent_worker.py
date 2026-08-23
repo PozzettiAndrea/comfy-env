@@ -1816,7 +1816,19 @@ def main():
 
             try:
                 import torch as _torch_worker
-                _infer_mode = _torch_worker.no_grad  # alix: torch.inference_mode() breaks models with nn.Parameter buffers (PyTorch #90882)
+                # no_grad, NOT inference_mode. Only the node call is wrapped, so a
+                # model that lazily creates an nn.Parameter on its first forward
+                # creates it INSIDE this context -- and inference_mode stamps it
+                # `is_inference`, permanently. Anything that later touches that
+                # parameter from OUTSIDE the context then raises: an autograd-
+                # tracked op with "Inference tensors cannot be saved for backward",
+                # an in-place update with "Inplace update to inference tensor
+                # outside InferenceMode is not allowed". For us that outside
+                # toucher is routine -- SubprocessModelPatcher moving the model
+                # between devices, a LoRA weight patch, load_state_dict.
+                # Measured cost of the safer context: +0.4% on a 16-layer forward.
+                # See tests/test_infer_mode.py; upstream pytorch#90882.
+                _infer_mode = _torch_worker.no_grad
             except ImportError:
                 import contextlib as _contextlib_worker
                 _infer_mode = _contextlib_worker.nullcontext
