@@ -21,11 +21,6 @@ def _log(msg: str) -> None:
 
 
 
-def _is_enabled() -> bool:
-    from ..settings import ISOLATE
-    return ISOLATE
-
-
 # Launch-env construction (build_isolation_env, _get_env_paths, platform
 # builders) moved to isolation/subenv.py -- a leaf, so subprocess.py and
 # metadata.py import it DOWNWARD instead of reaching up into this file.
@@ -566,10 +561,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                         )
                     if nodes_meta:
                         _log(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
-
-        elif isolation_dirs and not enabled:
-            if _DBG_WORKER:
-                _log(f"[comfy-env] Isolation disabled, skipping {len(isolation_dirs)} dirs")
 
     # Report skipped isolation dirs (no _env_* installed)
     for cf in config_files:
