@@ -1,6 +1,6 @@
 """Contract: setting resolution order is env var > per-node [settings] > default."""
 
-from comfy_env.settings import get_numeric, resolve_bool, resolve_numeric
+from comfy_env.settings import get_numeric, resolve_bool
 
 
 def test_env_var_states(monkeypatch):
@@ -22,9 +22,7 @@ def test_per_node_settings_take_priority(monkeypatch):
 
 
 def test_numeric_resolution(monkeypatch):
-    monkeypatch.setenv("COMFY_ENV_WORKER_VRAM_BUDGET", "8")
-    assert get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0) == 8.0
-    monkeypatch.setenv("COMFY_ENV_WORKER_VRAM_BUDGET", "garbage")
-    assert get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0) == 0
-    assert resolve_numeric(
-        "COMFY_ENV_WORKER_VRAM_BUDGET", {"worker_vram_budget": "4"}, 0) == 4.0
+    monkeypatch.setenv("COMFY_ENV_TEST_NUMERIC", "8")
+    assert get_numeric("COMFY_ENV_TEST_NUMERIC", 0) == 8.0
+    monkeypatch.setenv("COMFY_ENV_TEST_NUMERIC", "garbage")
+    assert get_numeric("COMFY_ENV_TEST_NUMERIC", 0) == 0

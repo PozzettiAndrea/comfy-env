@@ -124,8 +124,16 @@ def parse_config(data):
     # matches the only behavior that exists now -- and our own docs shipped
     # `isolate = true` in the sample [settings] block -- so it only warns.
     _REMOVED_SETTINGS = ("isolate", "install_isolated")
+    _REMOVED_SETTINGS_WARN = ("worker_vram_budget",)  # numeric: no inversion value
     _settings_table = data.get("settings")
     if isinstance(_settings_table, dict):
+        for _rk in _REMOVED_SETTINGS_WARN:
+            if _rk in _settings_table:
+                _settings_table.pop(_rk)
+                print(
+                    f"[comfy-env] WARNING: [settings] {_rk} was removed in "
+                    f"0.4.25 and is ignored -- delete it.",
+                    file=sys.stderr, flush=True)
         for _rk in _REMOVED_SETTINGS:
             if _rk not in _settings_table:
                 continue

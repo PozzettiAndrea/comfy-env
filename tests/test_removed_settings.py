@@ -106,3 +106,19 @@ def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
     assert "SKIPPED" in r.stdout          # removed key never enters os.environ
     assert "OTHERS-LOADED" in r.stdout    # surviving keys still load
     assert "rerun `comfy-env settings`" in r.stderr
+
+
+def test_toml_worker_vram_budget_warns_any_value(tmp_path, capsys):
+    """Numeric key: no inversion value exists, so every value warns-and-drops
+    (0 already meant auto; a stale cap returns to negotiated behavior)."""
+    cfg = load_config(_root(tmp_path, "[settings]\nworker_vram_budget = 8\n"))
+    err = capsys.readouterr().err
+    assert "worker_vram_budget was removed in 0.4.25" in err
+    assert "worker_vram_budget" not in (cfg.settings or {})
+
+
+def test_env_worker_vram_budget_warns_and_continues():
+    r = _run_with_env("COMFY_ENV_WORKER_VRAM_BUDGET", "8")
+    assert r.returncode == 0
+    assert "IMPORTED-OK" in r.stdout
+    assert "removed in 0.4.25" in r.stderr

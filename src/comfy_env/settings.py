@@ -2,8 +2,8 @@
 
 Precedence (most specific wins -- a per-pack declaration is more specific
 than a global environment variable):
-  1. Per-pack `[settings]` in comfy-env-root.toml (via resolve_bool/
-     resolve_numeric with node_settings)
+  1. Per-pack `[settings]` in comfy-env-root.toml (via resolve_bool
+     with node_settings)
   2. Environment variables (COMFY_ENV_*)
   3. Persistent ~/.comfy-env/settings.env (loaded at import with
      os.environ.setdefault -- it fills UNSET env vars, so it can never
@@ -27,10 +27,22 @@ SETTINGS_FILE = Path.home() / ".comfy-env" / "settings.env"
 # (the machine was told to run un-isolated and no longer will) and fails
 # loudly; a truthy one matches the only behavior that exists now and warns.
 _REMOVED_ENV_VARS = ("COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED")
+# Removed too, but warn-only for ANY value: a numeric cap has no
+# semantic-inversion value the way isolate=0 did -- 0 already meant "auto",
+# and a stale nonzero cap simply returns to negotiated behavior.
+_REMOVED_ENV_VARS_WARN = ("COMFY_ENV_WORKER_VRAM_BUDGET",)
 
 
 def _check_removed_env_vars():
     import sys as _sys
+    for _var in _REMOVED_ENV_VARS_WARN:
+        if os.environ.get(_var) is not None:
+            print(
+                f"[comfy-env] WARNING: {_var} was removed in 0.4.25 and is "
+                f"ignored (the VRAM budget is negotiated automatically) -- "
+                f"unset it.",
+                file=_sys.stderr, flush=True,
+            )
     for _var in _REMOVED_ENV_VARS:
         _val = os.environ.get(_var)
         if _val is None:
@@ -62,7 +74,7 @@ if SETTINGS_FILE.exists():
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 k = k.strip()
-                if k in _REMOVED_ENV_VARS:
+                if k in _REMOVED_ENV_VARS or k in _REMOVED_ENV_VARS_WARN:
                     _skipped_removed = True  # TUI residue; next save drops it
                     continue
                 os.environ.setdefault(k, v.strip())
@@ -99,9 +111,12 @@ GENERAL_DEFAULTS = {
 }
 
 # Numeric settings
-NUMERIC_SETTINGS = [
-    ("COMFY_ENV_WORKER_VRAM_BUDGET", "Worker VRAM budget (GB, 0=auto)", 0, "GB"),
-]
+# Empty since 0.4.25 -- COMFY_ENV_WORKER_VRAM_BUDGET (manual per-worker VRAM
+# cap) was removed: the budget-negotiation callback computes the honest number
+# automatically, nobody ever set the manual override, and its origin predates
+# anyone's memory. Kept as an empty container so the CLI settings surface
+# stays stable (same pattern as PATCH_SETTINGS).
+NUMERIC_SETTINGS = []
 
 
 def get_numeric(var: str, default: float = 0) -> float:
@@ -114,7 +129,6 @@ def get_numeric(var: str, default: float = 0) -> float:
         return default
 
 
-WORKER_VRAM_BUDGET = get_numeric("COMFY_ENV_WORKER_VRAM_BUDGET", 0)
 
 # Patches (monkey-patching ComfyUI internals). Empty since 0.4.21 -- the
 # only entry, COMFY_ENV_PATCH_SHAREABLE_POOL (parent-side CUDA shareable
@@ -128,7 +142,6 @@ PATCH_DEFAULTS = {}
 SETTINGS_KEY_MAP = {
     "auto_install": "COMFY_ENV_AUTO_INSTALL",
     "pool_ipc": "COMFY_ENV_POOL_IPC",
-    "worker_vram_budget": "COMFY_ENV_WORKER_VRAM_BUDGET",
 }
 _ENV_TO_SHORT = {v: k for k, v in SETTINGS_KEY_MAP.items()}
 
@@ -141,14 +154,3 @@ def resolve_bool(var: str, node_settings: dict = None, default: bool = False) ->
             return bool(node_settings[short_key])
     return _is_on(var, default)
 
-
-def resolve_numeric(var: str, node_settings: dict = None, default: float = 0) -> float:
-    """Resolve a numeric setting with per-node override support."""
-    if node_settings:
-        short_key = _ENV_TO_SHORT.get(var)
-        if short_key and short_key in node_settings:
-            try:
-                return float(node_settings[short_key])
-            except (ValueError, TypeError):
-                pass
-    return get_numeric(var, default)
