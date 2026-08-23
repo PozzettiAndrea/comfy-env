@@ -65,15 +65,25 @@ layers =
     comfy_env.environment
     comfy_env.detection
 ignore_imports =
-    # The root package __init__ is the public facade -- it re-exports from
-    # every subpackage, so `import comfy_env` anywhere routes through it.
-    # Exempt those facade edges so the contract checks DIRECT module imports,
-    # not facade-routed ones (the same reason isolation/__init__ -> wrap is
-    # exempt below).
+    # The root package __init__ is the public facade, so `import comfy_env`
+    # anywhere routes through it. Exempt those facade edges so the contract
+    # checks DIRECT module imports, not facade-routed ones (the same reason
+    # isolation/__init__ -> wrap is exempt below).
+    #
+    # Only the edges the pruned facade actually has. import-linter treats an
+    # ignore that matches nothing as an error, so a stale entry here fails the
+    # whole run -- and with it publish.yml, which is `needs: test`. The facade
+    # reaches environment via its SUBMODULES (environment.setup,
+    # environment.cache), which is a different edge, and no longer touches
+    # packages at all.
     comfy_env -> comfy_env.isolation
     comfy_env -> comfy_env.install
-    comfy_env -> comfy_env.packages
-    comfy_env -> comfy_env.environment
+    # register_serializer is re-exported from a module four levels down, so the
+    # facade edge is to that module -- NOT to `comfy_env.isolation`. An ignore
+    # matches one exact edge, so the line above does not cover this one, and
+    # without it every subpackage that touches the facade looks like it imports
+    # isolation.
+    comfy_env -> comfy_env.isolation.workers._ipc_shared
 
 [importlinter:contract:layers]
 name = isolation dependency layers point one way

@@ -456,8 +456,12 @@ def _resolve_wheel_combo(
       1. Try the bootstrap combo (`bootstrap_python` / `bootstrap_cuda` / `bootstrap_torch`).
          If every required cuda-wheel is published for it (across all Python versions
          used by envs), use it. Pin torch to ``==<bootstrap_torch>``.
-      2. Else try the known-good fallback ``(bootstrap_python, FALLBACK_COMBO)`` =
-         ``(py, "12.8", "2.8")``. Pin torch to ``==2.8.*``.
+      2. Else try the known-good fallback for this machine's CPU architecture:
+         ``(py, "12.8", "2.8")`` on x86_64, ``(py, "13.0", "2.10")`` on linux
+         aarch64 -- torch never shipped an aarch64 wheel for the 2.8 line, so
+         the x86 combo is unsatisfiable there, and 12.8/12.9 would leave Thor
+         without a kernel image (see FALLBACK_COMBO_AARCH64). Both axes differ,
+         so the torch pin follows the chosen combo rather than being fixed.
       3. Else raise.
 
     Returns None when there's nothing to resolve (no cuda-only packages required,
@@ -480,7 +484,7 @@ def _resolve_wheel_combo(
 
     from ..packages.cuda_wheels import (
         check_all_wheels_available,
-        FALLBACK_COMBO,
+        resolve_fallback_combo,
         CUDA_WHEELS_INDEX,
     )
 
@@ -543,8 +547,9 @@ def _resolve_wheel_combo(
             "[comfy-env] cuda-wheels: bootstrap torch unknown; skipping tier 1, trying fallback"
         )
 
-    # Tier 2: known-good fallback (cu128, torch 2.8)
-    fb_cuda, fb_torch = FALLBACK_COMBO
+    # Tier 2: known-good fallback for this CPU arch (cu128/torch2.8 on x86_64,
+    # cu130/torch2.10 on linux aarch64 -- see FALLBACK_COMBO_AARCH64 for why).
+    fb_cuda, fb_torch = resolve_fallback_combo()
     miss = _check_all_python_versions(
         fb_torch, fb_cuda, "tier 2 (fallback)",
     )

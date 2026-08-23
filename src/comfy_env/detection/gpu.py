@@ -65,7 +65,17 @@ def get_compute_capability(gpu_index: int = 0) -> tuple[int, int] | None:
 
 
 def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
-    """Blackwell: 12.8, Pascal: 12.4, others: 12.8"""
+    """x86_64 -- Blackwell: 12.8, pre-Turing: 12.4, others: 12.8.
+
+    linux aarch64 is a different world and always gets 13.0. PyTorch's ARM CUDA
+    builds compile a much shorter arch list than the x86 ones -- `{8.0, 9.0}` on
+    cu126 and `{8.0, 9.0, 10.0, 12.0}` on cu128/cu129, against x86's `{5.0 ...
+    12.0}` -- so sm_70 and sm_75 do not exist on ARM at all and the pre-Turing
+    branch below can never be satisfiable there. 12.4 is doubly wrong: NVIDIA's
+    sbsa apt repo starts at 12.5, so cuda-wheels deliberately does not build it
+    for ARM (arch_policy_aarch64). 13.0 because it is the only line whose ARM
+    arch list carries Thor (sm_110) natively -- see FALLBACK_COMBO_AARCH64.
+    """
     # Skip GPU detection on explicit CPU test runners (avoids torch import/CUDA warning)
     if os.environ.get("COMFY_TEST_GPU") == "0":
         return ""
@@ -75,6 +85,10 @@ def get_recommended_cuda_version(gpus: list[GPUInfo] | None = None) -> str:
 
     gpus = gpus if gpus is not None else detect_cuda_environment().gpus
     if not gpus: return ""
+
+    from .arch import cpu_arch
+    if cpu_arch() == "aarch64":
+        return "13.0"
 
     for gpu in gpus:
         if gpu.compute_capability[0] >= 10: return "12.8"

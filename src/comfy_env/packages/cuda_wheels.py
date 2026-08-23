@@ -11,6 +11,8 @@ import urllib.error
 import urllib.request
 from typing import Callable, List, Optional
 
+from ..detection.arch import cpu_arch
+
 try:
     from importlib.metadata import version as _pkg_version
     _UA = f"comfy-env/{_pkg_version('comfy-env')}"
@@ -43,6 +45,28 @@ def _ssl_context() -> Optional[ssl.SSLContext]:
 CUDA_TORCH_MAP = {"12.8": "2.8", "12.4": "2.4"}
 FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstrap python
 
+# ...except on linux aarch64, which is a different world and gets its own cell.
+# Three things rule out simply reusing the x86 combo, or nudging one axis of it:
+#
+#   * (12.8, 2.8) does not exist on ARM. PyTorch shipped no linux-aarch64 wheel
+#     for the whole 2.8 line on cu128 -- torch 2.8.0, torchvision 0.23.0 and
+#     torchaudio 2.8.0 are x86_64/win_amd64 only there. The aarch64 cu128 build
+#     broke during the 2.8 cycle (pytorch#157548) and came back for 2.9.
+#   * (13.0, 2.8) does not exist anywhere: PyTorch's CUDA 13 line starts at
+#     torch 2.9, so 2.8 cannot reach it on any platform.
+#   * Staying on 12.8/12.9 leaves Thor DEAD. Their ARM arch list is
+#     `8.0;9.0+PTX;10.0;12.0+PTX` -- sm_110 has no cubin at or below it (the
+#     10.0 cubin cannot cross a major, the 12.0 PTX is above), so a Thor gets
+#     cudaErrorNoKernelImageForDevice at first kernel launch. 13.0's ARM list
+#     adds 11.0 natively.
+#
+# So ARM takes (13.0, 2.10): every current ARM CUDA product is covered (Grace
+# sm_90, GB200 sm_100, Thor sm_110, Orin sm_87 via the 8.0 cubin), and from
+# torchvision 0.25 / torchaudio 2.10 the ARM wheels are CUDA-tagged (+cu130)
+# rather than the plain CPU-only builds cu128/cu129 carry at that torch level.
+# Cost, stated plainly: CUDA 13 needs driver r580+.
+FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
+
 # --- Backend -> wheel-index registry -------------------------------------------
 # The single seam for adding a non-CUDA accelerator's prebuilt wheels: register
 # its index base URL + tier-2 fallback combo here (data, not an `if backend ==`),
@@ -50,7 +74,15 @@ FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstra
 # the cuda resolver. A backend-dispatching caller uses `resolve_index_url(backend)`
 # instead of hardcoding an index; adding `rocm` is one dict entry + a rocm resolver.
 WHEEL_INDEX_REGISTRY: dict[str, dict] = {
-    "cuda": {"index": CUDA_WHEELS_INDEX, "fallback_combo": FALLBACK_COMBO},
+    "cuda": {
+        "index": CUDA_WHEELS_INDEX,
+        # Keyed by CPU arch: the fallback is a claim about published wheels, and
+        # what upstream publishes differs per architecture.
+        "fallback_combo": {
+            "x86_64": FALLBACK_COMBO,
+            "aarch64": FALLBACK_COMBO_AARCH64,
+        },
+    },
     # "rocm": {"index": ROCM_WHEELS_INDEX, "fallback_combo": (...)},  # additive later
 }
 
@@ -66,12 +98,24 @@ def resolve_index_url(backend: str = "cuda") -> str:
         ) from None
 
 
-def resolve_fallback_combo(backend: str = "cuda") -> tuple:
-    """Tier-2 (toolkit, torch) fallback combo for a backend."""
+def resolve_fallback_combo(backend: str = "cuda", arch: Optional[str] = None) -> tuple:
+    """Tier-2 (toolkit, torch) fallback combo for a backend on this machine's CPU.
+
+    `arch` overrides the detected architecture (for tests); it must be one of
+    the keys registered for the backend.
+    """
     try:
-        return WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
+        combos = WHEEL_INDEX_REGISTRY[backend]["fallback_combo"]
     except KeyError:
         raise ValueError(f"no fallback combo registered for backend {backend!r}") from None
+    arch = arch or cpu_arch()
+    try:
+        return combos[arch]
+    except KeyError:
+        raise ValueError(
+            f"no {backend} fallback combo registered for CPU arch {arch!r}; "
+            f"known: {sorted(combos)}"
+        ) from None
 
 # torch.minor -> (torchvision_minor, torchaudio_minor). Used as a fallback
 # when the bootstrap venv doesn't have torchvision/torchaudio installed
@@ -161,9 +205,18 @@ def _pkg_variants(package: str) -> List[str]:
 
 
 def _platform_tags() -> List[str]:
-    """Return platform tags to match against wheel filenames (most specific first)."""
+    """Substrings a wheel filename must contain to be installable on THIS machine.
+
+    The CPU architecture is load-bearing here, not a detail. Matching on bare
+    "manylinux" accepts `...-manylinux_2_34_x86_64.whl` on an ARM host, so the
+    probe reports the package as published, the combo resolves, and pip only
+    refuses it later ("is not a supported wheel on this platform") -- a quiet
+    failure a long way from its cause. Every wheel platform tag ends in the
+    arch, for both the manylinux and the plain linux spellings, so matching the
+    `_<arch>` suffix covers both and excludes the other architecture.
+    """
     if sys.platform.startswith("linux"):
-        return ["manylinux", "linux"]
+        return [f"_{cpu_arch()}"]
     if sys.platform == "win32":
         return ["win_amd64"]
     return []
