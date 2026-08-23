@@ -516,6 +516,32 @@ def fetch_metadata(
         if result.returncode != 0:
             rc = result.returncode
             hex_rc = f" 0x{rc & 0xFFFFFFFF:08X}" if sys.platform == "win32" and rc < 0 else ""
+            # A crash during interpreter teardown does not invalidate a payload that
+            # was already written. Environments bundling native libraries (bpy /
+            # embedded Blender, spconv) can fault on exit -- 0xC0000005 on Windows --
+            # after the scan has fully succeeded. Discarding the payload here makes
+            # every node in the pack silently vanish from the registry.
+            # Trust the file: if it unpickles and contains nodes, salvage it and warn.
+            salvaged = None
+            try:
+                if output_file and os.path.getsize(output_file) > 0:
+                    with open(output_file, "rb") as _f:
+                        candidate = pickle.load(_f)
+                    if candidate.get("nodes"):
+                        salvaged = candidate
+            except Exception:
+                salvaged = None
+            if salvaged is not None:
+                print(f"[comfy-env] Metadata scan for {package_name} crashed on exit "
+                      f"(exit {rc}{hex_rc}) but the payload was complete -- salvaged "
+                      f"{len(salvaged['nodes'])} nodes.", file=sys.stderr, flush=True)
+                try:
+                    cache_file.write_bytes(
+                        pickle.dumps({"cache_key": cache_key, "payload": salvaged})
+                    )
+                except Exception:
+                    pass
+                return salvaged
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             print(f"[comfy-env] Metadata scan failed for {package_name} "
                   f"(exit {rc}{hex_rc}, {elapsed:.1f}s):", file=sys.stderr, flush=True)
