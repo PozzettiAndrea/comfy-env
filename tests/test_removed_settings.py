@@ -74,12 +74,12 @@ def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
     home = tmp_path / "home"
     (home / ".comfy-env").mkdir(parents=True)
     (home / ".comfy-env" / "settings.env").write_text(
-        "COMFY_ENV_ISOLATE=0\nCOMFY_ENV_AUTO_INSTALL=0\n", encoding="utf-8"
+        "COMFY_ENV_ISOLATE=0\nCOMFY_ENV_POOL_IPC=0\n", encoding="utf-8"
     )
     code = (
         "import os, comfy_env.settings as s; "
         "print('ISOLATE-IN-ENV' if 'COMFY_ENV_ISOLATE' in os.environ else 'SKIPPED'); "
-        "print('OTHERS-LOADED' if os.environ.get('COMFY_ENV_AUTO_INSTALL') == '0' else 'OTHERS-MISSING')"
+        "print('OTHERS-LOADED' if os.environ.get('COMFY_ENV_POOL_IPC') == '0' else 'OTHERS-MISSING')"
     )
     env = {
         "PATH": "/usr/bin:/bin",
@@ -91,3 +91,30 @@ def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "SKIPPED" in r.stdout          # removed key never enters os.environ
     assert "OTHERS-LOADED" in r.stdout    # surviving keys still load
+
+
+# --- COMFY_ENV_AUTO_INSTALL (removed 0.4.25) --------------------------------
+# Opposite polarity to the two above: it did nothing when falsy (already the
+# default) and DID something when truthy, so TRUTHY is the semantic inversion
+# here -- the machine was told to self-heal missing envs and no longer will.
+
+def test_truthy_auto_install_fails_the_import():
+    r = _run_with_env("COMFY_ENV_AUTO_INSTALL", "1")
+    assert r.returncode != 0
+    assert "removed in 0.4.25" in r.stderr
+    assert "install() is the only" in r.stderr
+
+
+def test_falsy_auto_install_is_silently_ignored():
+    """It was already the default, so a falsy value never meant anything."""
+    r = _run_with_env("COMFY_ENV_AUTO_INSTALL", "0")
+    assert r.returncode == 0
+    assert "IMPORTED-OK" in r.stdout
+    assert "removed" not in r.stderr
+
+
+def test_auto_install_module_is_gone():
+    """One builder: install/workspace.py. No lazy second implementation."""
+    import importlib
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("comfy_env.isolation.auto_install")

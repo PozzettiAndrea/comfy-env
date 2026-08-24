@@ -271,9 +271,12 @@ def _discover_node_configs(
 
 
 def _bootstrap_torch_pin(bootstrap_torch: Optional[str]) -> Optional[str]:
-    """major.minor wildcard pin (``==2.10.*``), THE pin rule for every
-    builder (install_workspace AND auto_install must agree, or the same env
-    means different things depending on who built it).
+    """major.minor wildcard pin (``==2.10.*``), THE pin rule for env builds.
+
+    Structural since 0.4.25: ``install_workspace`` is the only builder, so
+    there is no second implementation to drift from this. The lazy
+    ``auto_install`` path that used to share it was removed precisely because
+    keeping two builders in agreement proved unenforceable.
 
     major.minor, not the exact patch: must match the granularity of the ABI
     tag that names the env directory (environment/cache.py _abi_tag). A

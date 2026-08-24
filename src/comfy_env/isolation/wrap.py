@@ -106,43 +106,24 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         else:
             return env_dir.resolve() if sys.platform == "win32" else env_dir
 
-    # Auto-install gate. Default OFF -- explicit opt-in via env var because
-    # a synchronous `pixi install` can block ComfyUI startup for minutes on
-    # heavy CUDA nodes. With it ON, missing envs are materialized on first
-    # node load; with it OFF, we log a clear warning and fall back to
-    # in-process import (the legacy behavior).
-    from ..settings import resolve_bool, GENERAL_DEFAULTS
-    auto_install_enabled = resolve_bool(
-        "COMFY_ENV_AUTO_INSTALL", None,
-        GENERAL_DEFAULTS["COMFY_ENV_AUTO_INSTALL"],
-    )
-    if auto_install_enabled:
-        try:
-            from .auto_install import ensure_env_materialized
-            materialized = ensure_env_materialized(
-                env_name=env_name,
-                plugin_dir=plugin_dir,
-                config_path=config_path,
-                comfyui_dir=comfyui_dir,
-                log=_log,
-            )
-            if materialized and materialized.exists():
-                return (
-                    materialized.resolve()
-                    if sys.platform == "win32"
-                    else materialized
-                )
-        except Exception as e:
-            _log(
-                f"[comfy-env] auto-install of `{env_name}` raised "
-                f"{type(e).__name__}: {e}"
-            )
-
+    # Envs are materialized ONLY by install() -- there is one builder
+    # (install/workspace.py). A lazy second path used to exist behind
+    # COMFY_ENV_AUTO_INSTALL; it was removed in 0.4.25 because it diverged
+    # from install_workspace in ways no seal could detect (it skipped the
+    # macOS libomp dedupe and uv's python-preference pinning, both of which
+    # left a permanently-wrong env that every later `comfy-env install`
+    # then SKIPPED as identity-matching).
+    #
+    # The path shown here must work from the user's cwd: bare
+    # `comfy-env install` resolves the config from the CURRENT directory,
+    # so it fails from the ComfyUI root. --dir is the spelling that works
+    # from anywhere.
     _log(
         f"[comfy-env] isolation env not found at {env_dir}: pixi has not "
-        f"materialized `{env_name}`; using in-process import. Run "
-        f"`comfy-env install` to create it, or set "
-        f"COMFY_ENV_AUTO_INSTALL=1 to materialize missing envs at startup."
+        f"materialized `{env_name}`; using in-process import. Build it with "
+        f"`comfy-env install --dir {plugin_dir}` "
+        f"(or `python -m comfy_env.cli install --dir {plugin_dir}` if the "
+        f"console script is not on PATH)."
     )
     return None
 

@@ -17,8 +17,7 @@ sharing).
 No backward compatibility with the v0.3.x single-file layout. Workspaces
 created by v0.3.x (``<workspace>/pixi.toml`` + ``<workspace>/.pixi/envs/<name>/``)
 are invisible to v0.4+; they need to be re-materialized via
-``comfy-env install`` or auto-install at startup
-(``COMFY_ENV_AUTO_INSTALL=1``). User is expected to ``rm -rf`` the legacy
+``comfy-env install``. User is expected to ``rm -rf`` the legacy
 ``<workspace>/.pixi/`` and ``<workspace>/pixi.toml`` once they've moved over.
 """
 

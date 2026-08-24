@@ -27,11 +27,19 @@ SETTINGS_FILE = Path.home() / ".comfy-env" / "settings.env"
 # and disappear on the next save. A falsy env var is a semantic inversion
 # (the machine was told to run un-isolated and no longer will) and fails
 # loudly; a truthy one matches the only behavior that exists now and warns.
-_REMOVED_ENV_VARS = ("COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED")
+_REMOVED_DISABLE_VARS = ("COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED")
+
+# Removed in 0.4.25. Opposite polarity to the two above: this one did nothing
+# when falsy (it was already the default) and DID something when truthy, so the
+# truthy setting is the semantic inversion here -- the machine was told to
+# self-heal missing envs at startup and no longer will.
+_REMOVED_ENABLE_VARS = ("COMFY_ENV_AUTO_INSTALL",)
+
+_REMOVED_ENV_VARS = _REMOVED_DISABLE_VARS + _REMOVED_ENABLE_VARS
 
 
 def _check_removed_env_vars():
-    for _var in _REMOVED_ENV_VARS:
+    for _var in _REMOVED_DISABLE_VARS:
         _val = os.environ.get(_var)
         if _val is None:
             continue
@@ -45,6 +53,23 @@ def _check_removed_env_vars():
                 f"the 'Containers, CI & air-gapped' page in the docs."
             )
         # Truthy matches the only behavior that exists now: silent ignore.
+
+    for _var in _REMOVED_ENABLE_VARS:
+        _val = os.environ.get(_var)
+        if _val is None:
+            continue
+        if _val.strip().lower() not in ("0", "false", "no", "off"):
+            raise RuntimeError(
+                f"[comfy-env] {_var}={_val} was removed in 0.4.25. Envs are no "
+                f"longer materialized lazily at startup: install() is the only "
+                f"builder. A second builder could not be kept in agreement with "
+                f"it -- it silently skipped the macOS libomp dedupe and uv's "
+                f"python pinning, leaving envs that every later install then "
+                f"SKIPPED as up to date. Unset this variable and build envs "
+                f"with `comfy-env install --dir <pack>` (in containers, at "
+                f"image build time -- see 'Containers, CI & air-gapped')."
+            )
+        # Falsy always was a no-op (the default was off): silent ignore.
 
 
 _check_removed_env_vars()
@@ -76,12 +101,10 @@ def _is_on(var: str, default: bool = False) -> bool:
 
 # General settings
 GENERAL_SETTINGS = [
-    ("COMFY_ENV_AUTO_INSTALL", "Auto-materialize missing envs on first node load (blocks startup)"),
     ("COMFY_ENV_POOL_IPC", "Pool IPC (zero-copy GPU tensor transfer)"),
 ]
 
 GENERAL_DEFAULTS = {
-    "COMFY_ENV_AUTO_INSTALL": False,   # OFF by default -- explicit opt-in (multi-min installs)
     "COMFY_ENV_POOL_IPC": False,
 }
 
