@@ -326,18 +326,9 @@ def _serialize_cuda_ipc(t) -> dict:
         func, args = reductions.reduce_tensor(t)
     except RuntimeError as e:
         if "received from another process" in str(e):
-            # BUG FIX: retain the clone. CUDA IPC has no cross-process
-            # refcount -- the EXPORTER must keep the allocation alive until
-            # the importer maps it. This function returns base64 handles and
-            # no tensor reference, so without this keep() the clone is
-            # unreferenced the moment we return, and the worker imports a
-            # handle onto freed device memory.
-            #
-            # tensor_utils' 30s keeper used to be the only thing under this
-            # branch, and it only covers callers that came through
-            # prepare_for_ipc_recursive (the two proxy bodies in metadata.py).
-            # Anything else reaching here -- call_module from the pool/route
-            # path, a tensor nested in a pack object -- had no keeper at all.
+            # CUDA IPC has no cross-process refcount: the EXPORTER keeps the
+            # allocation alive until the importer maps it. We return handles
+            # and no tensor, so the keeper is the clone's only reference.
             t = t.clone()
             _parent_tensor_keeper.keep(t)
             func, args = reductions.reduce_tensor(t)

@@ -1,21 +1,7 @@
-"""Contract: the per-call _call_state protocol, which three copies got wrong.
+"""Contract: the per-call _ipc_parent._call_state protocol.
 
-Three of the seven defects found in the 2026-08 transport review were the same
-shape -- an invariant maintained in three places (call_method / call_module /
-echo), two right and one wrong:
-
-  * echo() never set `worker_pool`, so a PoolIPC reply arrived with no pool
-    handle. verify_transport() uses echo as its ORACLE, so its bare except
-    swallowed the resulting error and Pool IPC demoted itself permanently on
-    every worker -- reported as a routine capability probe.
-  * All three `finally` blocks cleared `gpu_demoted` with the constant False
-    rather than restoring it, while _lock is an RLock *specifically* so
-    VRAM-eviction callbacks can re-enter on the same thread.
-
-These tests pin the protocol itself rather than any one caller, so a fourth
-entry point cannot be added with two thirds of it. No torch, no GPU, no
-subprocess -- deliberately, because the GPU lane that would have caught the
-first bug does not exist (pytest.mark.gpu is declared and applied to nothing).
+Pins the protocol rather than any one caller: call_method, call_module and
+echo each maintained it by hand, and echo was missing a third of it.
 """
 
 import ast
@@ -109,24 +95,57 @@ def test_scope_is_thread_local():
     assert seen == {"a": "POOL_A", "b": "POOL_B"}, seen
 
 
-def test_every_rpc_entry_point_uses_the_scope():
-    """A fourth caller must not be able to hand-roll two thirds of the protocol.
+def test_every_rpc_entry_point_restores_the_scope(monkeypatch):
+    """Every entry point must leave _call_state as it found it, win or lose.
 
-    This is the check that would have caught the echo bug: it asserts the
-    protocol is centralised, not that any one caller happens to be correct.
+    Asserted by observation, not by grepping the source for a call: a shared
+    decorator or pushing the scope into _send_request would satisfy this and
+    should not have to fail it.
     """
-    import inspect
-
     from comfy_env.isolation.workers import subprocess as sp
 
-    for name in ("call_method", "call_module", "echo"):
-        src = inspect.getsource(getattr(sp.SubprocessWorker, name))
-        assert "_enter_call_scope" in src, f"{name} does not enter the call scope"
-        assert "_exit_call_scope" in src, f"{name} does not exit the call scope"
-        # And nobody reintroduces the constant-assignment form.
-        assert "gpu_demoted = False" not in src, (
-            f"{name} assigns gpu_demoted a constant instead of restoring it"
-        )
+    calls = {
+        "call_method": (("mod", "Cls", "meth"), {}),
+        "call_module": (("mod", "func"), {}),
+        "echo": ((), {}),
+    }
+
+    for name, (args, kwargs) in calls.items():
+        for failing in (False, True):
+            worker = sp.SubprocessWorker.__new__(sp.SubprocessWorker)
+            worker.name = "scope-worker"
+            worker._lock = threading.RLock()
+            worker.gpu_zero_copy_ok = False        # demoted, must survive
+            worker._worker_pool = "POOL"
+            worker._call_counter = 0
+            worker._shutdown = False
+            worker._last_new_models = []
+            worker.default_timeout = 5
+
+            def _send_request(request, timeout):
+                assert _state() == (True, "POOL"), (
+                    f"{name} did not establish the scope before sending"
+                )
+                if failing:
+                    raise RuntimeError("worker exploded")
+                return {"status": "ok", "result": None, "call_id": request.get("call_id")}
+
+            monkeypatch.setattr(worker, "_send_request", _send_request, raising=False)
+            monkeypatch.setattr(worker, "_ensure_started", lambda: None, raising=False)
+
+            sentinel = _enter_call_scope(_FakeWorker(zero_copy_ok=True, pool="OUTER"))
+            try:
+                try:
+                    getattr(worker, name)(*args, **kwargs)
+                except Exception:
+                    if not failing:
+                        raise
+                assert _state() == (False, "OUTER"), (
+                    f"{name} did not restore the outer scope "
+                    f"({'exception' if failing else 'success'} path)"
+                )
+            finally:
+                _exit_call_scope(sentinel)
 
 
 def test_auto_registration_hooks_are_installed_at_worker_startup():
