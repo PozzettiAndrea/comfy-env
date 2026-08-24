@@ -15,14 +15,14 @@ import tempfile
 import time
 from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "13"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "14"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _log(msg: str) -> None:
@@ -223,6 +223,42 @@ if not _class_map and _has_entrypoint:
             print(f"[meta-scan] comfy_entrypoint failed: {_v3_error}",
                   file=sys.stderr, flush=True)
 
+_ACCEL_VOCAB = ("cuda", "rocm", "xpu", "mps")
+
+
+def _normalize_accel(value, node_name):
+    """ACCELERATOR -> sorted list of backends, or None for CPU-capable.
+
+    Accepts a string or a list/tuple: a node that runs on some but not all
+    GPU backends says so directly (["cuda", "mps"]). There is no "any GPU"
+    sentinel -- spell out the backends the node actually supports.
+
+    An unrecognized value is a hard error. It used to be str()'d into
+    something no backend could ever equal, which hid the node on EVERY
+    machine, silently, including one with the right hardware.
+    """
+    if not value:
+        return None
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        raise TypeError(
+            "%s: ACCELERATOR must be a string or a list of strings, got %s"
+            % (node_name, type(value).__name__))
+    out = []
+    for item in items:
+        key = str(item).strip().lower()
+        if key not in _ACCEL_VOCAB:
+            raise ValueError(
+                "%s: ACCELERATOR value %r is not a known backend (%s)"
+                % (node_name, item, ", ".join(_ACCEL_VOCAB)))
+        if key not in out:
+            out.append(key)
+    return sorted(out)
+
+
 nodes = {}
 for name, cls in _class_map.items():
     meta = {
@@ -235,11 +271,10 @@ for name, cls in _class_map.items():
         "input_is_list": getattr(cls, "INPUT_IS_LIST", None),
         "module_name": cls.__module__,
         "class_name": cls.__name__,
-        # Accelerator declaration (comfy-env convention): "cuda" | "rocm" |
-        # "xpu" | "mps" | "gpu" | None. Meaning: node REQUIRES this backend
-        # at execution time; absent/None = CPU-capable.
-        "accelerator": (str(getattr(cls, "ACCELERATOR", None))
-                        if getattr(cls, "ACCELERATOR", None) else None),
+        # Accelerator declaration (comfy-env convention): a sorted list of
+        # "cuda" / "rocm" / "xpu" / "mps", or None. Meaning: the node
+        # REQUIRES one of these backends at execution; absent = CPU-capable.
+        "accelerator": _normalize_accel(getattr(cls, "ACCELERATOR", None), name),
     }
     # Call INPUT_TYPES classmethod
     if hasattr(cls, "INPUT_TYPES") and callable(cls.INPUT_TYPES):
@@ -950,17 +985,16 @@ def _machine_backend() -> str:
     return _MACHINE_BACKEND
 
 
-def _accelerator_available(accel: Optional[str]) -> bool:
-    """Can a node declaring ACCELERATOR=accel execute on this machine?
+def _accelerator_available(accels: Optional[List[str]]) -> bool:
+    """Can a node declaring these accelerators execute on this machine?
 
-    None/empty = CPU-capable, always available. "gpu" = any non-cpu backend.
+    None/empty = CPU-capable, always available. Otherwise this machine's
+    backend must be one of them. The scan normalizes the declaration to a
+    list (_normalize_accel), so there is no scalar case to handle here.
     """
-    if not accel:
+    if not accels:
         return True
-    backend = _machine_backend()
-    if accel == "gpu":
-        return backend != "cpu"
-    return backend == accel
+    return _machine_backend() in accels
 
 
 def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
@@ -971,14 +1005,15 @@ def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
     outputs, badges its description, and raises a named-reason error when
     executed.
     """
-    accel = meta.get("accelerator")
+    accel = meta.get("accelerator") or []
     backend = _machine_backend()
+    names = " or ".join(a.upper() for a in accel)
     reason = (
-        f"Node '{node_name}' requires {str(accel).upper()}; this machine has "
+        f"Node '{node_name}' requires {names}; this machine has "
         f"backend '{backend}'"
-        + (" (no NVIDIA GPU detected)" if accel == "cuda" and backend == "cpu" else "")
+        + (" (no NVIDIA GPU detected)" if accel == ["cuda"] and backend == "cpu" else "")
         + ". Use a CPU-capable alternative node or run on a machine with "
-        f"{str(accel).upper()}."
+        f"{names}."
     )
     input_types = meta.get("input_types", {"required": {}})
     func_name = meta.get("function") or "execute"
@@ -993,7 +1028,7 @@ def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
         "CATEGORY": meta.get("category", ""),
         "OUTPUT_NODE": meta.get("output_node", False),
         "INPUT_TYPES": classmethod(lambda cls, _cached=input_types: _cached),
-        "DESCRIPTION": f"(requires {str(accel).upper()} -- unavailable on this machine)",
+        "DESCRIPTION": f"(requires {names} -- unavailable on this machine)",
         # ADR-0012: hidden from the node picker (ComfyUI hides DEPRECATED
         # nodes from menu/search) but still REGISTERED so shared workflows
         # load and dispatcher node-ids resolve.
@@ -1003,7 +1038,7 @@ def _build_unavailable_stub(node_name: str, meta: Dict[str, Any]) -> type:
         "_comfy_env_unavailable": reason,
         func_name: _raiser,
     }
-    print(f"[comfy-env] {node_name}: requires {accel}, machine backend is "
+    print(f"[comfy-env] {node_name}: requires {names}, machine backend is "
           f"'{backend}' -- registered but hidden from the node menu",
           file=sys.stderr, flush=True)
     return type(f"ComfyEnvUnavailable_{meta.get('class_name', node_name)}", (), attrs)

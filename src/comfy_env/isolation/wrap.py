@@ -576,8 +576,11 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     unavailable = [n for n, c in all_mappings.items()
                    if getattr(c, "_comfy_env_unavailable", None)]
     if unavailable:
-        accels = sorted({str(getattr(all_mappings[n], "_comfy_env_accelerator", "?"))
-                         for n in unavailable})
+        # _comfy_env_accelerator is a LIST -- flatten across nodes so the
+        # summary reads "cuda/mps", not "['cuda']/['cuda', 'mps']".
+        accels = sorted({a for n in unavailable
+                         for a in (getattr(all_mappings[n],
+                                           "_comfy_env_accelerator", None) or ["?"])})
         _log(f"[comfy-env] WARNING: {len(unavailable)} node(s) require "
              f"{'/'.join(accels)} but no such accelerator is present on this "
              f"machine -- registered but hidden from the node menu: "
