@@ -208,14 +208,9 @@ def cmd_doctor(args) -> int:
         print("  No packages to verify")
 
     print("\n3. Accelerator import rule")
-    from .lint import lint_accelerator_imports
-    findings = lint_accelerator_imports(Path.cwd())
-    if not findings:
-        print("  OK -- no top-level accelerator imports found")
-    for f in findings:
-        print(f"  [{f['level'].upper()}] {f['file']}:{f['line']}: {f['message']}")
-    if any(f["level"] == "error" for f in findings):
-        rc = 1
+    print("  Moved to `comfy-test lint --check accel`, which runs it in CI and")
+    print("  resolves import names exactly from env.stamp.json rather than")
+    print("  guessing them (faithc-aot installs `faithcontour`).")
     return rc
 
 
@@ -617,7 +612,7 @@ def cmd_gc(args) -> int:
     import shutil
 
     from .environment.cache import (
-        get_env_name, get_workspace_dir, _env_dir_name,
+        get_workspace_dir, _env_dir_name,
     )
     from .install.workspace import _discover_node_configs
 

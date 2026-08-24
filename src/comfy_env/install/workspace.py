@@ -30,7 +30,6 @@ from ..config import (
     ComfyEnvConfig,
     load_config,
     CONFIG_FILE_NAME,
-    ROOT_CONFIG_FILE_NAME,
 )
 from ..environment.cache import get_env_name
 from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py, _find_uv
@@ -717,13 +716,12 @@ def install_workspace(
         chosen_torch_index: Optional[str] = None
         chosen_torch_pin_for_override: Optional[str] = None
         if combo is not None:
-            chosen_python, chosen_cuda, chosen_torch_short, chosen_torch_pin_for_override, combo_src = combo
+            _, chosen_cuda, chosen_torch_short, chosen_torch_pin_for_override, combo_src = combo
             chosen_torch_index = (
                 f"https://download.pytorch.org/whl/cu"
                 f"{chosen_cuda.replace('.', '')[:3]}"
             )
         else:
-            chosen_python = bootstrap_python
             chosen_cuda = cuda_version
             chosen_torch_short = (
                 ".".join(bootstrap_torch.split(".")[:2]) if bootstrap_torch else None
@@ -923,6 +921,56 @@ def install_workspace(
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         _dedupe_envs_libomp(workspace_dir, to_install, log)
 
+        # Resolve declared [cuda] packages to the import names they actually
+        # install, by asking the env's own interpreter. importlib.metadata
+        # inverts RECORD for us; there is no way to compute this from the
+        # distribution name (faithc-aot installs `faithcontour`), and this is
+        # the only moment the env is guaranteed to exist and be complete.
+        def _resolve_accel_imports(env_name, cuda_packages):
+            if not cuda_packages:
+                return {}
+            import json
+            import subprocess
+
+            from ..environment.cache import get_workspace_env_dir
+            env_dir = get_workspace_env_dir(workspace_dir, env_name)
+            py = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
+            if not py.is_file():
+                return {}
+            script = (
+                "import json,sys\n"
+                "from importlib.metadata import packages_distributions\n"
+                "want={p.strip().lower().replace('_','-') for p in sys.argv[1:]}\n"
+                "out={}\n"
+                "for imp,dists in packages_distributions().items():\n"
+                "    for d in dists:\n"
+                "        k=d.lower().replace('_','-')\n"
+                "        if k in want: out.setdefault(k,[]).append(imp)\n"
+                "print(json.dumps({k:sorted(set(v)) for k,v in out.items()}))\n"
+            )
+            try:
+                r = subprocess.run(
+                    [str(py), "-c", script, *[str(p) for p in cuda_packages]],
+                    capture_output=True, text=True, timeout=60)
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr.strip()[:200] or "non-zero exit")
+                mapping = json.loads(r.stdout.strip() or "{}")
+            except Exception as e:
+                # Best-effort: a missing mapping degrades a downstream static
+                # check to "could not verify", never to a wrong answer.
+                log(f"[comfy-env] {env_name}: could not resolve accelerator "
+                    f"import names ({e}); stamp records none")
+                return {}
+            missing = [str(p) for p in cuda_packages
+                       if str(p).lower().replace("_", "-") not in mapping]
+            if missing:
+                # Expected on a machine with no GPU: [cuda] packages are not
+                # resolved or installed at all there (see the GPU-override
+                # note above), so there is nothing to map.
+                log(f"[comfy-env] {env_name}: no import names for "
+                    f"{', '.join(missing)} (not installed in this env)")
+            return mapping
+
         # Stamp each freshly-built env with what it was built from/against.
         # `_find_env_dir` validates this at bind time: today an env is trusted
         # because its directory exists, which is how a foreign-stack env gets
@@ -944,6 +992,7 @@ def install_workspace(
                 get_env_manifest_dir(env_name, comfyui_dir),
                 torch_pin=stamp_pin,
                 provenance=prov,
+                accel_imports=_resolve_accel_imports(env_name, _cfg.cuda_packages),
                 log=log,
             )
 

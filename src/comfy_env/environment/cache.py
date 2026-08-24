@@ -300,7 +300,8 @@ def get_workspace_env_dir(comfyui_dir, env_name):
 _STAMP_FILE = "env.stamp.json"
 
 
-def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown", log=None):
+def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown",
+                    accel_imports=None, log=None):
     """Record what an env was built from and against, next to its manifest.
 
     Written only after a successful install. `validate_env_stamp` checks it at
@@ -308,6 +309,14 @@ def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown", log=
     exists, and a foreign-stack env gets loaded into torch's private
     multiprocessing ABI (reduce_storage/rebuild_cuda_tensor) which has no
     version handshake of its own.
+
+    `accel_imports` maps each declared `[cuda]` package to the top-level import
+    names it actually installs -- `{"faithc-aot": ["faithcontour"]}`. A
+    distribution name is not an import name and cannot be derived from one, so
+    any check running outside the env (a linter on a bare checkout) can only
+    guess. Install is the one moment the answer is knowable, because the env
+    exists and its metadata is readable. Writing it down here is what lets a
+    later static check be exact instead of approximate.
     """
     import hashlib as _hashlib
     import json as _json
@@ -328,6 +337,7 @@ def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown", log=
         "torch_pin": torch_pin,
         "provenance": provenance,
         "pixi_lock_sha256": lock_sha,
+        "accel_imports": accel_imports or {},
     }
     try:
         (env_manifest_dir / _STAMP_FILE).write_text(
