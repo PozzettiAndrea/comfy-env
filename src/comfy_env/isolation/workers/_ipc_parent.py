@@ -86,8 +86,14 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
             sock.listen(1)
             return sock, f"abstract://{abstract_name[1:]}"
         else:
-            # macOS/other: filesystem sockets (no abstract namespace support)
-            sock_path = _get_socket_dir() / f"comfy_worker_{uuid.uuid4().hex[:SOCKET_ID_LENGTH]}.sock"
+            # macOS/other: filesystem sockets (no abstract namespace support).
+            # The name carries THIS process's pid: the file is only unlinked at
+            # clean shutdown, so a live instance's socket sits on disk for its
+            # whole session, and the startup reaper needs a way to tell it from
+            # one a crashed instance left behind (pool.py:_cleanup_stale_workers).
+            sock_path = (_get_socket_dir() /
+                         f"comfy_worker_{os.getpid()}_"
+                         f"{uuid.uuid4().hex[:SOCKET_ID_LENGTH]}.sock")
             try:
                 sock_path.unlink()
             except FileNotFoundError:

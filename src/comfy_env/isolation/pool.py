@@ -12,12 +12,11 @@ import asyncio  # noqa: F401 -- used lazily in route proxies
 import atexit
 import glob
 import os
+import re
 import shutil
-import signal
 import sys
 import tempfile
 import threading
-import time
 import weakref  # noqa: F401 -- used in _register_new_patchers
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,90 +44,76 @@ _WORKER_GENERATION = 0  # Monotonically increasing; incremented on each new work
 
 
 def _cleanup_stale_workers():
-    """Kill orphaned worker processes and remove stale temp directories on startup.
+    """Kill worker processes and remove socket/temp litter left by a DEAD
+    ComfyUI, on startup.
 
-    Only kills workers whose parent process no longer exists - safe for multiple
-    ComfyUI instances running on the same machine.
+    Everything here is guarded by "is the owning process still alive?", so a
+    second ComfyUI running on the same machine is never touched. psutil is
+    available unconditionally -- ComfyUI itself depends on it
+    (requirements.txt, and comfy/model_management.py imports it).
     """
     global _CLEANUP_DONE
     if _CLEANUP_DONE:
         return
     _CLEANUP_DONE = True
 
+    import psutil
+
     temp_dir = tempfile.gettempdir()
 
-    # Find stale socket files
+    # Sockets. A unix socket file is unlinked only on CLEAN shutdown
+    # (workers/subprocess.py, _shutdown), so a live instance's socket sits on
+    # disk for its entire session and is indistinguishable by name from one a
+    # crashed instance abandoned. The owning pid is in the filename for
+    # exactly this reason. Deleting a live sibling's socket does not break
+    # connections already established, but a worker that has not dialed in yet
+    # can no longer reach it.
+    # Linux binds in the ABSTRACT namespace (no filesystem entry), so this
+    # only ever finds anything on macOS/Windows.
+    sock_owner = re.compile(r"^comfy_worker_(\d+)_[0-9a-f]+\.sock$")
     socket_patterns = [
-        "/dev/shm/comfy_worker_*.sock",  # Linux shared memory
-        os.path.join(temp_dir, "comfy_worker_*.sock"),  # Fallback
+        "/dev/shm/comfy_worker_*.sock",
+        os.path.join(temp_dir, "comfy_worker_*.sock"),
     ]
-
     for pattern in socket_patterns:
         for sock_file in glob.glob(pattern):
+            m = sock_owner.match(os.path.basename(sock_file))
+            # No pid in the name: written by a comfy-env older than this one.
+            # Pre-1.0 ships as a barrage, so a sibling that old is not a case
+            # we carry -- treat it as litter, which is the old behavior.
+            if m and psutil.pid_exists(int(m.group(1))):
+                continue
             try:
                 os.unlink(sock_file)
                 print(f"[comfy-env] Removed stale socket: {sock_file}")
             except Exception:
                 pass
 
-    # Kill only ORPHANED worker processes (parent PID no longer exists)
-    # This is safe for multiple ComfyUI instances on same machine
-    try:
-        import psutil
-        for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
-            try:
-                cmdline = proc.info.get('cmdline') or []
-                if any('persistent_worker.py' in arg for arg in cmdline):
-                    parent_pid = proc.info.get('ppid')
-                    # Check if parent process still exists
-                    if parent_pid and not psutil.pid_exists(parent_pid):
-                        print(f"[comfy-env] Killing orphaned worker (parent {parent_pid} dead): {proc.pid}")
-                        proc.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-    except ImportError:
-        # psutil not available - use /proc on Linux
-        if sys.platform == 'linux':
-            for pid_dir in glob.glob('/proc/[0-9]*'):
-                try:
-                    pid = int(os.path.basename(pid_dir))
-                    with open(f'{pid_dir}/cmdline', 'rb') as f:
-                        cmdline = f.read().decode('utf-8', errors='ignore')
-                    if 'persistent_worker.py' in cmdline:
-                        with open(f'{pid_dir}/stat', 'r') as f:
-                            stat = f.read().split()
-                            ppid = int(stat[3])
-                        # Check if parent exists
-                        if not os.path.exists(f'/proc/{ppid}'):
-                            print(f"[comfy-env] Killing orphaned worker (parent {ppid} dead): {pid}")
-                            os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
-
-    # Find and remove stale temp directories
-    stale_dirs = glob.glob(os.path.join(temp_dir, "comfyui_pvenv_*"))
-    for stale_dir in stale_dirs:
+    # Worker processes whose parent is gone.
+    for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
         try:
-            # Check if any process is using this directory
+            cmdline = proc.info.get('cmdline') or []
+            if any('persistent_worker.py' in arg for arg in cmdline):
+                parent_pid = proc.info.get('ppid')
+                if parent_pid and not psutil.pid_exists(parent_pid):
+                    print(f"[comfy-env] Killing orphaned worker (parent {parent_pid} dead): {proc.pid}")
+                    proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # Temp dirs no live process is sitting in.
+    for stale_dir in glob.glob(os.path.join(temp_dir, "comfyui_pvenv_*")):
+        try:
             dir_in_use = False
-            try:
-                import psutil
-                for proc in psutil.process_iter(['pid', 'cmdline', 'cwd']):
-                    try:
-                        cwd = proc.info.get('cwd') or ''
-                        cmdline = ' '.join(proc.info.get('cmdline') or [])
-                        if stale_dir in cwd or stale_dir in cmdline:
-                            dir_in_use = True
-                            break
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            except ImportError:
-                # No psutil - check if worker script exists and is recent (< 1 hour)
-                worker_script = os.path.join(stale_dir, 'persistent_worker.py')
-                if os.path.exists(worker_script):
-                    age_hours = (time.time() - os.path.getmtime(worker_script)) / 3600
-                    if age_hours < 1:
-                        dir_in_use = True  # Assume in use if recent
+            for proc in psutil.process_iter(['pid', 'cmdline', 'cwd']):
+                try:
+                    cwd = proc.info.get('cwd') or ''
+                    cmdline = ' '.join(proc.info.get('cmdline') or [])
+                    if stale_dir in cwd or stale_dir in cmdline:
+                        dir_in_use = True
+                        break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
             if not dir_in_use:
                 shutil.rmtree(stale_dir)
