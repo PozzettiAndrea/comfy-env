@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from comfy_env.config import load_config
+from conftest import subprocess_env
 
 
 def _root(tmp_path, body):
@@ -41,12 +42,7 @@ def test_any_settings_table_hits_the_closed_schema(tmp_path, body):
 def _run_with_env(var, value):
     """Import comfy_env.settings under a controlled environment."""
     code = "import comfy_env.settings; print('IMPORTED-OK')"
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": "/nonexistent-so-settings-env-is-absent",
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        var: value,
-    }
+    env = subprocess_env(**{var: value})
     return subprocess.run(
         [sys.executable, "-c", code], env=env, capture_output=True, text=True,
     )
@@ -81,11 +77,7 @@ def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
         "print('ISOLATE-IN-ENV' if 'COMFY_ENV_ISOLATE' in os.environ else 'SKIPPED'); "
         "print('OTHERS-LOADED' if os.environ.get('COMFY_ENV_POOL_IPC') == '0' else 'OTHERS-MISSING')"
     )
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(home),
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-    }
+    env = subprocess_env(HOME=str(home), USERPROFILE=str(home))
     r = subprocess.run([sys.executable, "-c", code], env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr

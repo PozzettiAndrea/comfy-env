@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from comfy_env.environment import RuntimeEnv
+from conftest import subprocess_env
 
 # Renaming any of these is a breaking change for comfy-test.
 CONTRACT_FIELDS = {
@@ -43,10 +44,7 @@ def test_detect_survives_a_machine_with_no_workspace_and_no_torch(monkeypatch):
 def _cli(*args):
     return subprocess.run(
         [sys.executable, "-m", "comfy_env.cli", *args],
-        capture_output=True, text=True,
-        env={"PATH": "/usr/bin:/bin",
-             "HOME": "/nonexistent-so-settings-env-is-absent",
-             "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        capture_output=True, text=True, env=subprocess_env(),
     )
 
 
