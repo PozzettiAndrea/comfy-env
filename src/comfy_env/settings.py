@@ -108,6 +108,16 @@ GENERAL_DEFAULTS = {
     "COMFY_ENV_POOL_IPC": False,
 }
 
+# String settings. Unlike the boolean/numeric tables these are read at their
+# point of use (each has a non-trivial default to compute), so this table is
+# documentation for the settings surface rather than a resolution mechanism.
+STRING_SETTINGS = [
+    ("COMFY_ENV_ROOT",
+     "Workspace root where envs materialize (default: platform-specific)"),
+    ("COMFY_ENV_CUDA_WHEELS_INDEX",
+     "cuda-wheels index base URL -- point at a mirror for air-gapped sites"),
+]
+
 # Numeric settings
 # Empty since 0.4.25 -- COMFY_ENV_WORKER_VRAM_BUDGET (manual per-worker VRAM
 # cap) was removed: the budget-negotiation callback computes the honest number

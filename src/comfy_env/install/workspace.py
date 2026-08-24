@@ -488,7 +488,7 @@ def _resolve_wheel_combo(
     from ..packages.cuda_wheels import (
         check_all_wheels_available,
         resolve_fallback_combo,
-        CUDA_WHEELS_INDEX,
+        cuda_wheels_index,
     )
 
     log(
@@ -579,7 +579,7 @@ def _resolve_wheel_combo(
         f" -- missing or untried\n"
         f"  tier 2 (fallback):  cu{fb_cuda}/torch{fb_torch}.*"
         f" -- {miss} missing\n"
-        f"Check {CUDA_WHEELS_INDEX}{miss}/ and update the cuda-wheels build matrix."
+        f"Check {cuda_wheels_index()}{miss}/ and update the cuda-wheels build matrix."
     )
 
 

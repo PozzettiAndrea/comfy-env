@@ -21,7 +21,41 @@ except Exception:
 
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
-CUDA_WHEELS_INDEX = "https://pozzettiandrea.github.io/cuda-wheels/v2/"
+CUDA_WHEELS_INDEX_DEFAULT = "https://pozzettiandrea.github.io/cuda-wheels/v2/"
+
+
+def cuda_wheels_index() -> str:
+    """The cuda-wheels index base URL, with a trailing slash.
+
+    Override with ``COMFY_ENV_CUDA_WHEELS_INDEX`` (env var, or a line in
+    ``~/.comfy-env/settings.env`` -- that file is loaded into ``os.environ``
+    with ``setdefault``, so one lookup covers both tiers). The point is
+    mirrors: an air-gapped or bandwidth-limited site can serve the same
+    directory listing from its own host without patching comfy-env.
+
+    Resolved per call rather than frozen at import so a test or a caller can
+    change it without reloading the module.
+
+    !! This URL is a TRUST boundary. Wheels from it are installed with
+    ``uv pip install --no-deps`` against direct links and are NOT hash-checked
+    here, so whatever it serves executes at import time inside the isolated
+    env. Point it only at an index you control or trust as much as the
+    default (ADR-0026).
+    """
+    import os
+    # Importing settings has the side effect of loading ~/.comfy-env/settings.env
+    # into os.environ; without it a file-only override would be invisible here.
+    from .. import settings  # noqa: F401
+    raw = (os.environ.get("COMFY_ENV_CUDA_WHEELS_INDEX") or "").strip()
+    if not raw:
+        return CUDA_WHEELS_INDEX_DEFAULT
+    # Every call site does f"{index}{pkg}/", so a missing trailing slash would
+    # silently build ".../v2flash_attn/" instead of failing.
+    return raw if raw.endswith("/") else raw + "/"
+
+
+# Back-compat alias for readers that want the default without calling.
+CUDA_WHEELS_INDEX = CUDA_WHEELS_INDEX_DEFAULT
 
 
 def _ssl_context() -> Optional[ssl.SSLContext]:
@@ -75,7 +109,8 @@ FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
 # instead of hardcoding an index; adding `rocm` is one dict entry + a rocm resolver.
 WHEEL_INDEX_REGISTRY: dict[str, dict] = {
     "cuda": {
-        "index": CUDA_WHEELS_INDEX,
+        # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().
+        "index": None,
         # Keyed by CPU arch: the fallback is a claim about published wheels, and
         # what upstream publishes differs per architecture.
         "fallback_combo": {
@@ -90,6 +125,9 @@ WHEEL_INDEX_REGISTRY: dict[str, dict] = {
 def resolve_index_url(backend: str = "cuda") -> str:
     """Wheel-index base URL for a backend. Raises for an unregistered backend."""
     try:
+        WHEEL_INDEX_REGISTRY[backend]          # membership check
+        if backend == "cuda":
+            return cuda_wheels_index()
         return WHEEL_INDEX_REGISTRY[backend]["index"]
     except KeyError:
         raise ValueError(
@@ -332,7 +370,7 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
     attempted = []
     deferred_errors = []
     for pkg_dir in _pkg_variants(package):
-        index_url = f"{CUDA_WHEELS_INDEX}{pkg_dir}/"
+        index_url = f"{cuda_wheels_index()}{pkg_dir}/"
         if index_url in attempted:
             continue
         attempted.append(index_url)
@@ -349,7 +387,7 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
             wheel_url, display = match.group(1), match.group(2)
             if any(p in display for p in local_patterns) and py_tag in display:
                 if not platform_tags or any(t in display for t in platform_tags):
-                    url = wheel_url if wheel_url.startswith("http") else f"{CUDA_WHEELS_INDEX}{pkg_dir}/{wheel_url}"
+                    url = wheel_url if wheel_url.startswith("http") else f"{cuda_wheels_index()}{pkg_dir}/{wheel_url}"
                     candidates.append((url, display))
 
     if candidates:
@@ -384,7 +422,7 @@ def find_available_wheels(package: str) -> List[str]:
     link_pattern = re.compile(r'href="[^"]*?([^"/]+\.whl)"', re.IGNORECASE)
     for pkg_dir in _pkg_variants(package):
         try:
-            with urllib.request.urlopen(f"{CUDA_WHEELS_INDEX}{pkg_dir}/", timeout=10) as resp:
+            with urllib.request.urlopen(f"{cuda_wheels_index()}{pkg_dir}/", timeout=10) as resp:
                 html = resp.read().decode("utf-8")
             for match in link_pattern.finditer(html):
                 name = match.group(1).replace("%2B", "+")
@@ -417,7 +455,7 @@ def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> 
 
     for pkg_dir in _pkg_variants(package):
         try:
-            with urllib.request.urlopen(f"{CUDA_WHEELS_INDEX}{pkg_dir}/", timeout=10) as resp:
+            with urllib.request.urlopen(f"{cuda_wheels_index()}{pkg_dir}/", timeout=10) as resp:
                 html = resp.read().decode("utf-8")
         except Exception: continue
 
@@ -439,4 +477,4 @@ def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> 
 
 
 def get_find_links_urls(package: str) -> List[str]:
-    return [f"{CUDA_WHEELS_INDEX}{p}/" for p in _pkg_variants(package)]
+    return [f"{cuda_wheels_index()}{p}/" for p in _pkg_variants(package)]

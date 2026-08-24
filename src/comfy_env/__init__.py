@@ -73,6 +73,7 @@ _INTERNAL = {
     "PIXI": "comfy_env.pixi",
     "ensure_pixi": "comfy_env.pixi",
     "CUDA_WHEELS_INDEX": "comfy_env.packages.cuda_wheels",
+    "cuda_wheels_index": "comfy_env.packages.cuda_wheels",
     "get_wheel_url": "comfy_env.packages.cuda_wheels",
     "get_cuda_torch_mapping": "comfy_env.packages.cuda_wheels",
     "get_env_name": "comfy_env.environment.cache",
