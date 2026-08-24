@@ -49,8 +49,8 @@ def _check_removed_env_vars():
                 f"longer disable anything: isolation is always on, and missing "
                 f"envs fall back per-env automatically. Unset this variable "
                 f"(check your shell profile, Dockerfile/CI, systemd units). "
-                f"For containers, materialize envs at image build time -- see "
-                f"the 'Containers, CI & air-gapped' page in the docs."
+                f"In a container, run `comfy-env install --dir <pack>` at image "
+                f"build time so the runtime never needs the network."
             )
         # Truthy matches the only behavior that exists now: silent ignore.
 
@@ -66,8 +66,8 @@ def _check_removed_env_vars():
                 f"it -- it silently skipped the macOS libomp dedupe and uv's "
                 f"python pinning, leaving envs that every later install then "
                 f"SKIPPED as up to date. Unset this variable and build envs "
-                f"with `comfy-env install --dir <pack>` (in containers, at "
-                f"image build time -- see 'Containers, CI & air-gapped')."
+                f"with `comfy-env install --dir <pack>` (in a container, at "
+                f"image build time)."
             )
         # Falsy always was a no-op (the default was off): silent ignore.
 
