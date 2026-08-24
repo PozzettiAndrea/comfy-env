@@ -677,15 +677,21 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     Args:
         obj: Object to serialize
         registry: List to track SharedMemory objects for cleanup
-        visited: Dict tracking already-serialized objects (cycle detection)
+        visited: memo of already-serialized objects, id(obj) -> (obj, result).
+            Deduplicates shared references; it does NOT detect cycles, because
+            containers record themselves only after descending into children.
         tensor_serializer: Callable(tensor, registry, visited) -> dict metadata
         node_output_serializer: Optional callable for NodeOutput objects
     """
     from pathlib import PurePath
 
+    # Memo key is id(obj), so the memo must also hold a REFERENCE to obj:
+    # a value produced during the walk (a computed property, a dtype
+    # conversion) is freed on return and CPython hands the same address to the
+    # next field's temporary, which would then read this entry as its own.
     obj_id = id(obj)
     if obj_id in visited:
-        return visited[obj_id]
+        return visited[obj_id][1]
 
     t = type(obj).__name__
 
@@ -703,7 +709,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     # Held pickled bytes (class not importable here) -> fresh pickle block.
     if isinstance(obj, OpaquePickle):
         result = _pickle_frame(obj.data, registry)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Registered custom types take precedence over the built-in branches so
@@ -712,13 +718,13 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     if entry is not None:
         tag, serialize = entry
         result = {"__shm_custom__": tag, "payload": serialize(obj, _recurse)}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # torch.Tensor -> delegate to caller-provided strategy
     if t == 'Tensor':
         result = tensor_serializer(obj, registry, visited)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # numpy array -> PyTorch native shared memory (zero-copy), fallback to shm copy
@@ -745,7 +751,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                 registry.append(block)
                 result = {"__shm_np__": block.name, "shape": list(arr.shape),
                           "dtype": _encode_np_dtype(arr.dtype)}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # NOTE: trimesh has no builtin branch (removed 2026-08, no backcompat):
@@ -767,13 +773,13 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                       node_output_serializer=node_output_serializer),
             "feats_dtype": str(feats_cpu.dtype),
         }
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # V3 NodeOutput -> delegate to caller if provided
     if t == 'NodeOutput' and node_output_serializer is not None:
         result = node_output_serializer(obj, registry, visited)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Path -> string
@@ -786,7 +792,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                        tensor_serializer=tensor_serializer,
                                        node_output_serializer=node_output_serializer)
                   for k, v in obj.items()}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # list/tuple
@@ -795,7 +801,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                    tensor_serializer=tensor_serializer,
                                    node_output_serializer=node_output_serializer)
                   for v in obj]
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Convert numpy scalars to Python primitives for JSON serialization
@@ -828,7 +834,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
             f"missing dependency in this environment."
         ) from e
     result = _pickle_frame(obj_bytes, registry)
-    visited[obj_id] = result
+    visited[obj_id] = (obj, result)
     return result
 
 

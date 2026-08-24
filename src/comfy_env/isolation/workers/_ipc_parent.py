@@ -675,7 +675,7 @@ def _serialize_for_ipc(obj, visited=None):
 
     obj_id = id(obj)
     if obj_id in visited:
-        return visited[obj_id]
+        return visited[obj_id][1]
 
     # Handle Path objects - mark for reconstruction
     from pathlib import PurePath
@@ -705,25 +705,25 @@ def _serialize_for_ipc(obj, visited=None):
                 '__class_name__': cls.__name__,
                 '__attrs__': {k: _serialize_for_ipc(v, visited) for k, v in obj.__dict__.items()},
             }
-            visited[obj_id] = result
+            visited[obj_id] = (obj, result)
             return result
 
     # Recurse into containers
     if isinstance(obj, dict):
         result = {k: _serialize_for_ipc(v, visited) for k, v in obj.items()}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
     elif isinstance(obj, list):
         result = [_serialize_for_ipc(v, visited) for v in obj]
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
     elif isinstance(obj, tuple):
         result = tuple(_serialize_for_ipc(v, visited) for v in obj)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Primitives and other objects - cache and return as-is
-    visited[obj_id] = obj
+    visited[obj_id] = (obj, obj)
     return obj
 
 
