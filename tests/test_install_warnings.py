@@ -1,4 +1,4 @@
-"""Contract: the root role schema -- comfy-env-root.toml carries [node_reqs]
+"""Contract: the root role schema -- comfy-env-root.toml carries [node_packs]
 and [types] only; anything else is rejected at parse time, generically
 (no legacy keys are named anywhere in code)."""
 
@@ -30,9 +30,9 @@ def test_root_rejects_typos(tmp_path):
 def test_root_accepts_its_schema(tmp_path):
     cfg = load_config(_root(
         tmp_path,
-        '[node_reqs]\nOtherPack = "https://github.com/x/OtherPack"\n\n'
+        '[node_packs]\nOtherPack = "https://github.com/x/OtherPack"\n\n'
         '[types]\nWIDGET = "builtin"\n'))
-    assert cfg.node_reqs[0]["name"] == "OtherPack"
+    assert cfg.node_packs[0]["name"] == "OtherPack"
     assert cfg.types == {"WIDGET": "builtin"}
 
 

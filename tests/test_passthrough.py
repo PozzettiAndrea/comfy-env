@@ -53,11 +53,11 @@ def test_owned_section_typos_warn(capsys):
 
 def test_env_file_rejects_root_only_sections(tmp_path):
     p = tmp_path / "comfy-env.toml"
-    p.write_text("[node_reqs]\nOtherPack = \"x/OtherPack\"\n", encoding="utf-8")
-    with pytest.raises(ValueError, match=r"\[node_reqs\] belong in comfy-env-root.toml"):
+    p.write_text("[node_packs]\nOtherPack = \"x/OtherPack\"\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"\[node_packs\] belong in comfy-env-root.toml"):
         load_config(p)
-    p.write_text('[node_reqs]\nX = "https://github.com/x/X"\n', encoding="utf-8")
-    with pytest.raises(ValueError, match=r"\[node_reqs\] belong in"):
+    p.write_text('[node_packs]\nX = "https://github.com/x/X"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match=r"\[node_packs\] belong in"):
         load_config(p)
 
 

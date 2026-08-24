@@ -43,12 +43,12 @@ def test_cuda_scalar_normalized_to_list():
     assert cfg.has_cuda
 
 
-def test_node_reqs_string_and_table_forms():
-    cfg = parse_config({"node_reqs": {
+def test_node_packs_string_and_table_forms():
+    cfg = parse_config({"node_packs": {
         "ComfyUI-GeometryPack": "https://github.com/PozzettiAndrea/ComfyUI-GeometryPack",
         "OtherPack": {"registry": "other-pack", "version": "1.2.3"},
     }})
-    by_name = {r["name"]: r for r in cfg.node_reqs}
+    by_name = {r["name"]: r for r in cfg.node_packs}
     assert by_name["ComfyUI-GeometryPack"]["github"].endswith("GeometryPack")
     assert by_name["OtherPack"]["registry"] == "other-pack"
     assert by_name["OtherPack"]["version"] == "1.2.3"

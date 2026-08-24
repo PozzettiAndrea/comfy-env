@@ -1,4 +1,4 @@
-"""Node dependency installation - clone ComfyUI nodes from [node_reqs] section."""
+"""Node pack installation - clone ComfyUI node packs from [node_packs] section."""
 
 import json
 import shutil
@@ -146,13 +146,13 @@ def run_install_script(node_dir: Path, log: Callable[[str], None] = print) -> No
             log(f"  Warning: {node_dir.name} install.py failed (exit code {result.returncode})")
 
 
-def install_node_dependencies(
+def install_node_packs(
     node_deps: "List[dict]",
     custom_nodes_dir: Path,
     log: Callable[[str], None] = print,
     visited: Set[str] = None,
 ) -> None:
-    """Install node dependencies recursively."""
+    """Install required node packs recursively."""
     from ..config import discover_config
 
     visited = visited or set()
@@ -182,7 +182,7 @@ def install_node_dependencies(
             run_install_script(node_path, log)
 
             nested_config = discover_config(node_path)
-            if nested_config and nested_config.node_reqs:
-                install_node_dependencies(nested_config.node_reqs, custom_nodes_dir, log, visited)
+            if nested_config and nested_config.node_packs:
+                install_node_packs(nested_config.node_packs, custom_nodes_dir, log, visited)
         except Exception as e:
             log(f"  Warning: {name} failed: {e}")

@@ -85,11 +85,11 @@ def main(args: Optional[List[str]] = None) -> int:
 
 
 ROOT_DEFAULT_CONFIG = """\
-# comfy-env-root.toml - pack-level config. Carries [node_reqs] and
-# [settings] ONLY; env definitions (dependencies, cuda, env_vars, ...)
+# comfy-env-root.toml - pack-level config. Carries [node_packs] and
+# [types] ONLY; env definitions (dependencies, cuda, env_vars, ...)
 # go in a subdirectory comfy-env.toml.
 
-[node_reqs]
+[node_packs]
 # ComfyUI_essentials = "cubiq/ComfyUI_essentials"
 
 """

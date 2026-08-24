@@ -1,4 +1,4 @@
-"""Per-plugin install: node_reqs and main-env pip install.
+"""Per-plugin install: node_packs and main-env pip install.
 
 Called from `install()` in __init__.py for the plugin whose `install.py` invoked
 `from comfy_env import install; install()`. Workspace-level (`pixi install --all`)
@@ -20,25 +20,25 @@ from ..config import (
 )
 
 
-def _install_node_dependencies(
-    node_reqs: List[dict], node_dir: Path,
+def _install_node_packs(
+    node_packs: List[dict], node_dir: Path,
     log: Callable[[str], None], dry_run: bool,
 ) -> None:
-    from ..packages.node_dependencies import install_node_dependencies
+    from ..packages.node_packs import install_node_packs
     custom_nodes_dir = node_dir.parent
-    log(f"\nInstalling {len(node_reqs)} node dependencies...")
+    log(f"\nInstalling {len(node_packs)} node packs...")
     if dry_run:
-        for req in node_reqs:
+        for req in node_packs:
             log(f"  {req['name']}: {'exists' if (custom_nodes_dir / req['name']).exists() else 'would clone'}")
         return
-    install_node_dependencies(node_reqs, custom_nodes_dir, log, {node_dir.name})
+    install_node_packs(node_packs, custom_nodes_dir, log, {node_dir.name})
 
 
 def _reinstall_main_requirements(
     node_dir: Path, log: Callable[[str], None], dry_run: bool,
 ) -> None:
-    """Re-install main package's requirements.txt after node_reqs to restore correct versions."""
-    from ..packages.node_dependencies import install_requirements
+    """Re-install main package's requirements.txt after node_packs to restore correct versions."""
+    from ..packages.node_packs import install_requirements
     req_file = node_dir / "requirements.txt"
     if not req_file.exists():
         return
@@ -120,15 +120,15 @@ def check_sibling_comfy_env_pins(
     return findings
 
 
-def _collect_node_req_dirs(
-    node_reqs: List[dict],
+def _collect_node_pack_dirs(
+    node_packs: List[dict],
     custom_nodes_dir: Path,
     visited: Optional[Set[str]] = None,
 ) -> List[Path]:
-    """Recursively collect all directories of nodes installed via node_reqs."""
+    """Recursively collect all directories of nodes installed via node_packs."""
     visited = visited or set()
     result = []
-    for dep in node_reqs:
+    for dep in node_packs:
         name = dep["name"]
         if name in visited:
             continue
@@ -138,8 +138,8 @@ def _collect_node_req_dirs(
             continue
         result.append(node_path)
         nested_cfg = discover_config(node_path)
-        if nested_cfg and nested_cfg.node_reqs:
-            result.extend(_collect_node_req_dirs(nested_cfg.node_reqs, custom_nodes_dir, visited))
+        if nested_cfg and nested_cfg.node_packs:
+            result.extend(_collect_node_pack_dirs(nested_cfg.node_packs, custom_nodes_dir, visited))
     return result
 
 

@@ -22,7 +22,7 @@ class ComfyEnvConfig(dict):
     @property
     def has_dependencies(self):
         return bool(
-            self.get("cuda_packages") or self.get("node_reqs")
+            self.get("cuda_packages") or self.get("node_packs")
             or self.get("pixi_passthrough", {}).get("dependencies")
             or self.get("pixi_passthrough", {}).get("pypi-dependencies")
         )
@@ -32,8 +32,8 @@ class ComfyEnvConfig(dict):
 # Anything role-inappropriate -- dead legacy keys, typos, misplaced sections
 # -- is rejected at parse time rather than silently ignored (that's how a
 # no-op [env_vars] shipped in the flagship pack for months).
-ROOT_ALLOWED_SECTIONS = {"node_reqs", "types"}
-ROOT_ONLY_SECTIONS = {"node_reqs", "types"}
+ROOT_ALLOWED_SECTIONS = {"node_packs", "types"}
+ROOT_ONLY_SECTIONS = {"node_packs", "types"}
 
 # Comfy-env-owned sections of the ENV file and their known keys: the one
 # place pixi cannot validate for us, so unrecognized keys warn (a typo'd
@@ -61,7 +61,7 @@ def load_config(path):
             raise ValueError(
                 f"{path}: unsupported section(s) "
                 f"{', '.join('[' + s + ']' for s in unknown)} -- "
-                f"{ROOT_CONFIG_FILE_NAME} carries [node_reqs] and [types] "
+                f"{ROOT_CONFIG_FILE_NAME} carries [node_packs] and [types] "
                 f"only ([settings] was removed in 0.4.25 -- the surviving "
                 f"settings are machine-global env vars). Env definitions "
                 f"(dependencies, cuda, env_vars, ...) go in a subdirectory "
@@ -103,7 +103,7 @@ def parse_config(data):
             "python": str | None,
             "cuda_packages": [str],
             "env_vars": {str: str},
-            "node_reqs": [{"name": str, "github": str|None, "tag": str|None, ...}],
+            "node_packs": [{"name": str, "github": str|None, "tag": str|None, ...}],
             "options": {"health_check_timeout": float},
             "pixi_passthrough": dict,  # everything else goes straight to pixi.toml
         }
@@ -141,7 +141,7 @@ def parse_config(data):
         cuda_packages = [cuda_packages] if cuda_packages else []
 
     env_vars = {str(k): str(v) for k, v in data.pop("env_vars", {}).items()}
-    node_reqs = _parse_node_reqs(data.pop("node_reqs", {}))
+    node_packs = _parse_node_packs(data.pop("node_packs", {}))
     options = data.pop("options", {})
 
     # [types] (ADR-0015): SOCKET = "builtin" | "custom". Closed vocabulary
@@ -158,14 +158,14 @@ def parse_config(data):
         python=python,
         cuda_packages=cuda_packages,
         env_vars=env_vars,
-        node_reqs=node_reqs,
+        node_packs=node_packs,
         options={"health_check_timeout": float(options.get("health_check_timeout", DEFAULT_HEALTH_CHECK_TIMEOUT))},
         types={str(k): str(v) for k, v in types.items()},
         pixi_passthrough=data,
     )
 
 
-def _parse_node_reqs(data):
+def _parse_node_packs(data):
     reqs = []
     for name, value in data.items():
         if isinstance(value, str):

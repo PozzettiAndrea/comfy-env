@@ -1,4 +1,4 @@
-"""Packages layer - CUDA wheels, toml generation, node dependencies."""
+"""Packages layer - CUDA wheels, toml generation, node packs."""
 
 from ..pixi import PIXI, ensure_pixi
 from .cuda_wheels import (
@@ -13,8 +13,8 @@ from .toml_generator import (
     write_workspace_pixi_toml,
     parse_comfyui_requirements,
 )
-from .node_dependencies import (
-    install_node_dependencies,
+from .node_packs import (
+    install_node_packs,
     clone_node,
     normalize_repo_url,
 )
@@ -32,7 +32,7 @@ __all__ = [
     "write_workspace_pixi_toml",
     "parse_comfyui_requirements",
     # Node dependencies
-    "install_node_dependencies",
+    "install_node_packs",
     "clone_node",
     "normalize_repo_url",
 ]
