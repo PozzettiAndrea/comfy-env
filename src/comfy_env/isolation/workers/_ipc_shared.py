@@ -39,10 +39,6 @@ WORKER_FAULTHANDLER_BASENAME = "comfy_worker_faulthandler.log"
 # module at its top; its own directory is sys.path[0], and the file is
 # always copied alongside by SubprocessWorker)
 TENSOR_KEEPER_TTL = 60.0        # seconds to hold shared tensors before GC
-WATCHDOG_INTERVAL = 60          # seconds between watchdog thread dumps
-VRAM_POLL_THRESHOLD = 200 * 1024 * 1024  # 200MB change triggers log
-VRAM_POLL_INTERVAL = 0.1        # 100ms between VRAM polls
-VRAM_LOG_COOLDOWN = 1.0         # 1 second between VRAM log messages
 SOCKET_ACCEPT_TIMEOUT = 60      # seconds to wait for worker to connect
 SOCKET_ID_LENGTH = 12           # hex chars in socket name uuid
 
@@ -208,20 +204,6 @@ def _trim_pool(pool, min_bytes=0):
                 "cudaMemPoolTrimTo")
 
 
-def _get_pool_mem_stats(pool):
-    """Query reserved and active bytes from a CUDA memory pool."""
-    cudart = _get_cudart()
-    if not cudart or not pool:
-        return 0, 0
-    reserved = ctypes.c_size_t(0)
-    active = ctypes.c_size_t(0)
-    cudart.cudaMemPoolGetAttribute(
-        pool, ctypes.c_int(CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT),
-        ctypes.byref(reserved))
-    cudart.cudaMemPoolGetAttribute(
-        pool, ctypes.c_int(CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT),
-        ctypes.byref(active))
-    return reserved.value, active.value
 
 
 # =============================================================================
@@ -513,9 +495,6 @@ def _cuda_device_uuid():
         return None
 
 
-def registration_count():
-    """Number of registered type serializers (validation hook, ADR-0015)."""
-    return len(REGISTRY._by_type)
 
 
 def registration_calls():

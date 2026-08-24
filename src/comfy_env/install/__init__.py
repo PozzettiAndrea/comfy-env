@@ -23,7 +23,6 @@ from .helpers import USE_COMFY_ENV_VAR
 from .plugin import (
     _install_node_packs,
     _reinstall_main_requirements,
-    _collect_node_pack_dirs,
     check_sibling_comfy_env_pins,
 )
 from .workspace import install_workspace
@@ -68,15 +67,9 @@ def install(
     if cfg is None:
         raise FileNotFoundError(f"No {ROOT_CONFIG_FILE_NAME} or {CONFIG_FILE_NAME} found in {node_dir}")
 
-    node_pack_dirs: List[Path] = []
     if cfg.node_packs:
         _install_node_packs(cfg.node_packs, node_dir, log, dry_run)
         _reinstall_main_requirements(node_dir, log, dry_run)
-        node_pack_dirs = _collect_node_pack_dirs(cfg.node_packs, node_dir.parent)
-        for nr_dir in node_pack_dirs:
-            nr_cfg = discover_config(nr_dir, root=True)
-            if nr_cfg:
-                pass  # Future: could process nr_cfg here
 
     # Surface stale comfy-env pins in sibling packs (warn-only): whichever
     # pack reinstalls its requirements last wins in the shared env, so an old

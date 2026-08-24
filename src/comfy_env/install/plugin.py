@@ -120,26 +120,5 @@ def check_sibling_comfy_env_pins(
     return findings
 
 
-def _collect_node_pack_dirs(
-    node_packs: List[dict],
-    custom_nodes_dir: Path,
-    visited: Optional[Set[str]] = None,
-) -> List[Path]:
-    """Recursively collect all directories of nodes installed via node_packs."""
-    visited = visited or set()
-    result = []
-    for dep in node_packs:
-        name = dep["name"]
-        if name in visited:
-            continue
-        visited.add(name)
-        node_path = custom_nodes_dir / name
-        if not node_path.exists():
-            continue
-        result.append(node_path)
-        nested_cfg = discover_config(node_path)
-        if nested_cfg and nested_cfg.node_packs:
-            result.extend(_collect_node_pack_dirs(nested_cfg.node_packs, custom_nodes_dir, visited))
-    return result
 
 

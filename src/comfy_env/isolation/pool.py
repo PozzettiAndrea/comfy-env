@@ -8,7 +8,6 @@ and API route proxying. Depends downward on workers/subprocess and
 model_patcher (both lazy); imports nothing from wrap or metadata.
 """
 
-import asyncio  # noqa: F401 -- used lazily in route proxies
 import atexit
 import glob
 import os
@@ -17,7 +16,6 @@ import shutil
 import sys
 import tempfile
 import threading
-import weakref  # noqa: F401 -- used in _register_new_patchers
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 

@@ -89,7 +89,12 @@ def wlog(msg):
             import time
             f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
             f.flush()
-            os.fsync(f.fileno())
+            # No os.fsync: it cost 2.78 ms per line vs 0.02 ms without (measured,
+            # ext4). With 92 call sites -- 13 of them inside _from_shm's
+            # per-node recursion -- that was 50-100 ms of pure fsync on a
+            # typical call, dwarfing the transport itself. flush() already
+            # survives a Python-level crash; only a kernel panic loses the tail,
+            # and a kernel panic loses the worker anyway.
     except Exception:
         pass
     # NOTE: Don't print to stdout here! After 50+ requests the pipe buffer
@@ -211,7 +216,6 @@ from _ipc_shared import (  # noqa: F401 -- re-exported names used below
     _export_pointer,
     _import_pointer,
     _trim_pool,
-    _get_pool_mem_stats,
     _send_fd,
     _recv_fd,
     _PoolPtr,
@@ -401,28 +405,12 @@ _pool_ipc_ok = False
 _our_pool = None
 # Parent's shareable pool (parent->worker zero-copy); imported in main()'s
 # handshake, read by the module-level _from_shm().
-_parent_pool = None
 _pool_ipc_metadata_cache = {}
 _pool_ipc_cache_tensors = {}
 
 # Pool ctypes primitives and _PoolPtr come from _ipc_shared (imported at the
 # top of this file). The duplicated definitions that lived here drifted from
 # the shared copies before being deleted -- do not reintroduce them.
-
-def _deserialize_pool_ipc(data, source_pool):
-    import torch
-    export_data_bytes = _b64.b64decode(data["export_data"])
-    imported_ptr = _import_pointer(source_pool, export_data_bytes)
-    device_idx = data["device_idx"]
-    dtype = getattr(torch, data["dtype"].split(".")[-1])
-    storage_size = data["storage_size"]
-    raw = torch.as_tensor(_PoolPtr(imported_ptr, storage_size),
-                          device=torch.device(f"cuda:{device_idx}"))
-    tensor = torch.empty([], dtype=dtype, device=f"cuda:{device_idx}")
-    tensor.set_(raw.untyped_storage(), data["tensor_offset"],
-                tuple(data["tensor_size"]), tuple(data["tensor_stride"]))
-    tensor.requires_grad_(data["requires_grad"])
-    return tensor
 
 def _serialize_pool_ipc(t):
     """Serialize CUDA tensor via pool pointer export (zero-copy)."""
@@ -642,14 +630,6 @@ def _from_shm(obj, _depth=0, _key="root"):
         return _ipc_shared.deserialize_custom(
             obj, lambda v: _from_shm(v, _depth + 1, f"{_key}.custom"))
 
-    # PoolIPC -> zero-copy CUDA tensor via shareable pool (parent -> worker)
-    if obj.get("__type__") == "PoolIPC":
-        wlog(f"[_from_shm] {_key}: PoolIPC tensor_size={obj.get('tensor_size')}")
-        if _parent_pool is not None:
-            return _deserialize_pool_ipc(obj, _parent_pool)
-        wlog(f"[_from_shm] {_key}: PoolIPC but no parent pool, falling back to error")
-        raise RuntimeError("PoolIPC received but no parent pool handle available")
-
     # CudaIPC -> zero-copy CUDA tensor deserialization
     if obj.get("__type__") == "CudaIPC":
         wlog(f"[_from_shm] {_key}: CudaIPC tensor_size={obj.get('tensor_size')}")
@@ -800,107 +780,6 @@ _input_shm_blocks = []  # Keep parent->worker shm blocks alive during request pr
 _input_torch_storages = []  # Track parent-owned torch storages to balance _shared_incref
 _worker_fd_registry = []  # Keep worker fds alive for worker->parent tensor transfer
 
-# =============================================================================
-# Object Reference System - keep complex objects in worker, pass refs to host
-# =============================================================================
-
-_object_cache = {}  # Maps ref_id -> object
-_object_ids = {}    # Maps id(obj) -> ref_id (for deduplication)
-_ref_counter = 0
-
-def _cache_object(obj):
-    """Store object in cache, return reference ID. Deduplicates by object id."""
-    global _ref_counter
-    obj_id = id(obj)
-
-    # Return existing ref if we've seen this object
-    if obj_id in _object_ids:
-        return _object_ids[obj_id]
-
-    ref_id = f"ref_{_ref_counter:08x}"
-    _ref_counter += 1
-    _object_cache[ref_id] = obj
-    _object_ids[obj_id] = ref_id
-    return ref_id
-
-def _resolve_ref(ref_id):
-    """Get object from cache by reference ID."""
-    return _object_cache.get(ref_id)
-
-def _should_use_reference(obj):
-    """Check if object should be passed by reference instead of value."""
-    if obj is None:
-        return False
-    # Primitives - pass by value
-    if isinstance(obj, (bool, int, float, str, bytes)):
-        return False
-    # NumPy scalars - pass by value (convert to Python primitives)
-    obj_type = type(obj).__name__
-    if obj_type in ('float16', 'float32', 'float64', 'int8', 'int16', 'int32', 'int64',
-                    'uint8', 'uint16', 'uint32', 'uint64', 'bool_'):
-        return False
-    # NumPy arrays and torch tensors - pass by value (they serialize well)
-    if obj_type in ('ndarray', 'Tensor'):
-        return False
-    # Dicts, lists, tuples - recurse into contents (don't ref the container)
-    if isinstance(obj, (dict, list, tuple)):
-        return False
-    # Everything else (custom classes) - pass by reference
-    return True
-
-
-def _serialize_result(obj, visited=None):
-    """Convert result for IPC - complex objects become references."""
-    if visited is None:
-        visited = set()
-
-    obj_id = id(obj)
-    if obj_id in visited:
-        # Circular reference - use existing ref or create one
-        if obj_id in _object_ids:
-            return {"__comfy_ref__": _object_ids[obj_id], "__class__": type(obj).__name__}
-        return None  # Skip circular refs to primitives
-
-    if _should_use_reference(obj):
-        ref_id = _cache_object(obj)
-        return {"__comfy_ref__": ref_id, "__class__": type(obj).__name__}
-
-    visited.add(obj_id)
-
-    obj_type = type(obj).__name__  # noqa: F841
-
-    if isinstance(obj, dict):
-        return {k: _serialize_result(v, visited) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_serialize_result(v, visited) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_serialize_result(v, visited) for v in obj)
-
-    # Convert numpy scalars to Python primitives for JSON serialization
-    if obj_type in ('float16', 'float32', 'float64'):
-        return float(obj)
-    if obj_type in ('int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'):
-        return int(obj)
-    if obj_type == 'bool_':
-        return bool(obj)
-
-    return obj
-
-def _deserialize_input(obj):
-    """Convert input from IPC - references become real objects."""
-    if isinstance(obj, dict):
-        if "__comfy_ref__" in obj:
-            ref_id = obj["__comfy_ref__"]
-            real_obj = _resolve_ref(ref_id)
-            if real_obj is None:
-                raise ValueError(f"Object reference not found: {ref_id}")
-            return real_obj
-        return {k: _deserialize_input(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_deserialize_input(v) for v in obj]
-    if isinstance(obj, tuple):
-        return tuple(_deserialize_input(v) for v in obj)
-    return obj
 
 
 class SocketTransport:
@@ -1612,7 +1491,7 @@ def main():
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---
-    global _pool_ipc_ok, _our_pool, _parent_pool
+    global _pool_ipc_ok, _our_pool
     if _POOL_IPC_ENABLED and sys.platform == "linux":
         try:
             import torch as _pt
@@ -1652,21 +1531,6 @@ def main():
             wlog(f"[worker] Pool IPC setup failed: {e}, using CPU shm fallback")
             _pool_ipc_ok = False
             _our_pool = None
-
-    # --- Receive parent's shareable pool FD (for parent->worker zero-copy) ---
-    _parent_pool = None
-    try:
-        msg = transport.recv(timeout=5)
-        if msg and msg.get("type") == "parent_pool_fd_sent":
-            parent_fd = _recv_fd(sock, timeout=5)
-            _parent_pool = _import_pool_from_fd(parent_fd)
-            os.close(parent_fd)
-            wlog("[worker] Pool IPC: imported parent pool for parent->worker zero-copy")
-        else:
-            wlog("[worker] No parent shareable pool (parent->worker uses CPU shm)")
-    except Exception as e:
-        wlog(f"[worker] Parent pool import skipped: {e}")
-        _parent_pool = None
 
     wlog("[worker] Entering request loop...")
 
@@ -1758,7 +1622,6 @@ def main():
             shm_registry = []
             try:
                 payload = _from_shm(request.get("kwargs") or {})
-                payload = _deserialize_input(payload)
                 _serializing_call_id = _current_call_id
                 result_meta = _to_shm(payload, shm_registry)
                 try:
@@ -1799,7 +1662,6 @@ def main():
                 wlog(f"[worker] Reconstructing inputs from shm...")
                 inputs = _from_shm(kwargs_meta)
                 inputs = _deserialize_isolated_objects(inputs)
-                inputs = _deserialize_input(inputs)
                 wlog(f"[worker] Inputs ready: {list(inputs.keys()) if isinstance(inputs, dict) else type(inputs)}")
                 # Debug: log tensor shapes
                 if isinstance(inputs, dict):

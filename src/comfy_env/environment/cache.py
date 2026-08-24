@@ -269,12 +269,6 @@ def get_env_manifest_dir(env_name: str, comfyui_dir=None) -> Path:
     return target
 
 
-def get_env_manifest_path(env_name: str, comfyui_dir=None) -> Path:
-    """Path to one env's `pixi.toml` (new per-env layout).
-
-    `<workspace>/envs/<env_name>-<abi_tag>/pixi.toml`
-    """
-    return get_env_manifest_dir(env_name, comfyui_dir) / "pixi.toml"
 
 
 def resolve_pixi_manifest(env_root: Path) -> tuple[Path, str]:

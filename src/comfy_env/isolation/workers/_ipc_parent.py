@@ -111,32 +111,6 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
         return sock, f"tcp://127.0.0.1:{port}"
 
 
-def _connect_to_socket(addr: str) -> socket.socket:
-    """
-    Connect to a server socket.
-
-    Args:
-        addr: Address string ("abstract://name", "unix://path", or "tcp://host:port").
-
-    Returns:
-        Connected socket.
-    """
-    if addr.startswith("abstract://"):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(f"\0{addr[11:]}")  # Prepend \0 for abstract namespace
-        return sock
-    elif addr.startswith("unix://"):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.connect(addr[7:])  # Strip "unix://"
-        return sock
-    elif addr.startswith("tcp://"):
-        host_port = addr[6:]  # Strip "tcp://"
-        host, port = host_port.rsplit(":", 1)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, int(port)))
-        return sock
-    else:
-        raise ValueError(f"Unknown socket address scheme: {addr}")
 
 
 class SocketTransport:
@@ -475,51 +449,6 @@ def _deserialize_pool_ipc(data, source_pool):
     return tensor
 
 
-def _serialize_pool_ipc_parent(t):
-    """Serialize CUDA tensor via pool pointer export (parent side, zero-copy)."""
-    import torch
-    # Check cache
-    try:
-        storage_id = id(t.untyped_storage())
-        cached = _pool_ipc_metadata_cache.get(storage_id)
-        if cached is not None:
-            if (list(t.size()) == cached["tensor_size"]
-                    and list(t.stride()) == cached["tensor_stride"]
-                    and t.storage_offset() == cached.get("tensor_offset", 0)):
-                return cached
-            return {**cached, "tensor_size": list(t.size()),
-                    "tensor_stride": list(t.stride()),
-                    "tensor_offset": t.storage_offset()}
-    except Exception:
-        pass
-
-    torch.cuda.current_stream().synchronize()
-    storage = t.untyped_storage()
-    export_data = _export_pointer(storage.data_ptr())
-
-    result = {
-        "__type__": "PoolIPC",
-        "export_data": base64.b64encode(export_data).decode("ascii"),
-        "storage_size": storage.size(),
-        "dtype": str(t.dtype),
-        "tensor_size": list(t.size()),
-        "tensor_stride": list(t.stride()),
-        "tensor_offset": t.storage_offset(),
-        "device_idx": t.device.index or 0,
-        "requires_grad": t.requires_grad,
-    }
-    try:
-        _pool_ipc_metadata_cache[id(t.untyped_storage())] = result
-        _pool_ipc_cache_tensors[id(t.untyped_storage())] = t
-    except Exception:
-        pass
-    return result
-
-
-# =============================================================================
-# Shared memory serialization (parent -> worker)
-# =============================================================================
-
 def _parent_tensor_serializer(obj, registry, visited):
     """Parent-side tensor serialization strategy.
 
@@ -792,8 +721,3 @@ def _serialize_for_ipc(obj, visited=None):
     return obj
 
 
-def _get_shm_dir() -> Path:
-    """Get shared memory directory for efficient tensor transfer."""
-    if sys.platform == 'linux' and os.path.isdir('/dev/shm'):
-        return Path('/dev/shm')
-    return Path(tempfile.gettempdir())

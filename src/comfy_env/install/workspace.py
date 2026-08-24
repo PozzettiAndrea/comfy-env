@@ -460,7 +460,7 @@ def _resolve_wheel_combo(
     """Pick the (python, cuda, torch_match, torch_pin, source) combo for the workspace.
 
     The returned ``python`` field is the bootstrap Python; per-env Python versions
-    are handled at URL-resolution time in ``build_workspace_toml``.
+    are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
 
     Strategy:
       1. Try the bootstrap combo (`bootstrap_python` / `bootstrap_cuda` / `bootstrap_torch`).

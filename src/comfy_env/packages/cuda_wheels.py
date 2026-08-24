@@ -218,8 +218,6 @@ def get_cuda_torch_mapping() -> dict:
     return CUDA_TORCH_MAP.copy()
 
 
-def get_torch_version_for_cuda(cuda_version: str) -> Optional[str]:
-    return CUDA_TORCH_MAP.get(".".join(cuda_version.split(".")[:2]))
 
 
 def check_all_wheels_available(packages: List[str], torch_version: str,

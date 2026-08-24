@@ -76,7 +76,6 @@ from ._ipc_parent import (
     _from_shm,
     _cleanup_ipc_cache,
     _serialize_for_ipc,
-    _get_shm_dir,
 )
 
 # Launch-env builder: a leaf module (isolation/subenv.py), imported DOWNWARD.
@@ -153,7 +152,6 @@ class SubprocessWorker(Worker):
             raise FileNotFoundError(f"Python not found: {self.python}")
 
         self._temp_dir = Path(tempfile.mkdtemp(prefix='comfyui_pvenv_'))
-        self._shm_dir = _get_shm_dir()
         self._process: Optional[subprocess.Popen] = None
         self._shutdown = False
         self._lock = threading.RLock()  # Reentrant: VRAM eviction callbacks re-enter via send_command
@@ -585,13 +583,6 @@ class SubprocessWorker(Worker):
                     print(f"[{self.name}] Pool IPC handshake failed: {e}", file=sys.stderr, flush=True)
                 self._worker_pool = None
 
-        # No parent-side shareable pool: the parent->worker zero-copy hook was
-        # removed in 0.4.21 (experimental, default-off, and the cause of an
-        # environment->isolation import cycle -- see ADR-0030 / the pool
-        # redesign). The parent still sends the handshake message the worker
-        # expects (protocol unchanged); parent->worker CUDA tensors take the
-        # CPU shared-memory path.
-        self._transport.send({"type": "no_parent_pool"})
 
     def call(
         self,
