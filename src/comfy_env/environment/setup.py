@@ -64,6 +64,11 @@ def setup_env(node_dir=None):
     else:
         print(f"[comfy-env] {node_name}: no isolation envs", file=sys.stderr)
 
-    dedupe_libomp()
+    res = dedupe_libomp()
+    if res.status != "not-darwin":
+        print(f"[comfy-env] libomp: {res.summary()}", file=sys.stderr)
+        if res.candidates and not res.touched:
+            for sp in res.skipped_paths:
+                print(f"[comfy-env] libomp:   skipped {sp}", file=sys.stderr)
 
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)

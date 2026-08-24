@@ -396,10 +396,17 @@ def _dedupe_envs_libomp(
         if not sp_matches:
             continue
         try:
-            dedupe_libomp(Path(sp_matches[0]))
-            log(f"[comfy-env] {env_name}: deduped libomp")
+            res = dedupe_libomp(Path(sp_matches[0]))
+            log(f"[comfy-env] {env_name}: libomp -- {res.summary()}")
+            # A pass that found copies and replaced none is the case worth
+            # seeing in full: name every path the torch guard excluded, so a
+            # guard misfiring on the env's own name is visible in the log
+            # rather than inferred from a segfault later.
+            if res.candidates and not res.touched:
+                for sp in res.skipped_paths:
+                    log(f"[comfy-env] {env_name}:   skipped {sp}")
         except Exception as e:
-            log(f"[comfy-env] {env_name}: libomp dedupe failed: {e}")
+            log(f"[comfy-env] {env_name}: libomp dedupe FAILED: {e}")
 
 
 # ---------------------------------------------------------------------------
