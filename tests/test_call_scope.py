@@ -130,8 +130,8 @@ def test_every_rpc_entry_point_restores_the_scope(monkeypatch):
                     raise RuntimeError("worker exploded")
                 return {"status": "ok", "result": None, "call_id": request.get("call_id")}
 
-            monkeypatch.setattr(worker, "_send_request", _send_request, raising=False)
-            monkeypatch.setattr(worker, "_ensure_started", lambda: None, raising=False)
+            monkeypatch.setattr(worker, "_send_request", _send_request)
+            monkeypatch.setattr(worker, "_ensure_started", lambda: None)
 
             sentinel = _enter_call_scope(_FakeWorker(zero_copy_ok=True, pool="OUTER"))
             try:
