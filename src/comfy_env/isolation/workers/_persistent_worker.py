@@ -1055,20 +1055,26 @@ def main():
         wlog(f"[worker] Registered model '{model_id}': {size / 1e9:.2f} GB, kind={kind}")
         return size
 
-    def _auto_register_if_cuda(module):
-        """Auto-register an nn.Module if it just landed on CUDA."""
-        if _loading_via_shim[0]:
-            return  # Parent already coordinates VRAM during shimmed loads
+    def _register_cuda_module(module, label):
+        """Mint an id for a CUDA module and record it. Returns the id or None.
+
+        One body for both registration paths. _hooked_to/_hooked_cuda replace
+        torch.nn.Module.to/.cuda GLOBALLY, so this runs on whatever thread a
+        pack uses: the dedup check is re-tested under the lock, and the
+        counter bump is a read-modify-write that must not interleave.
+        """
         obj_id = id(module)
         if obj_id in _model_id_by_obj:
-            return  # Already registered
+            return None
         try:
             first_param = next(module.parameters(), None)
             if first_param is None or first_param.device.type != "cuda":
-                return
+                return None
         except Exception:
-            return
+            return None
         with _registry_lock:
+            if obj_id in _model_id_by_obj:
+                return None
             _model_counter[0] += 1
             model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
             size = _compute_model_size(module)
@@ -1076,7 +1082,14 @@ def main():
             _model_registry_meta[model_id] = {"size": size, "kind": "other"}
             _model_id_by_obj[obj_id] = model_id
             _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-            wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
+        wlog(f"[worker] {label} '{model_id}': {size / 1e9:.2f} GB")
+        return model_id
+
+    def _auto_register_if_cuda(module):
+        """Auto-register an nn.Module if it just landed on CUDA."""
+        if _loading_via_shim[0]:
+            return  # Parent already coordinates VRAM during shimmed loads
+        _register_cuda_module(module, "Auto-registered")
 
     def _register_if_cuda(module):
         """Register an nn.Module with parent if it's on CUDA.
@@ -1085,54 +1098,37 @@ def main():
         Called after shimmed load_models_gpu to ensure the parent can evict
         models that were loaded inside the shim.
         """
-        obj_id = id(module)
-        if obj_id in _model_id_by_obj:
-            return  # Already registered
-        try:
-            first_param = next(module.parameters(), None)
-            if first_param is None or first_param.device.type != "cuda":
-                return
-        except Exception:
-            return
-        with _registry_lock:
-            _model_counter[0] += 1
-            model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
-            size = _compute_model_size(module)
-            _model_registry[model_id] = module
-            _model_registry_meta[model_id] = {"size": size, "kind": "other"}
-            _model_id_by_obj[obj_id] = model_id
-            _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-            wlog(f"[worker] Post-shim registered '{model_id}': {size / 1e9:.2f} GB")
+        _register_cuda_module(module, "Post-shim registered")
 
-        # Install hooks on Module.to() and .cuda()
-        # Module.to() only fires for the outermost call -- PyTorch recurses
-        # through children via _apply(), not .to(), so we naturally catch
-        # only top-level models.
-        try:
-            import torch as _torch
-            _orig_module_to = _torch.nn.Module.to
-            _orig_module_cuda = _torch.nn.Module.cuda
+    # Install hooks on Module.to() and .cuda()
+    # Module.to() only fires for the outermost call -- PyTorch recurses
+    # through children via _apply(), not .to(), so we naturally catch
+    # only top-level models.
+    try:
+        import torch as _torch
+        _orig_module_to = _torch.nn.Module.to
+        _orig_module_cuda = _torch.nn.Module.cuda
 
-            def _hooked_to(self, *args, **kwargs):
-                result = _orig_module_to(self, *args, **kwargs)
-                _auto_register_if_cuda(self)
-                return result
+        def _hooked_to(self, *args, **kwargs):
+            result = _orig_module_to(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
 
-            def _hooked_cuda(self, *args, **kwargs):
-                result = _orig_module_cuda(self, *args, **kwargs)
-                _auto_register_if_cuda(self)
-                return result
+        def _hooked_cuda(self, *args, **kwargs):
+            result = _orig_module_cuda(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
 
-            _torch.nn.Module.to = _hooked_to
-            _torch.nn.Module.cuda = _hooked_cuda
-            wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
-        except ImportError:
-            wlog("[worker] torch not available, skipping auto-registration hooks")
+        _torch.nn.Module.to = _hooked_to
+        _torch.nn.Module.cuda = _hooked_cuda
+        wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
+    except ImportError:
+        wlog("[worker] torch not available, skipping auto-registration hooks")
 
-        # ---------------------------------------------------------------
-        # Bidirectional RPC -- call parent methods during execution
-        # ---------------------------------------------------------------
-        _current_call_id = None  # Tracks call_id of the request being processed
+    # ---------------------------------------------------------------
+    # Bidirectional RPC -- call parent methods during execution
+    # ---------------------------------------------------------------
+    _current_call_id = None  # Tracks call_id of the request being processed
 
     def _find_loaded_model(_model):
         """The worker's own ComfyUI LoadedModel wrapping this module, if any."""

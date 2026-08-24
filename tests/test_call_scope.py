@@ -18,13 +18,25 @@ subprocess -- deliberately, because the GPU lane that would have caught the
 first bug does not exist (pytest.mark.gpu is declared and applied to nothing).
 """
 
+import ast
 import threading
+from pathlib import Path
 
 from comfy_env.isolation.workers import _ipc_parent
 from comfy_env.isolation.workers.subprocess import (
     _enter_call_scope,
     _exit_call_scope,
 )
+
+
+def _worker_source():
+    """The worker program's text. It is exec'd by a foreign interpreter
+    (ADR-0006) and cannot be imported, so its scopes are only reachable here."""
+    import comfy_env.isolation.workers as pkg
+
+    return (Path(pkg.__file__).parent / "_persistent_worker.py").read_text(
+        encoding="utf-8"
+    )
 
 
 class _FakeWorker:
@@ -117,27 +129,92 @@ def test_every_rpc_entry_point_uses_the_scope():
         )
 
 
-def test_worker_model_registry_mutations_hold_the_lock():
+def test_auto_registration_hooks_are_installed_at_worker_startup():
+    """0.4.29 regression: a `with _registry_lock:` edit re-indented this block.
+
+    The Module.to/.cuda hooks must be installed in main(), unconditionally, at
+    worker startup. d7b8439 moved them inside _register_if_cuda -- which has a
+    single caller (the shimmed load_models_gpu) and three early returns above
+    the block -- so a pack that does model.cuda() itself registered nothing and
+    its VRAM was invisible to the parent's ledger for the process lifetime.
+
+    The worker is shipped as source text and exec'd by a foreign interpreter
+    (ADR-0006), so its scopes cannot be introspected any other way. The prior
+    version of this test asserted the counter sat inside the lock; the
+    regression satisfied that and shipped.
+    """
+    tree = ast.parse(_worker_source())
+
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child._parent = node
+
+    def enclosing_function(node):
+        node = getattr(node, "_parent", None)
+        while node is not None:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name
+            node = getattr(node, "_parent", None)
+        return "<module>"
+
+    installs = [
+        (n.lineno, t.attr, enclosing_function(n))
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Attribute)
+        and t.attr in ("to", "cuda")
+        and "Module" in ast.dump(t.value)
+    ]
+
+    assert len(installs) == 2, f"expected Module.to and Module.cuda hooks, got {installs}"
+    for lineno, attr, scope in installs:
+        assert scope == "main", (
+            f"Module.{attr} hook installed inside {scope}() at line {lineno}, not main(). "
+            "Auto-registration is then conditional on that function being reached."
+        )
+
+
+def test_cuda_registration_has_exactly_one_body():
+    """The duplication that made the re-indent possible.
+
+    _auto_register_if_cuda and _register_if_cuda held the same eight lines
+    twice; the lock was added to both, and the second edit swallowed the code
+    below it. One body cannot drift from itself.
+    """
+    tree = ast.parse(_worker_source())
+    fns = {
+        n.name: n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert "_register_cuda_module" in fns, "the shared registration body is gone"
+
+    for name in ("_auto_register_if_cuda", "_register_if_cuda"):
+        body = [s for s in fns[name].body if not isinstance(s, ast.Expr)]
+        mutates = [
+            s for s in ast.walk(fns[name])
+            if isinstance(s, ast.AugAssign)
+            and isinstance(s.target, ast.Subscript)
+            and getattr(s.target.value, "id", None) == "_model_counter"
+        ]
+        assert not mutates, (
+            f"{name} mints ids itself again -- it must delegate to "
+            "_register_cuda_module so the invariant has one home"
+        )
+        assert len(body) <= 2, f"{name} has grown its own registration body again"
+
+
+def test_model_counter_mutations_hold_the_lock():
     """Bug: `_model_counter[0] += 1` was an unlocked read-modify-write.
 
-    _hooked_to/_hooked_cuda replace torch.nn.Module.to/.cuda GLOBALLY, so they
-    fire on whatever thread a pack uses. Two models reaching CUDA concurrently
-    could mint the same model_id, leaving the loser GPU-resident with no ledger
-    entry -- permanently un-evictable.
-
-    The registrars live inside main()'s closure and cannot be imported, so this
-    asserts the structure: every counter mutation sits inside `with
-    _registry_lock:`. A structural test is weaker than a racing one, but it is
-    the strongest thing available for code that is shipped as source text and
-    executed by a foreign interpreter (ADR-0006).
+    Reached from _hooked_to/_hooked_cuda, which replace torch.nn.Module.to and
+    .cuda GLOBALLY and so fire on whatever thread a pack uses. Two models
+    reaching CUDA concurrently could mint the same model_id, leaving the loser
+    GPU-resident with no ledger entry -- permanently un-evictable.
     """
-    import ast
-    from pathlib import Path
-
-    import comfy_env.isolation.workers as pkg
-
-    src = (Path(pkg.__file__).parent / "_persistent_worker.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
+    tree = ast.parse(_worker_source())
 
     def mutations_outside_lock(node, inside_lock=False):
         found = []
