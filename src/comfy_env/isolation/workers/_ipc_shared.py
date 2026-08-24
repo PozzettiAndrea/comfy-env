@@ -475,6 +475,81 @@ def deserialize_custom(obj, recurse):
     return deser(obj["payload"], recurse)
 
 
+# ---------------------------------------------------------------------------
+# ComfyUI core geometry types: MESH / VOXEL / SPLAT
+# (comfy_api/latest/_util/geometry_types.py, used by nodes_hunyuan3d,
+# nodes_moge, nodes_depth_anything_3, nodes_save_3d).
+#
+# These are plain classes whose fields are all torch.Tensor. The generic walker
+# dispatches on type and has no branch for them, so without this they fall to
+# the pickle rung -- and their tensors are pickled along with them instead of
+# taking the shared-memory tensor path. Registering them here routes every
+# field through `recurse`, so the bulk rides the tensor ladder like any
+# IMAGE or LATENT.
+#
+# Registered rather than hardcoded as a branch, deliberately: a branch can only
+# encode (see __shm_sparse_tensor__, which decodes to a marker dict nothing
+# consumes). The registry is the only path that round-trips, and it also lets a
+# pack override these by re-registering the same type name.
+#
+# The class lookup is LAZY. This module is imported at the top of
+# _persistent_worker.py, BEFORE ComfyUI's source dir is placed on sys.path, so
+# resolving at registration time would leave every worker permanently
+# serialize-only. Resolution happens on first deserialize instead, by which
+# point sys.path is set up. A side that genuinely cannot import comfy_api (a
+# bare host, an env without ComfyUI) degrades to a materialized OpaquePayload
+# and can still forward the value -- the same contract packs get.
+_COMFY_GEOM_FIELDS = {
+    "MESH": ("vertices", "faces", "uvs", "vertex_colors", "texture",
+             "vertex_counts", "face_counts", "unlit"),
+    "VOXEL": ("data",),
+    "SPLAT": ("positions", "scales", "rotations", "opacities", "sh", "counts"),
+}
+_COMFY_GEOM_CLASSES = {}
+
+
+def _comfy_geom_class(name):
+    """Resolve comfy_api.latest.<name>, caching only successes so an early
+    miss (sys.path not yet built) does not poison later calls."""
+    cls = _COMFY_GEOM_CLASSES.get(name)
+    if cls is not None:
+        return cls
+    try:
+        import comfy_api.latest as _latest
+        cls = getattr(_latest, name, None)
+    except Exception:
+        cls = None
+    if cls is not None:
+        _COMFY_GEOM_CLASSES[name] = cls
+    return cls
+
+
+def _make_comfy_geom_codec(name):
+    fields = _COMFY_GEOM_FIELDS[name]
+
+    def _serialize(obj, recurse):
+        # getattr default: tolerate a ComfyUI that adds or drops a field.
+        return dict((f, recurse(getattr(obj, f, None))) for f in fields)
+
+    def _deserialize(payload, recurse):
+        values = dict((f, recurse(payload.get(f))) for f in fields)
+        cls = _comfy_geom_class(name)
+        if cls is None:
+            return OpaquePayload("comfy_api." + name, _own_tree(values))
+        return cls(**values)
+
+    return _serialize, _deserialize
+
+
+for _geom_name in _COMFY_GEOM_FIELDS:
+    _geom_ser, _geom_deser = _make_comfy_geom_codec(_geom_name)
+    # Tag by type identity (ADR-0015): two envs on different ComfyUI versions
+    # interoperate because each rebuilds with its OWN class.
+    register_serializer(_geom_name, _geom_ser, _geom_deser,
+                        tag="comfy_api." + _geom_name)
+del _geom_name, _geom_ser, _geom_deser
+
+
 def _cuda_device_uuid():
     """UUID string of torch's CURRENT CUDA device, or None if no CUDA.
 
