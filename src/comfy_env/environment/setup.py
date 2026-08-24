@@ -26,23 +26,6 @@ def _find_env_dirs(node_dir):
     return out
 
 
-def _ensure_base_directory():
-    """Ensure comfy.cli_args.args.base_directory is set.
-
-    Some nodes resolve relative paths via args.base_directory.
-    If the user didn't pass --base-directory, it defaults to None.
-    """
-    try:
-        from comfy.cli_args import args
-        if args.base_directory:
-            return
-        import folder_paths
-        args.base_directory = folder_paths.base_path
-    except Exception:
-        pass
-
-
-
 def setup_env(node_dir=None):
     """Set up comfy-env runtime. Call in prestartup_script.py."""
     if node_dir is None:
@@ -64,7 +47,17 @@ def setup_env(node_dir=None):
                 config_path = Path(env_path) / "comfy-env.toml"
                 env_name = get_env_name(node_dir, config_path)
                 target = get_workspace_env_dir(None, env_name)
-                status = "OK" if target.is_dir() else "MISSING -- run install.py"
+                if target.is_dir():
+                    status = "OK"
+                else:
+                    # Name the pack on THIS line. The header carrying node_name
+                    # is two lines up and scrolls away once several packs report,
+                    # and this is the line people grep for. Remedy matches
+                    # wrap.py: bare `comfy-env install` resolves the config from
+                    # the CURRENT directory, so it fails from the ComfyUI root --
+                    # --dir is the spelling that works from anywhere.
+                    status = (f"{node_name}: MISSING -- run "
+                              f"`comfy-env install --dir {node_dir}`")
                 print(f"[comfy-env]     env: {target}  [{status}]", file=sys.stderr)
             except Exception as e:
                 print(f"[comfy-env]     env: <resolution failed: {e}>", file=sys.stderr)
@@ -73,5 +66,4 @@ def setup_env(node_dir=None):
 
     dedupe_libomp()
 
-    _ensure_base_directory()
     print("[comfy-env] prestartup complete", file=sys.stderr, flush=True)
