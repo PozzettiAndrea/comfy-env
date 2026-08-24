@@ -113,13 +113,16 @@ def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
         return _build_isolation_env_linux(env, python)
 
 
-def _get_env_paths(env_dir: Path) -> "tuple[Optional[Path], Optional[Path]]":
-    """Get (site_packages, lib_dir) from env."""
+def _get_env_paths(env_dir: Path) -> "Optional[Path]":
+    """Get site_packages from env.
+
+    Used to return (site_packages, lib_dir) too. The lib_dir was threaded
+    through seven functions in three files and then dropped: _create_worker
+    accepted it and built SubprocessWorker without it.
+    """
     if sys.platform == "win32":
         sp = env_dir / "Lib" / "site-packages"
-        lib = env_dir / "Library" / "bin"
     else:
         matches = glob.glob(str(env_dir / "lib/python*/site-packages"))
         sp = Path(matches[0]) if matches else None
-        lib = env_dir / "lib"
-    return (sp, lib) if sp and sp.exists() else (None, None)
+    return sp if sp and sp.exists() else None

@@ -9,9 +9,7 @@ coupling broke on every refactor. These tests pin the schema, not the values.
 import json
 import subprocess
 import sys
-from pathlib import Path
 
-import pytest
 
 from comfy_env.environment import RuntimeEnv
 from conftest import subprocess_env

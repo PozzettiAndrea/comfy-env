@@ -6,7 +6,6 @@ from pathlib import Path
 
 from .libomp import dedupe_libomp
 
-USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
 
 
 def _find_env_dirs(node_dir):

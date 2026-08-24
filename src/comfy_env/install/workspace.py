@@ -754,8 +754,6 @@ def install_workspace(
                 torch_pin=torch_pin,
                 chosen_torch_index=chosen_torch_index,
                 chosen_torch_pin=chosen_torch_pin_for_override,
-                chosen_cuda=chosen_cuda if combo is not None else None,
-                chosen_torch_short=chosen_torch_short if combo is not None else None,
                 log=log,
             )
             urls = resolve_env_cuda_wheel_urls(
@@ -809,8 +807,6 @@ def install_workspace(
                 torch_pin=torch_pin,
                 chosen_torch_index=chosen_torch_index,
                 chosen_torch_pin=chosen_torch_pin_for_override,
-                chosen_cuda=chosen_cuda if combo is not None else None,
-                chosen_torch_short=chosen_torch_short if combo is not None else None,
                 log=log,
             )
             log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")

@@ -47,7 +47,6 @@ __all__ = [
 # internal that carries no compatibility promise.
 _INTERNAL = {
     "verify_installation": "comfy_env.install",
-    "USE_COMFY_ENV_VAR": "comfy_env.install",
     "get_comfyui_dir": "comfy_env.environment.cache.find_comfyui_dir_from_node",
     "find_comfyui_dir_from_node": "comfy_env.environment.cache",
     "ComfyEnvConfig": "comfy_env.config",

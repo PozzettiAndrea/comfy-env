@@ -38,23 +38,9 @@ class TensorKeeper:
             while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
                 self._keeper.popleft()
 
-    def keep_recursive(self, obj: Any) -> None:
-        try:
-            import torch
-            if isinstance(obj, torch.Tensor): self.keep(obj)
-            elif isinstance(obj, (list, tuple)):
-                for item in obj: self.keep_recursive(item)
-            elif isinstance(obj, dict):
-                for v in obj.values(): self.keep_recursive(v)
-        except ImportError: pass
-
-    def __len__(self) -> int:
-        with self._lock: return len(self._keeper)
-
 
 _tensor_keeper = TensorKeeper()
 keep_tensor = lambda t: _tensor_keeper.keep(t)
-keep_tensors_recursive = lambda obj: _tensor_keeper.keep_recursive(obj)
 
 
 def prepare_tensor_for_ipc(t: Any) -> Any:

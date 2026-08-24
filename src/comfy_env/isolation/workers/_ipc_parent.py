@@ -34,7 +34,6 @@ from ._ipc_shared import (
     _memfd_read,
     _PoolPtr,
     _import_pointer,
-    _export_pointer,
     _evict_cache_if_needed,
     _cuda_ipc_metadata_cache,
     _cuda_ipc_cache_tensors,
@@ -197,17 +196,6 @@ class _TensorKeeper:
 
 
 _parent_tensor_keeper = _TensorKeeper()
-_parent_fd_registry = []  # Keep fds alive until worker reads them
-
-
-def _cleanup_parent_fds(registry):
-    """Close parent-side fds after worker has read them."""
-    for fd in registry:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    registry.clear()
 
 
 def _serialize_tensor_native_parent(t, registry):
@@ -232,7 +220,12 @@ def _serialize_tensor_native_parent(t, registry):
         # sargs: (cls, DupFd, size)
         dupfd = sargs[1]
         fd = dupfd.detach()
-        _parent_fd_registry.append(fd)
+        # Per-CALL registry, NOT a module global. A global raced exactly like
+        # _call_state did (see below): it was cleared in each worker's finally,
+        # so worker A finishing closed worker B's in-flight fds when two
+        # workers were driven from different threads. _cleanup_shm() already
+        # closes int fds and runs on this same registry.
+        registry.append(fd)
         return {
             "__type__": "TensorRef",
             "strategy": "file_descriptor",

@@ -1,6 +1,5 @@
 """Contract: env names are user-visible on-disk identity; changes orphan envs."""
 
-from pathlib import Path
 
 import comfy_env.environment.cache as cache
 

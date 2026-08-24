@@ -68,6 +68,3 @@ def detect_backend() -> tuple[str, str | None]:
     return ("cpu", None)
 
 
-def is_accelerator() -> bool:
-    """True when a non-CPU backend is active (generic 'is a GPU-class device in use')."""
-    return detect_backend()[0] != "cpu"

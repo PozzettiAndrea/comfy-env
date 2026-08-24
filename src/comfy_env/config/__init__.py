@@ -33,7 +33,10 @@ class ComfyEnvConfig(dict):
 # -- is rejected at parse time rather than silently ignored (that's how a
 # no-op [env_vars] shipped in the flagship pack for months).
 ROOT_ALLOWED_SECTIONS = {"node_packs", "types"}
-ROOT_ONLY_SECTIONS = {"node_packs", "types"}
+# Deliberately the SAME object, not a second literal: "allowed at root" and
+# "root-only" are different questions that happen to have the same answer,
+# and two literals drift the moment someone adds a section to one.
+ROOT_ONLY_SECTIONS = ROOT_ALLOWED_SECTIONS
 
 # Comfy-env-owned sections of the ENV file and their known keys: the one
 # place pixi cannot validate for us, so unrecognized keys warn (a typo'd

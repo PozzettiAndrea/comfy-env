@@ -11,7 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
-from typing import Callable, List, Optional, Union
+from typing import Callable, Optional, Union
 
 from ..config import (
     discover_config,
@@ -19,7 +19,6 @@ from ..config import (
     CONFIG_FILE_NAME,
     ROOT_CONFIG_FILE_NAME,
 )
-from .helpers import USE_COMFY_ENV_VAR
 from .plugin import (
     _install_node_packs,
     _reinstall_main_requirements,
@@ -32,7 +31,6 @@ __all__ = [
     "install",
     "install_workspace",
     "verify_installation",
-    "USE_COMFY_ENV_VAR",
 ]
 
 

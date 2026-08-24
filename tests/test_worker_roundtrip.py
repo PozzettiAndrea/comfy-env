@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 
 from comfy_env.isolation.workers.subprocess import SubprocessWorker, _PERSISTENT_WORKER_SCRIPT
-from comfy_env.isolation.workers import _ipc_shared
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

@@ -171,7 +171,6 @@ if sys.platform == "linux":
 # Use default sharing strategy (file_descriptor on Linux).
 # Do NOT force file_system -- its torch_shm_manager prematurely unlinks files in torch 2.8.
 try:
-    import torch
     import torch.multiprocessing as mp
     wlog(f"[worker] PyTorch sharing strategy: {mp.get_sharing_strategy()}")
 except Exception as e:
@@ -205,20 +204,15 @@ if "comfy_env" not in sys.modules:
         _ce_stub.register_serializer = _ipc_shared.register_serializer
         _ce_stub.__all__ = ["register_serializer"]
         sys.modules["comfy_env"] = _ce_stub
-from _ipc_shared import (  # noqa: F401 -- re-exported names used below
-    _USE_MEMFD,
-    _memfd_write,
+from _ipc_shared import (
+    _cleanup_shm,
     _memfd_read,
     _create_shareable_pool,
     _export_pool_fd,
-    _import_pool_from_fd,
     _set_device_pool,
     _export_pointer,
-    _import_pointer,
     _trim_pool,
     _send_fd,
-    _recv_fd,
-    _PoolPtr,
 )
 
 # Release CPU affinity back to all cores for actual GPU work
@@ -408,7 +402,7 @@ _our_pool = None
 _pool_ipc_metadata_cache = {}
 _pool_ipc_cache_tensors = {}
 
-# Pool ctypes primitives and _PoolPtr come from _ipc_shared (imported at the
+# Pool ctypes primitives come from _ipc_shared (imported at the
 # top of this file). The duplicated definitions that lived here drifted from
 # the shared copies before being deleted -- do not reintroduce them.
 
@@ -458,7 +452,6 @@ def _serialize_pool_ipc(t):
 
 def _serialize_tensor_native(t, registry):
     """Serialize tensor using file_descriptor shared memory (zero-copy to parent)."""
-    import torch
     import torch.multiprocessing.reductions as reductions
 
     # Keep tensor alive until parent reads it
@@ -691,7 +684,6 @@ def _from_shm(obj, _depth=0, _key="root"):
 
     # generic pickled object (VideoFromFile, etc.)
     if "__shm_pickle__" in obj:
-        import pickle
         if "fd" in obj:
             wlog(f"[_from_shm] {_key}: pickled memfd pid={obj['pid']} fd={obj['fd']} size={obj['size']}")
             obj_bytes = _memfd_read(obj["pid"], obj["fd"], obj["size"])
@@ -713,18 +705,6 @@ def _from_shm(obj, _depth=0, _key="root"):
     if _depth == 0:
         wlog(f"[_from_shm] top-level keys: {list(obj.keys())}")
     return {k: _from_shm(v, _depth+1, k) for k, v in obj.items()}
-
-def _cleanup_shm(registry):
-    for item in registry:
-        try:
-            if isinstance(item, int):
-                os.close(item)  # memfd fd
-            else:
-                item.close()
-                item.unlink()
-        except Exception:
-            pass
-    registry.clear()
 
 # Shared memory keeper - holds references to prevent premature GC
 class ShmKeeper:

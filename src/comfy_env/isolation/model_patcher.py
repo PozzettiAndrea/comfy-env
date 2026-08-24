@@ -36,7 +36,7 @@ import sys
 
 import comfy.model_management
 
-from ..debug import VRAM as _DBG_VRAM, MODELS as _DBG_MODELS  # noqa: F401
+from ..debug import VRAM as _DBG_VRAM
 
 log = logging.getLogger("comfy_env.model_patcher")
 

@@ -44,9 +44,8 @@ from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
 # Debug logging -- granular categories from debug.py
 from ...debug import (
     SERIALIZE as _DBG_SERIALIZE, IPC as _DBG_IPC,
-    WORKER as _DBG_WORKER, MODELS as _DBG_MODELS,
+    WORKER as _DBG_WORKER,
 )
-_DEBUG = any((_DBG_SERIALIZE, _DBG_IPC, _DBG_WORKER, _DBG_MODELS))  # backward compat
 
 # Shared IPC constants needed directly by SubprocessWorker
 from ._ipc_shared import (
@@ -66,8 +65,6 @@ from ._ipc_parent import (
     _create_server_socket,
     SocketTransport,
     # Tensor lifecycle
-    _parent_fd_registry,
-    _cleanup_parent_fds,
     _pool_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
@@ -802,7 +799,6 @@ class SubprocessWorker(Worker):
             finally:
                 _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
-                _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
 
     def _send_consumed(self, call_id: int) -> None:
@@ -866,7 +862,6 @@ class SubprocessWorker(Worker):
             finally:
                 _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
-                _cleanup_parent_fds(_parent_fd_registry)
                 _cleanup_ipc_cache()
 
     def echo(self, **kwargs) -> tuple:
@@ -898,7 +893,7 @@ class SubprocessWorker(Worker):
             finally:
                 _ipc_parent._call_state.gpu_demoted = False
                 _cleanup_shm(shm_registry)
-                _cleanup_parent_fds(_parent_fd_registry)
+                _cleanup_ipc_cache()
 
     @staticmethod
     def _torch_family(version: Optional[str]) -> Optional[str]:

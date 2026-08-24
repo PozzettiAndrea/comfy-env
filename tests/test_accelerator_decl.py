@@ -133,7 +133,7 @@ def test_unavailable_node_is_visible_and_raises_named_reason(monkeypatch):
     }
     cls = md.build_proxy_class(
         node_name="CudaNode", meta=meta, env_dir=Path("unused"),
-        package_root=Path("unused"), sys_path=[], lib_path=None, env_vars={},
+        package_root=Path("unused"), sys_path=[], env_vars={},
     )
     # Registered with real inputs/outputs so workflows still load...
     assert cls.INPUT_TYPES() == meta["input_types"]
@@ -162,7 +162,7 @@ def test_available_accelerator_builds_normal_proxy(monkeypatch):
     }
     cls = md.build_proxy_class(
         node_name="CudaNode", meta=meta, env_dir=Path("unused"),
-        package_root=Path("unused"), sys_path=[], lib_path=None, env_vars={},
+        package_root=Path("unused"), sys_path=[], env_vars={},
     )
     assert not hasattr(cls, "_comfy_env_unavailable")
     assert cls._comfy_env_accelerator == ["cuda"]

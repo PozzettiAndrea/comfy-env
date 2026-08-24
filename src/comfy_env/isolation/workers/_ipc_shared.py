@@ -27,8 +27,6 @@ MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB message size limit
 CUDA_MEM_HANDLE_TYPE_POSIX_FD = 1
 CUDA_MEM_ALLOCATION_TYPE_PINNED = 1
 CUDA_MEM_LOCATION_TYPE_DEVICE = 1
-CUDA_MEMPOOL_ATTR_RESERVED_MEM_CURRENT = 3
-CUDA_MEMPOOL_ATTR_USED_MEM_CURRENT = 5
 
 # Worker faulthandler dump file (basename under tempdir). The worker writes
 # it; the parent's crash diagnostic reads it. MUST match on both sides --

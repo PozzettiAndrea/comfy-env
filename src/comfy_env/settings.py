@@ -92,13 +92,6 @@ if SETTINGS_FILE.exists():
         pass
 
 
-def _is_on(var: str, default: bool = False) -> bool:
-    val = os.environ.get(var, "")
-    if val == "":
-        return default
-    return val.lower() in ("1", "true", "yes")
-
-
 # General settings
 GENERAL_SETTINGS = [
     ("COMFY_ENV_POOL_IPC", "Pool IPC (zero-copy GPU tensor transfer)"),
@@ -111,13 +104,6 @@ GENERAL_DEFAULTS = {
 # String settings. Unlike the boolean/numeric tables these are read at their
 # point of use (each has a non-trivial default to compute), so this table is
 # documentation for the settings surface rather than a resolution mechanism.
-STRING_SETTINGS = [
-    ("COMFY_ENV_ROOT",
-     "Workspace root where envs materialize (default: platform-specific)"),
-    ("COMFY_ENV_CUDA_WHEELS_INDEX",
-     "cuda-wheels index base URL -- point at a mirror for air-gapped sites"),
-]
-
 # Numeric settings
 # Empty since 0.4.25 -- COMFY_ENV_WORKER_VRAM_BUDGET (manual per-worker VRAM
 # cap) was removed: the budget-negotiation callback computes the honest number
@@ -148,9 +134,4 @@ PATCH_DEFAULTS = {}
 
 
 
-def resolve_bool(var: str, node_settings: dict = None, default: bool = False) -> bool:
-    """Resolve a boolean setting. `node_settings` is vestigial (per-pack
-    [settings] removed 0.4.25) and ignored; kept only so call sites read
-    uniformly until the next signature sweep."""
-    return _is_on(var, default)
 

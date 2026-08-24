@@ -1,6 +1,6 @@
 [project]
 name = "comfy-env"
-version = "0.4.27"
+version = "0.4.28"
 description = "Environment management for ComfyUI custom nodes - CUDA wheel resolution and process isolation"
 readme = "README.md"
 license = {text = "MIT"}
@@ -58,7 +58,11 @@ target-version = "py310"
 [tool.ruff.lint]
 # CI gate is fatal-only for now: syntax errors, bad comparisons, undefined
 # names. Widen once the existing style debt is paid down.
-select = ["E9", "F63", "F7", "F82"]
+# F401 (unused import) and F841 (unused local) are ON deliberately: they
+# were off, and 20 dead imports plus four LYING `# noqa: F401` comments
+# accumulated behind the gap. ARG is left off -- unused args are common
+# in interface-shaped callbacks here.
+select = ["E9", "F63", "F7", "F82", "F401", "F841"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

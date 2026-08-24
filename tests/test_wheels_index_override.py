@@ -30,10 +30,24 @@ def test_blank_falls_back_to_the_default(monkeypatch, blank):
 
 
 def test_override_reaches_the_url_builder(monkeypatch):
-    """The point of the setting: lookups actually go to the mirror."""
+    """The point of the setting: lookups actually go to the mirror.
+
+    Asserts against the LIVE lookup path (get_wheel_url -> _fetch_with_retries)
+    rather than a helper, so the coverage cannot be invalidated by deleting an
+    unused convenience function -- which is how this test was written before.
+    """
     monkeypatch.setenv("COMFY_ENV_CUDA_WHEELS_INDEX", "https://mirror.internal/w/")
-    urls = cw.get_find_links_urls("flash-attn")
-    assert urls and all(u.startswith("https://mirror.internal/w/") for u in urls), urls
+    seen = []
+
+    def _fake_fetch(url, timeout=10, max_retries=3, log=None):
+        seen.append(url)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(cw, "_fetch_with_retries", _fake_fetch)
+    monkeypatch.setattr(cw, "_fetch_from_github_api", lambda *a, **k: None)
+    cw.get_wheel_url("flash-attn", "2.8.0", "12.8", "3.13")
+    assert seen, "get_wheel_url made no request"
+    assert all(u.startswith("https://mirror.internal/w/") for u in seen), seen
 
 
 def test_resolve_index_url_honours_the_override(monkeypatch):

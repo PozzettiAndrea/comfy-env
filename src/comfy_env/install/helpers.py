@@ -2,35 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Callable
 
-USE_COMFY_ENV_VAR = "USE_COMFY_ENV"
-
-
-def _rmtree(path) -> None:
-    """rmtree that handles read-only files and long paths on Windows."""
-    import shutil
-    if sys.platform == "win32":
-        import subprocess, tempfile
-        target = str(Path(path).resolve())
-        empty = tempfile.mkdtemp()
-        try:
-            subprocess.run(
-                ["robocopy", empty, target, "/MIR", "/W:0", "/R:0"],
-                capture_output=True,
-            )
-            shutil.rmtree(target, ignore_errors=True)
-        finally:
-            shutil.rmtree(empty, ignore_errors=True)
-    else:
-        shutil.rmtree(path)
-
-
-def _is_comfy_env_enabled() -> bool:
-    return os.environ.get(USE_COMFY_ENV_VAR, "1").lower() not in ("0", "false", "no", "off")
 
 
 def _patch_uv_platform_py(log: Callable[[str], None] = print) -> None:

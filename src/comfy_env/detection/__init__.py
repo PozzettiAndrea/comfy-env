@@ -6,7 +6,6 @@ No side effects. These functions gather information about the runtime environmen
 
 from .backend import (
     detect_backend,
-    is_accelerator,
     KNOWN_BACKENDS,
 )
 from .cuda import (
@@ -59,22 +58,9 @@ def get_pixi_platform() -> str:
     return _PIXI_PLATFORMS.get(key, f"{key[0]}-{key[1]}")
 
 
-def is_linux() -> bool:
-    return _sys.platform.startswith("linux")
-
-
-def is_windows() -> bool:
-    return _sys.platform == "win32"
-
-
-def is_macos() -> bool:
-    return _sys.platform == "darwin"
-
-
 __all__ = [
     # Backend detection (which accelerator torch will use)
     "detect_backend",
-    "is_accelerator",
     "KNOWN_BACKENDS",
     # CUDA detection
     "has_nvidia_gpu",
@@ -95,7 +81,4 @@ __all__ = [
     "get_gpu_summary",
     # Platform helpers
     "get_pixi_platform",
-    "is_linux",
-    "is_windows",
-    "is_macos",
 ]

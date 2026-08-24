@@ -12,7 +12,6 @@ These tests are scheduled for deletion together with the tombstones.
 
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 

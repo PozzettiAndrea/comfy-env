@@ -44,15 +44,6 @@ class _FakeResponse(io.BytesIO):
         return False
 
 
-def test_find_matching_wheel_picks_highest_version_numerically(monkeypatch):
-    # 1.9 vs 1.10: plain string comparison would pick 1.9. The contract is
-    # numeric ordering.
-    monkeypatch.setattr(cw.urllib.request, "urlopen",
-                        lambda url, timeout=10: _FakeResponse(INDEX_HTML.encode()))
-    spec = cw.find_matching_wheel("pkg", torch_version="2.8.0", cuda_version="12.8")
-    assert spec == "pkg===1.10+cu128torch2.8"
-
-
 def test_version_key_ordering():
     assert cw._version_key("1.10") > cw._version_key("1.9")
     assert cw._version_key("0.0.1") < cw._version_key("1.0")

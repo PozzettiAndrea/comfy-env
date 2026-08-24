@@ -1,17 +1,11 @@
-"""Contract: setting resolution order is env var > per-node [settings] > default."""
+"""Contract: settings resolve from env vars, then the default.
 
-from comfy_env.settings import get_numeric, resolve_bool
+(The per-pack [settings] tier was removed in 0.4.25, and resolve_bool -- the
+wrapper that still took a `node_settings` argument it ignored -- went with the
+rest of the dead settings surface.)
+"""
 
-
-def test_env_var_states(monkeypatch):
-    monkeypatch.delenv("COMFY_ENV_POOL_IPC", raising=False)
-    assert resolve_bool("COMFY_ENV_POOL_IPC", None, True) is True
-    assert resolve_bool("COMFY_ENV_POOL_IPC", None, False) is False
-    for truthy in ("1", "true", "YES"):
-        monkeypatch.setenv("COMFY_ENV_POOL_IPC", truthy)
-        assert resolve_bool("COMFY_ENV_POOL_IPC", None, False) is True
-    monkeypatch.setenv("COMFY_ENV_POOL_IPC", "0")
-    assert resolve_bool("COMFY_ENV_POOL_IPC", None, True) is False
+from comfy_env.settings import get_numeric
 
 
 def test_numeric_resolution(monkeypatch):

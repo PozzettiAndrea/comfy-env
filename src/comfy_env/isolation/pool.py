@@ -121,7 +121,7 @@ def _cleanup_stale_workers():
 
 
 def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
-                   lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                   env_vars: Optional[dict] = None,
                    health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
     """Create a fresh subprocess worker."""
     python = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
@@ -340,7 +340,7 @@ def _cleanup_stale_patchers(env_dir):
          f"(will be cleaned up during next unload)")
 
 
-def _register_proxy_routes(routes, env_dir, package_root, sys_path, lib_path, env_vars,
+def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
                            health_check_timeout):
     """Register aiohttp routes in the main process that forward to the isolation worker.
 
@@ -383,7 +383,7 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, lib_path, en
 
         # Each closure must capture its own copy of the loop variables
         async def _make_proxy(request, _env_dir=env_dir, _pkg_root=package_root,
-                              _sys_path=sys_path, _lib_path=lib_path, _env_vars=env_vars,
+                              _sys_path=sys_path, _env_vars=env_vars,
                               _module=module_name, _func=handler_func,
                               _hc_timeout=health_check_timeout, _path=path,
                               _counts=_proxy_call_counts):
@@ -399,7 +399,7 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, lib_path, en
                 _log(f"[comfy-env] Route {_path}: first call, body keys={list(body.keys())}")
 
             worker, _ = _get_or_create_worker(
-                _env_dir, _pkg_root, _sys_path, _lib_path, _env_vars, _hc_timeout,
+                _env_dir, _pkg_root, _sys_path, _env_vars, _hc_timeout,
             )
             if _first:
                 _log(f"[comfy-env] Route {_path}: worker={worker.name}, calling {_module}.{_func}")
@@ -431,7 +431,7 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, lib_path, en
 
 
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
-                          lib_path: Optional[str] = None, env_vars: Optional[dict] = None,
+                          env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
     """Get existing worker for this env, or create a new one.
 
@@ -454,7 +454,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                 pass
         _WORKER_GENERATION += 1
         gen = _WORKER_GENERATION
-        worker = _create_worker(env_dir, working_dir, sys_path, lib_path, env_vars, health_check_timeout)
+        worker = _create_worker(env_dir, working_dir, sys_path, env_vars, health_check_timeout)
         # Register bidirectional RPC callbacks
         worker.register_callback("request_vram_budget", _handle_vram_budget)
         worker.register_callback("report_progress", _handle_progress)

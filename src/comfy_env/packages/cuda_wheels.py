@@ -414,19 +414,6 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
     return None
 
 
-def find_available_wheels(package: str) -> List[str]:
-    """List all available wheels for a package."""
-    wheels = []
-    link_pattern = re.compile(r'href="[^"]*?([^"/]+\.whl)"', re.IGNORECASE)
-    for pkg_dir in _pkg_variants(package):
-        try:
-            with urllib.request.urlopen(f"{cuda_wheels_index()}{pkg_dir}/", timeout=10) as resp:
-                html = resp.read().decode("utf-8")
-            for match in link_pattern.finditer(html):
-                name = match.group(1).replace("%2B", "+")
-                if name not in wheels: wheels.append(name)
-        except Exception: continue
-    return wheels
 
 
 def _version_key(version: str):
@@ -442,37 +429,3 @@ def _version_key(version: str):
         else:
             key.append((0, 0, piece))
     return key
-
-
-def find_matching_wheel(package: str, torch_version: str, cuda_version: str) -> Optional[str]:
-    """Find wheel matching CUDA/torch version, return version spec."""
-    cuda_short = cuda_version.replace(".", "")[:3]
-    torch_short = ".".join(torch_version.split(".")[:2])
-    local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
-    wheel_pattern = re.compile(r'href="[^"]*?([^"/]+\.whl)"', re.IGNORECASE)
-
-    for pkg_dir in _pkg_variants(package):
-        try:
-            with urllib.request.urlopen(f"{cuda_wheels_index()}{pkg_dir}/", timeout=10) as resp:
-                html = resp.read().decode("utf-8")
-        except Exception: continue
-
-        best_match = best_version = None
-        for match in wheel_pattern.finditer(html):
-            wheel_name = match.group(1).replace("%2B", "+")
-            for local in local_patterns:
-                if local in wheel_name:
-                    parts = wheel_name.split("-")
-                    if len(parts) >= 2 and (
-                        best_version is None
-                        or _version_key(parts[1]) > _version_key(best_version)
-                    ):
-                        best_version = parts[1]
-                        best_match = f"{package}==={parts[1]}"
-                    break
-        if best_match: return best_match
-    return None
-
-
-def get_find_links_urls(package: str) -> List[str]:
-    return [f"{cuda_wheels_index()}{p}/" for p in _pkg_variants(package)]

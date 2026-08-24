@@ -12,10 +12,9 @@ Workspace model:
 """
 
 import copy
-import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config import ComfyEnvConfig
 from ..detection import get_pixi_platform
@@ -287,8 +286,6 @@ def build_env_toml(
     torch_pin: Optional[str] = None,
     chosen_torch_index: Optional[str] = None,
     chosen_torch_pin: Optional[str] = None,
-    chosen_cuda: Optional[str] = None,
-    chosen_torch_short: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """Build a self-contained pixi.toml dict for one isolated env.
@@ -382,8 +379,6 @@ def write_env_pixi_toml(
     torch_pin: Optional[str] = None,
     chosen_torch_index: Optional[str] = None,
     chosen_torch_pin: Optional[str] = None,
-    chosen_cuda: Optional[str] = None,
-    chosen_torch_short: Optional[str] = None,
     log: Callable[[str], None] = print,
 ) -> Dict[str, Any]:
     """Write ``<env_manifest_dir>/pixi.toml`` for one isolated env.
@@ -403,8 +398,6 @@ def write_env_pixi_toml(
         torch_pin=torch_pin,
         chosen_torch_index=chosen_torch_index,
         chosen_torch_pin=chosen_torch_pin,
-        chosen_cuda=chosen_cuda,
-        chosen_torch_short=chosen_torch_short,
         log=log,
     )
     # Provenance header (ADR-0013): when pixi rejects a forwarded key its

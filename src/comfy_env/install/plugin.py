@@ -8,16 +8,9 @@ is handled separately in `workspace.py`.
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, List, Tuple
 
-from ..config import (
-    ComfyEnvConfig,
-    load_config,
-    discover_config,
-    CONFIG_FILE_NAME,
-)
 
 
 def _install_node_packs(

@@ -24,7 +24,7 @@ def _log(msg: str) -> None:
 # Launch-env construction (build_isolation_env, _get_env_paths, platform
 # builders) moved to isolation/subenv.py -- a leaf, so subprocess.py and
 # metadata.py import it DOWNWARD instead of reaching up into this file.
-from .subenv import build_isolation_env, _get_env_paths  # noqa: F401
+from .subenv import _get_env_paths
 
 def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optional[Path]:
     """Resolve the pixi env dir for a node config in the workspace model.
@@ -287,7 +287,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         env_dir = _find_env_dir(cf.parent, config_path=cf)
         if not env_dir:
             continue
-        sp, lib = _get_env_paths(env_dir)
+        sp = _get_env_paths(env_dir)
         if not sp:
             continue
 
@@ -338,7 +338,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             "dir": cf.parent,
             "env_dir": env_dir,
             "sp": sp,
-            "lib": lib,
             "env_vars": env_vars,
             "health_check_timeout": health_check_timeout,
             "package_root": package_root,
@@ -389,7 +388,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             # Don't add host site-packages to sys_path -- torch is symlinked
             # into pixi env by metadata.py/subprocess.py. Adding host sp leaks
             # pip C-extension packages (scipy, numpy) that crash on macOS.
-            lib_path = str(env["lib"]) if env["lib"] else None
 
             for name, meta in root_nodes.items():
                 all_mappings[name] = build_proxy_class(
@@ -398,7 +396,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     env_dir=env["env_dir"],
                     package_root=package_root,
                     sys_path=sys_path_list,
-                    lib_path=lib_path,
                     env_vars=env["env_vars"],
                     health_check_timeout=env["health_check_timeout"],
                 )
@@ -408,7 +405,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             if root_routes:
                 _register_proxy_routes(
                     root_routes, env["env_dir"], package_root,
-                    sys_path_list, lib_path, env["env_vars"],
+                    sys_path_list, env["env_vars"],
                     env["health_check_timeout"],
                 )
             _log(f"[comfy-env] Imported {nodes_package} root: {len(root_nodes)} nodes (isolation)")
@@ -515,7 +512,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     package_root = env["package_root"]
                     sys_path_list = [str(env["sp"]), str(package_root)]
                     # Don't add host site-packages -- torch is symlinked into pixi env
-                    lib_path = str(env["lib"]) if env["lib"] else None
 
                     for name, meta in nodes_meta.items():
                         all_mappings[name] = build_proxy_class(
@@ -524,7 +520,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                             env_dir=env["env_dir"],
                             package_root=package_root,
                             sys_path=sys_path_list,
-                            lib_path=lib_path,
                             env_vars=env["env_vars"],
                             health_check_timeout=env["health_check_timeout"],
                         )
@@ -535,7 +530,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     if sub_routes:
                         _register_proxy_routes(
                             sub_routes, env["env_dir"], package_root,
-                            sys_path_list, lib_path, env["env_vars"],
+                            sys_path_list, env["env_vars"],
                             env["health_check_timeout"],
                         )
                     if nodes_meta:

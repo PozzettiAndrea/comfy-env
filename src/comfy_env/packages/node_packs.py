@@ -8,7 +8,7 @@ import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Callable, List, Optional, Set, TYPE_CHECKING
+from typing import Callable, List, Optional, Set
 
 
 COMFY_REGISTRY_API = "https://api.comfy.org"

@@ -774,7 +774,6 @@ def _build_v3_proxy_class(
     env_dir: Path,
     package_root: Path,
     sys_path: list,
-    lib_path: Optional[str],
     env_vars: Dict[str, str],
     health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
 ) -> type:
@@ -862,7 +861,7 @@ def _build_v3_proxy_class(
             f"schema lives in the isolation env. If this is reached, a code path is "
             f"bypassing the proxy's shadowed classmethods.")
 
-    def _make_v3_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, nn):
+    def _make_v3_proxy(fn, mod, cn, ed, pr, sp, ev, hct, nn):
         def proxy(cls, **kwargs):
             from .pool import (_get_or_create_worker, _remove_worker,
                                _register_new_patchers)
@@ -874,7 +873,7 @@ def _build_v3_proxy_class(
             if _DBG_VRAM:
                 _log_vram(f"Before {nn}")
 
-            worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
+            worker, gen = _get_or_create_worker(ed, pr, sp, ev, hct)
             _t0 = time.perf_counter()
             try:
                 try:
@@ -932,7 +931,7 @@ def _build_v3_proxy_class(
         "define_schema": _define_schema_stub,
         "execute": classmethod(_make_v3_proxy(
             func_name, module_name, class_name,
-            env_dir, package_root, sys_path, lib_path, env_vars,
+            env_dir, package_root, sys_path, env_vars,
             health_check_timeout, node_name,
         )),
         "FUNCTION": "execute",
@@ -1048,7 +1047,6 @@ def build_proxy_class(
     env_dir: Path,
     package_root: Path,
     sys_path: list,
-    lib_path: Optional[str],
     env_vars: Dict[str, str],
     health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
 ) -> type:
@@ -1067,7 +1065,7 @@ def build_proxy_class(
     if meta.get("is_v3") and meta.get("node_info_v1") is not None:
         try:
             return _build_v3_proxy_class(
-                node_name, meta, env_dir, package_root, sys_path, lib_path,
+                node_name, meta, env_dir, package_root, sys_path,
                 env_vars, health_check_timeout)
         except Exception as e:
             print(f"[comfy-env] V3 proxy build failed for {node_name}, "
@@ -1173,7 +1171,7 @@ def build_proxy_class(
     _hidden_strip = set(input_types.get("hidden", {}).keys()) - {"unique_id"}
 
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, lp, ev, hct, dcp, nn, hsk):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hsk):
         def proxy(self, **kwargs):
             from .pool import (_get_or_create_worker, _remove_worker,
                                _register_new_patchers)
@@ -1206,7 +1204,7 @@ def build_proxy_class(
             if _DBG_VRAM:
                 _log_vram(f"Before {nn}")
 
-            worker, gen = _get_or_create_worker(ed, pr, sp, lp, ev, hct)
+            worker, gen = _get_or_create_worker(ed, pr, sp, ev, hct)
             _t0 = time.perf_counter()
             try:
                 try:
@@ -1258,7 +1256,7 @@ def build_proxy_class(
 
     attrs[func_name] = _make_proxy(
         func_name, module_name, class_name,
-        env_dir, package_root, sys_path, lib_path, env_vars, health_check_timeout,
+        env_dir, package_root, sys_path, env_vars, health_check_timeout,
         dynamic_combo_parents, node_name, _hidden_strip,
     )
 
