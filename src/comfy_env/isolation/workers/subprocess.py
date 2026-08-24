@@ -189,6 +189,7 @@ class SubprocessWorker(Worker):
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
         self._last_ok = 0.0  # time of last successful round-trip (gates the health ping)
+        self._torn_down = False  # shutdown() has released this worker's resources
         self._last_echo_meta = None  # last echo() response (carries worker CUDA device UUID)
         self._authkey = None  # per-spawn IPC auth token (set in _ensure_started)
         self._on_restart = None  # Called when worker process is replaced (stale model cleanup)
@@ -248,9 +249,23 @@ class SubprocessWorker(Worker):
         try:
             if _DBG_WORKER:
                 print(f"[{self.name}] Health check: ping (timeout={self.health_check_timeout}s)...", file=sys.stderr, flush=True)
-            self._transport.send({"method": "ping"})
-            response = self._transport.recv(timeout=self.health_check_timeout)
-            ok = response is not None and response.get("status") == "pong"
+            self._call_counter += 1
+            ping_id = self._call_counter
+            self._transport.send({"method": "ping", "call_id": ping_id})
+            deadline = time.time() + self.health_check_timeout
+            ok = False
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                response = self._transport.recv(timeout=remaining)
+                if response is None:
+                    break
+                if self._drain_async_frame(response):
+                    continue
+                ok = (response.get("status") == "pong"
+                      and response.get("call_id") == ping_id)
+                break
             if _DBG_WORKER or not ok:
                 print(f"[{self.name}] Health check: {'ok' if ok else 'failed'}", file=sys.stderr, flush=True)
             return ok
@@ -260,6 +275,7 @@ class SubprocessWorker(Worker):
 
     def _kill_worker(self) -> None:
         """Kill the worker process and clean up resources."""
+        self._last_ok = 0.0  # the new process has proven nothing yet
         if self._process:
             try:
                 self._process.kill()
@@ -575,9 +591,7 @@ class SubprocessWorker(Worker):
                 msg = self._transport.recv(timeout=60)
                 if not msg:
                     raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
-                if msg.get("type") == "log":
-                    # Worker sends log messages during startup (e.g. comfy imports)
-                    print(f"[worker:{self.name}] {msg.get('message', '')}", file=sys.stderr, flush=True)
+                if self._drain_async_frame(msg):
                     continue
                 break
         except (ConnectionError, ConnectionResetError, OSError) as e:
@@ -654,6 +668,24 @@ class SubprocessWorker(Worker):
         except Exception as e:
             return {"type": "callback_response", "status": "error", "error": str(e)}
 
+    def _drain_async_frame(self, frame: dict) -> bool:
+        """Handle an unsolicited frame. True if consumed -- caller keeps waiting.
+
+        log and callback arrive from any worker thread at any point in a
+        conversation: the worker replaces builtins.print and puts a handler on
+        the root logger, both writing to this socket. Every loop that reads a
+        reply must skip them, so there is exactly one copy of the rule.
+        """
+        kind = frame.get("type")
+        if kind == "log":
+            print(f"[worker:{self.name}] {frame.get('message', '')}",
+                  file=sys.stderr, flush=True)
+            return True
+        if kind == "callback":
+            self._transport.send(self._handle_callback(frame))
+            return True
+        return False
+
     def _send_request(self, request: dict, timeout: float) -> dict:
         """Send request via socket and read response with timeout."""
         if not self._transport:
@@ -674,25 +706,17 @@ class SubprocessWorker(Worker):
                 if response is None:
                     break  # Timeout
 
-                # Handle log messages from worker
-                if response.get("type") == "log":
-                    msg = response.get("message", "")
-                    print(f"[worker:{self.name}] {msg}", file=sys.stderr, flush=True)
-                    continue  # Keep waiting for actual response
+                if self._drain_async_frame(response):
+                    continue
 
-                # Handle callback from worker (bidirectional RPC)
-                if response.get("type") == "callback":
-                    callback_response = self._handle_callback(response)
-                    self._transport.send(callback_response)
-                    continue  # Keep waiting for actual response
-
-                # Correlation check: every worker response echoes the request's
-                # call_id. A mismatched frame is a stale late reply (e.g. from
-                # a predecessor that timed out) -- drop it and keep waiting
-                # instead of returning the wrong result to the wrong caller.
+                # Correlation: every REPLY echoes the request's call_id, so a
+                # frame that does not match is not this call's answer. The old
+                # check skipped frames with no call_id at all, which let
+                # `ready` and `pool_fd_sent` be returned as a node's result --
+                # silently, as None.
                 resp_id = response.get("call_id")
-                if resp_id is not None and call_id is not None and resp_id != call_id:
-                    print(f"[{self.name}] Dropping stale frame "
+                if resp_id != call_id:
+                    print(f"[{self.name}] Dropping uncorrelated frame "
                           f"call_id={resp_id} (expecting {call_id})",
                           file=sys.stderr, flush=True)
                     continue
@@ -1063,9 +1087,17 @@ class SubprocessWorker(Worker):
             self._lock.release()
 
     def shutdown(self) -> None:
-        """Shut down the persistent worker."""
-        if self._shutdown:
+        """Shut down the persistent worker and release everything it holds.
+
+        Guarded on _torn_down, NOT on _shutdown: _send_request sets _shutdown
+        on a dead socket or a timeout, and the pool then calls shutdown() to
+        clean up precisely those workers. Gating on _shutdown made that call a
+        no-op, so every crashed worker leaked its process, its fd pair and its
+        temp dir for the life of the ComfyUI session.
+        """
+        if self._torn_down:
             return
+        self._torn_down = True
         self._shutdown = True
 
         # Send shutdown signal via socket
