@@ -98,6 +98,39 @@ _PERSISTENT_WORKER_SCRIPT = _WORKER_SCRIPT_PATH.read_text(encoding="utf-8")
 _HEALTH_PING_IDLE_SECONDS = 60.0
 
 
+def _enter_call_scope(worker):
+    """Begin the per-call _ipc_parent._call_state protocol; returns the state to restore.
+
+    Two bugs came from hand-writing this three times:
+
+    * ``gpu_demoted`` was cleared with the CONSTANT ``False`` in every
+      ``finally``, not restored. ``SubprocessWorker._lock`` is an RLock
+      *specifically* so VRAM-eviction callbacks can re-enter on the same
+      thread, so a nested call's exit re-enabled zero-copy for an outer call
+      the canary had demoted -- which then exported handles the worker cannot
+      import, failing after the node had done all its work.
+    * ``worker_pool`` was set around ``_from_shm`` by ``call_method`` and
+      ``call_module`` but NOT by ``echo``. Since ``verify_transport`` uses
+      ``echo`` as its oracle, a PoolIPC reply arrived with no pool handle,
+      ``_from_shm`` raised, ``verify_transport``'s bare except swallowed it,
+      and Pool IPC demoted itself permanently on every worker -- reported as
+      a routine capability probe rather than a defect.
+
+    Save/restore, not assign, and one place to be wrong.
+    """
+    st = _ipc_parent._call_state
+    prev = (getattr(st, "gpu_demoted", False), getattr(st, "worker_pool", None))
+    st.gpu_demoted = not getattr(worker, "gpu_zero_copy_ok", True)
+    st.worker_pool = worker._worker_pool
+    return prev
+
+
+def _exit_call_scope(prev):
+    """Restore what _enter_call_scope saved. Never assigns a constant."""
+    st = _ipc_parent._call_state
+    st.gpu_demoted, st.worker_pool = prev
+
+
 class SubprocessWorker(Worker):
     """
     Cross-venv worker using persistent subprocess + socket IPC.
@@ -193,12 +226,13 @@ class SubprocessWorker(Worker):
                 if (candidate / "main.py").exists() and (candidate / "comfy").exists():
                     return candidate
 
-        # Fallback: Walk up from working_dir (standard ComfyUI custom_nodes layout)
-        current = self.working_dir.resolve()
-        for _ in range(10):
-            if (current / "main.py").exists() and (current / "comfy").exists():
-                return current
-            current = current.parent
+        # No second walk here. There used to be one, from the same start point,
+        # using .resolve() -- which environment/cache.py documents as the wrong
+        # resolution: a pack behind a junction resolves to its physical
+        # location, where no ComfyUI root exists, so the walk either returns
+        # None (harmless) or finds a DIFFERENT checkout's root and hands it
+        # back as this worker's base. It also lacked the filesystem-root guard.
+        # find_comfyui_source_dir above already does this walk correctly.
         return None
 
     def _check_socket_health(self) -> bool:
@@ -740,7 +774,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
-            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _prev_scope = _enter_call_scope(self)
 
             try:
                 # Serialize kwargs to shared memory
@@ -788,16 +822,12 @@ class SubprocessWorker(Worker):
                 result_meta = response.get("result")
                 result = None
                 if result_meta is not None:
-                    _ipc_parent._call_state.worker_pool = self._worker_pool
-                    try:
-                        result = _from_shm(result_meta)
-                    finally:
-                        _ipc_parent._call_state.worker_pool = None
+                    result = _from_shm(result_meta)
                 self._send_consumed(call_id)
                 return result
 
             finally:
-                _ipc_parent._call_state.gpu_demoted = False
+                _exit_call_scope(_prev_scope)
                 _cleanup_shm(shm_registry)
                 _cleanup_ipc_cache()
 
@@ -826,7 +856,7 @@ class SubprocessWorker(Worker):
 
             timeout = timeout or 600.0
             shm_registry = []
-            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _prev_scope = _enter_call_scope(self)
 
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else None
@@ -851,16 +881,12 @@ class SubprocessWorker(Worker):
                 result_meta = response.get("result")
                 result = None
                 if result_meta is not None:
-                    _ipc_parent._call_state.worker_pool = self._worker_pool
-                    try:
-                        result = _from_shm(result_meta)
-                    finally:
-                        _ipc_parent._call_state.worker_pool = None
+                    result = _from_shm(result_meta)
                 self._send_consumed(call_id)
                 return result
 
             finally:
-                _ipc_parent._call_state.gpu_demoted = False
+                _exit_call_scope(_prev_scope)
                 _cleanup_shm(shm_registry)
                 _cleanup_ipc_cache()
 
@@ -873,7 +899,7 @@ class SubprocessWorker(Worker):
         """
         with self._lock:
             self._ensure_started()
-            _ipc_parent._call_state.gpu_demoted = not getattr(self, "gpu_zero_copy_ok", True)
+            _prev_scope = _enter_call_scope(self)
             shm_registry = []
             try:
                 kwargs_meta = _to_shm(kwargs, shm_registry) if kwargs else {}
@@ -891,7 +917,7 @@ class SubprocessWorker(Worker):
                 self._last_echo_meta = response
                 return result, response.get("torch_version")
             finally:
-                _ipc_parent._call_state.gpu_demoted = False
+                _exit_call_scope(_prev_scope)
                 _cleanup_shm(shm_registry)
                 _cleanup_ipc_cache()
 

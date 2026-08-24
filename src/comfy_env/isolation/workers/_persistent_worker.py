@@ -1027,6 +1027,12 @@ def main():
     _model_registry_meta = {}     # model_id -> {"size": int, "kind": str}
     _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
     _model_counter = [0]          # mutable counter in list for closure access
+    # Serialises the registry writes below. _hooked_to/_hooked_cuda replace
+    # torch.nn.Module.to/.cuda GLOBALLY, so they fire on whatever thread a
+    # pack uses. `_model_counter[0] += 1` is a read-modify-write: two models
+    # reaching CUDA concurrently could mint the SAME model_id, leaving the
+    # loser GPU-resident with no ledger entry -- permanently un-evictable.
+    _registry_lock = threading.Lock()
     _new_models_this_call = []    # populated during call, sent in response
     _loading_via_shim = [False]   # suppress auto-detection during shimmed load_models_gpu
 
@@ -1062,14 +1068,15 @@ def main():
                 return
         except Exception:
             return
-        _model_counter[0] += 1
-        model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
-        size = _compute_model_size(module)
-        _model_registry[model_id] = module
-        _model_registry_meta[model_id] = {"size": size, "kind": "other"}
-        _model_id_by_obj[obj_id] = model_id
-        _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-        wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
+        with _registry_lock:
+            _model_counter[0] += 1
+            model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
+            size = _compute_model_size(module)
+            _model_registry[model_id] = module
+            _model_registry_meta[model_id] = {"size": size, "kind": "other"}
+            _model_id_by_obj[obj_id] = model_id
+            _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
+            wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
 
     def _register_if_cuda(module):
         """Register an nn.Module with parent if it's on CUDA.
@@ -1087,44 +1094,45 @@ def main():
                 return
         except Exception:
             return
-        _model_counter[0] += 1
-        model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
-        size = _compute_model_size(module)
-        _model_registry[model_id] = module
-        _model_registry_meta[model_id] = {"size": size, "kind": "other"}
-        _model_id_by_obj[obj_id] = model_id
-        _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-        wlog(f"[worker] Post-shim registered '{model_id}': {size / 1e9:.2f} GB")
+        with _registry_lock:
+            _model_counter[0] += 1
+            model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
+            size = _compute_model_size(module)
+            _model_registry[model_id] = module
+            _model_registry_meta[model_id] = {"size": size, "kind": "other"}
+            _model_id_by_obj[obj_id] = model_id
+            _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
+            wlog(f"[worker] Post-shim registered '{model_id}': {size / 1e9:.2f} GB")
 
-    # Install hooks on Module.to() and .cuda()
-    # Module.to() only fires for the outermost call -- PyTorch recurses
-    # through children via _apply(), not .to(), so we naturally catch
-    # only top-level models.
-    try:
-        import torch as _torch
-        _orig_module_to = _torch.nn.Module.to
-        _orig_module_cuda = _torch.nn.Module.cuda
+        # Install hooks on Module.to() and .cuda()
+        # Module.to() only fires for the outermost call -- PyTorch recurses
+        # through children via _apply(), not .to(), so we naturally catch
+        # only top-level models.
+        try:
+            import torch as _torch
+            _orig_module_to = _torch.nn.Module.to
+            _orig_module_cuda = _torch.nn.Module.cuda
 
-        def _hooked_to(self, *args, **kwargs):
-            result = _orig_module_to(self, *args, **kwargs)
-            _auto_register_if_cuda(self)
-            return result
+            def _hooked_to(self, *args, **kwargs):
+                result = _orig_module_to(self, *args, **kwargs)
+                _auto_register_if_cuda(self)
+                return result
 
-        def _hooked_cuda(self, *args, **kwargs):
-            result = _orig_module_cuda(self, *args, **kwargs)
-            _auto_register_if_cuda(self)
-            return result
+            def _hooked_cuda(self, *args, **kwargs):
+                result = _orig_module_cuda(self, *args, **kwargs)
+                _auto_register_if_cuda(self)
+                return result
 
-        _torch.nn.Module.to = _hooked_to
-        _torch.nn.Module.cuda = _hooked_cuda
-        wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
-    except ImportError:
-        wlog("[worker] torch not available, skipping auto-registration hooks")
+            _torch.nn.Module.to = _hooked_to
+            _torch.nn.Module.cuda = _hooked_cuda
+            wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
+        except ImportError:
+            wlog("[worker] torch not available, skipping auto-registration hooks")
 
-    # ---------------------------------------------------------------
-    # Bidirectional RPC -- call parent methods during execution
-    # ---------------------------------------------------------------
-    _current_call_id = None  # Tracks call_id of the request being processed
+        # ---------------------------------------------------------------
+        # Bidirectional RPC -- call parent methods during execution
+        # ---------------------------------------------------------------
+        _current_call_id = None  # Tracks call_id of the request being processed
 
     def _find_loaded_model(_model):
         """The worker's own ComfyUI LoadedModel wrapping this module, if any."""
