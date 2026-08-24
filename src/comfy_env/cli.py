@@ -163,7 +163,7 @@ def cmd_install(args) -> int:
 
 
 def cmd_info(args) -> int:
-    from .detection import RuntimeEnv
+    from .environment import RuntimeEnv
     env = RuntimeEnv.detect()
 
     if args.json:

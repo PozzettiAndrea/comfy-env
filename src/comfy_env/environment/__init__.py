@@ -26,3 +26,5 @@ __all__ = [
     "USE_COMFY_ENV_VAR",
     "dedupe_libomp",
 ]
+
+from .runtime import RuntimeEnv  # noqa: E402,F401
