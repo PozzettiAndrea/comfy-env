@@ -398,7 +398,15 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
         _emit(f"[cuda-wheels]   Found: {display}")
         return url
 
-    # Index path failed for every variant -- try the different-transport fallback.
+    # deferred_errors is appended to ONLY in the except branches above, so it
+    # is an exact "the index was unreachable" signal. Without this gate the
+    # ordinary "no wheel published for this combo" outcome -- a clean HTTP 200
+    # with no matching filename -- printed a network diagnosis and paid for a
+    # full GitHub API round trip (15s x 3 retries) per package per combo.
+    if not deferred_errors:
+        _emit(f"[cuda-wheels]   No wheel published for this combo.")
+        return None
+
     _emit(f"[cuda-wheels]   GH Pages index unreachable, falling back to GitHub Releases API...")
     api_result = _fetch_from_github_api(package, torch_version, cuda_version, python_version, log=_emit)
     if api_result is not None:

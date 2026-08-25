@@ -18,11 +18,11 @@ class LibompResult(NamedTuple):
     candidate. If that is what is happening, this log shows it.
     """
 
-    status: str            # "ok" | "not-darwin" | "no-torch-import" | "no-canonical"
+    status: str            # "ok" | "partial" | "not-darwin" | "no-torch-import" | "no-canonical"
     candidates: int = 0    # redundant copies matched by the glob patterns
     linked: int = 0        # copies replaced with a symlink to torch's
     already: int = 0       # copies already pointing at torch's
-    skipped: int = 0       # copies the torch guard excluded
+    skipped: int = 0       # the canonical torch libomp itself
     failed: int = 0        # copies that could not be replaced (OSError)
     skipped_paths: Tuple[str, ...] = ()
 
@@ -109,10 +109,16 @@ def dedupe_libomp(site_packages: Optional[Path] = None) -> LibompResult:
     skipped_paths = []
 
     for libomp in candidates:
-        if "torch" in libomp:
+        # Skip the canonical file itself -- pattern 3 (<sp>/*/lib/libomp.dylib)
+        # matches it. This was `"torch" in libomp`, a substring test on the
+        # FULL PATH, and every env directory is named <pack>-<abi_tag> where
+        # _abi_tag() emits either "torchN-M" or "notorch" -- so every candidate
+        # was classified as torch's own and nothing was ever deduped.
+        if os.path.abspath(libomp) == os.path.abspath(torch_libomp):
             skipped += 1
             skipped_paths.append(libomp)
             continue
+        backup = None
         try:
             if os.path.islink(libomp):
                 if os.path.realpath(libomp) == os.path.realpath(torch_libomp):
@@ -120,14 +126,22 @@ def dedupe_libomp(site_packages: Optional[Path] = None) -> LibompResult:
                     continue
                 os.unlink(libomp)
             else:
-                os.rename(libomp, libomp + ".bak")
+                backup = libomp + ".bak"
+                os.rename(libomp, backup)
             os.symlink(torch_libomp, libomp)
             linked += 1
         except OSError:
+            # Never leave the package with no libomp at all: a failed symlink
+            # after a successful rename would delete the library outright.
+            if backup and os.path.exists(backup) and not os.path.exists(libomp):
+                try:
+                    os.rename(backup, libomp)
+                except OSError:
+                    pass
             failed += 1
 
     return LibompResult(
-        "ok",
+        "ok" if failed == 0 else "partial",
         candidates=len(candidates),
         linked=linked,
         already=already,

@@ -348,7 +348,7 @@ def build_env_toml(
     # to parse a manifest that declares `[feature.default.*]` explicitly.
     # Use "node" instead; the user-facing pixi environment name stays "default".
     feat = _build_node_feature(
-        cfg, "node", env_python,
+        cfg, env_name, env_python,
         torch_pin=node_torch_pin,
         torch_index=node_torch_index,
         glibc_version=glibc_version,
@@ -442,7 +442,8 @@ def resolve_env_cuda_wheel_urls(
         if not url:
             raise RuntimeError(
                 f"cuda-wheel {pkg!r} unavailable for "
-                f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{env_python}; "
+                f"cu{chosen_cuda}/torch{chosen_torch_short}/"
+                f"cp{env_python.replace('.', '')}; "
                 f"_resolve_wheel_combo should have caught this earlier."
             )
         urls[pkg] = url

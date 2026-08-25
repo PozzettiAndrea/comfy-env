@@ -46,16 +46,6 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     env["PATH"] = ";".join(minimal_path_parts)
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
-    # Scrub Python-pathing env vars inherited from the parent (python_embeded
-    # on portable). PYTHONPATH would let the env's python pick up modules from
-    # python_embeded's site-packages -- cp313 ABI but a *different* torch wheel
-    # (cu130 from the portable archive vs. the env's cu128/cu130 install). The
-    # DLL graph loaded straddles two torches, ERROR_PROC_NOT_FOUND on shm.dll.
-    # PYTHONNOUSERSITE keeps the env hermetic from %APPDATA%\Python user
-    # site-packages too. PYTHONSTARTUP can side-load arbitrary code; drop it.
-    for var in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
-        env.pop(var, None)
-    env["PYTHONNOUSERSITE"] = "1"
     # Pixi/conda envs on Windows: the Python binary resolves sys.prefix to the
     # base UV/conda Python instead of the env, causing both stdlib version
     # mismatches (SRE module mismatch) and missing site-packages (CGAL).
@@ -104,6 +94,22 @@ def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
     if env_vars:
         env.update(env_vars)
     env["COMFYUI_ISOLATION_WORKER"] = "1"
+
+    # Scrub Python-pathing vars inherited from the parent (python_embeded on
+    # portable). PYTHONPATH would let the env's python import from the
+    # parent's site-packages -- same ABI tag but a DIFFERENT torch wheel -- so
+    # the DLL graph straddles two torches: ERROR_PROC_NOT_FOUND on shm.dll.
+    # PYTHONHOME would point it at the parent's stdlib outright.
+    # PYTHONNOUSERSITE keeps ~/.local and %APPDATA%\Python out.
+    # PYTHONSTARTUP can side-load arbitrary code.
+    #
+    # Platform-independent, though it lived in the win32 builder alone until
+    # 0.4.30 -- so `pip install --user torch`, the documented PEP-668
+    # workaround, silently shadowed the pinned torch in every posix worker.
+    # win32 re-sets PYTHONHOME below for its own sys.prefix reasons.
+    for var in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONHOME"):
+        env.pop(var, None)
+    env["PYTHONNOUSERSITE"] = "1"
 
     if sys.platform == "win32":
         return _build_isolation_env_win32(env, python)

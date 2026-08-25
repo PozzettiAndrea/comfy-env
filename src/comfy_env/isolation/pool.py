@@ -139,14 +139,32 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 def _handle_progress(request: dict) -> dict:
     """Parent-side callback: forward subprocess progress to ComfyUI frontend.
 
-    Also checks if the user clicked cancel -- if so, returns an error
-    so the subprocess can stop processing.
+    Raises on cancel so the worker learns about it. Two reasons this is not
+    a `return {"status": "error"}`:
+
+    * InterruptProcessingException derives from BaseException, so the old
+      `except Exception` never caught it. It unwound out of _send_request's
+      read loop MID-CONVERSATION while the worker sat blocked in
+      _call_parent's recv() awaiting a callback_response that never came --
+      and that loop then ate the next real request as an unexpected frame.
+    * _handle_callback wraps any RETURN as {"status": "ok", "result": ...},
+      and the worker only inspects the outer status, so an error dict was
+      indistinguishable from success. Raising lets _handle_callback's
+      `except Exception` produce a genuine error frame, which _call_parent
+      turns into _InterruptedError inside the worker.
+
+    The message must keep containing "interrupted": _progress_hook matches on
+    it (_persistent_worker.py).
     """
     try:
         import comfy.model_management as mm
-        mm.throw_exception_if_processing_interrupted()
-    except Exception:
-        return {"status": "error", "error": "Processing interrupted by user"}
+    except ImportError:
+        mm = None  # not running inside ComfyUI -- nothing to cancel
+    if mm is not None:
+        try:
+            mm.throw_exception_if_processing_interrupted()
+        except mm.InterruptProcessingException:
+            raise RuntimeError("Processing interrupted by user")
     try:
         import comfy.utils
         if comfy.utils.PROGRESS_BAR_HOOK:
@@ -219,10 +237,14 @@ def _worker_held_bytes() -> int:
     """
     held = 0
     n_workers = 0
-    for _key, patchers in _WORKER_PATCHERS.items():
+    # Snapshot: _register_new_patchers and _cleanup_stale_patchers mutate
+    # these from the aiohttp executor thread, and _cleanup_stale_patchers runs
+    # outside _POOL_LOCK. Not taking the lock here on purpose -- it is a plain
+    # Lock held across verify_transport(), so re-entering would deadlock.
+    for _key, patchers in list(_WORKER_PATCHERS.items()):
         if patchers:
             n_workers += 1
-        for p in patchers.values():
+        for p in list(patchers.values()):
             try:
                 held += int(p.loaded_size())
             except Exception:

@@ -459,6 +459,11 @@ def fetch_metadata(
                 if _DEBUG or node_count > 0:
                     print(f"[comfy-env] Cache hit for {package_name}: {node_count} nodes",
                           file=sys.stderr, flush=True)
+                # A zero-node payload is cached like any other, and the cache
+                # only invalidates on a .py mtime change. Warning only on the
+                # fresh-scan path meant a broken entrypoint screamed once and
+                # was silent on every startup after.
+                _warn_empty_v3_scan(package_name, payload, node_count)
                 return payload
             elif _DEBUG:
                 print(f"[comfy-env] Cache stale for {package_name} "
