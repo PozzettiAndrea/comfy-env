@@ -10,6 +10,7 @@ The env vars propagate to subprocesses automatically via os.environ.
 """
 
 import os
+import sys
 from pathlib import Path
 
 SETTINGS_FILE = Path.home() / ".comfy-env" / "debug.env"
@@ -40,7 +41,6 @@ WORKER = DEBUG or _is_on("COMFY_ENV_DEBUG_WORKER")
 MODELS = DEBUG or _is_on("COMFY_ENV_DEBUG_MODELS")
 META = DEBUG or _is_on("COMFY_ENV_DEBUG_META")
 INSTALL = DEBUG or _is_on("COMFY_ENV_DEBUG_INSTALL")
-STACKTRACE = DEBUG or _is_on("COMFY_ENV_DEBUG_STACKTRACE")
 INPUTS_OUTPUTS = DEBUG or _is_on("COMFY_ENV_DEBUG_INPUTS_OUTPUTS")
 VRAM = DEBUG or _is_on("COMFY_ENV_DEBUG_VRAM")
 WATCHDOG = DEBUG or _is_on("COMFY_ENV_DEBUG_WATCHDOG")
@@ -57,5 +57,9 @@ CATEGORIES = [
     ("COMFY_ENV_DEBUG_MODELS", "Model registration & VRAM"),
     ("COMFY_ENV_DEBUG_META", "Node metadata scanning"),
     ("COMFY_ENV_DEBUG_INSTALL", "Environment install & build"),
-    ("COMFY_ENV_DEBUG_STACKTRACE", "Full stack traces from workers"),
 ]
+
+
+def log(msg: str) -> None:
+    """Print to stderr with flush -- survives process crashes."""
+    print(msg, file=sys.stderr, flush=True)

@@ -99,17 +99,10 @@ def discover_config(node_dir, root=True):
 
 
 def parse_config(data):
-    """Parse raw TOML dict into a normalized config dict.
+    """Parse a raw TOML dict into the normalized config dict built below.
 
-    Returns:
-        {
-            "python": str | None,
-            "cuda_packages": [str],
-            "env_vars": {str: str},
-            "node_packs": [{"name": str, "github": str|None, "tag": str|None, ...}],
-            "options": {"health_check_timeout": float},
-            "pixi_passthrough": dict,  # everything else goes straight to pixi.toml
-        }
+    Everything comfy-env does not claim lands in ``pixi_passthrough`` and goes
+    to pixi verbatim.
     """
     data = dict(data)  # shallow copy
 

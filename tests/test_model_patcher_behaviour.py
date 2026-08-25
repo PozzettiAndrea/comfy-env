@@ -109,11 +109,29 @@ def test_dead_worker_does_not_raise_from_eviction(patcher_mod):
     assert p.current_loaded_device() == "cpu"
 
 
-def test_transport_failure_does_not_raise_from_eviction(patcher_mod):
-    p = _make(patcher_mod, FakeWorker(boom=True))
-    p.partially_unload("cpu", memory_to_free=1024)   # no exception
-    p.detach()                                        # no exception
-    assert p.loaded_size() == 0
+def test_live_worker_that_refuses_an_unload_is_not_reported_as_offloaded(patcher_mod):
+    """A failed command on a LIVE worker means the weights are still resident.
+
+    FakeWorker(boom=True) is alive; only the command fails. Collapsing that
+    into the dead-worker outcome told ComfyUI it had reclaimed N GB it had
+    not, and zeroed loaded_size so the model was never picked for eviction
+    again -- every later admission decision computed against a card believed
+    to have N GB more free. Rule #1 of this module: never lie about bytes.
+    """
+    resident = 8 * 1024**3
+    p = _make(patcher_mod, FakeWorker(boom=True), resident=resident)
+
+    freed = p.partially_unload("cpu", memory_to_free=1024)   # must not raise
+    assert freed == 0, "reported bytes freed that are still on the card"
+    assert p.loaded_size() == resident, (
+        "loaded_size was zeroed, so ComfyUI will never try to evict this again"
+    )
+
+    p.detach()                                               # must not raise
+    assert p.loaded_size() == resident
+    assert p.current_loaded_device() != "cpu", (
+        "reported the model as moved off the GPU after the move failed"
+    )
 
 
 def test_load_path_does_raise_on_dead_worker(patcher_mod):

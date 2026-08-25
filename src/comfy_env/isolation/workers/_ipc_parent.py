@@ -1,20 +1,12 @@
-"""
-Parent-side IPC code for comfy-env subprocess workers.
+"""Parent-side IPC: socket setup, transport, tensor serialization, keepers.
 
-This module contains all parent-process IPC infrastructure:
-- Socket creation/connection utilities
-- SocketTransport (thread-safe, length-prefixed JSON)
-- TensorKeeper for shared memory GC prevention
-- Tensor serialization (CPU shared memory, CUDA IPC, Pool IPC)
-- _to_shm / _from_shm (parent-side serialization/deserialization)
-- Legacy serialization helpers for ComfyUI custom objects
+The worker's half lives in _persistent_worker.py; anything both sides must
+agree on lives in _ipc_shared.py.
 """
 
 import base64
-import json
 import os
 import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -28,7 +20,6 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from ._ipc_shared import (
-    MAX_MESSAGE_SIZE,
     TENSOR_KEEPER_TTL,
     SOCKET_ID_LENGTH,
     _memfd_read,
@@ -36,6 +27,7 @@ from ._ipc_shared import (
     _import_pointer,
     _evict_cache_if_needed,
     _cuda_ipc_metadata_cache,
+    _deserialize_cuda_ipc,
     _cuda_ipc_cache_tensors,
     _to_shm_generic,
     _decode_np_dtype,
@@ -49,9 +41,7 @@ from ...debug import (
 )
 
 
-# =============================================================================
 # Socket IPC utilities - cross-platform with TCP fallback
-# =============================================================================
 
 def _has_af_unix() -> bool:
     """Check if AF_UNIX sockets are available."""
@@ -112,73 +102,7 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
 
 
 
-class SocketTransport:
-    """
-    Length-prefixed JSON transport over sockets.
-
-    Message format: [4-byte big-endian length][JSON payload]
-    """
-
-    def __init__(self, sock: socket.socket):
-        self._sock = sock
-        self._send_lock = threading.Lock()
-        self._recv_lock = threading.Lock()
-
-    def send(self, obj: dict) -> None:
-        """Send a JSON-serializable object."""
-        data = json.dumps(obj).encode('utf-8')
-        msg = struct.pack('>I', len(data)) + data
-        with self._send_lock:
-            self._sock.sendall(msg)
-
-    def recv(self, timeout: Optional[float] = None) -> dict:
-        """Receive a JSON object. Returns None on timeout."""
-        with self._recv_lock:
-            if timeout is not None:
-                self._sock.settimeout(timeout)
-            try:
-                # Read 4-byte length header
-                raw_len = self._recvall(4)
-                if not raw_len:
-                    raise ConnectionError("Socket closed")
-                msg_len = struct.unpack('>I', raw_len)[0]
-
-                if msg_len > MAX_MESSAGE_SIZE:
-                    raise ValueError(f"Message too large: {msg_len} bytes")
-
-                # Read payload
-                data = self._recvall(msg_len)
-                if len(data) < msg_len:
-                    raise ConnectionError(f"Incomplete message: {len(data)}/{msg_len}")
-
-                return json.loads(data.decode('utf-8'))
-            except socket.timeout:
-                return None
-            finally:
-                if timeout is not None:
-                    self._sock.settimeout(None)
-
-    def _recvall(self, n: int) -> bytes:
-        """Receive exactly n bytes."""
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                return bytes(data)
-            data.extend(chunk)
-        return bytes(data)
-
-    def close(self) -> None:
-        """Close the socket."""
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-
-# =============================================================================
 # Tensor lifecycle management (parent side)
-# =============================================================================
 
 class _TensorKeeper:
     """Hold shared tensor references to prevent GC before worker reads them."""
@@ -256,9 +180,7 @@ def _serialize_tensor_native_parent(t, registry):
         raise RuntimeError(f"Unexpected reduce function: {sfunc.__name__}")
 
 
-# =============================================================================
 # CUDA IPC - zero-copy GPU tensor transfer (Linux only)
-# =============================================================================
 
 _cuda_ipc_supported: Optional[bool] = None
 
@@ -326,18 +248,9 @@ def _serialize_cuda_ipc(t) -> dict:
         func, args = reductions.reduce_tensor(t)
     except RuntimeError as e:
         if "received from another process" in str(e):
-            # BUG FIX: retain the clone. CUDA IPC has no cross-process
-            # refcount -- the EXPORTER must keep the allocation alive until
-            # the importer maps it. This function returns base64 handles and
-            # no tensor reference, so without this keep() the clone is
-            # unreferenced the moment we return, and the worker imports a
-            # handle onto freed device memory.
-            #
-            # tensor_utils' 30s keeper used to be the only thing under this
-            # branch, and it only covers callers that came through
-            # prepare_for_ipc_recursive (the two proxy bodies in metadata.py).
-            # Anything else reaching here -- call_module from the pool/route
-            # path, a tensor nested in a pack object -- had no keeper at all.
+            # CUDA IPC has no cross-process refcount: the EXPORTER keeps the
+            # allocation alive until the importer maps it. We return handles
+            # and no tensor, so the keeper is the clone's only reference.
             t = t.clone()
             _parent_tensor_keeper.keep(t)
             func, args = reductions.reduce_tensor(t)
@@ -361,59 +274,19 @@ def _serialize_cuda_ipc(t) -> dict:
     }
 
 
-def _deserialize_cuda_ipc(data: dict):
-    """Deserialize CUDA tensor from IPC handle.
-
-    Caches the IPC metadata so the handle can be forwarded if this tensor
-    is later sent to another worker (avoids cloning).
-    """
-    import torch
-    import torch.multiprocessing.reductions as reductions
-    dtype = getattr(torch, data["dtype"].split(".")[-1])
-    handle = base64.b64decode(data["handle"])
-    ref_counter_handle = base64.b64decode(data["ref_counter_handle"])
-    event_handle = base64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    tensor = reductions.rebuild_cuda_tensor(
-        torch.Tensor,
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["tensor_offset"],
-        torch.storage.TypedStorage,
-        dtype,
-        data["device_idx"],
-        handle,
-        data["storage_size"],
-        data["storage_offset"],
-        data["requires_grad"],
-        ref_counter_handle,
-        data["ref_counter_offset"],
-        event_handle,
-        data["event_sync_required"],
-    )
-    # Cache IPC metadata for handle forwarding (zero-copy re-sharing)
-    try:
-        storage_id = id(tensor.untyped_storage())
-        _cuda_ipc_metadata_cache[storage_id] = data
-        _cuda_ipc_cache_tensors[storage_id] = tensor
-    except Exception:
-        pass
-    return tensor
-
-
-# =============================================================================
 # Pool IPC - shareable CUDA memory pool (cudaMallocAsync-compatible)
-# =============================================================================
 
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 
-_pool_ipc_metadata_cache: Dict[int, dict] = {}
+# Only the tensors: the parent never reads back pool metadata, it just needs
+# a strong ref so the imported allocation stays mapped.
 _pool_ipc_cache_tensors: Dict[int, Any] = {}
 
 # Per-CALL state, set by SubprocessWorker around each call. THREAD-LOCAL
 # on purpose: module globals here raced when two workers were driven from
 # different threads (executor call in one, aiohttp route in another) --
-# worker B's call could read worker A's pool handle or demotion flag.
-# (2026-08 review finding; the RLock serializes per-worker, not globally.)
+# worker B's call could read worker A's pool handle or demotion flag. The
+# RLock serializes per-worker, not globally.
 _call_state = threading.local()  # attrs: worker_pool, gpu_demoted
 
 
@@ -445,11 +318,9 @@ def _deserialize_pool_ipc(data, source_pool):
                 tuple(data["tensor_size"]), tuple(data["tensor_stride"]))
     tensor.requires_grad_(data["requires_grad"])
 
-    # Cache for cross-worker forwarding
+    # Hold the imported tensor so its allocation stays mapped.
     try:
-        sid = id(tensor.untyped_storage())
-        _pool_ipc_metadata_cache[sid] = data
-        _pool_ipc_cache_tensors[sid] = tensor
+        _pool_ipc_cache_tensors[id(tensor.untyped_storage())] = tensor
     except Exception:
         pass
     return tensor
@@ -482,9 +353,7 @@ def _to_shm(obj, registry, visited=None):
                            tensor_serializer=_parent_tensor_serializer)
 
 
-# =============================================================================
 # Shared memory deserialization (worker -> parent)
-# =============================================================================
 
 def _deserialize_tensor_ref(data):
     """Deserialize tensor from shared memory (TensorRef format).
@@ -627,9 +496,7 @@ def _from_shm(obj, unlink=True):
     return {k: _from_shm(v, unlink) for k, v in obj.items()}
 
 
-# =============================================================================
 # IPC cache cleanup
-# =============================================================================
 
 def _cleanup_ipc_cache():
     """Remove stale entries and enforce size bounds on IPC forwarding caches."""
@@ -647,20 +514,16 @@ def _cleanup_ipc_cache():
             dead = [k for k, t in _pool_ipc_cache_tensors.items()
                     if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
             for k in dead:
-                _pool_ipc_metadata_cache.pop(k, None)
                 _pool_ipc_cache_tensors.pop(k, None)
     except Exception:
         pass
     # Enforce size bounds to prevent unbounded growth in long sessions
     _evict_cache_if_needed(_cuda_ipc_metadata_cache)
     _evict_cache_if_needed(_cuda_ipc_cache_tensors)
-    _evict_cache_if_needed(_pool_ipc_metadata_cache)
     _evict_cache_if_needed(_pool_ipc_cache_tensors)
 
 
-# =============================================================================
 # Legacy serialization helpers (for isolated objects)
-# =============================================================================
 
 def _serialize_for_ipc(obj, visited=None):
     """
@@ -675,7 +538,7 @@ def _serialize_for_ipc(obj, visited=None):
 
     obj_id = id(obj)
     if obj_id in visited:
-        return visited[obj_id]
+        return visited[obj_id][1]
 
     # Handle Path objects - mark for reconstruction
     from pathlib import PurePath
@@ -705,25 +568,25 @@ def _serialize_for_ipc(obj, visited=None):
                 '__class_name__': cls.__name__,
                 '__attrs__': {k: _serialize_for_ipc(v, visited) for k, v in obj.__dict__.items()},
             }
-            visited[obj_id] = result
+            visited[obj_id] = (obj, result)
             return result
 
     # Recurse into containers
     if isinstance(obj, dict):
         result = {k: _serialize_for_ipc(v, visited) for k, v in obj.items()}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
     elif isinstance(obj, list):
         result = [_serialize_for_ipc(v, visited) for v in obj]
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
     elif isinstance(obj, tuple):
         result = tuple(_serialize_for_ipc(v, visited) for v in obj)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Primitives and other objects - cache and return as-is
-    visited[obj_id] = obj
+    visited[obj_id] = (obj, obj)
     return obj
 
 

@@ -101,37 +101,4 @@ GENERAL_DEFAULTS = {
     "COMFY_ENV_POOL_IPC": False,
 }
 
-# String settings. Unlike the boolean/numeric tables these are read at their
-# point of use (each has a non-trivial default to compute), so this table is
-# documentation for the settings surface rather than a resolution mechanism.
-# Numeric settings
-# Empty since 0.4.25 -- COMFY_ENV_WORKER_VRAM_BUDGET (manual per-worker VRAM
-# cap) was removed: the budget-negotiation callback computes the honest number
-# automatically, nobody ever set the manual override, and its origin predates
-# anyone's memory. Kept as an empty container so the CLI settings surface
-# stays stable (same pattern as PATCH_SETTINGS).
-NUMERIC_SETTINGS = []
-
-
-def get_numeric(var: str, default: float = 0) -> float:
-    val = os.environ.get(var, "")
-    if val == "":
-        return default
-    try:
-        return float(val)
-    except ValueError:
-        return default
-
-
-
-# Patches (monkey-patching ComfyUI internals). Empty since 0.4.21 -- the
-# only entry, COMFY_ENV_PATCH_SHAREABLE_POOL (parent-side CUDA shareable
-# pool), was removed: experimental, default-off, and the cause of an
-# environment->isolation import cycle. Kept as empty containers so the CLI
-# settings surface stays stable.
-PATCH_SETTINGS = []
-PATCH_DEFAULTS = {}
-
-
-
 

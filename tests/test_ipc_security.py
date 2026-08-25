@@ -53,9 +53,8 @@ def test_parent_rejects_wrong_authkey(worker):
     # Drive the accept path directly with a peer that presents a bad key:
     # the parent must refuse, not proceed into the protocol.
     import threading
-    from comfy_env.isolation.workers._ipc_parent import (
-        _create_server_socket, SocketTransport,
-    )
+    from comfy_env.isolation.workers._ipc_parent import _create_server_socket
+    from comfy_env.isolation.workers._ipc_shared import SocketTransport
 
     srv, addr = _create_server_socket()
 

@@ -7,16 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import WORKER as _DBG_WORKER
+from ..debug import WORKER as _DBG_WORKER, log as _log
 # Worker pool (state, lifecycle, VRAM/progress callbacks, route proxying,
 # stale-patcher invariant) extracted to isolation/pool.py so metadata.py
 # imports it downward. wrap.register_nodes uses these two at startup:
 from .pool import _cleanup_stale_workers, _register_proxy_routes  # noqa: F401
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
 
 
 
@@ -74,9 +69,8 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         return None
 
     if config_path is None:
-        # Only comfy-env.toml names an env. The root file was once a
-        # fallback candidate here -- an identity for an env that install
-        # never creates (2026-08 review wart, removed).
+        # Only comfy-env.toml names an env: the root file describes the
+        # install, not an env install() will ever create.
         if (node_dir / "comfy-env.toml").exists():
             config_path = node_dir / "comfy-env.toml"
         if config_path is None:
@@ -106,13 +100,11 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         else:
             return env_dir.resolve() if sys.platform == "win32" else env_dir
 
-    # Envs are materialized ONLY by install() -- there is one builder
-    # (install/workspace.py). A lazy second path used to exist behind
-    # COMFY_ENV_AUTO_INSTALL; it was removed in 0.4.25 because it diverged
-    # from install_workspace in ways no seal could detect (it skipped the
-    # macOS libomp dedupe and uv's python-preference pinning, both of which
-    # left a permanently-wrong env that every later `comfy-env install`
-    # then SKIPPED as identity-matching).
+    # Envs are materialized ONLY by install() -- one builder
+    # (install/workspace.py), deliberately. A second lazy path diverges in
+    # ways no seal detects: skip the macOS libomp dedupe or uv's
+    # python-preference pin and you get a permanently-wrong env that every
+    # later `comfy-env install` SKIPS as identity-matching.
     #
     # The path shown here must work from the user's cwd: bare
     # `comfy-env install` resolves the config from the CURRENT directory,
@@ -156,7 +148,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS = register_nodes()
 
     For main-process dirs (no comfy-env.toml): imports normally.
-    For isolation dirs (comfy-env.toml + _env_*): subprocess metadata scan + proxy classes.
+    For isolation dirs (comfy-env.toml + a materialized env): subprocess
+    metadata scan + proxy classes.
 
     Args:
         nodes_package: Name of the nodes subpackage (default: "nodes")
@@ -223,9 +216,8 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # here fails this pack only: ComfyUI's load_custom_node wraps the import,
     # logs the traceback and boots without us -- "never break ComfyUI
     # startup" is satisfied by the host's own per-pack isolation, not by us
-    # swallowing the error. This block used to `except Exception` into
-    # root_cfg=None, which silently emptied _custom_sockets below and so
-    # disabled the very [types] validation the next comment calls LOUD.
+    # swallowing the error. Catching here would empty _custom_sockets below
+    # and silently disable the [types] validation the next comment calls LOUD.
     root_cfg = None
     try:
         from ..config import discover_config
@@ -291,10 +283,9 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
         if not sp:
             continue
 
-        # ONE parser (the config layer) -- this block once tomli.load'ed the
-        # file and re-implemented env_vars/options/cuda normalization by
-        # hand; duplicated contracts drift (the .log/.txt faulthandler split
-        # was the same disease).
+        # ONE parser (the config layer). Re-implementing env_vars/options/cuda
+        # normalization here is how contracts drift -- see the .log/.txt
+        # faulthandler split.
         env_vars = {}
         health_check_timeout = DEFAULT_HEALTH_CHECK_TIMEOUT
         try:
@@ -353,9 +344,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
     # Worker reentry guard: inside an isolation worker, never isolate again.
     enabled = os.environ.get("COMFYUI_ISOLATION_WORKER") != "1"
 
-    # ==================================================================
     # Discover and import node sources
-    # ==================================================================
     # Two patterns (mutually exclusive):
     #   1. nodes/ itself is the source (isolation or direct)
     #   2. Subdirectories of nodes/ are individual sources
@@ -373,7 +362,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
             _t0 = _time.perf_counter()
             root_meta = fetch_metadata(
                 env_dir=env["env_dir"],
-                node_dir=nodes_dir,
                 package_name=nodes_package,
                 working_dir=pkg_dir,
                 env_vars=env["env_vars"],
@@ -486,7 +474,6 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                 t0 = time.perf_counter()
                 meta = fetch_metadata(
                     env_dir=env["env_dir"],
-                    node_dir=subdir,
                     package_name=package_name,
                     working_dir=pkg_dir,
                     env_vars=env["env_vars"],
@@ -536,7 +523,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
                     if nodes_meta:
                         _log(f"[comfy-env] Registered {len(nodes_meta)} isolation nodes from {subdir.name}")
 
-    # Report skipped isolation dirs (no _env_* installed)
+    # Report skipped isolation dirs (no materialized env)
     for cf in config_files:
         if cf.parent.resolve() not in isolation_envs:
             env_dir = _find_env_dir(cf.parent)

@@ -168,7 +168,10 @@ def _short_global_root():
 
     override = os.environ.get("COMFY_ENV_ROOT")
     if override:
-        root = Path(override)
+        # expanduser: nothing expands `~` when the value comes from a
+        # Dockerfile ENV, a systemd unit or a CI variable, and a literal `~`
+        # directory under cwd is never found again.
+        root = Path(override).expanduser().absolute()
     elif sys.platform == "win32":
         root = _windows_local_appdata() / "Programs" / "comfy-env"
     else:
@@ -368,6 +371,11 @@ def validate_env_stamp(env_manifest_dir):
         stamp = _json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         return True, f"stamp unreadable ({e}); not verified"
+    if not isinstance(stamp, dict):
+        # `null`, a bare string, a list: json.loads succeeds, .get() does not.
+        # The AttributeError escaped into register_nodes() and took the whole
+        # pack out of ComfyUI.
+        return True, f"stamp is {type(stamp).__name__}, not an object; not verified"
     want = _abi_tag()
     got = stamp.get("abi_tag")
     if got and got != want:
@@ -586,10 +594,8 @@ def copy_files(src, dst, pattern="*", overwrite=False):
     """
     # Resolve the caller's directory HERE, in the public function body, where
     # depth 1 means "whoever called copy_files" -- a fact about the call
-    # contract. This used to live inside the nested helper below at depth 2,
-    # which encoded an INTERNAL structural fact (that a helper exists between
-    # the caller and the frame walk). Adding any frame -- a decorator, another
-    # helper, a deprecation shim -- shifted it silently: `__file__` on the
+    # contract, not about our internal helper layout. Adding any frame -- a
+    # decorator, another helper, a shim -- shifts it silently: `__file__` on the
     # wrong frame is still a valid path, so `src` resolved under comfy-env's
     # own directory, `src.exists()` returned False, and the function returned
     # 0 having copied nothing. No exception, no log, no thread to pull.

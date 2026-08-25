@@ -1,22 +1,16 @@
-"""Contract: a worker resolves the ComfyUI root through custom_nodes/, not through a link.
+"""Contract: a worker resolves the ComfyUI root through custom_nodes/, not a link.
 
-`SubprocessWorker._find_comfyui_base` used to have a second walk after
-`find_comfyui_source_dir` -- from the same start point, but using
-`.resolve()`, which environment/cache.py documents as the wrong resolution:
+abspath, not resolve(): a pack behind a junction must walk up through
+custom_nodes/ into the ComfyUI tree. resolve() takes it to its physical
+location instead -- which may sit under a DIFFERENT checkout, whose root then
+becomes this worker's base for models, input and output.
 
-    abspath, NOT resolve(): a pack living behind a junction/symlink must walk
-    up through custom_nodes/ into the ComfyUI tree. resolve() follows the link
-    to the physical location, where no ComfyUI root exists ...
-
-In the plain case that fallback merely returned None, so it looked harmless.
-It is not harmless when the physical location happens to sit under a DIFFERENT
-ComfyUI checkout -- then it returns that checkout as this worker's base, and
-the worker resolves models, input and output against the wrong install.
-
-That is the case pinned here. cache.py's two copies of this walk are covered by
-test_symlink_plugin_root.py; this one had no coverage, which is why it drifted.
+Only test_pack_outside_any_checkout_does_not_borrow_the_link_targets_root
+discriminates against the old code; the other three are regression pins for
+layouts that already worked.
 """
 
+import shutil
 import sys
 
 import pytest
@@ -32,18 +26,29 @@ def _make_comfyui(root):
     return root
 
 
-def _worker_for(working_dir):
-    """Construct without spawning -- __init__ does not start the process."""
-    return SubprocessWorker(
-        python=sys.executable,
-        working_dir=working_dir,
-        sys_path=[],
-        name="test-worker",
-    )
+@pytest.fixture()
+def _worker_for():
+    """Construct without spawning -- but __init__ still mkdtemps a worker tree."""
+    made = []
+
+    def build(working_dir):
+        w = SubprocessWorker(
+            python=sys.executable,
+            working_dir=working_dir,
+            sys_path=[],
+            name="test-worker",
+        )
+        made.append(w)
+        return w
+
+    yield build
+
+    for w in made:
+        shutil.rmtree(w._temp_dir, ignore_errors=True)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs symlink without admin")
-def test_symlinked_pack_resolves_through_custom_nodes(tmp_path):
+def test_symlinked_pack_resolves_through_custom_nodes(tmp_path, _worker_for):
     """The real install must win, even when the pack physically lives elsewhere."""
     real = _make_comfyui(tmp_path / "real_comfy")
 
@@ -58,7 +63,7 @@ def test_symlinked_pack_resolves_through_custom_nodes(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="needs symlink without admin")
-def test_pack_outside_any_checkout_does_not_borrow_the_link_targets_root(tmp_path):
+def test_pack_outside_any_checkout_does_not_borrow_the_link_targets_root(tmp_path, _worker_for):
     """The case where the deleted fallback was actively wrong, not merely useless.
 
     The correct walk (abspath, through custom_nodes/) must fail here -- the pack
@@ -88,7 +93,7 @@ def test_pack_outside_any_checkout_does_not_borrow_the_link_targets_root(tmp_pat
     assert base is None
 
 
-def test_plain_pack_still_resolves(tmp_path):
+def test_plain_pack_still_resolves(tmp_path, _worker_for):
     """No regression for the ordinary, un-linked layout."""
     real = _make_comfyui(tmp_path / "comfy")
     pack = real / "custom_nodes" / "PlainPack" / "nodes"
@@ -97,7 +102,7 @@ def test_plain_pack_still_resolves(tmp_path):
     assert _worker_for(pack)._find_comfyui_base() == real
 
 
-def test_no_comfyui_anywhere_returns_none(tmp_path):
+def test_no_comfyui_anywhere_returns_none(tmp_path, _worker_for):
     """A walk that finds nothing must terminate and return None, not guess."""
     orphan = tmp_path / "no_comfy" / "pack" / "nodes"
     orphan.mkdir(parents=True)

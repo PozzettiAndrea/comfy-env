@@ -16,15 +16,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
+from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
+                     VRAM as _DBG_VRAM, log as _log)
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
 _CACHE_VERSION = "14"  # Bump when _METADATA_SCRIPT or cache format changes
-
-
-def _log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
 
 
 def _describe_value(name: str, v) -> str:
@@ -94,9 +91,7 @@ def _log_vram(label: str) -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
 # Metadata extraction script (runs in isolation subprocess)
-# ---------------------------------------------------------------------------
 
 _METADATA_SCRIPT = r'''
 import sys
@@ -374,9 +369,7 @@ with open(output_path, "wb") as _f:
 '''
 
 
-# ---------------------------------------------------------------------------
 # Metadata fetching
-# ---------------------------------------------------------------------------
 
 def _warn_empty_v3_scan(package_name: str, payload: dict, node_count: int) -> None:
     """Loud diagnostic when a pack has a V3 entrypoint but the scan found nothing.
@@ -408,7 +401,6 @@ def _warn_empty_v3_scan(package_name: str, payload: dict, node_count: int) -> No
 
 def fetch_metadata(
     env_dir: Path,
-    node_dir: Path,
     package_name: str,
     working_dir: Path,
     env_vars: Optional[Dict[str, str]] = None,
@@ -416,8 +408,7 @@ def fetch_metadata(
     """Fetch node metadata by running a subprocess in the isolation env.
 
     Args:
-        env_dir: Path to _env_* directory
-        node_dir: Path to the node subdirectory (e.g., nodes/gpu/)
+        env_dir: Path to the materialized env in the global cache
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         env_vars: Additional environment variables from comfy-env.toml
@@ -459,6 +450,11 @@ def fetch_metadata(
                 if _DEBUG or node_count > 0:
                     print(f"[comfy-env] Cache hit for {package_name}: {node_count} nodes",
                           file=sys.stderr, flush=True)
+                # A zero-node payload is cached like any other, and the cache
+                # only invalidates on a .py mtime change. Warning only on the
+                # fresh-scan path meant a broken entrypoint screamed once and
+                # was silent on every startup after.
+                _warn_empty_v3_scan(package_name, payload, node_count)
                 return payload
             elif _DEBUG:
                 print(f"[comfy-env] Cache stale for {package_name} "
@@ -623,9 +619,7 @@ def fetch_metadata(
                     pass
 
 
-# ---------------------------------------------------------------------------
 # Dynamic combo refresh (parent-side directory rescan)
-# ---------------------------------------------------------------------------
 #
 # Isolated nodes are represented in the main process by a proxy whose
 # INPUT_TYPES would otherwise return a snapshot captured once at scan time, so
@@ -730,9 +724,7 @@ def _scan_dynamic_dir(spec):
     return names
 
 
-# ---------------------------------------------------------------------------
 # Proxy class builder
-# ---------------------------------------------------------------------------
 
 def _collect_dynamic_marks(input_types: Dict[str, Any]):
     """[(section, input_name, marker_spec)] for combos opted into live dir rescan."""
@@ -766,6 +758,73 @@ def _splice_dynamic_options(sections: Dict[str, Any], marks) -> Dict[str, Any]:
             new_opts["options"] = fresh
             result[sec][name] = (entry[0], new_opts)
     return result
+
+
+def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
+                    self_state, kwargs, node_name):
+    """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
+
+    Keyword-only on purpose: the two closures this replaces took nine and
+    eleven positional single-letter arguments in slightly different orders, and
+    being unable to mix them up was the only safety the duplication provided.
+
+    self_state: V1 sends the instance __dict__; V3 sends None. It is passed IN
+    rather than derived here -- a V3 proxy's bound object is the CLASS, whose
+    __dict__ is truthy and full of classmethod objects that json.dumps refuses,
+    so deriving it would kill every V3 node call on the wire.
+
+    Callers shape kwargs BEFORE calling (V1 strips hidden keys and nests
+    DynamicCombo dotted keys; V3 does neither), so what is logged here is
+    exactly what goes out.
+    """
+    from .pool import (_get_or_create_worker, _remove_worker,
+                       _register_new_patchers)
+    from .tensor_utils import prepare_for_ipc_recursive
+
+    env_dir = worker_spec[0]
+    if _DBG_IO:
+        _log(f"[comfy-env] Running {node_name}: "
+             + ", ".join(_describe_value(k, v) for k, v in kwargs.items()))
+    if _DBG_VRAM:
+        _log_vram(f"Before {node_name}")
+
+    worker, gen = _get_or_create_worker(*worker_spec)
+    _t0 = time.perf_counter()
+    try:
+        kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
+        try:
+            result = worker.call_method(
+                module_name=module_name,
+                class_name=class_name,
+                method_name=method_name,
+                self_state=self_state,
+                kwargs=kwargs,
+                timeout=600.0,
+            )
+        finally:
+            # Register auto-detected models even when the call RAISED: the
+            # weights are on the GPU either way, and a model with no ledger
+            # entry can never be evicted.
+            try:
+                _register_new_patchers(env_dir, worker, gen)
+            except Exception as _re:
+                _log(f"[comfy-env] patcher registration failed: {_re}")
+
+        result = prepare_for_ipc_recursive(result)
+
+        if _DBG_IO:
+            elapsed = time.perf_counter() - _t0
+            out_desc = (", ".join(_describe_value(f"[{i}]", v)
+                                  for i, v in enumerate(result))
+                        if isinstance(result, tuple)
+                        else _describe_value("result", result))
+            _log(f"[comfy-env] {node_name} done ({elapsed:.2f}s): {out_desc}")
+        if _DBG_VRAM:
+            _log_vram(f"After {node_name}")
+        return result
+    except (RuntimeError, ConnectionError):
+        _remove_worker(env_dir)
+        raise
 
 
 def _build_v3_proxy_class(
@@ -863,66 +922,12 @@ def _build_v3_proxy_class(
 
     def _make_v3_proxy(fn, mod, cn, ed, pr, sp, ev, hct, nn):
         def proxy(cls, **kwargs):
-            from .pool import (_get_or_create_worker, _remove_worker,
-                               _register_new_patchers)
-
-            # I/O + VRAM logging (before call)
-            if _DBG_IO:
-                inputs_desc = ", ".join(_describe_value(k, v) for k, v in kwargs.items())
-                _log(f"[comfy-env] Running {nn}: {inputs_desc}")
-            if _DBG_VRAM:
-                _log_vram(f"Before {nn}")
-
-            worker, gen = _get_or_create_worker(ed, pr, sp, ev, hct)
-            _t0 = time.perf_counter()
-            try:
-                try:
-                    from .tensor_utils import prepare_for_ipc_recursive
-                    kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
-                except ImportError:
-                    pass
-
-                try:
-                    result = worker.call_method(
-                        module_name=mod,
-                        class_name=cn,
-                        method_name=fn,
-                        self_state=None,
-                        kwargs=kwargs,
-                        timeout=600.0,
-                    )
-                finally:
-                    # Register auto-detected models even when the call RAISED:
-                    # the weights are on the GPU either way, and a model with
-                    # no ledger entry can never be evicted.
-                    try:
-                        _register_new_patchers(ed, worker, gen)
-                    except Exception as _re:
-                        _log(f"[comfy-env] patcher registration failed: {_re}")
-
-                try:
-                    from .tensor_utils import prepare_for_ipc_recursive
-                    result = prepare_for_ipc_recursive(result)
-                except ImportError:
-                    pass
-
-                # I/O + VRAM logging (after call)
-                if _DBG_IO:
-                    elapsed = time.perf_counter() - _t0
-                    if isinstance(result, tuple):
-                        out_desc = ", ".join(
-                            _describe_value(f"[{i}]", v) for i, v in enumerate(result)
-                        )
-                    else:
-                        out_desc = _describe_value("result", result)
-                    _log(f"[comfy-env] {nn} done ({elapsed:.2f}s): {out_desc}")
-                if _DBG_VRAM:
-                    _log_vram(f"After {nn}")
-
-                return result
-            except (RuntimeError, ConnectionError):
-                _remove_worker(ed)
-                raise
+            # self_state is the literal None, never derived from `cls`.
+            return _call_in_worker(
+                worker_spec=(ed, pr, sp, ev, hct),
+                module_name=mod, class_name=cn, method_name=fn,
+                self_state=None, kwargs=kwargs, node_name=nn,
+            )
         return proxy
 
     attrs = {
@@ -963,9 +968,7 @@ def _build_v3_proxy_class(
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
 
 
-# ---------------------------------------------------------------------------
 # Accelerator availability (ACCELERATOR node declaration)
-# ---------------------------------------------------------------------------
 
 _MACHINE_BACKEND: Optional[str] = None
 
@@ -1173,9 +1176,6 @@ def build_proxy_class(
     # Proxy FUNCTION method -- reuses persistent worker across calls
     def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hsk):
         def proxy(self, **kwargs):
-            from .pool import (_get_or_create_worker, _remove_worker,
-                               _register_new_patchers)
-
             # Strip hidden kwargs that V3 execute() doesn't expect
             if hsk:
                 kwargs = {k: v for k, v in kwargs.items() if k not in hsk}
@@ -1197,61 +1197,12 @@ def build_proxy_class(
                     nested[k] = v
                 kwargs = nested
 
-            # I/O + VRAM logging (before call)
-            if _DBG_IO:
-                inputs_desc = ", ".join(_describe_value(k, v) for k, v in kwargs.items())
-                _log(f"[comfy-env] Running {nn}: {inputs_desc}")
-            if _DBG_VRAM:
-                _log_vram(f"Before {nn}")
-
-            worker, gen = _get_or_create_worker(ed, pr, sp, ev, hct)
-            _t0 = time.perf_counter()
-            try:
-                try:
-                    from .tensor_utils import prepare_for_ipc_recursive
-                    kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
-                except ImportError:
-                    pass
-
-                try:
-                    result = worker.call_method(
-                        module_name=mod,
-                        class_name=cn,
-                        method_name=fn,
-                        self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
-                        kwargs=kwargs,
-                        timeout=600.0,
-                    )
-                finally:
-                    # Register even on failure -- see the V3 proxy above.
-                    try:
-                        _register_new_patchers(ed, worker, gen)
-                    except Exception as _re:
-                        _log(f"[comfy-env] patcher registration failed: {_re}")
-
-                try:
-                    from .tensor_utils import prepare_for_ipc_recursive
-                    result = prepare_for_ipc_recursive(result)
-                except ImportError:
-                    pass
-
-                # I/O + VRAM logging (after call)
-                if _DBG_IO:
-                    elapsed = time.perf_counter() - _t0
-                    if isinstance(result, tuple):
-                        out_desc = ", ".join(
-                            _describe_value(f"[{i}]", v) for i, v in enumerate(result)
-                        )
-                    else:
-                        out_desc = _describe_value("result", result)
-                    _log(f"[comfy-env] {nn} done ({elapsed:.2f}s): {out_desc}")
-                if _DBG_VRAM:
-                    _log_vram(f"After {nn}")
-
-                return result
-            except (RuntimeError, ConnectionError):
-                _remove_worker(ed)
-                raise
+            return _call_in_worker(
+                worker_spec=(ed, pr, sp, ev, hct),
+                module_name=mod, class_name=cn, method_name=fn,
+                self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
+                kwargs=kwargs, node_name=nn,
+            )
         return proxy
 
     attrs[func_name] = _make_proxy(

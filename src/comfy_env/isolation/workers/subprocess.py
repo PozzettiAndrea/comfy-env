@@ -1,29 +1,8 @@
-"""
-SubprocessWorker - Cross-venv isolation using persistent subprocess + socket IPC.
+"""SubprocessWorker -- cross-venv isolation over a persistent subprocess.
 
-This worker supports calling functions in a different Python environment:
-- Uses a persistent subprocess to avoid spawn overhead
-- Socket-based IPC for commands/responses; bulk tensors ride shared memory
-- Warm calls cost milliseconds (2.4 ms echo floor measured 2026-08)
-
-Use this when you need:
-- Different PyTorch version
-- Incompatible native library dependencies
-- Different Python version
-
-Example:
-    worker = SubprocessWorker(
-        python="/path/to/other/venv/bin/python",
-        working_dir="/path/to/code",
-    )
-
-    # Call a method by module path
-    result = worker.call_method(
-        module_name="my_module",
-        class_name="MyClass",
-        method_name="process",
-        kwargs={"image": my_tensor},
-    )
+Socket IPC for commands, shared memory for bulk tensors. The subprocess is
+persistent because spawn cost dominates otherwise: a warm call is a 2.4 ms
+echo floor (measured 2026-08).
 """
 
 import os
@@ -55,17 +34,14 @@ from ._ipc_shared import (
     _cleanup_shm,
 )
 
-# =============================================================================
 # Parent-side IPC code -- imported from _ipc_parent module
-# =============================================================================
 
+from ._ipc_shared import SocketTransport
 from ._ipc_parent import (
     # Socket utilities
     _has_af_unix,
     _create_server_socket,
-    SocketTransport,
     # Tensor lifecycle
-    _pool_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
     _probe_cuda_ipc,
@@ -99,24 +75,11 @@ _HEALTH_PING_IDLE_SECONDS = 60.0
 
 
 def _enter_call_scope(worker):
-    """Begin the per-call _ipc_parent._call_state protocol; returns the state to restore.
+    """Set the per-call _ipc_parent._call_state; returns the previous values.
 
-    Two bugs came from hand-writing this three times:
-
-    * ``gpu_demoted`` was cleared with the CONSTANT ``False`` in every
-      ``finally``, not restored. ``SubprocessWorker._lock`` is an RLock
-      *specifically* so VRAM-eviction callbacks can re-enter on the same
-      thread, so a nested call's exit re-enabled zero-copy for an outer call
-      the canary had demoted -- which then exported handles the worker cannot
-      import, failing after the node had done all its work.
-    * ``worker_pool`` was set around ``_from_shm`` by ``call_method`` and
-      ``call_module`` but NOT by ``echo``. Since ``verify_transport`` uses
-      ``echo`` as its oracle, a PoolIPC reply arrived with no pool handle,
-      ``_from_shm`` raised, ``verify_transport``'s bare except swallowed it,
-      and Pool IPC demoted itself permanently on every worker -- reported as
-      a routine capability probe rather than a defect.
-
-    Save/restore, not assign, and one place to be wrong.
+    Save and restore, never assign a constant: _lock is an RLock so
+    VRAM-eviction callbacks re-enter on the same thread, and a nested call's
+    exit must not clear an outer call's demotion.
     """
     st = _ipc_parent._call_state
     prev = (getattr(st, "gpu_demoted", False), getattr(st, "worker_pool", None))
@@ -126,29 +89,18 @@ def _enter_call_scope(worker):
 
 
 def _exit_call_scope(prev):
-    """Restore what _enter_call_scope saved. Never assigns a constant."""
+    """Restore what _enter_call_scope saved."""
     st = _ipc_parent._call_state
     st.gpu_demoted, st.worker_pool = prev
 
 
 class SubprocessWorker(Worker):
-    """
-    Cross-venv worker using persistent subprocess + socket IPC.
+    """Cross-venv worker: persistent subprocess + socket IPC.
 
-    Uses Unix domain sockets (or TCP localhost on older Windows) for IPC.
-    This completely separates IPC from stdout/stderr, so C libraries
-    printing to stdout (like Blender) won't corrupt the protocol.
-
-    Benefits:
-    - Works on Windows with different venv Python (full isolation)
-    - Compiled CUDA extensions load correctly in the venv
-    - Warm calls cost milliseconds (measured 2026-08: 2.4 ms echo floor,
-      ~30 ms including the per-call health ping; persistent subprocess
-      avoids the ~2.4 s spawn+import cost per call)
-    - Tensor transfer via shared memory files
-    - Immune to stdout pollution from C libraries
-
-    Use this for calls to isolated venvs with different Python/dependencies.
+    IPC rides a unix socket (TCP localhost on older Windows), never
+    stdout/stderr -- so a C library that prints (Blender, and it does) cannot
+    corrupt the protocol. Persistence is what makes it usable: ~2.4 s
+    spawn+import per call becomes a 2.4 ms warm echo floor (measured 2026-08).
     """
 
     def __init__(
@@ -160,17 +112,6 @@ class SubprocessWorker(Worker):
         name: Optional[str] = None,
         health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
     ):
-        """
-        Initialize persistent worker.
-
-        Args:
-            python: Path to Python executable in target venv.
-            working_dir: Working directory for subprocess.
-            sys_path: Additional paths to add to sys.path.
-            env: Additional environment variables.
-            name: Optional name for logging.
-            health_check_timeout: Timeout in seconds for worker health checks.
-        """
         self.python = Path(python)
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.sys_path = sys_path or []
@@ -189,6 +130,7 @@ class SubprocessWorker(Worker):
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
         self._last_ok = 0.0  # time of last successful round-trip (gates the health ping)
+        self._torn_down = False  # shutdown() has released this worker's resources
         self._last_echo_meta = None  # last echo() response (carries worker CUDA device UUID)
         self._authkey = None  # per-spawn IPC auth token (set in _ensure_started)
         self._on_restart = None  # Called when worker process is replaced (stale model cleanup)
@@ -226,13 +168,6 @@ class SubprocessWorker(Worker):
                 if (candidate / "main.py").exists() and (candidate / "comfy").exists():
                     return candidate
 
-        # No second walk here. There used to be one, from the same start point,
-        # using .resolve() -- which environment/cache.py documents as the wrong
-        # resolution: a pack behind a junction resolves to its physical
-        # location, where no ComfyUI root exists, so the walk either returns
-        # None (harmless) or finds a DIFFERENT checkout's root and hands it
-        # back as this worker's base. It also lacked the filesystem-root guard.
-        # find_comfyui_source_dir above already does this walk correctly.
         return None
 
     def _check_socket_health(self) -> bool:
@@ -248,9 +183,23 @@ class SubprocessWorker(Worker):
         try:
             if _DBG_WORKER:
                 print(f"[{self.name}] Health check: ping (timeout={self.health_check_timeout}s)...", file=sys.stderr, flush=True)
-            self._transport.send({"method": "ping"})
-            response = self._transport.recv(timeout=self.health_check_timeout)
-            ok = response is not None and response.get("status") == "pong"
+            self._call_counter += 1
+            ping_id = self._call_counter
+            self._transport.send({"method": "ping", "call_id": ping_id})
+            deadline = time.time() + self.health_check_timeout
+            ok = False
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                response = self._transport.recv(timeout=remaining)
+                if response is None:
+                    break
+                if self._drain_async_frame(response):
+                    continue
+                ok = (response.get("status") == "pong"
+                      and response.get("call_id") == ping_id)
+                break
             if _DBG_WORKER or not ok:
                 print(f"[{self.name}] Health check: {'ok' if ok else 'failed'}", file=sys.stderr, flush=True)
             return ok
@@ -260,6 +209,7 @@ class SubprocessWorker(Worker):
 
     def _kill_worker(self) -> None:
         """Kill the worker process and clean up resources."""
+        self._last_ok = 0.0  # the new process has proven nothing yet
         if self._process:
             try:
                 self._process.kill()
@@ -282,7 +232,6 @@ class SubprocessWorker(Worker):
         self._worker_pool = None
         # Clear stale pool IPC caches -- pointer export data from dead worker's
         # pool is invalid and would corrupt CUDA state if reused with new pool
-        _pool_ipc_metadata_cache.clear()
         _pool_ipc_cache_tensors.clear()
 
     def _worker_exit_diagnostic(self) -> str:
@@ -575,9 +524,7 @@ class SubprocessWorker(Worker):
                 msg = self._transport.recv(timeout=60)
                 if not msg:
                     raise RuntimeError(f"{self.name}: Worker failed to send ready signal")
-                if msg.get("type") == "log":
-                    # Worker sends log messages during startup (e.g. comfy imports)
-                    print(f"[worker:{self.name}] {msg.get('message', '')}", file=sys.stderr, flush=True)
+                if self._drain_async_frame(msg):
                     continue
                 break
         except (ConnectionError, ConnectionResetError, OSError) as e:
@@ -654,6 +601,24 @@ class SubprocessWorker(Worker):
         except Exception as e:
             return {"type": "callback_response", "status": "error", "error": str(e)}
 
+    def _drain_async_frame(self, frame: dict) -> bool:
+        """Handle an unsolicited frame. True if consumed -- caller keeps waiting.
+
+        log and callback arrive from any worker thread at any point in a
+        conversation: the worker replaces builtins.print and puts a handler on
+        the root logger, both writing to this socket. Every loop that reads a
+        reply must skip them, so there is exactly one copy of the rule.
+        """
+        kind = frame.get("type")
+        if kind == "log":
+            print(f"[worker:{self.name}] {frame.get('message', '')}",
+                  file=sys.stderr, flush=True)
+            return True
+        if kind == "callback":
+            self._transport.send(self._handle_callback(frame))
+            return True
+        return False
+
     def _send_request(self, request: dict, timeout: float) -> dict:
         """Send request via socket and read response with timeout."""
         if not self._transport:
@@ -674,25 +639,17 @@ class SubprocessWorker(Worker):
                 if response is None:
                     break  # Timeout
 
-                # Handle log messages from worker
-                if response.get("type") == "log":
-                    msg = response.get("message", "")
-                    print(f"[worker:{self.name}] {msg}", file=sys.stderr, flush=True)
-                    continue  # Keep waiting for actual response
+                if self._drain_async_frame(response):
+                    continue
 
-                # Handle callback from worker (bidirectional RPC)
-                if response.get("type") == "callback":
-                    callback_response = self._handle_callback(response)
-                    self._transport.send(callback_response)
-                    continue  # Keep waiting for actual response
-
-                # Correlation check: every worker response echoes the request's
-                # call_id. A mismatched frame is a stale late reply (e.g. from
-                # a predecessor that timed out) -- drop it and keep waiting
-                # instead of returning the wrong result to the wrong caller.
+                # Correlation: every REPLY echoes the request's call_id, so a
+                # frame that does not match is not this call's answer. The old
+                # check skipped frames with no call_id at all, which let
+                # `ready` and `pool_fd_sent` be returned as a node's result --
+                # silently, as None.
                 resp_id = response.get("call_id")
-                if resp_id is not None and call_id is not None and resp_id != call_id:
-                    print(f"[{self.name}] Dropping stale frame "
+                if resp_id != call_id:
+                    print(f"[{self.name}] Dropping uncorrelated frame "
                           f"call_id={resp_id} (expecting {call_id})",
                           file=sys.stderr, flush=True)
                     continue
@@ -747,21 +704,11 @@ class SubprocessWorker(Worker):
         kwargs: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Any:
-        """
-        Call a class method by module/class/method path.
+        """Call a class method by module/class/method path.
 
-        Args:
-            module_name: Module containing the class (e.g., "depth_estimate").
-            class_name: Class name (e.g., "SAM3D_DepthEstimate").
-            method_name: Method name (e.g., "estimate_depth").
-            self_state: Optional dict to populate instance __dict__.
-            kwargs: Keyword arguments for the method.
-            timeout: Timeout in seconds.
-
-        Returns:
-            Return value of the method.
+        self_state populates the instance __dict__ before the call; the worker
+        never keeps an instance between calls.
         """
-        import sys
         if _DBG_WORKER:
             print(f"[SubprocessWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
 
@@ -1063,9 +1010,17 @@ class SubprocessWorker(Worker):
             self._lock.release()
 
     def shutdown(self) -> None:
-        """Shut down the persistent worker."""
-        if self._shutdown:
+        """Shut down the persistent worker and release everything it holds.
+
+        Guarded on _torn_down, NOT on _shutdown: _send_request sets _shutdown
+        on a dead socket or a timeout, and the pool then calls shutdown() to
+        clean up precisely those workers. Gating on _shutdown made that call a
+        no-op, so every crashed worker leaked its process, its fd pair and its
+        temp dir for the life of the ComfyUI session.
+        """
+        if self._torn_down:
             return
+        self._torn_down = True
         self._shutdown = True
 
         # Send shutdown signal via socket

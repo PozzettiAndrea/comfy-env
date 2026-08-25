@@ -1,11 +1,8 @@
 """Isolation subprocess launch-environment construction.
 
 A leaf module: stdlib + comfy_env.debug only, imported DOWNWARD by
-subprocess.py and metadata.py (which spawn workers) and by wrap.py (env
-paths). It was previously inlined at the top of wrap.py, which forced
-subprocess/metadata to reach UP into the orchestrator for it -- a
-lazy-import cycle. Nothing here depends on the worker pool, node
-registration, or metadata; it is pure launch-env setup.
+subprocess.py, metadata.py and wrap.py. Keeping it a leaf is what stops
+those three reaching UP into the orchestrator and forming an import cycle.
 """
 
 import glob
@@ -14,12 +11,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..debug import INSTALL as _DBG_INSTALL
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
+from ..debug import INSTALL as _DBG_INSTALL, log as _log
 
 
 def _build_isolation_env_win32(env: dict, python: Path) -> dict:
@@ -46,16 +38,6 @@ def _build_isolation_env_win32(env: dict, python: Path) -> dict:
     env["PATH"] = ";".join(minimal_path_parts)
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["PYTHONIOENCODING"] = "utf-8"
-    # Scrub Python-pathing env vars inherited from the parent (python_embeded
-    # on portable). PYTHONPATH would let the env's python pick up modules from
-    # python_embeded's site-packages -- cp313 ABI but a *different* torch wheel
-    # (cu130 from the portable archive vs. the env's cu128/cu130 install). The
-    # DLL graph loaded straddles two torches, ERROR_PROC_NOT_FOUND on shm.dll.
-    # PYTHONNOUSERSITE keeps the env hermetic from %APPDATA%\Python user
-    # site-packages too. PYTHONSTARTUP can side-load arbitrary code; drop it.
-    for var in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE"):
-        env.pop(var, None)
-    env["PYTHONNOUSERSITE"] = "1"
     # Pixi/conda envs on Windows: the Python binary resolves sys.prefix to the
     # base UV/conda Python instead of the env, causing both stdlib version
     # mismatches (SRE module mismatch) and missing site-packages (CGAL).
@@ -105,6 +87,22 @@ def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
         env.update(env_vars)
     env["COMFYUI_ISOLATION_WORKER"] = "1"
 
+    # Scrub Python-pathing vars inherited from the parent (python_embeded on
+    # portable). PYTHONPATH would let the env's python import from the
+    # parent's site-packages -- same ABI tag but a DIFFERENT torch wheel -- so
+    # the DLL graph straddles two torches: ERROR_PROC_NOT_FOUND on shm.dll.
+    # PYTHONHOME would point it at the parent's stdlib outright.
+    # PYTHONNOUSERSITE keeps ~/.local and %APPDATA%\Python out.
+    # PYTHONSTARTUP can side-load arbitrary code.
+    #
+    # Platform-independent, though it lived in the win32 builder alone until
+    # 0.4.30 -- so `pip install --user torch`, the documented PEP-668
+    # workaround, silently shadowed the pinned torch in every posix worker.
+    # win32 re-sets PYTHONHOME below for its own sys.prefix reasons.
+    for var in ("PYTHONPATH", "PYTHONSTARTUP", "PYTHONUSERBASE", "PYTHONHOME"):
+        env.pop(var, None)
+    env["PYTHONNOUSERSITE"] = "1"
+
     if sys.platform == "win32":
         return _build_isolation_env_win32(env, python)
     elif sys.platform == "darwin":
@@ -114,12 +112,7 @@ def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
 
 
 def _get_env_paths(env_dir: Path) -> "Optional[Path]":
-    """Get site_packages from env.
-
-    Used to return (site_packages, lib_dir) too. The lib_dir was threaded
-    through seven functions in three files and then dropped: _create_worker
-    accepted it and built SubprocessWorker without it.
-    """
+    """Get site_packages from env."""
     if sys.platform == "win32":
         sp = env_dir / "Lib" / "site-packages"
     else:

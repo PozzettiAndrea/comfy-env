@@ -19,7 +19,7 @@ which fails when that set changes). Everything else hits ``__getattr__`` and
 raises **naming the attribute**, turning future upstream drift into a pointed
 traceback instead of silent corruption.
 
-Two honesty rules the old proxy broke:
+Two honesty rules:
 
 * **Never lie about bytes.** ``partially_unload`` returns what the worker
   actually freed. Returning a too-large number defeats ComfyUI's escalation
@@ -75,6 +75,20 @@ class SubprocessModel:
         self._size = size_bytes
 
 
+class _Outcome:
+    """Distinguishes a reply from the two silent-failure outcomes."""
+
+    def __init__(self, name):
+        self._name = name
+
+    def __repr__(self):
+        return self._name
+
+
+WORKER_GONE = _Outcome("WORKER_GONE")   # process died; its VRAM died with it
+SEND_FAILED = _Outcome("SEND_FAILED")   # worker alive; weights still resident
+
+
 class SubprocessModelPatcher:
     """Standalone duck-type for a worker-resident model.
 
@@ -110,9 +124,7 @@ class SubprocessModelPatcher:
         self._model_id = model_id
         self._kind = kind  # "unet", "clip", "vae", "other"
 
-    # ------------------------------------------------------------------
     # IPC
-    # ------------------------------------------------------------------
 
     def _worker_gone(self):
         return not self._worker.is_alive()
@@ -124,19 +136,27 @@ class SubprocessModelPatcher:
         self.model.model_offload_buffer_memory = 0
 
     def _send(self, command, *, quiet_on_loss, **kwargs):
-        """Send an IPC command.
+        """Send an IPC command. Returns the reply, or a sentinel.
 
-        quiet_on_loss=True (eviction paths): a dead/restarted worker means the
-        VRAM is already gone, so report success instead of raising -- raising
-        here would escape into ComfyUI's free_memory loop.
-        quiet_on_loss=False (load paths): failing loudly is correct.
+        Eviction paths must not raise -- they run inside ComfyUI's free_memory
+        loop -- but the two ways they can fail mean opposite things about the
+        card, and must not collapse into one answer:
+
+        WORKER_GONE   the process died, so its VRAM died with it. Genuinely
+                      freed; safe to report as offloaded.
+        SEND_FAILED   the worker is ALIVE and refused the command. The weights
+                      are still resident. Claiming otherwise tells ComfyUI it
+                      reclaimed bytes it did not, and zeroes loaded_size so the
+                      model is never picked for eviction again -- every later
+                      admission decision is then computed against a card
+                      believed to have that much more free.
         """
         if self._worker_gone():
             if quiet_on_loss:
                 log.warning("Worker for model '%s' is gone; treating as offloaded",
                             self._model_id)
                 self._mark_offloaded()
-                return None
+                return WORKER_GONE
             raise RuntimeError(
                 f"Subprocess worker died; model '{self._model_id}' is no longer "
                 f"available. Please reload the model node.")
@@ -144,15 +164,12 @@ class SubprocessModelPatcher:
             return self._worker.send_command(command, model_id=self._model_id, **kwargs)
         except Exception as e:
             if quiet_on_loss:
-                log.warning("Model '%s': %s failed (%s); treating as offloaded",
-                            self._model_id, command, e)
-                self._mark_offloaded()
-                return None
+                log.warning("Model '%s': %s failed (%s); worker is alive, so the "
+                            "weights are still resident", self._model_id, command, e)
+                return SEND_FAILED
             raise
 
-    # ------------------------------------------------------------------
     # The surface ComfyUI actually uses
-    # ------------------------------------------------------------------
 
     def model_size(self):
         return self.size
@@ -222,10 +239,13 @@ class SubprocessModelPatcher:
         want = int(memory_to_free) if memory_to_free else resident_before
         _log_vram(f"Before partial offload '{self._model_id}' (-{want // (1024 * 1024)} MB)")
         r = self._send("model_partial_unload", quiet_on_loss=True, bytes_to_free=want)
-        if r is None:
-            # Worker gone: the VRAM went with the process. Everything that was
-            # resident is genuinely freed.
+        if r is WORKER_GONE:
+            # The VRAM went with the process; everything resident is freed.
             return resident_before
+        if r is SEND_FAILED:
+            # Nothing was freed, and loaded_size stays put so ComfyUI keeps
+            # escalating instead of believing the bytes came back.
+            return 0
         freed = int(r.get("freed", 0))
         resident = int(r.get("resident", max(0, resident_before - freed)))
         self.model.model_loaded_weight_memory = resident
@@ -241,14 +261,18 @@ class SubprocessModelPatcher:
             return self.model  # already off the GPU; skip the round trip
         size_mb = self.size // (1024 * 1024)
         _log_vram(f"Before offload '{self._model_id}' ({size_mb} MB)")
-        self._send("model_to_device", quiet_on_loss=True, device=str(self.offload_device))
+        r = self._send("model_to_device", quiet_on_loss=True,
+                       device=str(self.offload_device))
+        if r is SEND_FAILED:
+            # Still on the card. Report nothing reclaimed rather than logging
+            # an offload that did not happen.
+            _log_vram(f"Offload '{self._model_id}' FAILED; still resident")
+            return self.model
         self._mark_offloaded()
         _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
         return self.model
 
-    # ------------------------------------------------------------------
     # Explicitly unsupported (reachable only if a pack ever returns a MODEL)
-    # ------------------------------------------------------------------
 
     def add_patches(self, *args, **kwargs):
         raise NotImplementedError(

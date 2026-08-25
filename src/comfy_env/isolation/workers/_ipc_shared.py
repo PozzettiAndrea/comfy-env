@@ -12,16 +12,85 @@ next to persistent_worker.py so the worker can `import _ipc_shared`.
 
 import ctypes
 import ctypes.util
+import json
 import mmap as _mmap_mod
 import os
 import socket
+import struct
 import sys
+import threading
 
-# =============================================================================
 # Constants
-# =============================================================================
 
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB message size limit
+
+
+class SocketTransport:
+    """Length-prefixed JSON transport: [4-byte big-endian length][JSON].
+
+    ONE copy for both sides. The worker's copy drifted three times before this
+    merge, and the drift inverted the contract: `None` meant "timed out" in the
+    parent and "peer closed" in the worker, so the same return value called for
+    opposite handling depending on which file you were reading. A desynced
+    length-prefixed stream hangs rather than raising, which is why drift here is
+    expensive to find.
+
+    Semantics, now single: recv() returns None ONLY on timeout. A closed peer or
+    a truncated payload raises ConnectionError.
+
+    send() MUST hold the lock: the worker routes print() and logging records
+    into transport.send, and pack code prints from threads it spawns. An
+    unlocked send interleaves partial writes and desyncs the stream for good.
+    """
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.Lock()
+
+    def send(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        msg = struct.pack(">I", len(data)) + data
+        with self._send_lock:
+            self._sock.sendall(msg)
+
+    def recv(self, timeout=None):
+        with self._recv_lock:
+            if timeout is not None:
+                self._sock.settimeout(timeout)
+            try:
+                raw_len = self._recvall(4)
+                if not raw_len:
+                    raise ConnectionError("Socket closed")
+                msg_len = struct.unpack(">I", raw_len)[0]
+                if msg_len > MAX_MESSAGE_SIZE:
+                    raise ValueError("Message too large: %d bytes" % msg_len)
+                data = self._recvall(msg_len)
+                if len(data) < msg_len:
+                    raise ConnectionError(
+                        "Incomplete message: %d/%d" % (len(data), msg_len))
+                return json.loads(data.decode("utf-8"))
+            except socket.timeout:
+                return None
+            finally:
+                if timeout is not None:
+                    self._sock.settimeout(None)
+
+    def _recvall(self, n):
+        data = bytearray()
+        while len(data) < n:
+            chunk = self._sock.recv(n - len(data))
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+        return bytes(data)
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
 
 # CUDA memory pool constants
 CUDA_MEM_HANDLE_TYPE_POSIX_FD = 1
@@ -44,9 +113,7 @@ SOCKET_ID_LENGTH = 12           # hex chars in socket name uuid
 MAX_IPC_CACHE_SIZE = 256        # max entries in IPC handle forwarding caches
 
 
-# =============================================================================
 # Anonymous shared memory via memfd_create (Linux)
-# =============================================================================
 
 _USE_MEMFD = sys.platform == "linux"
 _libc = None
@@ -80,9 +147,7 @@ def _memfd_read(pid, fd, size):
         os.close(local_fd)
 
 
-# =============================================================================
 # CUDA memory pool ctypes bindings
-# =============================================================================
 
 class _CudaMemPoolPtrExportData(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_ubyte * 64)]
@@ -204,9 +269,7 @@ def _trim_pool(pool, min_bytes=0):
 
 
 
-# =============================================================================
 # FD passing (SCM_RIGHTS) over Unix domain sockets
-# =============================================================================
 
 def _send_fd(sock, fd):
     """Send a file descriptor over a Unix domain socket via SCM_RIGHTS."""
@@ -231,9 +294,7 @@ def _recv_fd(sock, timeout=10.0):
         sock.settimeout(None)
 
 
-# =============================================================================
 # Pool pointer wrapper
-# =============================================================================
 
 class _PoolPtr:
     """Wrap imported CUDA pointer for __cuda_array_interface__."""
@@ -244,9 +305,7 @@ class _PoolPtr:
         }
 
 
-# =============================================================================
 # Shared memory registry cleanup
-# =============================================================================
 
 def _cleanup_shm(registry):
     """Close all shared memory in registry (memfd fds or SharedMemory blocks)."""
@@ -262,17 +321,15 @@ def _cleanup_shm(registry):
     registry.clear()
 
 
-# =============================================================================
 # IPC cache management
-# =============================================================================
 
 # IPC handle forwarding cache: avoids cloning when re-sharing CUDA tensors
 # received via IPC from another worker (Worker A -> Parent -> Worker B).
 # Keyed by id(storage). Lives HERE, in the only comfy_env-import-free leaf
 # module, so the tensor leaf (tensor_utils) can read it at module top level
 # without a package-init import cycle -- and so the container sits next to
-# the eviction policy that bounds it. Both the parent transport
-# (_ipc_parent) and the worker (_persistent_worker) share this one copy.
+# the eviction policy that bounds it. Both sides genuinely share it: the
+# worker used to shadow these with unbounded module globals of its own.
 _cuda_ipc_metadata_cache = {}   # id(storage) -> ipc metadata dict
 _cuda_ipc_cache_tensors = {}    # id(storage) -> tensor ref, keeps storage IDs stable
 
@@ -285,9 +342,7 @@ def _evict_cache_if_needed(cache_dict):
             del cache_dict[k]
 
 
-# =============================================================================
 # Serializer registry (custom data types)
-# =============================================================================
 #
 # Node packs can teach the transport about their own types. Both sides of the
 # process boundary carry THIS module (the parent imports it from comfy_env;
@@ -301,29 +356,9 @@ def _evict_cache_if_needed(cache_dict):
 #     SKELETON = "builtin"    # automatic transport, listed for humans/tests
 #
 # <pack>/serialization.py is loaded by FILE PATH under a mangled per-pack
-# module name on BOTH sides (parent + worker), must keep its top-level
-# imports to stdlib/numpy/comfy_env (heavy deps inside the functions), and
-# looks like:
-#
-#     try:  # parent process
-#         from comfy_env.isolation.workers import _ipc_shared as ipc
-#     except ImportError:  # worker process (module copied next to the worker)
-#         import _ipc_shared as ipc
-#
-#     def _ser(obj, recurse):
-#         return {"verts": recurse(obj.vertices), "id": obj.id}
-#
-#     def _deser(payload, recurse):
-#         from mymeshlib import MyMesh
-#         return MyMesh(recurse(payload["verts"]), payload["id"])
-#
-#     try:  # register deserialize only where the library exists; a side
-#         import mymeshlib  # noqa: F401  -- without it holds materialized
-#         _DESER = _deser   #                OpaquePayload receipts instead
-#     except ImportError:
-#         _DESER = None
-#
-#     ipc.register_serializer("MyMesh", _ser, _DESER, tag="mymeshlib.MyMesh")
+# module name on BOTH sides, and must keep its top-level imports to
+# stdlib/numpy/comfy_env (heavy deps go inside the functions). Worked example:
+# docs/comfy-env/serializers.md.
 #
 # Tag convention (ADR-0015): shared library types tag by TYPE IDENTITY
 # ("mymeshlib.MyMesh") so independent packs interoperate; pack-private
@@ -379,6 +414,51 @@ REGISTRY = SerializerRegistry()
 # get bigger", which is registration_count().
 _REGISTER_CALLS = 0
 
+
+
+def _deserialize_cuda_ipc(data):
+    """Rebuild a CUDA tensor from an IPC handle. Used by BOTH sides.
+
+    Caches the metadata so the handle can be forwarded without cloning if this
+    tensor is sent on again (worker A -> parent -> worker B), and bounds that
+    cache HERE. The worker has no periodic sweep of its own -- _cleanup_ipc_cache
+    is parent-only and the worker cannot import it -- so evicting at insert is
+    the only thing between a long session and a permanent VRAM pin: every entry
+    holds a strong reference to an imported mapping, which pins the EXPORTER's
+    allocation in the other process.
+    """
+    import base64
+    import torch
+    import torch.multiprocessing.reductions as reductions
+
+    dtype = getattr(torch, data["dtype"].split(".")[-1])
+    event_handle = data["event_handle"]
+    tensor = reductions.rebuild_cuda_tensor(
+        torch.Tensor,
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["tensor_offset"],
+        torch.storage.TypedStorage,
+        dtype,
+        data["device_idx"],
+        base64.b64decode(data["handle"]),
+        data["storage_size"],
+        data["storage_offset"],
+        data["requires_grad"],
+        base64.b64decode(data["ref_counter_handle"]),
+        data["ref_counter_offset"],
+        base64.b64decode(event_handle) if event_handle else None,
+        data["event_sync_required"],
+    )
+    try:
+        storage_id = id(tensor.untyped_storage())
+        _cuda_ipc_metadata_cache[storage_id] = data
+        _cuda_ipc_cache_tensors[storage_id] = tensor
+        _evict_cache_if_needed(_cuda_ipc_metadata_cache)
+        _evict_cache_if_needed(_cuda_ipc_cache_tensors)
+    except Exception:
+        pass
+    return tensor
 
 def register_serializer(type_name, serialize, deserialize=None, tag=None):
     """Register a custom type with the transport (see module comment above).
@@ -631,9 +711,7 @@ def load_serializer_files(spec, log=None):
     return available, executed
 
 
-# =============================================================================
 # Generic shared memory serialization (_to_shm)
-# =============================================================================
 
 def _encode_np_dtype(dt):
     """JSON round-trippable numpy dtype.
@@ -677,15 +755,21 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     Args:
         obj: Object to serialize
         registry: List to track SharedMemory objects for cleanup
-        visited: Dict tracking already-serialized objects (cycle detection)
+        visited: memo of already-serialized objects, id(obj) -> (obj, result).
+            Deduplicates shared references; it does NOT detect cycles, because
+            containers record themselves only after descending into children.
         tensor_serializer: Callable(tensor, registry, visited) -> dict metadata
         node_output_serializer: Optional callable for NodeOutput objects
     """
     from pathlib import PurePath
 
+    # Memo key is id(obj), so the memo must also hold a REFERENCE to obj:
+    # a value produced during the walk (a computed property, a dtype
+    # conversion) is freed on return and CPython hands the same address to the
+    # next field's temporary, which would then read this entry as its own.
     obj_id = id(obj)
     if obj_id in visited:
-        return visited[obj_id]
+        return visited[obj_id][1]
 
     t = type(obj).__name__
 
@@ -703,7 +787,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     # Held pickled bytes (class not importable here) -> fresh pickle block.
     if isinstance(obj, OpaquePickle):
         result = _pickle_frame(obj.data, registry)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Registered custom types take precedence over the built-in branches so
@@ -712,13 +796,13 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     if entry is not None:
         tag, serialize = entry
         result = {"__shm_custom__": tag, "payload": serialize(obj, _recurse)}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # torch.Tensor -> delegate to caller-provided strategy
     if t == 'Tensor':
         result = tensor_serializer(obj, registry, visited)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # numpy array -> PyTorch native shared memory (zero-copy), fallback to shm copy
@@ -745,7 +829,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                 registry.append(block)
                 result = {"__shm_np__": block.name, "shape": list(arr.shape),
                           "dtype": _encode_np_dtype(arr.dtype)}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # NOTE: trimesh has no builtin branch (removed 2026-08, no backcompat):
@@ -767,13 +851,13 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                       node_output_serializer=node_output_serializer),
             "feats_dtype": str(feats_cpu.dtype),
         }
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # V3 NodeOutput -> delegate to caller if provided
     if t == 'NodeOutput' and node_output_serializer is not None:
         result = node_output_serializer(obj, registry, visited)
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Path -> string
@@ -786,7 +870,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                        tensor_serializer=tensor_serializer,
                                        node_output_serializer=node_output_serializer)
                   for k, v in obj.items()}
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # list/tuple
@@ -795,7 +879,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
                                    tensor_serializer=tensor_serializer,
                                    node_output_serializer=node_output_serializer)
                   for v in obj]
-        visited[obj_id] = result
+        visited[obj_id] = (obj, result)
         return result
 
     # Convert numpy scalars to Python primitives for JSON serialization
@@ -828,7 +912,7 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
             f"missing dependency in this environment."
         ) from e
     result = _pickle_frame(obj_bytes, registry)
-    visited[obj_id] = result
+    visited[obj_id] = (obj, result)
     return result
 
 

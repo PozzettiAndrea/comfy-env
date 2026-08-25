@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import subprocess
 import sys
 
@@ -9,8 +10,14 @@ def has_nvidia_gpu() -> bool:
     return detect_cuda_version() is not None
 
 
+@functools.lru_cache(maxsize=1)
 def detect_cuda_version() -> str | None:
-    """Detect system CUDA version. Priority: pixi -> torch metadata."""
+    """Detect system CUDA version. Priority: pixi -> torch metadata.
+
+    Cached: this spawns `pixi info --json` (10s timeout), and install_workspace
+    reaches it once per discovered env through _fast_key -- ~80 subprocess
+    spawns on the all-clean path that does no work.
+    """
     if pixi_cuda := _get_cuda_from_pixi():
         return pixi_cuda
     return get_bootstrap_torch_cuda()

@@ -39,9 +39,7 @@ _PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
 _INSTALL_HASH_FILE = "install.hash"
 
 
-# ---------------------------------------------------------------------------
 # Bootstrap probing & node discovery
-# ---------------------------------------------------------------------------
 
 def _resolve_workspace_torch(
     log: Callable[[str], None],
@@ -257,8 +255,8 @@ def _discover_node_configs(
 #     changes);
 #   - GPU-presence flips change the fast key -> full derivation -> the
 #     cpu/cu index flip changes the manifest -> rebuild;
-#   - comfy-env version bumps no longer force rebuilds (identity depends
-#     only on output; the version stays in the stamp for diagnostics).
+#   - a comfy-env version bump does NOT force a rebuild: identity depends
+#     only on output. The version stays in the stamp for diagnostics.
 #
 # install.hash format (one entry per line):
 #   v2:<identity-sha256>
@@ -272,10 +270,8 @@ def _discover_node_configs(
 def _bootstrap_torch_pin(bootstrap_torch: Optional[str]) -> Optional[str]:
     """major.minor wildcard pin (``==2.10.*``), THE pin rule for env builds.
 
-    Structural since 0.4.25: ``install_workspace`` is the only builder, so
-    there is no second implementation to drift from this. The lazy
-    ``auto_install`` path that used to share it was removed precisely because
-    keeping two builders in agreement proved unenforceable.
+    ``install_workspace`` is deliberately the only builder: keeping two
+    implementations of this rule in agreement proved unenforceable.
 
     major.minor, not the exact patch: must match the granularity of the ABI
     tag that names the env directory (environment/cache.py _abi_tag). A
@@ -408,9 +404,7 @@ def _dedupe_envs_libomp(
             log(f"[comfy-env] {env_name}: libomp dedupe FAILED: {e}")
 
 
-# ---------------------------------------------------------------------------
 # Cuda-wheel combo resolution
-# ---------------------------------------------------------------------------
 
 def _aggregate_cuda_packages(
     discovered: List[Tuple[str, Path, Path, ComfyEnvConfig]],
@@ -461,17 +455,11 @@ def _resolve_wheel_combo(
     The returned ``python`` field is the bootstrap Python; per-env Python versions
     are handled at URL-resolution time in ``resolve_env_cuda_wheel_urls``.
 
-    Strategy:
-      1. Try the bootstrap combo (`bootstrap_python` / `bootstrap_cuda` / `bootstrap_torch`).
-         If every required cuda-wheel is published for it (across all Python versions
-         used by envs), use it. Pin torch to ``==<bootstrap_torch>``.
-      2. Else try the known-good fallback for this machine's CPU architecture:
-         ``(py, "12.8", "2.8")`` on x86_64, ``(py, "13.0", "2.10")`` on linux
-         aarch64 -- torch never shipped an aarch64 wheel for the 2.8 line, so
-         the x86 combo is unsatisfiable there, and 12.8/12.9 would leave Thor
-         without a kernel image (see FALLBACK_COMBO_AARCH64). Both axes differ,
-         so the torch pin follows the chosen combo rather than being fixed.
-      3. Else raise.
+    The bootstrap combo wins if every required wheel is published for it across
+    all env Pythons; else the per-architecture fallback (FALLBACK_COMBO /
+    FALLBACK_COMBO_AARCH64 in cuda_wheels record WHY the two architectures need
+    different ones); else raise. The cuda and torch axes move together, so the
+    torch pin follows the chosen combo rather than being fixed.
 
     Returns None when there's nothing to resolve (no cuda-only packages required,
     or running on macOS/CPU). In that case the caller skips wheel-combo logic and
@@ -589,9 +577,7 @@ def _resolve_wheel_combo(
     )
 
 
-# ---------------------------------------------------------------------------
 # Top-level workspace install
-# ---------------------------------------------------------------------------
 
 def install_workspace(
     comfyui_dir: Path,
@@ -722,10 +708,9 @@ def install_workspace(
                 f"{chosen_cuda.replace('.', '')[:3]}"
             )
         else:
-            chosen_cuda = cuda_version
-            chosen_torch_short = (
-                ".".join(bootstrap_torch.split(".")[:2]) if bootstrap_torch else None
-            )
+            # Never observed: both reads below are guarded on
+            # `combo is not None`. Bound only so the names exist.
+            chosen_cuda = chosen_torch_short = None
 
         # On Desktop app, requirements.txt is in the app bundle (source dir),
         # not the user data dir. Resolve source dir separately for downstream use.
@@ -757,7 +742,6 @@ def install_workspace(
                 log=log,
             )
             urls = resolve_env_cuda_wheel_urls(
-                env_name=env_name,
                 cfg=cfg,
                 bootstrap_python=bootstrap_python,
                 chosen_cuda=chosen_cuda if combo is not None else None,

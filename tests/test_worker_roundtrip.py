@@ -82,9 +82,40 @@ def test_timeout_kills_worker(worker):
 
 
 def test_worker_imports_shared_constants():
-    # The worker takes the faulthandler filename and retention windows FROM
-    # _ipc_shared (single source of truth) -- the hand-synced literals that
-    # once drifted (.log vs .txt; 30s vs 60s) are structurally gone.
+    # The worker takes the faulthandler filename and retention window FROM
+    # _ipc_shared rather than repeating the literals.
     assert "import _ipc_shared" in _PERSISTENT_WORKER_SCRIPT
     assert "_ipc_shared.WORKER_FAULTHANDLER_BASENAME" in _PERSISTENT_WORKER_SCRIPT
     assert "_ipc_shared.TENSOR_KEEPER_TTL" in _PERSISTENT_WORKER_SCRIPT
+
+
+def test_no_keeper_hardcodes_its_retention_window():
+    """The check above greps the WORKER script, so it cannot see the others.
+
+    It carried a comment claiming the 30s-vs-60s drift was "structurally gone".
+    It was not: tensor_utils.TensorKeeper still defaulted to a literal 30.0
+    while the other three keepers took TENSOR_KEEPER_TTL (60.0) -- a regression
+    test asserting a property it is structurally incapable of observing.
+    """
+    import ast
+    from pathlib import Path
+
+    import comfy_env
+
+    root = Path(comfy_env.__file__).parent
+    offenders = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for arg, default in zip(reversed(node.args.args),
+                                    reversed(node.args.defaults)):
+                if arg.arg == "retention_seconds" and isinstance(default, ast.Constant):
+                    offenders.append(
+                        (path.relative_to(root).as_posix(), node.lineno, default.value))
+
+    assert not offenders, (
+        f"keeper(s) hardcode a retention window instead of TENSOR_KEEPER_TTL: "
+        f"{offenders}"
+    )

@@ -17,8 +17,6 @@ from .tensor_utils import (
     keep_tensor,
     prepare_tensor_for_ipc,
     prepare_for_ipc_recursive,
-    release_tensor,
-    release_tensors_recursive,
 )
 
 __all__ = [
@@ -33,6 +31,4 @@ __all__ = [
     "keep_tensor",
     "prepare_tensor_for_ipc",
     "prepare_for_ipc_recursive",
-    "release_tensor",
-    "release_tensors_recursive",
 ]

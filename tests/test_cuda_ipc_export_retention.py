@@ -1,21 +1,10 @@
 """Contract: the exporter must retain a tensor it exported an IPC handle for.
 
-CUDA IPC inverts the POSIX rule. There is no cross-process refcount: the
-EXPORTER must keep the allocation alive until the importer maps it. But
-`_serialize_cuda_ipc` returns base64 handles and no tensor reference, so on the
-`"received from another process"` branch -- where it must clone before it can
-re-export -- the clone had ZERO references the moment the function returned.
-The worker then imported a handle onto freed device memory.
+CUDA IPC inverts the POSIX rule: there is no cross-process refcount, so the
+EXPORTER keeps the allocation alive until the importer maps it.
 
-`tensor_utils`' 30s keeper masked this, but only for callers that came through
-`prepare_for_ipc_recursive` (the two proxy bodies in metadata.py). Anything
-else reaching the serializer -- call_module from the pool/route path, a tensor
-nested inside a pack object -- had no keeper at all.
-
-Runs on CPU with a stubbed `reduce_tensor`: `_serialize_cuda_ipc` never checks
-`is_cuda`, so the branch is reachable without a GPU. That matters, because the
-GPU lane that would otherwise cover this does not exist -- `pytest.mark.gpu` is
-declared in pyproject.toml and applied to zero tests.
+Not GPU coverage -- reduce_tensor is stubbed, so no handle is ever created or
+mapped. This is a regression pin on one line: the keep() beside the clone.
 """
 
 import pytest
@@ -80,35 +69,6 @@ def test_exported_clone_is_retained(monkeypatch):
     )
 
 
-def test_retention_survives_dropping_every_local_reference(monkeypatch):
-    """What the bug actually looked like: nothing else holds the clone."""
-    import torch.multiprocessing.reductions as reductions
-
-    calls = {"n": 0}
-    ref = {}
-
-    def fake_reduce(t):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("received from another process")
-        # Weakly witness the clone so we can tell if it was collected.
-        ref["w"] = t
-        return (None, _fake_reduce_args())
-
-    monkeypatch.setattr(reductions, "reduce_tensor", fake_reduce)
-
-    _ipc_parent._serialize_cuda_ipc(torch.ones(2, 2))
-
-    # The caller's tensor is gone; only the keeper can be holding the clone.
-    import gc
-
-    gc.collect()
-    kept = [obj for _ts, obj in list(_ipc_parent._parent_tensor_keeper._keeper)]
-    assert any(obj is ref["w"] for obj in kept), (
-        "clone was not retained by the transport after the call returned"
-    )
-
-
 def test_non_cloning_path_is_unaffected(monkeypatch):
     """A tensor that reduces cleanly must not be cloned, and needs no rescue."""
     import torch.multiprocessing.reductions as reductions
@@ -124,3 +84,43 @@ def test_non_cloning_path_is_unaffected(monkeypatch):
     _ipc_parent._serialize_cuda_ipc(original)
 
     assert seen == [original], "clean path must export the original, not a clone"
+
+
+def test_import_cache_is_bounded(monkeypatch):
+    """The forwarding cache must evict, on BOTH sides.
+
+    Each entry holds a strong reference to an imported CUDA mapping, which pins
+    the EXPORTER's allocation in the other process. The worker used to keep its
+    own copies of these dicts, and neither _evict_cache_if_needed nor
+    _cleanup_ipc_cache is reachable from the worker -- so a long-lived worker
+    drained the parent's VRAM monotonically, invisible to every ledger.
+
+    Runs on CPU: rebuild_cuda_tensor is stubbed, so no handle is ever mapped.
+    """
+    import base64
+
+    import torch.multiprocessing.reductions as reductions
+
+    from comfy_env.isolation.workers import _ipc_shared as S
+
+    monkeypatch.setattr(reductions, "rebuild_cuda_tensor",
+                        lambda *a: torch.ones(2, 2))
+    monkeypatch.setattr(S, "_cuda_ipc_metadata_cache", {})
+    monkeypatch.setattr(S, "_cuda_ipc_cache_tensors", {})
+
+    frame = {
+        "dtype": "torch.float32", "tensor_size": [2, 2], "tensor_stride": [2, 1],
+        "tensor_offset": 0, "device_idx": 0,
+        "handle": base64.b64encode(b"h").decode(), "storage_size": 16,
+        "storage_offset": 0, "requires_grad": False,
+        "ref_counter_handle": base64.b64encode(b"r").decode(),
+        "ref_counter_offset": 0,
+        "event_handle": None, "event_sync_required": False,
+    }
+    for _ in range(S.MAX_IPC_CACHE_SIZE * 3):
+        S._deserialize_cuda_ipc(dict(frame))
+
+    assert len(S._cuda_ipc_cache_tensors) <= S.MAX_IPC_CACHE_SIZE, (
+        "import cache grew without bound -- each entry pins exporter VRAM"
+    )
+    assert len(S._cuda_ipc_metadata_cache) <= S.MAX_IPC_CACHE_SIZE

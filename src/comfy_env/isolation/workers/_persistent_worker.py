@@ -1,9 +1,7 @@
 
 import sys
 import os
-import json
 import socket
-import struct
 import traceback
 import faulthandler
 import collections
@@ -37,7 +35,6 @@ _DBG_SERIALIZE = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_SERIALIZE")
 _DBG_IPC = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_IPC")
 _DBG_WORKER = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_WORKER")
 _DBG_MODELS = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_MODELS")
-_DBG_STACKTRACE = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_STACKTRACE")
 _DBG_VRAM = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_VRAM")
 _DBG_WATCHDOG = _DBG_ALL or _dbg_on("COMFY_ENV_DEBUG_WATCHDOG")
 _DEBUG = any((_DBG_SERIALIZE, _DBG_IPC, _DBG_WORKER, _DBG_MODELS))
@@ -148,9 +145,7 @@ if _DBG_VRAM:
     _vram_thread.start()
     wlog("[worker] VRAM poller started (200MB threshold, 100ms poll, 1s cooldown)")
 
-# =============================================================================
 # Shared Memory Serialization
-# =============================================================================
 
 # Pin to single CPU core before importing torch to prevent TSC non-monotonicity
 # during libc10_cuda.so static initialization (WSL has imprecise per-core TSC sync).
@@ -308,15 +303,13 @@ def _probe_cuda_ipc():
     return _cuda_ipc_supported
 
 # IPC handle forwarding cache (worker-side, for passthrough tensors)
-_cuda_ipc_metadata_cache = {}
-_cuda_ipc_cache_tensors = {}
 
 def _serialize_cuda_ipc(t):
     import torch.multiprocessing.reductions as reductions
     # Check IPC handle cache -- forward original handle if available
     try:
         storage_id = id(t.untyped_storage())
-        cached = _cuda_ipc_metadata_cache.get(storage_id)
+        cached = _ipc_shared._cuda_ipc_metadata_cache.get(storage_id)
         if cached is not None:
             if (list(t.size()) == cached["tensor_size"]
                     and list(t.stride()) == cached["tensor_stride"]
@@ -356,43 +349,7 @@ def _serialize_cuda_ipc(t):
     }
 
 
-def _deserialize_cuda_ipc(data):
-    import torch
-    import torch.multiprocessing.reductions as reductions
-    dtype = getattr(torch, data["dtype"].split(".")[-1])
-    handle = _b64.b64decode(data["handle"])
-    ref_counter_handle = _b64.b64decode(data["ref_counter_handle"])
-    event_handle = _b64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    tensor = reductions.rebuild_cuda_tensor(
-        torch.Tensor,
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["tensor_offset"],
-        torch.storage.TypedStorage,
-        dtype,
-        data["device_idx"],
-        handle,
-        data["storage_size"],
-        data["storage_offset"],
-        data["requires_grad"],
-        ref_counter_handle,
-        data["ref_counter_offset"],
-        event_handle,
-        data["event_sync_required"],
-    )
-    # Cache IPC metadata for handle forwarding (zero-copy passthrough)
-    try:
-        storage_id = id(tensor.untyped_storage())
-        _cuda_ipc_metadata_cache[storage_id] = data
-        _cuda_ipc_cache_tensors[storage_id] = tensor
-    except Exception:
-        pass
-    return tensor
-
-
-# =============================================================================
 # Pool IPC - shareable CUDA memory pool (worker side)
-# =============================================================================
 
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 _pool_ipc_ok = False
@@ -626,7 +583,7 @@ def _from_shm(obj, _depth=0, _key="root"):
     # CudaIPC -> zero-copy CUDA tensor deserialization
     if obj.get("__type__") == "CudaIPC":
         wlog(f"[_from_shm] {_key}: CudaIPC tensor_size={obj.get('tensor_size')}")
-        return _deserialize_cuda_ipc(obj)
+        return _ipc_shared._deserialize_cuda_ipc(obj)
 
     # TensorRef -> use PyTorch's native deserialization (both directions)
     if obj.get("__type__") == "TensorRef":
@@ -762,60 +719,6 @@ _worker_fd_registry = []  # Keep worker fds alive for worker->parent tensor tran
 
 
 
-class SocketTransport:
-    """Length-prefixed JSON transport.
-
-    send() MUST be locked: the worker routes print()/logging into
-    transport.send, and pack code prints from threads it spawns -- an
-    unlocked send interleaves partial writes from two threads and
-    permanently desyncs the length-prefixed stream. Mirrors the parent's
-    SocketTransport (_ipc_parent.py), including the MAX_MESSAGE_SIZE
-    check the worker copy previously lacked.
-    """
-    def __init__(self, sock):
-        self._sock = sock
-        self._send_lock = threading.Lock()
-        self._recv_lock = threading.Lock()
-
-    def send(self, obj):
-        data = json.dumps(obj).encode("utf-8")
-        msg = struct.pack(">I", len(data)) + data
-        with self._send_lock:
-            self._sock.sendall(msg)
-
-    def recv(self, timeout=None):
-        with self._recv_lock:
-            if timeout is not None:
-                self._sock.settimeout(timeout)
-            try:
-                raw_len = self._recvall(4)
-                if not raw_len:
-                    return None
-                msg_len = struct.unpack(">I", raw_len)[0]
-                if msg_len > _ipc_shared.MAX_MESSAGE_SIZE:
-                    raise ValueError(f"Message too large: {msg_len} bytes")
-                data = self._recvall(msg_len)
-                return json.loads(data.decode("utf-8"))
-            finally:
-                if timeout is not None:
-                    self._sock.settimeout(None)
-
-    def _recvall(self, n):
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                return bytes(data)
-            data.extend(chunk)
-        return bytes(data)
-
-    def close(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-
 def _connect(addr):
     """Connect to server socket (abstract://, unix://, or tcp://)."""
     if addr.startswith("abstract://"):
@@ -884,7 +787,7 @@ def main():
 
     # Connect to host process
     sock = _connect(socket_addr)
-    transport = SocketTransport(sock)
+    transport = _ipc_shared.SocketTransport(sock)
     # First frame MUST be the auth token: the parent refuses to speak the
     # protocol (which carries pickled payloads) to an unauthenticated peer.
     transport.send({"authkey": authkey})
@@ -893,8 +796,14 @@ def main():
     _vram_poll_transport = transport
     wlog("[worker] Connected, waiting for config...")
 
-    # Read config as first message
-    config = transport.recv()
+    # Read config as first message. recv() raises on a closed socket now, and
+    # a parent that dies before sending config is a routine shutdown, not a
+    # fault -- main() is called unguarded, so an escape here is a traceback.
+    try:
+        config = transport.recv()
+    except (ConnectionError, OSError) as e:
+        wlog(f"[worker] Parent closed before sending config ({e}), exiting")
+        return
     if not config:
         wlog("[worker] No config received, exiting")
         return
@@ -1055,20 +964,26 @@ def main():
         wlog(f"[worker] Registered model '{model_id}': {size / 1e9:.2f} GB, kind={kind}")
         return size
 
-    def _auto_register_if_cuda(module):
-        """Auto-register an nn.Module if it just landed on CUDA."""
-        if _loading_via_shim[0]:
-            return  # Parent already coordinates VRAM during shimmed loads
+    def _register_cuda_module(module, label):
+        """Mint an id for a CUDA module and record it. Returns the id or None.
+
+        One body for both registration paths. _hooked_to/_hooked_cuda replace
+        torch.nn.Module.to/.cuda GLOBALLY, so this runs on whatever thread a
+        pack uses: the dedup check is re-tested under the lock, and the
+        counter bump is a read-modify-write that must not interleave.
+        """
         obj_id = id(module)
         if obj_id in _model_id_by_obj:
-            return  # Already registered
+            return None
         try:
             first_param = next(module.parameters(), None)
             if first_param is None or first_param.device.type != "cuda":
-                return
+                return None
         except Exception:
-            return
+            return None
         with _registry_lock:
+            if obj_id in _model_id_by_obj:
+                return None
             _model_counter[0] += 1
             model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
             size = _compute_model_size(module)
@@ -1076,7 +991,14 @@ def main():
             _model_registry_meta[model_id] = {"size": size, "kind": "other"}
             _model_id_by_obj[obj_id] = model_id
             _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-            wlog(f"[worker] Auto-registered '{model_id}': {size / 1e9:.2f} GB")
+        wlog(f"[worker] {label} '{model_id}': {size / 1e9:.2f} GB")
+        return model_id
+
+    def _auto_register_if_cuda(module):
+        """Auto-register an nn.Module if it just landed on CUDA."""
+        if _loading_via_shim[0]:
+            return  # Parent already coordinates VRAM during shimmed loads
+        _register_cuda_module(module, "Auto-registered")
 
     def _register_if_cuda(module):
         """Register an nn.Module with parent if it's on CUDA.
@@ -1085,54 +1007,35 @@ def main():
         Called after shimmed load_models_gpu to ensure the parent can evict
         models that were loaded inside the shim.
         """
-        obj_id = id(module)
-        if obj_id in _model_id_by_obj:
-            return  # Already registered
-        try:
-            first_param = next(module.parameters(), None)
-            if first_param is None or first_param.device.type != "cuda":
-                return
-        except Exception:
-            return
-        with _registry_lock:
-            _model_counter[0] += 1
-            model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
-            size = _compute_model_size(module)
-            _model_registry[model_id] = module
-            _model_registry_meta[model_id] = {"size": size, "kind": "other"}
-            _model_id_by_obj[obj_id] = model_id
-            _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
-            wlog(f"[worker] Post-shim registered '{model_id}': {size / 1e9:.2f} GB")
+        _register_cuda_module(module, "Post-shim registered")
 
-        # Install hooks on Module.to() and .cuda()
-        # Module.to() only fires for the outermost call -- PyTorch recurses
-        # through children via _apply(), not .to(), so we naturally catch
-        # only top-level models.
-        try:
-            import torch as _torch
-            _orig_module_to = _torch.nn.Module.to
-            _orig_module_cuda = _torch.nn.Module.cuda
+    # Install hooks on Module.to() and .cuda()
+    # Module.to() only fires for the outermost call -- PyTorch recurses
+    # through children via _apply(), not .to(), so we naturally catch
+    # only top-level models.
+    try:
+        import torch as _torch
+        _orig_module_to = _torch.nn.Module.to
+        _orig_module_cuda = _torch.nn.Module.cuda
 
-            def _hooked_to(self, *args, **kwargs):
-                result = _orig_module_to(self, *args, **kwargs)
-                _auto_register_if_cuda(self)
-                return result
+        def _hooked_to(self, *args, **kwargs):
+            result = _orig_module_to(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
 
-            def _hooked_cuda(self, *args, **kwargs):
-                result = _orig_module_cuda(self, *args, **kwargs)
-                _auto_register_if_cuda(self)
-                return result
+        def _hooked_cuda(self, *args, **kwargs):
+            result = _orig_module_cuda(self, *args, **kwargs)
+            _auto_register_if_cuda(self)
+            return result
 
-            _torch.nn.Module.to = _hooked_to
-            _torch.nn.Module.cuda = _hooked_cuda
-            wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
-        except ImportError:
-            wlog("[worker] torch not available, skipping auto-registration hooks")
+        _torch.nn.Module.to = _hooked_to
+        _torch.nn.Module.cuda = _hooked_cuda
+        wlog("[worker] Installed Module.to()/cuda() auto-registration hooks")
+    except ImportError:
+        wlog("[worker] torch not available, skipping auto-registration hooks")
 
-        # ---------------------------------------------------------------
-        # Bidirectional RPC -- call parent methods during execution
-        # ---------------------------------------------------------------
-        _current_call_id = None  # Tracks call_id of the request being processed
+    # Bidirectional RPC -- call parent methods during execution
+    _current_call_id = None  # Tracks call_id of the request being processed
 
     def _find_loaded_model(_model):
         """The worker's own ComfyUI LoadedModel wrapping this module, if any."""
@@ -1283,9 +1186,9 @@ def main():
         """
         transport.send({"type": "callback", "method": method, "call_id": _current_call_id, **params})
         while True:
+            # recv() raises ConnectionError if the parent went away; None is
+            # only ever a timeout, and this call passes none.
             response = transport.recv()
-            if response is None:
-                raise RuntimeError("Parent disconnected during callback")
             # Handle interleaved management commands
             if response.get("method") == "model_to_device":
                 _handle_model_to_device(response)

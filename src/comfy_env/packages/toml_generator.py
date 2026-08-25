@@ -1,12 +1,11 @@
 """Generate the workspace pixi.toml from ComfyUI requirements + per-node configs.
 
 Workspace model:
-- One pixi workspace per ComfyUI install at `<comfyui_dir>/.ce/pixi.toml`.
-- One self-contained `[feature.<env_name>]` per environment. Each carries its
-  own python pin, pip/setuptools, glibc, KMP env var, torch family pin, and
-  declared deps. Nothing is shared between features.
-- `[environments]` maps `<env_name> -> [<env_name>]` with `no-default-feature = true`.
-  No solve-groups: every env solves independently.
+- One manifest per env, each a standalone pixi workspace. It carries its own
+  python pin, pip/setuptools, glibc, KMP env var, torch family pin and deps;
+  nothing is shared, and a parse error in one env cannot affect another.
+- The feature is always named `node` and the environment always `default`
+  (pixi reserves `default` as a feature name -- see build_env_toml).
 - The only cross-env coupling is the torch pin, which is replicated verbatim
   into each feature so workers and parent share an identical torch family.
 """
@@ -31,9 +30,7 @@ def _require_tomli_w():
         raise ImportError("tomli-w required: pip install tomli-w")
 
 
-# ---------------------------------------------------------------------------
 # requirements.txt parsing
-# ---------------------------------------------------------------------------
 
 
 def _common_base_dependencies(version: str) -> Dict[str, Any]:
@@ -110,9 +107,8 @@ def _strip_torch_family(
 #
 # _HANDLED_PASSTHROUGH: tables the compiler already places/transforms itself
 #   (torch-family REWRITE inside dependencies/pypi-dependencies; [activation]
-#   MERGE; workspace.channels forwarding). ([serializers] was removed in
-#   0.4.16 -- wire types now declare in comfy-env-root.toml [types],
-#   ADR-0015; the env-file parser rejects the old section.)
+#   MERGE; workspace.channels forwarding). Wire types declare in
+#   comfy-env-root.toml [types] (ADR-0015), not here.
 # _DENIED_PASSTHROUGH / _DENIED_WORKSPACE_KEYS: compiler-owned, hard error --
 #   the single-feature/single-env manifest shape IS ADR-0007, and platforms/
 #   name/version are host-derived identity.
@@ -155,7 +151,6 @@ def _build_node_feature(
     torch_index: Optional[str],
     glibc_version: Optional[str],
     log: Callable[[str], None] = print,
-    cuda_wheel_urls: Optional[Dict[str, str]] = None,
     macos_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
@@ -205,15 +200,6 @@ def _build_node_feature(
         if cur_target:
             feat.setdefault("target", {})[current] = cur_target
 
-    if cuda_wheel_urls:
-        pypi = feat.setdefault("pypi-dependencies", {})
-        for pkg, url in cuda_wheel_urls.items():
-            pypi[pkg] = {"url": url}
-        log(
-            f"[comfy-env] {name}: cuda-wheels inlined as pypi-dependencies "
-            f"({', '.join(cuda_wheel_urls.keys())})"
-        )
-
     pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
     if pypi_options:
         feat["pypi-options"] = pypi_options
@@ -234,8 +220,8 @@ def _build_node_feature(
             feat["system-requirements"] = auto_reqs
 
     # [activation]: MERGE (ADR-0013) -- author entries pass through; the
-    # compiler's own key wins only on direct collision. (Previously the
-    # hardcoded block silently clobbered author activation.)
+    # compiler's own key wins only on direct collision. Assigning the block
+    # outright silently clobbers author activation.
     activation = copy.deepcopy(cfg.pixi_passthrough.get("activation", {}))
     if not isinstance(activation, dict):
         activation = {}
@@ -290,7 +276,7 @@ def build_env_toml(
 ) -> Dict[str, Any]:
     """Build a self-contained pixi.toml dict for one isolated env.
 
-    Each env gets its own manifest declaring a single feature ``default``
+    Each env gets its own manifest declaring a single feature ``node``
     and a single environment ``default``. No solve-groups, no cross-env
     references. A parse error in one env's pixi.toml has zero effect on
     any other env.
@@ -348,7 +334,7 @@ def build_env_toml(
     # to parse a manifest that declares `[feature.default.*]` explicitly.
     # Use "node" instead; the user-facing pixi environment name stays "default".
     feat = _build_node_feature(
-        cfg, "node", env_python,
+        cfg, env_name, env_python,
         torch_pin=node_torch_pin,
         torch_index=node_torch_index,
         glibc_version=glibc_version,
@@ -415,7 +401,6 @@ def write_env_pixi_toml(
 
 
 def resolve_env_cuda_wheel_urls(
-    env_name: str,
     cfg: ComfyEnvConfig,
     bootstrap_python: Optional[str],
     chosen_cuda: Optional[str],
@@ -442,7 +427,8 @@ def resolve_env_cuda_wheel_urls(
         if not url:
             raise RuntimeError(
                 f"cuda-wheel {pkg!r} unavailable for "
-                f"cu{chosen_cuda}/torch{chosen_torch_short}/cp{env_python}; "
+                f"cu{chosen_cuda}/torch{chosen_torch_short}/"
+                f"cp{env_python.replace('.', '')}; "
                 f"_resolve_wheel_combo should have caught this earlier."
             )
         urls[pkg] = url

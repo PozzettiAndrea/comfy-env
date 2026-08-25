@@ -20,12 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
+from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
 _CLEANUP_DONE = False
@@ -139,14 +134,32 @@ def _create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 def _handle_progress(request: dict) -> dict:
     """Parent-side callback: forward subprocess progress to ComfyUI frontend.
 
-    Also checks if the user clicked cancel -- if so, returns an error
-    so the subprocess can stop processing.
+    Raises on cancel so the worker learns about it. Two reasons this is not
+    a `return {"status": "error"}`:
+
+    * InterruptProcessingException derives from BaseException, so the old
+      `except Exception` never caught it. It unwound out of _send_request's
+      read loop MID-CONVERSATION while the worker sat blocked in
+      _call_parent's recv() awaiting a callback_response that never came --
+      and that loop then ate the next real request as an unexpected frame.
+    * _handle_callback wraps any RETURN as {"status": "ok", "result": ...},
+      and the worker only inspects the outer status, so an error dict was
+      indistinguishable from success. Raising lets _handle_callback's
+      `except Exception` produce a genuine error frame, which _call_parent
+      turns into _InterruptedError inside the worker.
+
+    The message must keep containing "interrupted": _progress_hook matches on
+    it (_persistent_worker.py).
     """
     try:
         import comfy.model_management as mm
-        mm.throw_exception_if_processing_interrupted()
-    except Exception:
-        return {"status": "error", "error": "Processing interrupted by user"}
+    except ImportError:
+        mm = None  # not running inside ComfyUI -- nothing to cancel
+    if mm is not None:
+        try:
+            mm.throw_exception_if_processing_interrupted()
+        except mm.InterruptProcessingException:
+            raise RuntimeError("Processing interrupted by user")
     try:
         import comfy.utils
         if comfy.utils.PROGRESS_BAR_HOOK:
@@ -219,10 +232,14 @@ def _worker_held_bytes() -> int:
     """
     held = 0
     n_workers = 0
-    for _key, patchers in _WORKER_PATCHERS.items():
+    # Snapshot: _register_new_patchers and _cleanup_stale_patchers mutate
+    # these from the aiohttp executor thread, and _cleanup_stale_patchers runs
+    # outside _POOL_LOCK. Not taking the lock here on purpose -- it is a plain
+    # Lock held across verify_transport(), so re-entering would deadlock.
+    for _key, patchers in list(_WORKER_PATCHERS.items()):
         if patchers:
             n_workers += 1
-        for p in patchers.values():
+        for p in list(patchers.values()):
             try:
                 held += int(p.loaded_size())
             except Exception:
@@ -291,9 +308,8 @@ def _handle_vram_budget(request: dict) -> dict:
         _log(f"[comfy-env] VRAM after eviction: "
              f"blind={mm.get_free_memory(device) / 1e9:.2f}GB")
 
-    # vram_state/extra_reserved pass through as ComfyUI computed them. (A
-    # manual per-worker cap, COMFY_ENV_WORKER_VRAM_BUDGET, used to override
-    # them here; removed 0.4.25 -- the negotiation below is the mechanism.)
+    # vram_state/extra_reserved pass through as ComfyUI computed them; the
+    # negotiation below is the only mechanism that adjusts them.
     vram_state_name = mm.vram_state.name
     extra_reserved = mm.EXTRA_RESERVED_VRAM
 

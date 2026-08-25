@@ -101,12 +101,8 @@ FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstra
 # Cost, stated plainly: CUDA 13 needs driver r580+.
 FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
 
-# --- Backend -> wheel-index registry -------------------------------------------
-# The single seam for adding a non-CUDA accelerator's prebuilt wheels: register
-# its index base URL + tier-2 fallback combo here (data, not an `if backend ==`),
-# and ship a resolver alongside. Only `cuda` is populated today -- this module IS
-# the cuda resolver. A backend-dispatching caller uses `resolve_index_url(backend)`
-# instead of hardcoding an index; adding `rocm` is one dict entry + a rocm resolver.
+# Backend -> wheel-index registry. Data, not an `if backend ==`: callers go
+# through resolve_index_url(backend) rather than hardcoding an index.
 WHEEL_INDEX_REGISTRY: dict[str, dict] = {
     "cuda": {
         # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().
@@ -212,12 +208,6 @@ def derive_family_pins(torch_pin: str) -> Optional[tuple]:
         return None
     vision_minor, audio_minor = pair
     return (f"=={vision_minor}.*", f"=={audio_minor}.*")
-
-
-def get_cuda_torch_mapping() -> dict:
-    return CUDA_TORCH_MAP.copy()
-
-
 
 
 def check_all_wheels_available(packages: List[str], torch_version: str,
@@ -398,7 +388,15 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
         _emit(f"[cuda-wheels]   Found: {display}")
         return url
 
-    # Index path failed for every variant -- try the different-transport fallback.
+    # deferred_errors is appended to ONLY in the except branches above, so it
+    # is an exact "the index was unreachable" signal. Without this gate the
+    # ordinary "no wheel published for this combo" outcome -- a clean HTTP 200
+    # with no matching filename -- printed a network diagnosis and paid for a
+    # full GitHub API round trip (15s x 3 retries) per package per combo.
+    if not deferred_errors:
+        _emit(f"[cuda-wheels]   No wheel published for this combo.")
+        return None
+
     _emit(f"[cuda-wheels]   GH Pages index unreachable, falling back to GitHub Releases API...")
     api_result = _fetch_from_github_api(package, torch_version, cuda_version, python_version, log=_emit)
     if api_result is not None:
