@@ -408,7 +408,6 @@ def _warn_empty_v3_scan(package_name: str, payload: dict, node_count: int) -> No
 
 def fetch_metadata(
     env_dir: Path,
-    node_dir: Path,
     package_name: str,
     working_dir: Path,
     env_vars: Optional[Dict[str, str]] = None,
@@ -417,7 +416,6 @@ def fetch_metadata(
 
     Args:
         env_dir: Path to _env_* directory
-        node_dir: Path to the node subdirectory (e.g., nodes/gpu/)
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         env_vars: Additional environment variables from comfy-env.toml

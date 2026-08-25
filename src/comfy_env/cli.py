@@ -20,11 +20,6 @@ def main(args: Optional[List[str]] = None) -> int:
     p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
     p.add_argument("--isolated", action="store_true", help=f"Create {CONFIG_FILE_NAME} instead (for isolated folders)")
 
-    # generate
-    p = sub.add_parser("generate", help="Generate pixi.toml from config")
-    p.add_argument("config", type=str, help="Path to config file")
-    p.add_argument("--force", "-f", action="store_true", help="Overwrite existing")
-
     # install
     p = sub.add_parser("install", help="Install dependencies")
     p.add_argument("--config", "-c", type=str, help="Config path")
@@ -68,7 +63,7 @@ def main(args: Optional[List[str]] = None) -> int:
         return 0
 
     commands = {
-        "init": cmd_init, "generate": cmd_generate, "install": cmd_install,
+        "init": cmd_init, "install": cmd_install,
         "info": cmd_info, "doctor": cmd_doctor,
         "settings": cmd_settings, "debug": cmd_debug,
         "gc": cmd_gc, "cleanup": cmd_gc,
@@ -125,32 +120,6 @@ def cmd_init(args) -> int:
     return 0
 
 
-def cmd_generate(args) -> int:
-    from .config import load_config
-    from .packages.toml_generator import write_pixi_toml
-
-    config_path = Path(args.config).resolve()
-    if not config_path.exists():
-        print(f"Not found: {config_path}", file=sys.stderr)
-        return 1
-
-    node_dir = config_path.parent
-    pixi_path = node_dir / "pixi.toml"
-    if pixi_path.exists() and not args.force:
-        print(f"Already exists: {pixi_path}\nUse --force to overwrite", file=sys.stderr)
-        return 1
-
-    config = load_config(config_path)
-    if not config:
-        print(f"Failed to load: {config_path}", file=sys.stderr)
-        return 1
-
-    print(f"Generating pixi.toml from {config_path}")
-    write_pixi_toml(config, node_dir)
-    print(f"Created {pixi_path}\nNext: cd {node_dir} && pixi install")
-    return 0
-
-
 def cmd_install(args) -> int:
     from .install import install
     node_dir = Path(args.dir) if args.dir else Path.cwd()
@@ -185,33 +154,19 @@ def cmd_info(args) -> int:
 
 
 def cmd_doctor(args) -> int:
-    from .install import verify_installation
-    from .config import load_config, discover_config
-
     print("Diagnostics\n" + "=" * 40)
     print("\n1. Environment")
     cmd_info(argparse.Namespace(json=False))
 
-    print("2. Packages")
-    packages = []
-    if args.package:
-        packages = [args.package]
-    else:
-        cfg = load_config(Path(args.config)) if args.config else discover_config(Path.cwd())
-        if cfg:
-            packages = list(cfg.pixi_passthrough.get("pypi-dependencies", {}).keys()) + cfg.cuda_packages
-
-    rc = 0
-    if packages:
-        rc = 0 if verify_installation(packages) else 1
-    else:
-        print("  No packages to verify")
-
-    print("\n3. Accelerator import rule")
-    print("  Moved to `comfy-test lint --check accel`, which runs it in CI and")
-    print("  resolves import names exactly from env.stamp.json rather than")
-    print("  guessing them (faithc-aot installs `faithcontour`).")
-    return rc
+    # There is deliberately no package check here. It used to __import__ the
+    # ISOLATED env's dependencies in the HOST interpreter, which the host-env
+    # principle guarantees are absent -- so it reported every working install
+    # as broken and exited 1.
+    print("\n2. Package and accelerator checks")
+    print("  Run `comfy-test lint --check accel`: it runs in CI and resolves")
+    print("  import names from env.stamp.json rather than guessing them")
+    print("  (faithc-aot installs `faithcontour`).")
+    return 0
 
 
 def _read_env_file(path):
@@ -242,14 +197,12 @@ def cmd_debug(args) -> int:
 
 def _open_settings_tui(initial_tab=0) -> int:
     from .debug import CATEGORIES as DEBUG_CATEGORIES, SETTINGS_FILE as DEBUG_FILE
-    from .settings import (GENERAL_SETTINGS, GENERAL_DEFAULTS, SETTINGS_FILE as GENERAL_FILE,
-                           PATCH_SETTINGS, PATCH_DEFAULTS,
-                           NUMERIC_SETTINGS, get_numeric)
+    from .settings import (GENERAL_SETTINGS, GENERAL_DEFAULTS,
+                           SETTINGS_FILE as GENERAL_FILE)
 
     # Read current state
     debug_enabled = _read_env_file(DEBUG_FILE)
     general_enabled = _read_env_file(GENERAL_FILE)
-    patch_enabled = _read_env_file(GENERAL_FILE)  # patches stored in same file
 
     # Also check live env vars
     for var, _ in DEBUG_CATEGORIES:
@@ -261,42 +214,24 @@ def _open_settings_tui(initial_tab=0) -> int:
             general_enabled.add(var)
         elif val == "" and GENERAL_DEFAULTS.get(var, False):
             general_enabled.add(var)  # default on
-    for var, _ in PATCH_SETTINGS:
-        val = os.environ.get(var, "")
-        if val.lower() in ("1", "true", "yes"):
-            patch_enabled.add(var)
-        elif val == "" and PATCH_DEFAULTS.get(var, False):
-            patch_enabled.add(var)
-
-    # Read current numeric values: {var: current_value}
-    numeric_values = {}
-    for var, label, default, unit in NUMERIC_SETTINGS:
-        numeric_values[var] = get_numeric(var, default)
-
     tabs = [
         ("General", GENERAL_SETTINGS, general_enabled, GENERAL_FILE),
         ("Debug", DEBUG_CATEGORIES, debug_enabled, DEBUG_FILE),
-        ("Patches", PATCH_SETTINGS, patch_enabled, GENERAL_FILE),
     ]
 
     try:
         import curses
-        return _settings_tui(curses, tabs, initial_tab, numeric_values, GENERAL_FILE)
+        return _settings_tui(curses, tabs, initial_tab)
     except ImportError:
-        return _settings_text(tabs, initial_tab, numeric_values, GENERAL_FILE)
+        return _settings_text(tabs)
 
 
-def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=None):
+def _settings_tui(curses, tabs, initial_tab):
     """Curses-based tabbed settings TUI."""
-    from .settings import NUMERIC_SETTINGS
-
     tab_names = [t[0] for t in tabs]
     tab_items = [t[1] for t in tabs]  # list of [(var, label), ...]
     tab_selected = [[var in t[2] for var, _ in t[1]] for t in tabs]
     tab_files = [t[3] for t in tabs]
-
-    if numeric_values is None:
-        numeric_values = {}
 
     active_tab = initial_tab
     cursor = 0
@@ -309,40 +244,7 @@ def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=N
         return tab_selected[active_tab]
 
     def n_items():
-        """Total items: boolean toggles + numeric settings (on General tab only)."""
-        n = len(cur_items())
-        if active_tab == 0:  # General tab
-            n += len(NUMERIC_SETTINGS)
-        return n
-
-    def _edit_numeric(stdscr, var, label, unit, h, w):
-        """Mini inline editor for a numeric value. Returns new value or None."""
-        curses.curs_set(1)
-        prompt = f"  {label} ({unit}): "
-        cur = str(numeric_values.get(var, 0))
-        buf = list(cur)
-        while True:
-            stdscr.move(h - 1, 0)
-            stdscr.clrtoeol()
-            stdscr.addstr(h - 1, 2, prompt + "".join(buf) + "_", curses.A_BOLD)
-            stdscr.refresh()
-            k = stdscr.getch()
-            if k in (10, 13, curses.KEY_ENTER):
-                curses.curs_set(0)
-                try:
-                    return float("".join(buf)) if buf else 0.0
-                except ValueError:
-                    return None
-            elif k == 27:  # ESC
-                curses.curs_set(0)
-                return None
-            elif k in (curses.KEY_BACKSPACE, 127, 8):
-                if buf:
-                    buf.pop()
-            elif 32 <= k < 127:
-                ch = chr(k)
-                if ch in "0123456789.":
-                    buf.append(ch)
+        return len(cur_items())
 
     def draw(stdscr):
         nonlocal active_tab, cursor, status_msg
@@ -387,19 +289,6 @@ def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=N
                 attr = curses.A_REVERSE if cursor == i else 0
                 line = f"  [{check}] {label:<48s} {var}"
                 stdscr.addstr(y, 0, line[:w-1], attr)
-
-            # Numeric settings (General tab only, after boolean items)
-            if active_tab == 0 and NUMERIC_SETTINGS:
-                for ni_idx, (var, label, default, unit) in enumerate(NUMERIC_SETTINGS):
-                    row_idx = bool_count + ni_idx
-                    y = row_idx + 4
-                    if y >= h - 4:
-                        break
-                    val = numeric_values.get(var, default)
-                    val_str = f"{val:g}" if val != int(val) or val == 0 else f"{int(val)}"
-                    attr = curses.A_REVERSE if cursor == row_idx else 0
-                    line = f"  [{val_str:>4s}] {label:<46s} {var}"
-                    stdscr.addstr(y, 0, line[:w-1], attr)
 
             ni = n_items()
 
@@ -449,38 +338,23 @@ def _settings_tui(curses, tabs, initial_tab, numeric_values=None, numeric_file=N
             elif key in (ord(' '), curses.KEY_ENTER, 10, 13):
                 if cursor < bool_count:
                     cur_sel()[cursor] = not cur_sel()[cursor]
-                elif active_tab == 0 and cursor < bool_count + len(NUMERIC_SETTINGS):
-                    # Numeric setting -- open inline editor
-                    num_idx = cursor - bool_count
-                    var, label, default, unit = NUMERIC_SETTINGS[num_idx]
-                    new_val = _edit_numeric(stdscr, var, label, unit, h, w)
-                    if new_val is not None:
-                        numeric_values[var] = new_val
-                        status_msg = f"Set {var}={new_val:g}"
                 elif cursor == ni:
-                    _save_all_settings(tab_items, tab_selected, tab_files,
-                                       numeric_values, numeric_file)
+                    _save_all_settings(tab_items, tab_selected, tab_files)
                     return 0
                 elif cursor == ni + 1:
                     return 0
             elif key in (ord('a'), ord('A')):
-                _save_all_settings(tab_items, tab_selected, tab_files,
-                                   numeric_values, numeric_file)
+                _save_all_settings(tab_items, tab_selected, tab_files)
                 return 0
 
     return curses.wrapper(draw)
 
 
-def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
+def _settings_text(tabs):
     """Simple text fallback for systems without curses."""
-    from .settings import NUMERIC_SETTINGS
-
     tab_items = [t[1] for t in tabs]
     tab_selected = [[var in t[2] for var, _ in t[1]] for t in tabs]
     tab_files = [t[3] for t in tabs]
-
-    if numeric_values is None:
-        numeric_values = {}
 
     def _display():
         nonlocal offset
@@ -495,13 +369,6 @@ def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
                     check = "*"
                 print(f"  {offset + i}. [{check}] {label:<48s} {var}")
             offset += len(items)
-            # Numeric settings on General tab
-            if ti == 0 and NUMERIC_SETTINGS:
-                for var, label, default, unit in NUMERIC_SETTINGS:
-                    val = numeric_values.get(var, default)
-                    val_str = f"{val:g}"
-                    print(f"  {offset}. [{val_str:>4s}] {label:<46s} {var}")
-                    offset += 1
 
     offset = 0
     offsets = []
@@ -509,7 +376,7 @@ def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
     print("=" * 40)
     _display()
     print()
-    print("Enter numbers to toggle (space-separated), 'set VAR=VALUE' for numeric, 'save' to save:")
+    print("Enter numbers to toggle (space-separated), 'save' to save:")
 
     while True:
         try:
@@ -519,35 +386,12 @@ def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
         if line.lower() in ("q", "quit", "exit"):
             return 0
         if line.lower() in ("s", "save"):
-            _save_all_settings(tab_items, tab_selected, tab_files,
-                               numeric_values, numeric_file)
+            _save_all_settings(tab_items, tab_selected, tab_files)
             print("Saved.")
             return 0
-        # Handle 'set VAR=VALUE'
-        if line.lower().startswith("set ") and "=" in line:
-            _, rest = line.split(None, 1)
-            k, v = rest.split("=", 1)
-            k = k.strip()
-            try:
-                numeric_values[k] = float(v.strip())
-                print(f"  Set {k}={numeric_values[k]:g}")
-            except ValueError:
-                print(f"  Invalid value: {v.strip()}")
-            continue
         for part in line.split():
             try:
                 idx = int(part)
-                # Check if it's a numeric setting index (on General tab)
-                bool_total = sum(len(t[1]) for t in tabs)
-                if idx >= bool_total and idx < bool_total + len(NUMERIC_SETTINGS):
-                    num_idx = idx - bool_total
-                    var, label, default, unit = NUMERIC_SETTINGS[num_idx]
-                    try:
-                        val = input(f"  {label} ({unit}): ").strip()
-                        numeric_values[var] = float(val) if val else default
-                    except (ValueError, EOFError):
-                        pass
-                    continue
                 # Find which tab and local index
                 for ti in range(len(tabs)):
                     if idx < offsets[ti] + len(tab_items[ti]):
@@ -560,23 +404,14 @@ def _settings_text(tabs, initial_tab, numeric_values=None, numeric_file=None):
         _display()
 
 
-def _save_all_settings(tab_items, tab_selected, tab_files,
-                       numeric_values=None, numeric_file=None):
+def _save_all_settings(tab_items, tab_selected, tab_files):
     """Write settings to their respective files (merges tabs sharing the same file)."""
-    # Group by file path (General and Patches may share the same file)
     from collections import defaultdict
     file_entries = defaultdict(list)  # filepath -> [(var, value_str), ...]
     for items, selected, filepath in zip(tab_items, tab_selected, tab_files):
         for i, (var, _) in enumerate(items):
             val_str = "1" if selected[i] else "0"
             file_entries[filepath].append((var, val_str))
-            os.environ[var] = val_str
-
-    # Append numeric settings to their file
-    if numeric_values and numeric_file:
-        for var, val in numeric_values.items():
-            val_str = f"{val:g}"
-            file_entries[numeric_file].append((var, val_str))
             os.environ[var] = val_str
 
     for filepath, entries in file_entries.items():

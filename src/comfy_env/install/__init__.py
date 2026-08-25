@@ -25,12 +25,10 @@ from .plugin import (
     check_sibling_comfy_env_pins,
 )
 from .workspace import install_workspace
-from .verify import verify_installation
 
 __all__ = [
     "install",
     "install_workspace",
-    "verify_installation",
 ]
 
 

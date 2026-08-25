@@ -46,7 +46,6 @@ __all__ = [
 # as a signpost rather than a re-export: importing any of them binds you to an
 # internal that carries no compatibility promise.
 _INTERNAL = {
-    "verify_installation": "comfy_env.install",
     "get_comfyui_dir": "comfy_env.environment.cache.find_comfyui_dir_from_node",
     "find_comfyui_dir_from_node": "comfy_env.environment.cache",
     "ComfyEnvConfig": "comfy_env.config",
@@ -74,15 +73,12 @@ _INTERNAL = {
     "CUDA_WHEELS_INDEX": "comfy_env.packages.cuda_wheels",
     "cuda_wheels_index": "comfy_env.packages.cuda_wheels",
     "get_wheel_url": "comfy_env.packages.cuda_wheels",
-    "get_cuda_torch_mapping": "comfy_env.packages.cuda_wheels",
     "get_env_name": "comfy_env.environment.cache",
     "get_workspace_dir": "comfy_env.environment.cache",
     "Worker": "comfy_env.isolation.workers",
     "WorkerError": "comfy_env.isolation.workers",
     "SubprocessWorker": "comfy_env.isolation.workers.subprocess",
     "TensorKeeper": "comfy_env.isolation.tensor_utils",
-    "release_tensor": "comfy_env.isolation.tensor_utils",
-    "release_tensors_recursive": "comfy_env.isolation.tensor_utils",
 }
 
 

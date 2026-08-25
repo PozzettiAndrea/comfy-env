@@ -65,7 +65,6 @@ from ._ipc_parent import (
     _create_server_socket,
     SocketTransport,
     # Tensor lifecycle
-    _pool_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
     _probe_cuda_ipc,
@@ -278,7 +277,6 @@ class SubprocessWorker(Worker):
         self._worker_pool = None
         # Clear stale pool IPC caches -- pointer export data from dead worker's
         # pool is invalid and would corrupt CUDA state if reused with new pool
-        _pool_ipc_metadata_cache.clear()
         _pool_ipc_cache_tensors.clear()
 
     def _worker_exit_diagnostic(self) -> str:

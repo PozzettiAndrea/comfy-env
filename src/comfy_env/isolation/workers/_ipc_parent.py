@@ -397,7 +397,8 @@ def _deserialize_cuda_ipc(data: dict):
 
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 
-_pool_ipc_metadata_cache: Dict[int, dict] = {}
+# Only the tensors: the parent never reads back pool metadata, it just needs
+# a strong ref so the imported allocation stays mapped.
 _pool_ipc_cache_tensors: Dict[int, Any] = {}
 
 # Per-CALL state, set by SubprocessWorker around each call. THREAD-LOCAL
@@ -436,11 +437,9 @@ def _deserialize_pool_ipc(data, source_pool):
                 tuple(data["tensor_size"]), tuple(data["tensor_stride"]))
     tensor.requires_grad_(data["requires_grad"])
 
-    # Cache for cross-worker forwarding
+    # Hold the imported tensor so its allocation stays mapped.
     try:
-        sid = id(tensor.untyped_storage())
-        _pool_ipc_metadata_cache[sid] = data
-        _pool_ipc_cache_tensors[sid] = tensor
+        _pool_ipc_cache_tensors[id(tensor.untyped_storage())] = tensor
     except Exception:
         pass
     return tensor
@@ -638,14 +637,12 @@ def _cleanup_ipc_cache():
             dead = [k for k, t in _pool_ipc_cache_tensors.items()
                     if not isinstance(t, torch.Tensor) or t.storage().size() == 0]
             for k in dead:
-                _pool_ipc_metadata_cache.pop(k, None)
                 _pool_ipc_cache_tensors.pop(k, None)
     except Exception:
         pass
     # Enforce size bounds to prevent unbounded growth in long sessions
     _evict_cache_if_needed(_cuda_ipc_metadata_cache)
     _evict_cache_if_needed(_cuda_ipc_cache_tensors)
-    _evict_cache_if_needed(_pool_ipc_metadata_cache)
     _evict_cache_if_needed(_pool_ipc_cache_tensors)
 
 

@@ -155,7 +155,6 @@ def _build_node_feature(
     torch_index: Optional[str],
     glibc_version: Optional[str],
     log: Callable[[str], None] = print,
-    cuda_wheel_urls: Optional[Dict[str, str]] = None,
     macos_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
@@ -204,15 +203,6 @@ def _build_node_feature(
                     del cur_target[tbl]
         if cur_target:
             feat.setdefault("target", {})[current] = cur_target
-
-    if cuda_wheel_urls:
-        pypi = feat.setdefault("pypi-dependencies", {})
-        for pkg, url in cuda_wheel_urls.items():
-            pypi[pkg] = {"url": url}
-        log(
-            f"[comfy-env] {name}: cuda-wheels inlined as pypi-dependencies "
-            f"({', '.join(cuda_wheel_urls.keys())})"
-        )
 
     pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
     if pypi_options:
@@ -415,7 +405,6 @@ def write_env_pixi_toml(
 
 
 def resolve_env_cuda_wheel_urls(
-    env_name: str,
     cfg: ComfyEnvConfig,
     bootstrap_python: Optional[str],
     chosen_cuda: Optional[str],

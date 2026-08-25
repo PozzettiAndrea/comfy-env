@@ -214,12 +214,6 @@ def derive_family_pins(torch_pin: str) -> Optional[tuple]:
     return (f"=={vision_minor}.*", f"=={audio_minor}.*")
 
 
-def get_cuda_torch_mapping() -> dict:
-    return CUDA_TORCH_MAP.copy()
-
-
-
-
 def check_all_wheels_available(packages: List[str], torch_version: str,
                                cuda_version: str, python_version: str,
                                log: Optional[Callable[[str], None]] = None) -> Optional[str]:

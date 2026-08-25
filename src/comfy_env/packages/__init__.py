@@ -5,7 +5,6 @@ from .cuda_wheels import (
     CUDA_WHEELS_INDEX,
     cuda_wheels_index,
     get_wheel_url,
-    get_cuda_torch_mapping,
 )
 from .node_packs import (
     install_node_packs,
@@ -19,7 +18,6 @@ __all__ = [
     "CUDA_WHEELS_INDEX",
     "cuda_wheels_index",
     "get_wheel_url",
-    "get_cuda_torch_mapping",
     # Node dependencies
     "install_node_packs",
     "clone_node",

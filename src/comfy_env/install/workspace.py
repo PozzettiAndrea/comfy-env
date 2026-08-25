@@ -722,10 +722,9 @@ def install_workspace(
                 f"{chosen_cuda.replace('.', '')[:3]}"
             )
         else:
-            chosen_cuda = cuda_version
-            chosen_torch_short = (
-                ".".join(bootstrap_torch.split(".")[:2]) if bootstrap_torch else None
-            )
+            # Never observed: both reads below are guarded on
+            # `combo is not None`. Bound only so the names exist.
+            chosen_cuda = chosen_torch_short = None
 
         # On Desktop app, requirements.txt is in the app bundle (source dir),
         # not the user data dir. Resolve source dir separately for downstream use.
@@ -757,7 +756,6 @@ def install_workspace(
                 log=log,
             )
             urls = resolve_env_cuda_wheel_urls(
-                env_name=env_name,
                 cfg=cfg,
                 bootstrap_python=bootstrap_python,
                 chosen_cuda=chosen_cuda if combo is not None else None,
