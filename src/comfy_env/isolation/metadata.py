@@ -94,9 +94,7 @@ def _log_vram(label: str) -> None:
             pass
 
 
-# ---------------------------------------------------------------------------
 # Metadata extraction script (runs in isolation subprocess)
-# ---------------------------------------------------------------------------
 
 _METADATA_SCRIPT = r'''
 import sys
@@ -374,9 +372,7 @@ with open(output_path, "wb") as _f:
 '''
 
 
-# ---------------------------------------------------------------------------
 # Metadata fetching
-# ---------------------------------------------------------------------------
 
 def _warn_empty_v3_scan(package_name: str, payload: dict, node_count: int) -> None:
     """Loud diagnostic when a pack has a V3 entrypoint but the scan found nothing.
@@ -415,7 +411,7 @@ def fetch_metadata(
     """Fetch node metadata by running a subprocess in the isolation env.
 
     Args:
-        env_dir: Path to _env_* directory
+        env_dir: Path to the materialized env in the global cache
         package_name: Dotted module name (e.g., "nodes.gpu")
         working_dir: Package root for sys.path (e.g., .../ComfyUI-GeometryPack/)
         env_vars: Additional environment variables from comfy-env.toml
@@ -626,9 +622,7 @@ def fetch_metadata(
                     pass
 
 
-# ---------------------------------------------------------------------------
 # Dynamic combo refresh (parent-side directory rescan)
-# ---------------------------------------------------------------------------
 #
 # Isolated nodes are represented in the main process by a proxy whose
 # INPUT_TYPES would otherwise return a snapshot captured once at scan time, so
@@ -733,9 +727,7 @@ def _scan_dynamic_dir(spec):
     return names
 
 
-# ---------------------------------------------------------------------------
 # Proxy class builder
-# ---------------------------------------------------------------------------
 
 def _collect_dynamic_marks(input_types: Dict[str, Any]):
     """[(section, input_name, marker_spec)] for combos opted into live dir rescan."""
@@ -966,9 +958,7 @@ def _build_v3_proxy_class(
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
 
 
-# ---------------------------------------------------------------------------
 # Accelerator availability (ACCELERATOR node declaration)
-# ---------------------------------------------------------------------------
 
 _MACHINE_BACKEND: Optional[str] = None
 

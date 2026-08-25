@@ -1,24 +1,11 @@
-"""
-Base Worker Interface - Protocol for all worker implementations.
-"""
+"""Base Worker interface -- the protocol every worker implementation satisfies."""
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional
 
 
 class Worker(ABC):
-    """
-    Abstract base class for process isolation workers.
-
-    All workers must implement:
-    - call(): Execute a function in the isolated process
-    - shutdown(): Clean up resources
-
-    Workers should be used as context managers when possible:
-
-        with SubprocessWorker(python="/path/to/venv/bin/python") as worker:
-            result = worker.call(my_func, arg1, arg2)
-    """
+    """Abstract base for process-isolation workers. Usable as a context manager."""
 
     @abstractmethod
     def call(
@@ -28,32 +15,13 @@ class Worker(ABC):
         timeout: Optional[float] = None,
         **kwargs
     ) -> Any:
-        """
-        Execute a function in the isolated worker process.
-
-        Args:
-            func: The function to execute. Must be picklable (top-level or staticmethod).
-            *args: Positional arguments passed to func.
-            timeout: Optional timeout in seconds (None = no timeout).
-            **kwargs: Keyword arguments passed to func.
-
-        Returns:
-            The return value of func(*args, **kwargs).
-
-        Raises:
-            TimeoutError: If execution exceeds timeout.
-            RuntimeError: If worker process dies or raises exception.
-        """
+        """Execute func in the isolated process. It must be picklable
+        (top-level or staticmethod). Raises TimeoutError or RuntimeError."""
         pass
 
     @abstractmethod
     def shutdown(self) -> None:
-        """
-        Shut down the worker and release resources.
-
-        Safe to call multiple times. After shutdown, further calls to
-        call() will raise RuntimeError.
-        """
+        """Release everything the worker holds. Idempotent; call() raises after."""
         pass
 
     @abstractmethod

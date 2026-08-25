@@ -1,29 +1,8 @@
-"""
-SubprocessWorker - Cross-venv isolation using persistent subprocess + socket IPC.
+"""SubprocessWorker -- cross-venv isolation over a persistent subprocess.
 
-This worker supports calling functions in a different Python environment:
-- Uses a persistent subprocess to avoid spawn overhead
-- Socket-based IPC for commands/responses; bulk tensors ride shared memory
-- Warm calls cost milliseconds (2.4 ms echo floor measured 2026-08)
-
-Use this when you need:
-- Different PyTorch version
-- Incompatible native library dependencies
-- Different Python version
-
-Example:
-    worker = SubprocessWorker(
-        python="/path/to/other/venv/bin/python",
-        working_dir="/path/to/code",
-    )
-
-    # Call a method by module path
-    result = worker.call_method(
-        module_name="my_module",
-        class_name="MyClass",
-        method_name="process",
-        kwargs={"image": my_tensor},
-    )
+Socket IPC for commands, shared memory for bulk tensors. The subprocess is
+persistent because spawn cost dominates otherwise: a warm call is a 2.4 ms
+echo floor (measured 2026-08).
 """
 
 import os
@@ -55,9 +34,7 @@ from ._ipc_shared import (
     _cleanup_shm,
 )
 
-# =============================================================================
 # Parent-side IPC code -- imported from _ipc_parent module
-# =============================================================================
 
 from ._ipc_parent import (
     # Socket utilities
@@ -118,23 +95,12 @@ def _exit_call_scope(prev):
 
 
 class SubprocessWorker(Worker):
-    """
-    Cross-venv worker using persistent subprocess + socket IPC.
+    """Cross-venv worker: persistent subprocess + socket IPC.
 
-    Uses Unix domain sockets (or TCP localhost on older Windows) for IPC.
-    This completely separates IPC from stdout/stderr, so C libraries
-    printing to stdout (like Blender) won't corrupt the protocol.
-
-    Benefits:
-    - Works on Windows with different venv Python (full isolation)
-    - Compiled CUDA extensions load correctly in the venv
-    - Warm calls cost milliseconds (measured 2026-08: 2.4 ms echo floor,
-      ~30 ms including the per-call health ping; persistent subprocess
-      avoids the ~2.4 s spawn+import cost per call)
-    - Tensor transfer via shared memory files
-    - Immune to stdout pollution from C libraries
-
-    Use this for calls to isolated venvs with different Python/dependencies.
+    IPC rides a unix socket (TCP localhost on older Windows), never
+    stdout/stderr -- so a C library that prints (Blender, and it does) cannot
+    corrupt the protocol. Persistence is what makes it usable: ~2.4 s
+    spawn+import per call becomes a 2.4 ms warm echo floor (measured 2026-08).
     """
 
     def __init__(
@@ -146,17 +112,6 @@ class SubprocessWorker(Worker):
         name: Optional[str] = None,
         health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT,
     ):
-        """
-        Initialize persistent worker.
-
-        Args:
-            python: Path to Python executable in target venv.
-            working_dir: Working directory for subprocess.
-            sys_path: Additional paths to add to sys.path.
-            env: Additional environment variables.
-            name: Optional name for logging.
-            health_check_timeout: Timeout in seconds for worker health checks.
-        """
         self.python = Path(python)
         self.working_dir = Path(working_dir) if working_dir else Path.cwd()
         self.sys_path = sys_path or []
@@ -749,21 +704,11 @@ class SubprocessWorker(Worker):
         kwargs: Optional[Dict[str, Any]] = None,
         timeout: Optional[float] = None,
     ) -> Any:
-        """
-        Call a class method by module/class/method path.
+        """Call a class method by module/class/method path.
 
-        Args:
-            module_name: Module containing the class (e.g., "depth_estimate").
-            class_name: Class name (e.g., "SAM3D_DepthEstimate").
-            method_name: Method name (e.g., "estimate_depth").
-            self_state: Optional dict to populate instance __dict__.
-            kwargs: Keyword arguments for the method.
-            timeout: Timeout in seconds.
-
-        Returns:
-            Return value of the method.
+        self_state populates the instance __dict__ before the call; the worker
+        never keeps an instance between calls.
         """
-        import sys
         if _DBG_WORKER:
             print(f"[SubprocessWorker] call_method: {module_name}.{class_name}.{method_name}", file=sys.stderr, flush=True)
 

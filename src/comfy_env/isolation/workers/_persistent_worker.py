@@ -147,9 +147,7 @@ if _DBG_VRAM:
     _vram_thread.start()
     wlog("[worker] VRAM poller started (200MB threshold, 100ms poll, 1s cooldown)")
 
-# =============================================================================
 # Shared Memory Serialization
-# =============================================================================
 
 # Pin to single CPU core before importing torch to prevent TSC non-monotonicity
 # during libc10_cuda.so static initialization (WSL has imprecise per-core TSC sync).
@@ -389,9 +387,7 @@ def _deserialize_cuda_ipc(data):
     return tensor
 
 
-# =============================================================================
 # Pool IPC - shareable CUDA memory pool (worker side)
-# =============================================================================
 
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 _pool_ipc_ok = False
@@ -1124,9 +1120,7 @@ def main():
     except ImportError:
         wlog("[worker] torch not available, skipping auto-registration hooks")
 
-    # ---------------------------------------------------------------
     # Bidirectional RPC -- call parent methods during execution
-    # ---------------------------------------------------------------
     _current_call_id = None  # Tracks call_id of the request being processed
 
     def _find_loaded_model(_model):

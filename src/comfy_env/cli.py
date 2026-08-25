@@ -428,11 +428,9 @@ def _save_all_settings(tab_items, tab_selected, tab_files):
 def cmd_gc(args) -> int:
     """List/delete envs no installed node references.
 
-    Replaces the old `cleanup` stub, which printed advice about a layout
-    (`_env_*` folders in node dirs) that has not existed since v0.4. Envs are
-    6-11 GB each and NOTHING else ever deletes one -- every ABI bump and every
-    rename orphans a full copy, so without this the machine-global root only
-    grows.
+    Envs are 6-11 GB each and NOTHING else ever deletes one -- every ABI bump
+    and every rename orphans a full copy, so without this the machine-global
+    root only grows.
 
     Referenced = for each comfy-env.toml discovered under this install's
     custom_nodes, the ABI-tagged directory name for the CURRENT stack. Every

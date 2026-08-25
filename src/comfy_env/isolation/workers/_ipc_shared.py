@@ -17,9 +17,7 @@ import os
 import socket
 import sys
 
-# =============================================================================
 # Constants
-# =============================================================================
 
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB message size limit
 
@@ -44,9 +42,7 @@ SOCKET_ID_LENGTH = 12           # hex chars in socket name uuid
 MAX_IPC_CACHE_SIZE = 256        # max entries in IPC handle forwarding caches
 
 
-# =============================================================================
 # Anonymous shared memory via memfd_create (Linux)
-# =============================================================================
 
 _USE_MEMFD = sys.platform == "linux"
 _libc = None
@@ -80,9 +76,7 @@ def _memfd_read(pid, fd, size):
         os.close(local_fd)
 
 
-# =============================================================================
 # CUDA memory pool ctypes bindings
-# =============================================================================
 
 class _CudaMemPoolPtrExportData(ctypes.Structure):
     _fields_ = [("reserved", ctypes.c_ubyte * 64)]
@@ -204,9 +198,7 @@ def _trim_pool(pool, min_bytes=0):
 
 
 
-# =============================================================================
 # FD passing (SCM_RIGHTS) over Unix domain sockets
-# =============================================================================
 
 def _send_fd(sock, fd):
     """Send a file descriptor over a Unix domain socket via SCM_RIGHTS."""
@@ -231,9 +223,7 @@ def _recv_fd(sock, timeout=10.0):
         sock.settimeout(None)
 
 
-# =============================================================================
 # Pool pointer wrapper
-# =============================================================================
 
 class _PoolPtr:
     """Wrap imported CUDA pointer for __cuda_array_interface__."""
@@ -244,9 +234,7 @@ class _PoolPtr:
         }
 
 
-# =============================================================================
 # Shared memory registry cleanup
-# =============================================================================
 
 def _cleanup_shm(registry):
     """Close all shared memory in registry (memfd fds or SharedMemory blocks)."""
@@ -262,9 +250,7 @@ def _cleanup_shm(registry):
     registry.clear()
 
 
-# =============================================================================
 # IPC cache management
-# =============================================================================
 
 # IPC handle forwarding cache: avoids cloning when re-sharing CUDA tensors
 # received via IPC from another worker (Worker A -> Parent -> Worker B).
@@ -285,9 +271,7 @@ def _evict_cache_if_needed(cache_dict):
             del cache_dict[k]
 
 
-# =============================================================================
 # Serializer registry (custom data types)
-# =============================================================================
 #
 # Node packs can teach the transport about their own types. Both sides of the
 # process boundary carry THIS module (the parent imports it from comfy_env;
@@ -301,29 +285,9 @@ def _evict_cache_if_needed(cache_dict):
 #     SKELETON = "builtin"    # automatic transport, listed for humans/tests
 #
 # <pack>/serialization.py is loaded by FILE PATH under a mangled per-pack
-# module name on BOTH sides (parent + worker), must keep its top-level
-# imports to stdlib/numpy/comfy_env (heavy deps inside the functions), and
-# looks like:
-#
-#     try:  # parent process
-#         from comfy_env.isolation.workers import _ipc_shared as ipc
-#     except ImportError:  # worker process (module copied next to the worker)
-#         import _ipc_shared as ipc
-#
-#     def _ser(obj, recurse):
-#         return {"verts": recurse(obj.vertices), "id": obj.id}
-#
-#     def _deser(payload, recurse):
-#         from mymeshlib import MyMesh
-#         return MyMesh(recurse(payload["verts"]), payload["id"])
-#
-#     try:  # register deserialize only where the library exists; a side
-#         import mymeshlib  # noqa: F401  -- without it holds materialized
-#         _DESER = _deser   #                OpaquePayload receipts instead
-#     except ImportError:
-#         _DESER = None
-#
-#     ipc.register_serializer("MyMesh", _ser, _DESER, tag="mymeshlib.MyMesh")
+# module name on BOTH sides, and must keep its top-level imports to
+# stdlib/numpy/comfy_env (heavy deps go inside the functions). Worked example:
+# docs/comfy-env/serializers.md.
 #
 # Tag convention (ADR-0015): shared library types tag by TYPE IDENTITY
 # ("mymeshlib.MyMesh") so independent packs interoperate; pack-private
@@ -631,9 +595,7 @@ def load_serializer_files(spec, log=None):
     return available, executed
 
 
-# =============================================================================
 # Generic shared memory serialization (_to_shm)
-# =============================================================================
 
 def _encode_np_dtype(dt):
     """JSON round-trippable numpy dtype.

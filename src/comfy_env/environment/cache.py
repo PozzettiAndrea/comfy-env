@@ -594,10 +594,8 @@ def copy_files(src, dst, pattern="*", overwrite=False):
     """
     # Resolve the caller's directory HERE, in the public function body, where
     # depth 1 means "whoever called copy_files" -- a fact about the call
-    # contract. This used to live inside the nested helper below at depth 2,
-    # which encoded an INTERNAL structural fact (that a helper exists between
-    # the caller and the frame walk). Adding any frame -- a decorator, another
-    # helper, a deprecation shim -- shifted it silently: `__file__` on the
+    # contract, not about our internal helper layout. Adding any frame -- a
+    # decorator, another helper, a shim -- shifts it silently: `__file__` on the
     # wrong frame is still a valid path, so `src` resolved under comfy-env's
     # own directory, `src.exists()` returned False, and the function returned
     # 0 having copied nothing. No exception, no log, no thread to pull.

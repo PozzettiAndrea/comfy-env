@@ -313,9 +313,8 @@ def _handle_vram_budget(request: dict) -> dict:
         _log(f"[comfy-env] VRAM after eviction: "
              f"blind={mm.get_free_memory(device) / 1e9:.2f}GB")
 
-    # vram_state/extra_reserved pass through as ComfyUI computed them. (A
-    # manual per-worker cap, COMFY_ENV_WORKER_VRAM_BUDGET, used to override
-    # them here; removed 0.4.25 -- the negotiation below is the mechanism.)
+    # vram_state/extra_reserved pass through as ComfyUI computed them; the
+    # negotiation below is the only mechanism that adjusts them.
     vram_state_name = mm.vram_state.name
     extra_reserved = mm.EXTRA_RESERVED_VRAM
 

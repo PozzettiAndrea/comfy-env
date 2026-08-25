@@ -6,10 +6,8 @@ import threading
 import time
 from typing import Any
 
-# The CUDA IPC forwarding cache lives in the standalone leaf _ipc_shared
-# (imports nothing from comfy_env), so this is a clean top-level DOWNWARD
-# import -- no cycle, no function-body bandage. (Previously imported from
-# .workers.subprocess inside a function to dodge a package-init cycle.)
+# _ipc_shared is a standalone leaf (imports nothing from comfy_env), so this
+# can be a top-level DOWNWARD import rather than a function-body bandage.
 from .workers._ipc_shared import _cuda_ipc_metadata_cache
 
 logger = logging.getLogger("comfy_env")

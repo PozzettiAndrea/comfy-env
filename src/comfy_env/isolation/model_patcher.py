@@ -19,7 +19,7 @@ which fails when that set changes). Everything else hits ``__getattr__`` and
 raises **naming the attribute**, turning future upstream drift into a pointed
 traceback instead of silent corruption.
 
-Two honesty rules the old proxy broke:
+Two honesty rules:
 
 * **Never lie about bytes.** ``partially_unload`` returns what the worker
   actually freed. Returning a too-large number defeats ComfyUI's escalation
@@ -124,9 +124,7 @@ class SubprocessModelPatcher:
         self._model_id = model_id
         self._kind = kind  # "unet", "clip", "vae", "other"
 
-    # ------------------------------------------------------------------
     # IPC
-    # ------------------------------------------------------------------
 
     def _worker_gone(self):
         return not self._worker.is_alive()
@@ -171,9 +169,7 @@ class SubprocessModelPatcher:
                 return SEND_FAILED
             raise
 
-    # ------------------------------------------------------------------
     # The surface ComfyUI actually uses
-    # ------------------------------------------------------------------
 
     def model_size(self):
         return self.size
@@ -276,9 +272,7 @@ class SubprocessModelPatcher:
         _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
         return self.model
 
-    # ------------------------------------------------------------------
     # Explicitly unsupported (reachable only if a pack ever returns a MODEL)
-    # ------------------------------------------------------------------
 
     def add_patches(self, *args, **kwargs):
         raise NotImplementedError(

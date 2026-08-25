@@ -101,12 +101,8 @@ FALLBACK_COMBO = ("12.8", "2.8")  # (cuda, torch) -- always paired with bootstra
 # Cost, stated plainly: CUDA 13 needs driver r580+.
 FALLBACK_COMBO_AARCH64 = ("13.0", "2.10")
 
-# --- Backend -> wheel-index registry -------------------------------------------
-# The single seam for adding a non-CUDA accelerator's prebuilt wheels: register
-# its index base URL + tier-2 fallback combo here (data, not an `if backend ==`),
-# and ship a resolver alongside. Only `cuda` is populated today -- this module IS
-# the cuda resolver. A backend-dispatching caller uses `resolve_index_url(backend)`
-# instead of hardcoding an index; adding `rocm` is one dict entry + a rocm resolver.
+# Backend -> wheel-index registry. Data, not an `if backend ==`: callers go
+# through resolve_index_url(backend) rather than hardcoding an index.
 WHEEL_INDEX_REGISTRY: dict[str, dict] = {
     "cuda": {
         # Resolved lazily via resolve_index_url() -- see cuda_wheels_index().

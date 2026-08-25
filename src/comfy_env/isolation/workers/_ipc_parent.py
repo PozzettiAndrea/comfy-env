@@ -1,13 +1,7 @@
-"""
-Parent-side IPC code for comfy-env subprocess workers.
+"""Parent-side IPC: socket setup, transport, tensor serialization, keepers.
 
-This module contains all parent-process IPC infrastructure:
-- Socket creation/connection utilities
-- SocketTransport (thread-safe, length-prefixed JSON)
-- TensorKeeper for shared memory GC prevention
-- Tensor serialization (CPU shared memory, CUDA IPC, Pool IPC)
-- _to_shm / _from_shm (parent-side serialization/deserialization)
-- Legacy serialization helpers for ComfyUI custom objects
+The worker's half lives in _persistent_worker.py; anything both sides must
+agree on lives in _ipc_shared.py.
 """
 
 import base64
@@ -49,9 +43,7 @@ from ...debug import (
 )
 
 
-# =============================================================================
 # Socket IPC utilities - cross-platform with TCP fallback
-# =============================================================================
 
 def _has_af_unix() -> bool:
     """Check if AF_UNIX sockets are available."""
@@ -176,9 +168,7 @@ class SocketTransport:
             pass
 
 
-# =============================================================================
 # Tensor lifecycle management (parent side)
-# =============================================================================
 
 class _TensorKeeper:
     """Hold shared tensor references to prevent GC before worker reads them."""
@@ -256,9 +246,7 @@ def _serialize_tensor_native_parent(t, registry):
         raise RuntimeError(f"Unexpected reduce function: {sfunc.__name__}")
 
 
-# =============================================================================
 # CUDA IPC - zero-copy GPU tensor transfer (Linux only)
-# =============================================================================
 
 _cuda_ipc_supported: Optional[bool] = None
 
@@ -391,9 +379,7 @@ def _deserialize_cuda_ipc(data: dict):
     return tensor
 
 
-# =============================================================================
 # Pool IPC - shareable CUDA memory pool (cudaMallocAsync-compatible)
-# =============================================================================
 
 _POOL_IPC_ENABLED = os.environ.get("COMFY_ENV_POOL_IPC", "").lower() in ("1", "true", "yes")
 
@@ -404,8 +390,8 @@ _pool_ipc_cache_tensors: Dict[int, Any] = {}
 # Per-CALL state, set by SubprocessWorker around each call. THREAD-LOCAL
 # on purpose: module globals here raced when two workers were driven from
 # different threads (executor call in one, aiohttp route in another) --
-# worker B's call could read worker A's pool handle or demotion flag.
-# (2026-08 review finding; the RLock serializes per-worker, not globally.)
+# worker B's call could read worker A's pool handle or demotion flag. The
+# RLock serializes per-worker, not globally.
 _call_state = threading.local()  # attrs: worker_pool, gpu_demoted
 
 
@@ -472,9 +458,7 @@ def _to_shm(obj, registry, visited=None):
                            tensor_serializer=_parent_tensor_serializer)
 
 
-# =============================================================================
 # Shared memory deserialization (worker -> parent)
-# =============================================================================
 
 def _deserialize_tensor_ref(data):
     """Deserialize tensor from shared memory (TensorRef format).
@@ -617,9 +601,7 @@ def _from_shm(obj, unlink=True):
     return {k: _from_shm(v, unlink) for k, v in obj.items()}
 
 
-# =============================================================================
 # IPC cache cleanup
-# =============================================================================
 
 def _cleanup_ipc_cache():
     """Remove stale entries and enforce size bounds on IPC forwarding caches."""
@@ -646,9 +628,7 @@ def _cleanup_ipc_cache():
     _evict_cache_if_needed(_pool_ipc_cache_tensors)
 
 
-# =============================================================================
 # Legacy serialization helpers (for isolated objects)
-# =============================================================================
 
 def _serialize_for_ipc(obj, visited=None):
     """

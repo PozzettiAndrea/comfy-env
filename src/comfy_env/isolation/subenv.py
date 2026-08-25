@@ -1,11 +1,8 @@
 """Isolation subprocess launch-environment construction.
 
 A leaf module: stdlib + comfy_env.debug only, imported DOWNWARD by
-subprocess.py and metadata.py (which spawn workers) and by wrap.py (env
-paths). It was previously inlined at the top of wrap.py, which forced
-subprocess/metadata to reach UP into the orchestrator for it -- a
-lazy-import cycle. Nothing here depends on the worker pool, node
-registration, or metadata; it is pure launch-env setup.
+subprocess.py, metadata.py and wrap.py. Keeping it a leaf is what stops
+those three reaching UP into the orchestrator and forming an import cycle.
 """
 
 import glob
@@ -120,12 +117,7 @@ def build_isolation_env(python: Path, env_vars: dict = None) -> dict:
 
 
 def _get_env_paths(env_dir: Path) -> "Optional[Path]":
-    """Get site_packages from env.
-
-    Used to return (site_packages, lib_dir) too. The lib_dir was threaded
-    through seven functions in three files and then dropped: _create_worker
-    accepted it and built SubprocessWorker without it.
-    """
+    """Get site_packages from env."""
     if sys.platform == "win32":
         sp = env_dir / "Lib" / "site-packages"
     else:

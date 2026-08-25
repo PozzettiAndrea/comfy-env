@@ -4,7 +4,7 @@ comfy-env - Environment management for ComfyUI custom nodes.
 Features:
 - CUDA wheel resolution (pre-built wheels without compilation)
 - Process isolation (run nodes in separate Python environments)
-- Local _env_* folders (no central cache, no junctions)
+- A machine-global env cache keyed by ABI tag (environment/cache.py)
 """
 
 from importlib.metadata import version, PackageNotFoundError
