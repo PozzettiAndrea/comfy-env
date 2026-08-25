@@ -16,15 +16,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO, VRAM as _DBG_VRAM
+from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
+                     VRAM as _DBG_VRAM, log as _log)
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
 _CACHE_VERSION = "14"  # Bump when _METADATA_SCRIPT or cache format changes
-
-
-def _log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
 
 
 def _describe_value(name: str, v) -> str:

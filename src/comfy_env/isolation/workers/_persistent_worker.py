@@ -1,9 +1,7 @@
 
 import sys
 import os
-import json
 import socket
-import struct
 import traceback
 import faulthandler
 import collections
@@ -757,60 +755,6 @@ _worker_fd_registry = []  # Keep worker fds alive for worker->parent tensor tran
 
 
 
-class SocketTransport:
-    """Length-prefixed JSON transport.
-
-    send() MUST be locked: the worker routes print()/logging into
-    transport.send, and pack code prints from threads it spawns -- an
-    unlocked send interleaves partial writes from two threads and
-    permanently desyncs the length-prefixed stream. Mirrors the parent's
-    SocketTransport (_ipc_parent.py), including the MAX_MESSAGE_SIZE
-    check the worker copy previously lacked.
-    """
-    def __init__(self, sock):
-        self._sock = sock
-        self._send_lock = threading.Lock()
-        self._recv_lock = threading.Lock()
-
-    def send(self, obj):
-        data = json.dumps(obj).encode("utf-8")
-        msg = struct.pack(">I", len(data)) + data
-        with self._send_lock:
-            self._sock.sendall(msg)
-
-    def recv(self, timeout=None):
-        with self._recv_lock:
-            if timeout is not None:
-                self._sock.settimeout(timeout)
-            try:
-                raw_len = self._recvall(4)
-                if not raw_len:
-                    return None
-                msg_len = struct.unpack(">I", raw_len)[0]
-                if msg_len > _ipc_shared.MAX_MESSAGE_SIZE:
-                    raise ValueError(f"Message too large: {msg_len} bytes")
-                data = self._recvall(msg_len)
-                return json.loads(data.decode("utf-8"))
-            finally:
-                if timeout is not None:
-                    self._sock.settimeout(None)
-
-    def _recvall(self, n):
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                return bytes(data)
-            data.extend(chunk)
-        return bytes(data)
-
-    def close(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-
 def _connect(addr):
     """Connect to server socket (abstract://, unix://, or tcp://)."""
     if addr.startswith("abstract://"):
@@ -879,7 +823,7 @@ def main():
 
     # Connect to host process
     sock = _connect(socket_addr)
-    transport = SocketTransport(sock)
+    transport = _ipc_shared.SocketTransport(sock)
     # First frame MUST be the auth token: the parent refuses to speak the
     # protocol (which carries pickled payloads) to an unauthenticated peer.
     transport.send({"authkey": authkey})
@@ -888,8 +832,14 @@ def main():
     _vram_poll_transport = transport
     wlog("[worker] Connected, waiting for config...")
 
-    # Read config as first message
-    config = transport.recv()
+    # Read config as first message. recv() raises on a closed socket now, and
+    # a parent that dies before sending config is a routine shutdown, not a
+    # fault -- main() is called unguarded, so an escape here is a traceback.
+    try:
+        config = transport.recv()
+    except (ConnectionError, OSError) as e:
+        wlog(f"[worker] Parent closed before sending config ({e}), exiting")
+        return
     if not config:
         wlog("[worker] No config received, exiting")
         return
@@ -1272,9 +1222,9 @@ def main():
         """
         transport.send({"type": "callback", "method": method, "call_id": _current_call_id, **params})
         while True:
+            # recv() raises ConnectionError if the parent went away; None is
+            # only ever a timeout, and this call passes none.
             response = transport.recv()
-            if response is None:
-                raise RuntimeError("Parent disconnected during callback")
             # Handle interleaved management commands
             if response.get("method") == "model_to_device":
                 _handle_model_to_device(response)

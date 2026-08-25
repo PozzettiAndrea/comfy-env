@@ -12,14 +12,85 @@ next to persistent_worker.py so the worker can `import _ipc_shared`.
 
 import ctypes
 import ctypes.util
+import json
 import mmap as _mmap_mod
 import os
 import socket
+import struct
 import sys
+import threading
 
 # Constants
 
 MAX_MESSAGE_SIZE = 100 * 1024 * 1024  # 100MB message size limit
+
+
+class SocketTransport:
+    """Length-prefixed JSON transport: [4-byte big-endian length][JSON].
+
+    ONE copy for both sides. The worker's copy drifted three times before this
+    merge, and the drift inverted the contract: `None` meant "timed out" in the
+    parent and "peer closed" in the worker, so the same return value called for
+    opposite handling depending on which file you were reading. A desynced
+    length-prefixed stream hangs rather than raising, which is why drift here is
+    expensive to find.
+
+    Semantics, now single: recv() returns None ONLY on timeout. A closed peer or
+    a truncated payload raises ConnectionError.
+
+    send() MUST hold the lock: the worker routes print() and logging records
+    into transport.send, and pack code prints from threads it spawns. An
+    unlocked send interleaves partial writes and desyncs the stream for good.
+    """
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.Lock()
+
+    def send(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        msg = struct.pack(">I", len(data)) + data
+        with self._send_lock:
+            self._sock.sendall(msg)
+
+    def recv(self, timeout=None):
+        with self._recv_lock:
+            if timeout is not None:
+                self._sock.settimeout(timeout)
+            try:
+                raw_len = self._recvall(4)
+                if not raw_len:
+                    raise ConnectionError("Socket closed")
+                msg_len = struct.unpack(">I", raw_len)[0]
+                if msg_len > MAX_MESSAGE_SIZE:
+                    raise ValueError("Message too large: %d bytes" % msg_len)
+                data = self._recvall(msg_len)
+                if len(data) < msg_len:
+                    raise ConnectionError(
+                        "Incomplete message: %d/%d" % (len(data), msg_len))
+                return json.loads(data.decode("utf-8"))
+            except socket.timeout:
+                return None
+            finally:
+                if timeout is not None:
+                    self._sock.settimeout(None)
+
+    def _recvall(self, n):
+        data = bytearray()
+        while len(data) < n:
+            chunk = self._sock.recv(n - len(data))
+            if not chunk:
+                return bytes(data)
+            data.extend(chunk)
+        return bytes(data)
+
+    def close(self):
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
 
 # CUDA memory pool constants
 CUDA_MEM_HANDLE_TYPE_POSIX_FD = 1

@@ -5,10 +5,8 @@ agree on lives in _ipc_shared.py.
 """
 
 import base64
-import json
 import os
 import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -22,7 +20,6 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from ._ipc_shared import (
-    MAX_MESSAGE_SIZE,
     TENSOR_KEEPER_TTL,
     SOCKET_ID_LENGTH,
     _memfd_read,
@@ -102,70 +99,6 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
         return sock, f"tcp://127.0.0.1:{port}"
 
 
-
-
-class SocketTransport:
-    """
-    Length-prefixed JSON transport over sockets.
-
-    Message format: [4-byte big-endian length][JSON payload]
-    """
-
-    def __init__(self, sock: socket.socket):
-        self._sock = sock
-        self._send_lock = threading.Lock()
-        self._recv_lock = threading.Lock()
-
-    def send(self, obj: dict) -> None:
-        """Send a JSON-serializable object."""
-        data = json.dumps(obj).encode('utf-8')
-        msg = struct.pack('>I', len(data)) + data
-        with self._send_lock:
-            self._sock.sendall(msg)
-
-    def recv(self, timeout: Optional[float] = None) -> dict:
-        """Receive a JSON object. Returns None on timeout."""
-        with self._recv_lock:
-            if timeout is not None:
-                self._sock.settimeout(timeout)
-            try:
-                # Read 4-byte length header
-                raw_len = self._recvall(4)
-                if not raw_len:
-                    raise ConnectionError("Socket closed")
-                msg_len = struct.unpack('>I', raw_len)[0]
-
-                if msg_len > MAX_MESSAGE_SIZE:
-                    raise ValueError(f"Message too large: {msg_len} bytes")
-
-                # Read payload
-                data = self._recvall(msg_len)
-                if len(data) < msg_len:
-                    raise ConnectionError(f"Incomplete message: {len(data)}/{msg_len}")
-
-                return json.loads(data.decode('utf-8'))
-            except socket.timeout:
-                return None
-            finally:
-                if timeout is not None:
-                    self._sock.settimeout(None)
-
-    def _recvall(self, n: int) -> bytes:
-        """Receive exactly n bytes."""
-        data = bytearray()
-        while len(data) < n:
-            chunk = self._sock.recv(n - len(data))
-            if not chunk:
-                return bytes(data)
-            data.extend(chunk)
-        return bytes(data)
-
-    def close(self) -> None:
-        """Close the socket."""
-        try:
-            self._sock.close()
-        except OSError:
-            pass
 
 
 # Tensor lifecycle management (parent side)

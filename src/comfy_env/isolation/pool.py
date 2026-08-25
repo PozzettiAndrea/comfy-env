@@ -20,12 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
+from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
 _CLEANUP_DONE = False

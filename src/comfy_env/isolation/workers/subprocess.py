@@ -36,11 +36,11 @@ from ._ipc_shared import (
 
 # Parent-side IPC code -- imported from _ipc_parent module
 
+from ._ipc_shared import SocketTransport
 from ._ipc_parent import (
     # Socket utilities
     _has_af_unix,
     _create_server_socket,
-    SocketTransport,
     # Tensor lifecycle
     _pool_ipc_cache_tensors,
     _pool_ipc_available,

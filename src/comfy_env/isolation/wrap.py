@@ -7,16 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from ..debug import WORKER as _DBG_WORKER
+from ..debug import WORKER as _DBG_WORKER, log as _log
 # Worker pool (state, lifecycle, VRAM/progress callbacks, route proxying,
 # stale-patcher invariant) extracted to isolation/pool.py so metadata.py
 # imports it downward. wrap.register_nodes uses these two at startup:
 from .pool import _cleanup_stale_workers, _register_proxy_routes  # noqa: F401
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
 
 
 

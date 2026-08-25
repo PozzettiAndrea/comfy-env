@@ -10,6 +10,7 @@ The env vars propagate to subprocesses automatically via os.environ.
 """
 
 import os
+import sys
 from pathlib import Path
 
 SETTINGS_FILE = Path.home() / ".comfy-env" / "debug.env"
@@ -57,3 +58,8 @@ CATEGORIES = [
     ("COMFY_ENV_DEBUG_META", "Node metadata scanning"),
     ("COMFY_ENV_DEBUG_INSTALL", "Environment install & build"),
 ]
+
+
+def log(msg: str) -> None:
+    """Print to stderr with flush -- survives process crashes."""
+    print(msg, file=sys.stderr, flush=True)

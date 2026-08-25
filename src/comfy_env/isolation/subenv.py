@@ -11,12 +11,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..debug import INSTALL as _DBG_INSTALL
-
-
-def _log(msg: str) -> None:
-    """Print to stderr with flush -- survives process crashes."""
-    print(msg, file=sys.stderr, flush=True)
+from ..debug import INSTALL as _DBG_INSTALL, log as _log
 
 
 def _build_isolation_env_win32(env: dict, python: Path) -> dict:
