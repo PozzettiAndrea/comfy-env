@@ -6,6 +6,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+*.whl
+*.tar.gz
 .eggs/
 
 # Virtual environments
