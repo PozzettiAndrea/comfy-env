@@ -27,6 +27,7 @@ from ._ipc_shared import (
     _import_pointer,
     _evict_cache_if_needed,
     _cuda_ipc_metadata_cache,
+    _deserialize_cuda_ipc,
     _cuda_ipc_cache_tensors,
     _to_shm_generic,
     _decode_np_dtype,
@@ -271,45 +272,6 @@ def _serialize_cuda_ipc(t) -> dict:
         "event_handle": base64.b64encode(args[13]).decode("ascii") if args[13] else None,
         "event_sync_required": args[14],
     }
-
-
-def _deserialize_cuda_ipc(data: dict):
-    """Deserialize CUDA tensor from IPC handle.
-
-    Caches the IPC metadata so the handle can be forwarded if this tensor
-    is later sent to another worker (avoids cloning).
-    """
-    import torch
-    import torch.multiprocessing.reductions as reductions
-    dtype = getattr(torch, data["dtype"].split(".")[-1])
-    handle = base64.b64decode(data["handle"])
-    ref_counter_handle = base64.b64decode(data["ref_counter_handle"])
-    event_handle = base64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    tensor = reductions.rebuild_cuda_tensor(
-        torch.Tensor,
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["tensor_offset"],
-        torch.storage.TypedStorage,
-        dtype,
-        data["device_idx"],
-        handle,
-        data["storage_size"],
-        data["storage_offset"],
-        data["requires_grad"],
-        ref_counter_handle,
-        data["ref_counter_offset"],
-        event_handle,
-        data["event_sync_required"],
-    )
-    # Cache IPC metadata for handle forwarding (zero-copy re-sharing)
-    try:
-        storage_id = id(tensor.untyped_storage())
-        _cuda_ipc_metadata_cache[storage_id] = data
-        _cuda_ipc_cache_tensors[storage_id] = tensor
-    except Exception:
-        pass
-    return tensor
 
 
 # Pool IPC - shareable CUDA memory pool (cudaMallocAsync-compatible)

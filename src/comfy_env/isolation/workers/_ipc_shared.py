@@ -328,8 +328,8 @@ def _cleanup_shm(registry):
 # Keyed by id(storage). Lives HERE, in the only comfy_env-import-free leaf
 # module, so the tensor leaf (tensor_utils) can read it at module top level
 # without a package-init import cycle -- and so the container sits next to
-# the eviction policy that bounds it. Both the parent transport
-# (_ipc_parent) and the worker (_persistent_worker) share this one copy.
+# the eviction policy that bounds it. Both sides genuinely share it: the
+# worker used to shadow these with unbounded module globals of its own.
 _cuda_ipc_metadata_cache = {}   # id(storage) -> ipc metadata dict
 _cuda_ipc_cache_tensors = {}    # id(storage) -> tensor ref, keeps storage IDs stable
 
@@ -414,6 +414,51 @@ REGISTRY = SerializerRegistry()
 # get bigger", which is registration_count().
 _REGISTER_CALLS = 0
 
+
+
+def _deserialize_cuda_ipc(data):
+    """Rebuild a CUDA tensor from an IPC handle. Used by BOTH sides.
+
+    Caches the metadata so the handle can be forwarded without cloning if this
+    tensor is sent on again (worker A -> parent -> worker B), and bounds that
+    cache HERE. The worker has no periodic sweep of its own -- _cleanup_ipc_cache
+    is parent-only and the worker cannot import it -- so evicting at insert is
+    the only thing between a long session and a permanent VRAM pin: every entry
+    holds a strong reference to an imported mapping, which pins the EXPORTER's
+    allocation in the other process.
+    """
+    import base64
+    import torch
+    import torch.multiprocessing.reductions as reductions
+
+    dtype = getattr(torch, data["dtype"].split(".")[-1])
+    event_handle = data["event_handle"]
+    tensor = reductions.rebuild_cuda_tensor(
+        torch.Tensor,
+        tuple(data["tensor_size"]),
+        tuple(data["tensor_stride"]),
+        data["tensor_offset"],
+        torch.storage.TypedStorage,
+        dtype,
+        data["device_idx"],
+        base64.b64decode(data["handle"]),
+        data["storage_size"],
+        data["storage_offset"],
+        data["requires_grad"],
+        base64.b64decode(data["ref_counter_handle"]),
+        data["ref_counter_offset"],
+        base64.b64decode(event_handle) if event_handle else None,
+        data["event_sync_required"],
+    )
+    try:
+        storage_id = id(tensor.untyped_storage())
+        _cuda_ipc_metadata_cache[storage_id] = data
+        _cuda_ipc_cache_tensors[storage_id] = tensor
+        _evict_cache_if_needed(_cuda_ipc_metadata_cache)
+        _evict_cache_if_needed(_cuda_ipc_cache_tensors)
+    except Exception:
+        pass
+    return tensor
 
 def register_serializer(type_name, serialize, deserialize=None, tag=None):
     """Register a custom type with the transport (see module comment above).

@@ -303,15 +303,13 @@ def _probe_cuda_ipc():
     return _cuda_ipc_supported
 
 # IPC handle forwarding cache (worker-side, for passthrough tensors)
-_cuda_ipc_metadata_cache = {}
-_cuda_ipc_cache_tensors = {}
 
 def _serialize_cuda_ipc(t):
     import torch.multiprocessing.reductions as reductions
     # Check IPC handle cache -- forward original handle if available
     try:
         storage_id = id(t.untyped_storage())
-        cached = _cuda_ipc_metadata_cache.get(storage_id)
+        cached = _ipc_shared._cuda_ipc_metadata_cache.get(storage_id)
         if cached is not None:
             if (list(t.size()) == cached["tensor_size"]
                     and list(t.stride()) == cached["tensor_stride"]
@@ -349,40 +347,6 @@ def _serialize_cuda_ipc(t):
         "event_handle": _b64.b64encode(args[13]).decode("ascii") if args[13] else None,
         "event_sync_required": args[14],
     }
-
-
-def _deserialize_cuda_ipc(data):
-    import torch
-    import torch.multiprocessing.reductions as reductions
-    dtype = getattr(torch, data["dtype"].split(".")[-1])
-    handle = _b64.b64decode(data["handle"])
-    ref_counter_handle = _b64.b64decode(data["ref_counter_handle"])
-    event_handle = _b64.b64decode(data["event_handle"]) if data["event_handle"] else None
-    tensor = reductions.rebuild_cuda_tensor(
-        torch.Tensor,
-        tuple(data["tensor_size"]),
-        tuple(data["tensor_stride"]),
-        data["tensor_offset"],
-        torch.storage.TypedStorage,
-        dtype,
-        data["device_idx"],
-        handle,
-        data["storage_size"],
-        data["storage_offset"],
-        data["requires_grad"],
-        ref_counter_handle,
-        data["ref_counter_offset"],
-        event_handle,
-        data["event_sync_required"],
-    )
-    # Cache IPC metadata for handle forwarding (zero-copy passthrough)
-    try:
-        storage_id = id(tensor.untyped_storage())
-        _cuda_ipc_metadata_cache[storage_id] = data
-        _cuda_ipc_cache_tensors[storage_id] = tensor
-    except Exception:
-        pass
-    return tensor
 
 
 # Pool IPC - shareable CUDA memory pool (worker side)
@@ -619,7 +583,7 @@ def _from_shm(obj, _depth=0, _key="root"):
     # CudaIPC -> zero-copy CUDA tensor deserialization
     if obj.get("__type__") == "CudaIPC":
         wlog(f"[_from_shm] {_key}: CudaIPC tensor_size={obj.get('tensor_size')}")
-        return _deserialize_cuda_ipc(obj)
+        return _ipc_shared._deserialize_cuda_ipc(obj)
 
     # TensorRef -> use PyTorch's native deserialization (both directions)
     if obj.get("__type__") == "TensorRef":

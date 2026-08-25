@@ -122,3 +122,35 @@ def test_ipc_shared_imports_nothing_from_comfy_env():
         f"the worker and imported by its bare basename; comfy_env is not "
         f"importable there."
     )
+
+
+def test_worker_does_not_shadow_the_shared_ipc_caches():
+    """The worker must not define its own IPC forwarding caches.
+
+    It did, at module scope, while _ipc_shared's comment claimed both sides
+    shared one copy. The consequence was not a stale read: _evict_cache_if_needed
+    and _cleanup_ipc_cache are both parent-only and the worker cannot import
+    them, so the worker's copies were never bounded and never swept. Each entry
+    holds a strong reference to an imported CUDA mapping, which pins the
+    EXPORTER's allocation in the other process -- so a long-lived worker
+    permanently drained the parent's VRAM, invisibly to every ledger the system
+    has.
+    """
+    src = (WORKERS / "_persistent_worker.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    shadowed = [
+        (node.lineno, t.id)
+        for node in tree.body                       # module scope only
+        if isinstance(node, ast.Assign)
+        for t in node.targets
+        if isinstance(t, ast.Name)
+        and t.id in {"_cuda_ipc_metadata_cache", "_cuda_ipc_cache_tensors"}
+    ]
+    assert not shadowed, (
+        f"worker shadows the shared IPC cache(s) at {shadowed}; its copies are "
+        f"never evicted, so they pin the parent's VRAM for the worker's lifetime"
+    )
+    assert "_ipc_shared._cuda_ipc_metadata_cache" in src, (
+        "the worker's serializer must read the shared, bounded cache"
+    )
