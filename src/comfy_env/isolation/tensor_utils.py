@@ -8,7 +8,7 @@ from typing import Any
 
 # _ipc_shared is a standalone leaf (imports nothing from comfy_env), so this
 # can be a top-level DOWNWARD import rather than a function-body bandage.
-from .workers._ipc_shared import _cuda_ipc_metadata_cache
+from .workers._ipc_shared import _cuda_ipc_metadata_cache, TENSOR_KEEPER_TTL
 
 logger = logging.getLogger("comfy_env")
 
@@ -16,7 +16,7 @@ logger = logging.getLogger("comfy_env")
 class TensorKeeper:
     """Keep tensor references during IPC to prevent premature GC."""
 
-    def __init__(self, retention_seconds: float = 30.0):
+    def __init__(self, retention_seconds: float = TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper: collections.deque = collections.deque()
         self._lock = threading.Lock()
