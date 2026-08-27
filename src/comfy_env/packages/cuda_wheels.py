@@ -21,7 +21,7 @@ except Exception:
 
 logger = logging.getLogger("comfy-env.cuda-wheels")
 
-CUDA_WHEELS_INDEX_DEFAULT = "https://pozzettiandrea.github.io/cuda-wheels/v2/"
+CUDA_WHEELS_INDEX_DEFAULT = "https://comfy-forge.github.io/cuda-wheels/"
 
 
 def cuda_wheels_index() -> str:
@@ -285,7 +285,7 @@ def _fetch_from_github_api(package: str, torch_version: str, cuda_version: str,
                            python_version: str,
                            log: Optional[Callable[[str], None]] = None) -> Optional[tuple]:
     """Fallback when the GH Pages index is unreachable: list release assets
-    via `api.github.com/repos/PozzettiAndrea/cuda-wheels/releases` and match
+    via `api.github.com/repos/Comfy-Forge/cuda-wheels/releases` and match
     by the same filename pattern. Different routing edge than Pages, so often
     works when Fastly is RST-ing the Pages host. Returns `(url, name)` or None.
     """
@@ -296,7 +296,7 @@ def _fetch_from_github_api(package: str, torch_version: str, cuda_version: str,
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
     pkg_variants_set = set(_pkg_variants(package))
 
-    api_url = "https://api.github.com/repos/PozzettiAndrea/cuda-wheels/releases?per_page=100"
+    api_url = "https://api.github.com/repos/Comfy-Forge/cuda-wheels/releases?per_page=100"
     try:
         body = _fetch_with_retries(api_url, timeout=15, log=log)
     except Exception as e:
@@ -350,7 +350,14 @@ def get_wheel_url(package: str, torch_version: str, cuda_version: str, python_ve
     platform_tags = _platform_tags()
 
     local_patterns = [f"+cu{cuda_short}torch{torch_short}", f"+pt{torch_short}cu{cuda_short}"]
-    link_pattern = re.compile(r'href="([^"]+\.whl)"[^>]*>([^<]+)</a>', re.IGNORECASE)
+    # Matching is on the anchor TEXT, not the href filename, and that is a
+    # contract with the farm: torch-free packages (spconv, cumm) are built
+    # once per CUDA line and aliased across torch minors by display name only
+    # (generate_index.py:expand_torch_free_aliases). A filename matcher would
+    # find no wheel for most combos of those packages. The href is what we
+    # download -- and it may carry a PEP 503 `#sha256=...` fragment, which
+    # MUST be preserved: it is what makes a pixi.lock entry hash-verified.
+    link_pattern = re.compile(r'href="([^"]+\.whl(?:#[^"]*)?)"[^>]*>([^<]+)</a>', re.IGNORECASE)
 
     _emit(f"[cuda-wheels] Looking up {package}: cu{cuda_short} torch{torch_short} {py_tag} {' '.join(platform_tags) or 'any'}")
 
