@@ -7,7 +7,7 @@ imports isolation code -- it builds proxy classes from the serialized metadata.
 
 import hashlib
 import os
-import pickle
+import json
 import subprocess
 import sys
 import tempfile
@@ -21,7 +21,45 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "15"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "16"  # Bump when _METADATA_SCRIPT or cache format changes
+
+
+def _write_cache_atomic(cache_file, cache_key, payload) -> None:
+    """Write the metadata cache via temp-file + os.replace.
+
+    The env dir is machine-global and two ComfyUI processes can start
+    together; a plain write_text can be read half-written by the sibling.
+    os.replace is atomic on POSIX and Windows within one filesystem."""
+    import tempfile
+    data = json.dumps({"cache_key": cache_key, "payload": payload},
+                      ensure_ascii=False)
+    fd, tmp = tempfile.mkstemp(dir=str(cache_file.parent),
+                               prefix=cache_file.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp, str(cache_file))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _warn_dropped_nodes(package_name: str, payload) -> None:
+    """A node in nodes_failed is a USER-VISIBLE disappearance -- its saved
+    workflows report 'node type not found'. One loud line per node, at the
+    moment the payload is consumed, so the answer to 'where did my node go'
+    is in the startup log next to the pack's own scan line."""
+    failed = payload.get("nodes_failed") or {}
+    for name, reason in failed.items():
+        print(f"[comfy-env] WARNING: {package_name}: node {name!r} was DROPPED "
+              f"by the metadata scan and will be missing from ComfyUI: {reason}",
+              file=sys.stderr, flush=True)
+    for w in (payload.get("sanitize_warnings") or [])[:10]:
+        print(f"[comfy-env] {package_name}: scan sanitize: {w}",
+              file=sys.stderr, flush=True)
 
 
 def _describe_value(name: str, v) -> str:
@@ -96,7 +134,7 @@ def _log_vram(label: str) -> None:
 _METADATA_SCRIPT = r'''
 import sys
 import os
-import pickle
+import json
 import importlib
 
 # Windows: register DLL directories BEFORE any extension module imports.
@@ -316,7 +354,7 @@ for name, cls in _class_map.items():
 
     # V3 detection + native metadata capture. The real class lives here in the
     # isolation env, so its schema-backed classproperties/GET_NODE_INFO_V1 resolve
-    # correctly; we capture the plain-dict results (Schema objects don't pickle).
+    # correctly; we capture the plain-dict results (Schema objects are not serializable).
     is_v3 = _V3Base is not None and isinstance(cls, type) and issubclass(cls, _V3Base)
     meta["is_v3"] = is_v3
     if is_v3:
@@ -379,30 +417,95 @@ payload = {"nodes": nodes, "display": display, "routes": routes,
            "has_comfy_entrypoint": _has_entrypoint,
            "v3_entrypoint_error": _v3_error}
 
-# Sanitize payload: coerce subclass instances (e.g. AnyType(str)) back to
-# plain built-in types so pickle doesn't embed module references that may
-# not be importable in the main process.
-_COERCE = {str: str, int: int, float: float, bool: bool, bytes: bytes}
-def _sanitize(obj):
-    if obj is None or type(obj) in (str, int, float, bool, bytes):
+# Convert the payload to strict JSON-safe data, tracking the key path.
+#
+# The predecessor (_sanitize + pickle) had a fallthrough `return obj` that
+# let unknown objects ride the pickle into the parent, where they failed
+# LATE and cryptically: an Enum default made the parent's unpickle raise
+# ModuleNotFoundError outside the caught tuple, silently deleting the whole
+# pack; a torch.dtype survived to web.json_response and 500'd the entire
+# /object_info. Here every value is decided NOW, in the process where the
+# offending type is importable and debuggable, and the failure names the
+# node and the exact key path.
+#
+# Policy (2026-08 review): coerce what has an obvious faithful mapping,
+# DROP-AND-WARN the single offending key/element for the rest -- a weird
+# widget default must cost that widget's default, never the node, and a
+# broken node must never cost the pack.
+_COERCE = (str, int, float, bool)
+_warnings = []
+
+def _to_json(obj, path):
+    if obj is None or type(obj) in (str, int, bool):
         return obj
-    for base, ctor in _COERCE.items():
+    if type(obj) is float:
+        if obj != obj or obj in (float("inf"), float("-inf")):
+            _warnings.append(f"{path}: non-finite float {obj!r} dropped")
+            return _DROP
+        return obj
+    for base in _COERCE:
         if isinstance(obj, base) and type(obj) is not base:
-            return ctor(obj)
+            return base(obj)   # AnyType("*"), IntEnum, np.bool_ subclasses
+    if type(obj).__module__ == "numpy" and hasattr(obj, "item"):
+        return _to_json(obj.item(), path)   # numpy scalars
     if isinstance(obj, dict):
-        return {_sanitize(k): _sanitize(v) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str):
+                key = str(k)   # collapse str subclasses
+            else:
+                _warnings.append(
+                    f"{path}: non-string dict key {k!r} ({type(k).__name__}) "
+                    f"dropped (json would silently stringify it)")
+                continue
+            val = _to_json(v, f"{path}[{key!r}]")
+            if val is not _DROP:
+                out[key] = val
+        return out
     if isinstance(obj, (list, tuple)):
-        sanitized = [_sanitize(v) for v in obj]
-        return type(obj)(sanitized) if type(obj) in (list, tuple) else list(sanitized)
-    return obj
+        out = []
+        for i, v in enumerate(obj):
+            val = _to_json(v, f"{path}[{i}]")
+            if val is not _DROP:
+                out.append(val)
+        return out
+    _warnings.append(
+        f"{path}: {type(obj).__module__}.{type(obj).__name__} is not "
+        f"JSON-serializable, dropped: {repr(obj)[:120]}")
+    return _DROP
 
-payload = _sanitize(payload)
+_DROP = object()
 
-# Write the payload to the parent-allocated file. Anything pixi, torch DLL
-# loaders, or imported code printed during this run went to stderr and never
-# touched the protocol.
-with open(output_path, "wb") as _f:
-    pickle.dump(payload, _f)
+# Per-node containment: one bad node lands in nodes_failed with its reason;
+# the other nodes survive. Top-level keys convert without a net -- a failure
+# there is a scan bug and must exit non-zero.
+_converted_nodes = {}
+_nodes_failed = {}
+for _name, _meta in payload["nodes"].items():
+    try:
+        _v = _to_json(_meta, "nodes[" + repr(_name) + "]")
+        _converted_nodes[_name] = {} if _v is _DROP else _v
+    except Exception as _e:
+        _nodes_failed[_name] = repr(_e)[:300]
+        print(f"[meta-scan] node {_name} dropped: {_e}", file=sys.stderr, flush=True)
+payload["nodes"] = _converted_nodes
+rest = {k: _to_json(v, k) for k, v in payload.items() if k != "nodes"}
+payload = {"nodes": payload["nodes"], **{k: (None if v is _DROP else v) for k, v in rest.items()}}
+if _nodes_failed:
+    payload["nodes_failed"] = _nodes_failed
+if _warnings:
+    payload["sanitize_warnings"] = _warnings
+    for _w in _warnings:
+        print(f"[meta-scan] WARNING: {_w}", file=sys.stderr, flush=True)
+
+# Serialize FIRST, then write: json.dump straight to the stream could raise
+# mid-write and leave a truncated-but-nonempty file for the parent's salvage
+# path to trip over. allow_nan=False is a second belt behind the converter;
+# ensure_ascii=False + explicit utf-8 because real payloads carry non-ASCII
+# and an unmarked Windows default is cp1252.
+_data = json.dumps(payload, allow_nan=False, ensure_ascii=False)
+with open(output_path, "w", encoding="utf-8") as _f:
+    _f.write(_data)
 '''
 
 
@@ -462,7 +565,12 @@ def fetch_metadata(
     # --- Metadata cache ---
     # Invalidate when ANY .py file in the package changes (not just __init__.py).
     # Uses max mtime of all .py files -- fast (stat calls only, no file reads).
-    cache_file = env_dir / ".metadata_cache.pkl"
+    # .json since 0.4.33. The legacy .pkl is deliberately NOT unlinked: the
+    # workspace is machine-global (environment/cache.py get_workspace_dir) and
+    # installs pinned to older comfy-env versions still read and rewrite it --
+    # deleting it here would make the two versions thrash a full rescan at
+    # each other on every restart. GC it in a post-barrage release.
+    cache_file = env_dir / ".metadata_cache.json"
     pkg_dir = working_dir / package_name.replace(".", "/")
     try:
         py_files = sorted(pkg_dir.rglob("*.py"))
@@ -480,7 +588,7 @@ def fetch_metadata(
 
     if cache_file.exists():
         try:
-            cached = pickle.loads(cache_file.read_bytes())
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
             if cached.get("cache_key") == cache_key:
                 payload = cached["payload"]
                 node_count = len(payload.get("nodes", {}))
@@ -504,7 +612,7 @@ def fetch_metadata(
     scan_env = build_isolation_env(python, env_vars)
 
     # Write script and allocate a dedicated payload file. The worker dumps the
-    # pickle payload into `output_file` so the protocol is decoupled from
+    # JSON payload into `output_file` so the protocol is decoupled from
     # stdout/stderr (which pixi, torch DLL loaders, and other noise can
     # contaminate, especially on Windows).
     script_file = None
@@ -518,7 +626,7 @@ def fetch_metadata(
             script_file = f.name
 
         out_fd, output_file = tempfile.mkstemp(
-            suffix=".pkl", prefix="comfy_meta_out_",
+            suffix=".json", prefix="comfy_meta_out_",
         )
         os.close(out_fd)
 
@@ -587,12 +695,16 @@ def fetch_metadata(
             # embedded Blender, spconv) can fault on exit -- 0xC0000005 on Windows --
             # after the scan has fully succeeded. Discarding the payload here makes
             # every node in the pack silently vanish from the registry.
-            # Trust the file: if it unpickles and contains nodes, salvage it and warn.
+            # Trust the file: if it parses and contains nodes, salvage it and
+            # warn. A truncated JSON raises JSONDecodeError exactly as a
+            # truncated pickle raised -- same fall-through to the failure
+            # branch. (The child serializes fully before writing, so a
+            # truncated-but-nonempty file means the process died mid-write.)
             salvaged = None
             try:
                 if output_file and os.path.getsize(output_file) > 0:
-                    with open(output_file, "rb") as _f:
-                        candidate = pickle.load(_f)
+                    candidate = json.loads(
+                        Path(output_file).read_text(encoding="utf-8"))
                     if candidate.get("nodes"):
                         salvaged = candidate
             except Exception:
@@ -602,9 +714,7 @@ def fetch_metadata(
                       f"(exit {rc}{hex_rc}) but the payload was complete -- salvaged "
                       f"{len(salvaged['nodes'])} nodes.", file=sys.stderr, flush=True)
                 try:
-                    cache_file.write_bytes(
-                        pickle.dumps({"cache_key": cache_key, "payload": salvaged})
-                    )
+                    _write_cache_atomic(cache_file, cache_key, salvaged)
                 except Exception:
                     pass
                 return salvaged
@@ -618,9 +728,12 @@ def fetch_metadata(
         # Read the payload from the dedicated file -- never touches stdout,
         # so pixi/torch/DLL-loader noise can't corrupt the protocol.
         try:
-            with open(output_file, "rb") as _f:
-                payload = pickle.load(_f)
-        except (OSError, EOFError, pickle.UnpicklingError) as e:
+            payload = json.loads(Path(output_file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError) as e:
+            # json.JSONDecodeError is a ValueError subclass. This set is
+            # CLOSED and enumerable -- the pickle version let a
+            # ModuleNotFoundError from an unpicklable payload escape to the
+            # blanket handler below, silently deleting the whole pack.
             stderr_tail = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-5:]
             print(
                 f"[comfy-env] Metadata scan: payload unreadable for {package_name}: "
@@ -635,10 +748,11 @@ def fetch_metadata(
         if _DEBUG or node_count > 0:
             print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)", file=sys.stderr, flush=True)
         _warn_empty_v3_scan(package_name, payload, node_count)
+        _warn_dropped_nodes(package_name, payload)
 
-        # --- Write cache ---
+        # --- Write cache (atomic: two ComfyUI processes share this dir) ---
         try:
-            cache_file.write_bytes(pickle.dumps({"cache_key": cache_key, "payload": payload}))
+            _write_cache_atomic(cache_file, cache_key, payload)
         except Exception:
             pass  # Non-fatal
 

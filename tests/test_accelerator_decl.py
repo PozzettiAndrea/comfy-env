@@ -13,7 +13,7 @@ including one with the right hardware, with no message anywhere.
 """
 
 import os
-import pickle
+import json
 import subprocess
 import sys
 import textwrap
@@ -80,7 +80,7 @@ def test_scan_captures_accelerator_and_flags_toplevel_import(tmp_path):
     _write_fixture_pkg(tmp_path)
     script = tmp_path / "scan.py"
     script.write_text(md._METADATA_SCRIPT, encoding="utf-8")
-    out = tmp_path / "payload.pkl"
+    out = tmp_path / "payload.json"
 
     env = dict(os.environ)
     env["COMFY_ENV_ACCEL_PKGS"] = "fake-cumesh"  # dist-style name, dash variant
@@ -89,7 +89,7 @@ def test_scan_captures_accelerator_and_flags_toplevel_import(tmp_path):
         env=env, capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
-    payload = pickle.loads(out.read_bytes())
+    payload = json.loads(out.read_text(encoding="utf-8"))
 
     nodes = payload["nodes"]
     assert nodes["CpuNode"]["accelerator"] is None
@@ -198,7 +198,7 @@ def test_unknown_accelerator_value_fails_the_scan_loudly(tmp_path):
     script.write_text(md._METADATA_SCRIPT, encoding="utf-8")
     proc = subprocess.run(
         [sys.executable, str(script), str(tmp_path), "bad_pkg",
-         str(tmp_path / "payload.pkl")],
+         str(tmp_path / "payload.json")],
         capture_output=True, text=True, timeout=120,
     )
     assert proc.returncode != 0
