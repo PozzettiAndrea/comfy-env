@@ -44,24 +44,6 @@ def _patch_uv_platform_py(log: Callable[[str], None] = print) -> None:
             log(f"[comfy-env] Patched {platform_py} for conda-forge compat")
 
 
-def _find_uv() -> str:
-    """Find the uv binary installed alongside comfy-env."""
-    import shutil
-    exe_dir = Path(sys.executable).parent
-    uv_name = "uv.exe" if sys.platform == "win32" else "uv"
-    candidate = exe_dir / uv_name
-    if candidate.exists():
-        return str(candidate)
-    if sys.platform == "win32":
-        candidate = exe_dir / "Scripts" / uv_name
-        if candidate.exists():
-            return str(candidate)
-    uv = shutil.which("uv")
-    if uv:
-        return uv
-    raise FileNotFoundError("uv binary not found")
-
-
 def _make_tee_log(log_callback: Callable[[str], None], log_path: Path) -> Callable[[str], None]:
     """Tee logs to both the original callback and a file."""
     import datetime

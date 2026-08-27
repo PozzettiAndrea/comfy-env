@@ -152,6 +152,7 @@ def _build_node_feature(
     glibc_version: Optional[str],
     log: Callable[[str], None] = print,
     macos_version: Optional[str] = None,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
 
@@ -181,6 +182,16 @@ def _build_node_feature(
     if node_pypi:
         _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
         pypi.update(node_pypi)
+    # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
+    # which pixi records in the lock and uv verifies). The wheels' in-farm
+    # METADATA declares no dependencies, so a URL dep is exactly the
+    # `--no-deps` semantics the retired post-pixi uv pass had -- but inside
+    # pixi.lock, hashed, cached, and safe against a plain `pixi install`.
+    # Merged LAST so neither the torch pin nor an author entry shadows it.
+    if cuda_wheel_urls:
+        for _pkg, _url in sorted(cuda_wheel_urls.items()):
+            _key = _pkg.lower().replace("_", "-")
+            pypi[_key] = {"url": _url}
     if pypi:
         feat["pypi-dependencies"] = pypi
 
@@ -273,6 +284,7 @@ def build_env_toml(
     chosen_torch_index: Optional[str] = None,
     chosen_torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build a self-contained pixi.toml dict for one isolated env.
 
@@ -340,6 +352,7 @@ def build_env_toml(
         glibc_version=glibc_version,
         macos_version=macos_version,
         log=log,
+        cuda_wheel_urls=cuda_wheel_urls,
     )
 
     return {
@@ -366,6 +379,7 @@ def write_env_pixi_toml(
     chosen_torch_index: Optional[str] = None,
     chosen_torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
+    cuda_wheel_urls: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Write ``<env_manifest_dir>/pixi.toml`` for one isolated env.
 
@@ -385,6 +399,7 @@ def write_env_pixi_toml(
         chosen_torch_index=chosen_torch_index,
         chosen_torch_pin=chosen_torch_pin,
         log=log,
+        cuda_wheel_urls=cuda_wheel_urls,
     )
     # Provenance header (ADR-0013): when pixi rejects a forwarded key its
     # error names THIS generated file, which the author never wrote -- the
@@ -407,11 +422,11 @@ def resolve_env_cuda_wheel_urls(
     chosen_torch_short: Optional[str],
     log: Callable[[str], None] = print,
 ) -> Dict[str, str]:
-    """Return the cuda-wheel URLs needed for one env's post-pixi install.
+    """Return the cuda-wheel URLs for one env, keyed by declared package name.
 
-    Mirrors the per-env loop the v0.3 workspace-wide builder used, so
-    callers using ``write_env_pixi_toml`` can still drive the post-pixi
-    ``uv pip install --no-deps`` pass.
+    The URLs are inlined into the generated manifest as direct-URL
+    pypi-dependencies (``build_env_toml(cuda_wheel_urls=...)``), so they land
+    in pixi.lock. They may carry ``#sha256=`` fragments; preserve them.
     """
     cuda_only = [p for p in cfg.cuda_packages if p not in _TORCH_PKGS]
     if not (cuda_only and chosen_cuda and chosen_torch_short):

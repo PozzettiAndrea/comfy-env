@@ -6,13 +6,13 @@ self-contained pixi.toml per env (packages/toml_generator.py), and runs
 `pixi install --manifest-path envs/<name>/pixi.toml` per env -- so a broken
 manifest cannot poison another env's install (ADR-0007).
 
-CUDA wheels are deliberately NOT inlined into the manifests: pixi cannot
-express no-deps installs and the wheels' upstream Requires-Dist metadata is
-wrong for our artifacts, so after `pixi install` they are installed
-out-of-band via `uv pip install --no-deps` (the wheel pass inside
-install_workspace). This puts them outside pixi.lock -- the "two-system
-problem" in the docs -- until Requires-Dist curation in the cuda-wheels
-farm makes them resolver-safe and the inline path can revive.
+CUDA wheels are inlined into the manifests as direct-URL pypi-dependencies.
+This became possible when the farm blanked in-wheel Requires-Dist (a URL dep
+is therefore `--no-deps` by construction) and closed the "two-system problem":
+the wheels live inside pixi.lock, hashed when the index carries `#sha256=`
+fragments, cached by uv instead of re-downloaded, and immune to a plain
+`pixi install` stripping them. The post-pixi `uv pip install --no-deps` pass
+this replaced was deleted with it.
 
 Also handles env stamping (ABI + version + torch pin), install-hash skip of
 unchanged envs, and the post-install libomp dedupe.
@@ -32,7 +32,7 @@ from ..config import (
     CONFIG_FILE_NAME,
 )
 from ..environment.cache import get_env_name
-from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py, _find_uv
+from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py
 
 
 _PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
@@ -293,6 +293,11 @@ def _fast_key(
     from ..environment.cache import _abi_tag
 
     h = hashlib.sha256()
+    # Manifest-format generation. Bump when the SHAPE of what install writes
+    # changes (not its inputs): the level-1 gate otherwise short-circuits on
+    # unchanged local inputs and an on-disk layout from an older comfy-env
+    # persists invisibly. fmt2 = cuda wheels inlined into pixi.toml/pixi.lock.
+    h.update(b"fmt:2\n")
     h.update(b"abi:")
     h.update(_abi_tag().encode())
     h.update(b"\ngpu:")
@@ -324,7 +329,10 @@ def _env_identity(manifest: Dict[str, Any], wheel_urls: List[str]) -> str:
     h.update(json.dumps(manifest, sort_keys=True, default=str).encode())
     h.update(b"\0")
     h.update("\n".join(sorted(wheel_urls)).encode())
-    return "v2:" + h.hexdigest()
+    # v3: cuda wheels moved INSIDE the manifest (direct-URL pypi-deps) and the
+    # post-pixi uv pass was deleted. The prefix bump re-derives every cuda env
+    # once, which is exactly right: their on-disk layout changed.
+    return "v3:" + h.hexdigest()
 
 
 def _read_hash_file(hp: Path) -> Tuple[Optional[str], Optional[str], bool]:
@@ -732,6 +740,17 @@ def install_workspace(
         cuda_urls_by_env: Dict[str, Dict[str, str]] = {}
         for env_name, _plugin, _cf, cfg in candidates:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            # URLs first: they are INPUTS to the manifest now, inlined as
+            # direct-URL pypi-dependencies rather than fed to a post-pixi
+            # uv pass (which no longer exists).
+            urls = resolve_env_cuda_wheel_urls(
+                cfg=cfg,
+                bootstrap_python=bootstrap_python,
+                chosen_cuda=chosen_cuda if combo is not None else None,
+                chosen_torch_short=chosen_torch_short if combo is not None else None,
+                log=log,
+            )
+            cuda_urls_by_env[env_name] = urls
             manifest = build_env_toml(
                 env_name, cfg,
                 torch_index=torch_index,
@@ -740,13 +759,7 @@ def install_workspace(
                 chosen_torch_index=chosen_torch_index,
                 chosen_torch_pin=chosen_torch_pin_for_override,
                 log=log,
-            )
-            urls = resolve_env_cuda_wheel_urls(
-                cfg=cfg,
-                bootstrap_python=bootstrap_python,
-                chosen_cuda=chosen_cuda if combo is not None else None,
-                chosen_torch_short=chosen_torch_short if combo is not None else None,
-                log=log,
+                cuda_wheel_urls=urls,
             )
             identity = _env_identity(manifest, list(urls.values()))
             env_identity[env_name] = identity
@@ -770,10 +783,9 @@ def install_workspace(
 
             to_install.append((env_name, _plugin, _cf, cfg))
             if urls:
-                cuda_urls_by_env[env_name] = urls
                 log(
-                    f"[comfy-env] {env_name}: cuda-wheels deferred for post-pixi "
-                    f"install ({', '.join(urls.keys())})"
+                    f"[comfy-env] {env_name}: cuda-wheels inlined into the "
+                    f"manifest ({', '.join(urls.keys())})"
                 )
 
         # Emit one pixi.toml per genuinely-stale env. Clean envs keep their
@@ -792,6 +804,7 @@ def install_workspace(
                 chosen_torch_index=chosen_torch_index,
                 chosen_torch_pin=chosen_torch_pin_for_override,
                 log=log,
+                cuda_wheel_urls=cuda_urls_by_env.get(env_name),
             )
             log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
 
@@ -864,39 +877,6 @@ def install_workspace(
                     f"declares it in this run. Leaving as-is. "
                     f"Remove via `rm -rf {d}` if intended."
                 )
-
-        # CUDA-only wheels installed with --no-deps after pixi (pixi's resolver
-        # can't suppress their declared dependencies, which are often wrong for
-        # custom-built wheels).
-        if cuda_urls_by_env:
-            uv_path = _find_uv()
-            from ..environment.cache import get_workspace_env_dir
-            for env_name, pkg_urls in cuda_urls_by_env.items():
-                env_dir = get_workspace_env_dir(workspace_dir, env_name)
-                if not env_dir.is_dir():
-                    log(f"[comfy-env] Warning: env dir {env_dir} not found, skipping cuda-wheels")
-                    continue
-                wheel_urls = list(pkg_urls.values())
-                log(
-                    f"[comfy-env] {env_name}: installing cuda-wheels with --no-deps "
-                    f"({', '.join(pkg_urls.keys())})"
-                )
-                env_python = env_dir / "bin" / "python"
-                if not env_python.exists():
-                    env_python = env_dir / "python.exe"
-                if not env_python.exists():
-                    env_python = env_dir / "Scripts" / "python.exe"
-                uv_result = _run_streaming(
-                    [uv_path, "pip", "install", "--no-deps", "--no-cache",
-                     "--python", str(env_python)] + wheel_urls,
-                    log=log, cwd=workspace_dir, env=pixi_env,
-                )
-                _log_subprocess(log, uv_result, f"uv pip install --no-deps ({env_name})")
-                if uv_result.returncode != 0:
-                    raise RuntimeError(
-                        f"uv pip install --no-deps failed for {env_name}:\n"
-                        f"stderr: {uv_result.stderr}\nstdout: {uv_result.stdout}"
-                    )
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
         _dedupe_envs_libomp(workspace_dir, to_install, log)
