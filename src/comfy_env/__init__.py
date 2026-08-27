@@ -32,7 +32,11 @@ from .environment.setup import setup_env
 from .environment.cache import copy_files
 from .isolation import register_nodes
 from .isolation.workers._ipc_shared import register_serializer
-from .isolation.provided import input_files
+# input_files is exported LAZILY via __getattr__ below. An eager import here
+# creates the package-level edge comfy_env -> comfy_env.isolation, and every
+# lower layer that does `from .. import __version__` (environment.cache,
+# install.plugin, packages.toml_generator) then transitively imports
+# isolation -- breaking the one-way dependency graph contract.
 
 __all__ = [
     "install",
@@ -85,7 +89,10 @@ _INTERNAL = {
 
 
 def __getattr__(name):
-    """PEP 562 signpost for names that are no longer re-exported."""
+    """PEP 562: lazy public exports + signpost for internals."""
+    if name == "input_files":
+        from .isolation.provided import input_files
+        return input_files
     where = _INTERNAL.get(name)
     if where:
         raise AttributeError(

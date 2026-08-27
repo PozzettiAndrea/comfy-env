@@ -84,6 +84,9 @@ ignore_imports =
     # without it every subpackage that touches the facade looks like it imports
     # isolation.
     comfy_env -> comfy_env.isolation.workers._ipc_shared
+    # input_files, same shape: re-exported (lazily, via __getattr__ -- grimp
+    # still counts the function-body import) from a deep isolation module.
+    comfy_env -> comfy_env.isolation.provided
 
 [importlinter:contract:layers]
 name = isolation dependency layers point one way
