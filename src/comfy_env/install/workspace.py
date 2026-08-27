@@ -178,6 +178,7 @@ def _discover_node_configs(
         log(f"[comfy-env] _discover: {custom_nodes} is not a directory")
         return []
 
+    log("")
     log(f"[comfy-env] _discover: scanning {custom_nodes}")
     out: List[Tuple[str, Path, Path, ComfyEnvConfig]] = []
     seen: Dict[str, Path] = {}
@@ -230,6 +231,7 @@ def _discover_node_configs(
             seen[env_name] = cf
             log(f"[comfy-env] _discover: {plugin_dir.name} -> {env_name} ({cf.relative_to(comfyui_dir)})")
             out.append((env_name, plugin_dir, cf, cfg))
+    log("")
     return out
 
 
