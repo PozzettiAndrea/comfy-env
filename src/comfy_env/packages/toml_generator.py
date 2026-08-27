@@ -218,17 +218,14 @@ def _build_node_feature(
     # System requirements: node-declared wins outright; else auto-detect from
     # host (glibc on Linux, torch's wheel macOS floor on macOS). Both may be
     # set on the same platform if applicable.
+    # Author-declared [system-requirements] passes through verbatim (their
+    # choice of spelling; pixi 0.75 warns on the table but honours it). The
+    # AUTO-detected glibc/macos values no longer land here: pixi deprecated
+    # the table in favour of keys on the workspace `platforms` entry, so
+    # build_env_toml emits them there and this feature stays silent.
     sys_reqs = cfg.pixi_passthrough.get("system-requirements")
     if sys_reqs:
         feat["system-requirements"] = copy.deepcopy(sys_reqs)
-    else:
-        auto_reqs: Dict[str, Any] = {}
-        if glibc_version:
-            auto_reqs["libc"] = {"family": "glibc", "version": glibc_version}
-        if macos_version:
-            auto_reqs["macos"] = macos_version
-        if auto_reqs:
-            feat["system-requirements"] = auto_reqs
 
     # [activation]: MERGE (ADR-0013) -- author entries pass through; the
     # compiler's own key wins only on direct collision. Assigning the block
@@ -355,12 +352,27 @@ def build_env_toml(
         cuda_wheel_urls=cuda_wheel_urls,
     )
 
+    # Platform entry: the modern spelling of what [system-requirements]
+    # carried -- pixi 0.75 accepts glibc/macos (and cuda etc.) as keys on a
+    # workspace platforms entry and deprecates the table. Same solver input,
+    # no deprecation warning. Skipped when the author declared their own
+    # [system-requirements], so the constraint is stated exactly once.
+    platform_entry: Any = current_platform
+    if not cfg.pixi_passthrough.get("system-requirements"):
+        extras: Dict[str, str] = {}
+        if glibc_version:
+            extras["glibc"] = glibc_version
+        if macos_version:
+            extras["macos"] = macos_version
+        if extras:
+            platform_entry = {"platform": current_platform, **extras}
+
     return {
         "workspace": {
             "name": f"comfy-env-{env_name}",
             "version": "0.1.0",
             "channels": channels,
-            "platforms": [current_platform],
+            "platforms": [platform_entry],
         },
         "feature": {"node": feat},
         "environments": {
