@@ -21,7 +21,7 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "14"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "15"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _describe_value(name: str, v) -> str:
@@ -269,6 +269,43 @@ for name, cls in _class_map.items():
         # REQUIRES one of these backends at execution; absent = CPU-capable.
         "accelerator": _normalize_accel(getattr(cls, "ACCELERATOR", None), name),
     }
+
+    # Validation / fingerprint contracts (captured as ARG NAMES, not code).
+    # The parent synthesizes named-arg replacements: forwarding either to a
+    # worker is banned -- VALIDATE_INPUTS runs at prompt validation and
+    # IS_CHANGED once per node per prompt, so a worker call there cold-spawns
+    # every env before anything executes.
+    def _named_args(fn):
+        import inspect as _inspect
+        try:
+            spec = _inspect.getfullargspec(fn)
+        except TypeError:
+            return None
+        args = [a for a in spec.args if a not in ("cls", "self", "s")]
+        return args
+    _validate = None
+    _fingerprint = None
+    if _V3Base is not None and isinstance(cls, type) and issubclass(cls, _V3Base):
+        try:
+            from comfy_api.internal import first_real_override as _fro
+            _v = _fro(cls, "validate_inputs")
+            if _v is not None:
+                _validate = _named_args(_v)
+            _f = _fro(cls, "fingerprint_inputs")
+            if _f is not None:
+                _fingerprint = _named_args(_f)
+        except Exception:
+            pass
+    else:
+        _v = getattr(cls, "VALIDATE_INPUTS", None)
+        if callable(_v):
+            _validate = _named_args(_v)
+        _f = getattr(cls, "IS_CHANGED", None)
+        if callable(_f):
+            _fingerprint = _named_args(_f)
+    meta["validate_args"] = _validate
+    meta["fingerprint_args"] = _fingerprint
+
     # Call INPUT_TYPES classmethod
     if hasattr(cls, "INPUT_TYPES") and callable(cls.INPUT_TYPES):
         try:
@@ -649,6 +686,119 @@ _DYNAMIC_DIR_KEY = "comfy_env_dynamic_dir"
 _DYNAMIC_SOURCES_KEY = "comfy_env_sources"
 
 
+def _contained_root(base: str, subdir) -> "Optional[str]":
+    """Resolve base/subdir and REJECT anything escaping base.
+
+    The subdir comes from a marker dict written by pack code running in the
+    isolation env -- it is untrusted input to the parent. Unfenced, a spec of
+    {"dir": "/etc"} wins os.path.join outright and {"dir": "../.."} walks out,
+    and the resulting listing is served to any browser via /object_info.
+    Rejection is LOUD (stderr names the dir) and returns None; callers treat
+    None as "this source contributes nothing", so the cached options stand.
+    Comparison is case-normalized for Windows.
+    """
+    subdir = str(subdir or "")
+    root = os.path.join(base, subdir) if subdir else base
+    base_r = os.path.normcase(os.path.realpath(base))
+    root_r = os.path.normcase(os.path.realpath(root))
+    if root_r == base_r or root_r.startswith(base_r + os.sep):
+        return root
+    print(
+        f"[comfy-env] ERROR: dynamic-combo source dir {subdir!r} escapes the "
+        f"input directory -- rejected. Fix the comfy_env_sources entry.",
+        file=sys.stderr, flush=True)
+    return None
+
+
+def _make_named_validate(names):
+    """A classmethod `f(cls, a=None, b=None, ...) -> True` with EXACTLY the
+    given parameter names.
+
+    The signature is the whole point: execution.py exempts an input from its
+    built-in min/max/combo checks iff the input's name appears in the validate
+    function's argspec (execution.py:1019). A **kwargs form would exempt EVERY
+    input on the node -- including numeric clamps users rely on -- so the
+    names must be exact. Names that are not identifiers are skipped (they
+    could not be exempted this way anyhow).
+    """
+    names = [n for n in names if isinstance(n, str) and n.isidentifier()
+             and n not in ("cls", "self", "s")]
+    if not names:
+        return None, []
+    params = ", ".join(f"{n}=None" for n in names)
+    ns: dict = {}
+    exec(f"def _cev_validate(cls, {params}):\n    return True\n", ns)
+    return classmethod(ns["_cev_validate"]), names
+
+
+def _resolve_marked_value(spec, value):
+    """Best-effort absolute path for a dynamic-combo VALUE, parent-side.
+
+    Mirrors _scan_one_source's rel_to_input semantics: try the value against
+    the input root and against each source dir. First existing file wins.
+    Returns None when nothing exists (or folder_paths is unavailable).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        import folder_paths
+        base = folder_paths.get_input_directory()
+    except Exception:
+        return None
+    candidates = [os.path.join(base, value)]
+    sources = spec.get(_DYNAMIC_SOURCES_KEY) or []
+    if not sources and spec.get(_DYNAMIC_DIR_KEY) is not None:
+        sources = [{"dir": spec.get(_DYNAMIC_DIR_KEY)}]
+    for src in sources:
+        root = _contained_root(base, (src or {}).get("dir", ""))
+        if root:
+            candidates.append(os.path.join(root, value))
+    for c in candidates:
+        rc = os.path.realpath(c)
+        if os.path.normcase(rc).startswith(os.path.normcase(os.path.realpath(base)) + os.sep) \
+                and os.path.isfile(rc):
+            return rc
+    return None
+
+
+def _make_dynamic_fingerprint(marks):
+    """A classmethod fingerprinting marked combo values by file mtime,
+    entirely parent-side.
+
+    This replaces the pack's own IS_CHANGED/fingerprint_inputs, which the
+    proxy cannot carry (forwarding to a worker would cold-spawn every env
+    once per node per prompt, at caching time -- and a linked input arrives
+    stubbed as None during that call, poisoning the signature). It attaches
+    ONLY when the pack's declared fingerprint args are a subset of the marked
+    combo inputs, or the marker opts in explicitly
+    (comfy_env_fingerprint = "mtime"); anything wider stays inert, exactly as
+    today, so nodes like CADabra's raytracer keep their correct caching.
+
+    Never raises: an error inside would become NaN in the caching signature
+    (execution.py catches -> float("NaN")), which never equals itself and
+    forces re-execution every run.
+    """
+    spec_by = {n: sp for (_s, n, sp) in marks
+               if isinstance(n, str) and n.isidentifier()}
+    names = sorted(spec_by)
+    if not names:
+        return None
+    params = ", ".join(f"{n}=None" for n in names)
+    ns: dict = {"_spec_by": spec_by, "_resolve": _resolve_marked_value, "os": os}
+    exec(
+        f"def _cev_fingerprint(cls, {params}):\n"
+        f"    out = []\n"
+        f"    for _n in {names!r}:\n"
+        f"        _v = locals().get(_n)\n"
+        f"        try:\n"
+        f"            _p = _resolve(_spec_by[_n], _v)\n"
+        f"            out.append((_n, _v, os.stat(_p).st_mtime_ns if _p else None))\n"
+        f"        except Exception:\n"
+        f"            out.append((_n, _v, None))\n"
+        f"    return repr(out)\n", ns)
+    return classmethod(ns["_cev_fingerprint"])
+
+
 def _extract_dynamic_spec(entry):
     """Return the marker dict from a captured INPUT_TYPES combo entry, or None.
 
@@ -667,7 +817,9 @@ def _scan_one_source(base, src, exts):
     subdir = src.get("dir", "") or ""
     recursive = bool(src.get("recursive", False))
     rel_to_input = bool(src.get("rel_to_input", False))
-    root = os.path.join(base, subdir) if subdir else base
+    root = _contained_root(base, subdir)
+    if root is None:
+        return []
     out = []
     try:
         if recursive:
@@ -719,8 +871,13 @@ def _scan_dynamic_dir(spec):
                 seen.add(n)
                 names.append(n)
     names.sort()
-    if not names and placeholder is not None:
-        names = [placeholder]
+    if not names:
+        # No placeholder declared -> return None so the splice keeps the
+        # CACHED options. Splicing [] would make every saved workflow using
+        # this node fail combo validation the moment a folder is empty --
+        # a transient state (mid-upload, external drive unmounted) must not
+        # brick workflows.
+        return [placeholder] if placeholder is not None else None
     return names
 
 
@@ -964,6 +1121,27 @@ def _build_v3_proxy_class(
         "_comfy_env_class": class_name,
         "_comfy_env_accelerator": meta.get("accelerator"),
     }
+
+    # Validation exemption (named-arg, parent-side, NEVER forwarded).
+    # V3 branch note: execution.py resolves the V3 validate via
+    # first_real_override(cls, "validate_inputs") -- the LOWERCASE name.
+    # Attaching VALIDATE_INPUTS here would be dead code.
+    _marked = [n for (_s, n, _sp) in dynamic_marks]
+    _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
+                               if a not in _marked]
+    _validate_cm, _ = _make_named_validate(_exempt)
+    if _validate_cm is not None:
+        attrs["validate_inputs"] = _validate_cm
+
+    # Staleness: parent-side mtime fingerprint (see _make_dynamic_fingerprint).
+    _fp_args = meta.get("fingerprint_args")
+    _fp_optin = any(sp.get("comfy_env_fingerprint") == "mtime"
+                    for (_s, _n, sp) in dynamic_marks)
+    if dynamic_marks and (_fp_optin or (
+            _fp_args is not None and set(_fp_args) <= set(_marked))):
+        _fp_cm = _make_dynamic_fingerprint(dynamic_marks)
+        if _fp_cm is not None:
+            attrs["fingerprint_inputs"] = _fp_cm
 
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
 
@@ -1210,6 +1388,25 @@ def build_proxy_class(
         env_dir, package_root, sys_path, env_vars, health_check_timeout,
         dynamic_combo_parents, node_name, _hidden_strip,
     )
+
+    # Validation exemption (named-arg, parent-side, NEVER forwarded). The V1
+    # branch of execution.py looks up the UPPERCASE name.
+    _marked = [n for (_s, n, _sp) in dynamic_dir_inputs]
+    _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
+                               if a not in _marked]
+    _validate_cm, _ = _make_named_validate(_exempt)
+    if _validate_cm is not None:
+        attrs["VALIDATE_INPUTS"] = _validate_cm
+
+    # Staleness: parent-side mtime fingerprint, same gate as the V3 builder.
+    _fp_args = meta.get("fingerprint_args")
+    _fp_optin = any(sp.get("comfy_env_fingerprint") == "mtime"
+                    for (_s, _n, sp) in dynamic_dir_inputs)
+    if dynamic_dir_inputs and (_fp_optin or (
+            _fp_args is not None and set(_fp_args) <= set(_marked))):
+        _fp_cm = _make_dynamic_fingerprint(dynamic_dir_inputs)
+        if _fp_cm is not None:
+            attrs["IS_CHANGED"] = _fp_cm
 
     # Create the class
     proxy_cls = type(class_name, (), attrs)

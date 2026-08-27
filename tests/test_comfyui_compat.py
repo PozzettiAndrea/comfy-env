@@ -12,11 +12,19 @@ Contact surface (keep this list in sync with reality):
     get_torch_device, LoadedModel, current_loaded_models, cleanup_models
                                               (model_patcher.py, wrap.py,
                                                environment/setup.py pool patch)
+  - folder_paths.get_input_directory          (isolation/metadata.py dynamic
+                                               combos + mtime fingerprint)
+  - execution.py validate contract: inputs named in the VALIDATE_INPUTS /
+    validate_inputs argspec are exempted     (metadata.py synthesized
+                                              named-arg validate)
+  - execution.py caching contract: IS_CHANGED / fingerprint_inputs consulted
+    once per node per prompt                 (metadata.py mtime fingerprint)
 
 Needs a ComfyUI checkout: set COMFYUI_DIR. Skipped otherwise.
 """
 
 import inspect
+from pathlib import Path
 import os
 import sys
 
@@ -49,6 +57,20 @@ def test_model_patcher_surface():
     params = list(inspect.signature(ModelPatcher.__init__).parameters)
     for expected in ("model", "load_device", "offload_device"):
         assert expected in params
+
+
+def test_folder_paths_input_directory():
+    import folder_paths
+    assert callable(folder_paths.get_input_directory)
+
+
+def test_execution_validate_exemption_contract():
+    """Synthesized named-arg validate relies on execution.py exempting inputs
+    named in the validate argspec. Source-level canary (read the file, not
+    import it -- importing execution drags in torch/model_management)."""
+    src = (Path(COMFYUI_DIR) / "execution.py").read_text(encoding="utf-8")
+    assert "validate_function_inputs" in src
+    assert "validate_has_kwargs" in src
 
 
 def test_model_management_surface():
