@@ -55,10 +55,19 @@ def test_info_json_stdout_is_pure_json():
     assert set(d) == CONTRACT_FIELDS
 
 
-def test_info_and_doctor_actually_run():
-    """Both were dead for nine days behind an import of a deleted symbol,
-    with no test to notice. This is that test."""
-    for args in (("info",), ("doctor",)):
+def test_info_actually_runs():
+    """info was dead for nine days behind an import of a deleted symbol,
+    with no test to notice. This is that test. (doctor, its sibling here,
+    was removed in 0.4.35: it printed info's block plus a pointer at
+    comfy-test lint and checked nothing itself.)"""
+    r = _cli("info")
+    assert r.returncode == 0, r.stderr
+    assert "cannot import name" not in r.stderr
+
+
+def test_removed_commands_and_flags_are_really_gone():
+    """doctor and install --config must fail argparse, not linger half-wired
+    (doctor --config was parsed and never read for its whole life)."""
+    for args in (("doctor",), ("install", "--config", "x.toml")):
         r = _cli(*args)
-        assert r.returncode == 0, f"{args}: {r.stderr}"
-        assert "cannot import name" not in r.stderr
+        assert r.returncode == 2, f"{args}: rc={r.returncode} {r.stderr}"

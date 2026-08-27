@@ -22,18 +22,12 @@ def main(args: Optional[List[str]] = None) -> int:
 
     # install
     p = sub.add_parser("install", help="Install dependencies")
-    p.add_argument("--config", "-c", type=str, help="Config path")
     p.add_argument("--dry-run", action="store_true", help="Preview only")
     p.add_argument("--dir", "-d", type=str, help="Node directory")
 
     # info
     p = sub.add_parser("info", help="Show runtime info")
     p.add_argument("--json", action="store_true", help="JSON output")
-
-    # doctor
-    p = sub.add_parser("doctor", help="Verify installation")
-    p.add_argument("--package", "-p", type=str, help="Check specific package")
-    p.add_argument("--config", "-c", type=str, help="Config path")
 
     # settings
     sub.add_parser("settings", help="Configure comfy-env settings")
@@ -64,7 +58,7 @@ def main(args: Optional[List[str]] = None) -> int:
 
     commands = {
         "init": cmd_init, "install": cmd_install,
-        "info": cmd_info, "doctor": cmd_doctor,
+        "info": cmd_info,
         "settings": cmd_settings, "debug": cmd_debug,
         "gc": cmd_gc, "cleanup": cmd_gc,
     }
@@ -124,7 +118,7 @@ def cmd_install(args) -> int:
     from .install import install
     node_dir = Path(args.dir) if args.dir else Path.cwd()
     try:
-        install(config=args.config, node_dir=node_dir, dry_run=args.dry_run)
+        install(node_dir=node_dir, dry_run=args.dry_run)
         return 0
     except Exception as e:
         print(f"Failed: {e}", file=sys.stderr)
@@ -150,22 +144,6 @@ def cmd_info(args) -> int:
         print(f"  GPU:      {env.gpu_name}")
         if env.gpu_compute: print(f"  Compute:  {env.gpu_compute}")
     print()
-    return 0
-
-
-def cmd_doctor(args) -> int:
-    print("Diagnostics\n" + "=" * 40)
-    print("\n1. Environment")
-    cmd_info(argparse.Namespace(json=False))
-
-    # There is deliberately no package check here. It used to __import__ the
-    # ISOLATED env's dependencies in the HOST interpreter, which the host-env
-    # principle guarantees are absent -- so it reported every working install
-    # as broken and exited 1.
-    print("\n2. Package and accelerator checks")
-    print("  Run `comfy-test lint --check accel`: it runs in CI and resolves")
-    print("  import names from env.stamp.json rather than guessing them")
-    print("  (faithc-aot installs `faithcontour`).")
     return 0
 
 
