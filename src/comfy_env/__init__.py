@@ -32,6 +32,7 @@ from .environment.setup import setup_env
 from .environment.cache import copy_files
 from .isolation import register_nodes
 from .isolation.workers._ipc_shared import register_serializer
+from .isolation.provided import input_files
 
 __all__ = [
     "install",
@@ -39,6 +40,7 @@ __all__ = [
     "register_nodes",
     "copy_files",
     "register_serializer",
+    "input_files",
 ]
 
 
