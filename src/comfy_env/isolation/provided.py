@@ -14,7 +14,7 @@ One function, three habitats:
   ADR-0006).
 
 This file must stay stdlib-only at import (folder_paths is imported lazily
-at call time) and parseable by Python 3.9.
+at call time) and parseable by Python 3.10.
 """
 
 import os

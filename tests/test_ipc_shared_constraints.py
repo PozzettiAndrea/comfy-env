@@ -4,10 +4,11 @@ Two rules govern it, and until now nothing enforced either. Every de-duplication
 between the parent and the worker pushes more code into this file, so the rules
 need a tripwire before the code arrives, not after.
 
-1. It must parse under Python 3.9 -- the oldest interpreter a pack env may pin.
-   The worker program is read as TEXT and exec'd by that interpreter (ADR-0006),
-   and _ipc_shared.py is copied next to it, so a 3.10+ construct here is a
-   SyntaxError in the worker and never in CI.
+1. It must parse under Python 3.10 -- the floor comfy-env supports, matching
+   ComfyUI's own requires-python >= 3.10 (a config pinning lower is rejected at
+   load). The worker program is read as TEXT and exec'd by the pack env's
+   interpreter (ADR-0006), and _ipc_shared.py is copied next to it, so a
+   3.11+ construct here is a SyntaxError in the worker and never in CI.
 
 2. It must not import torch or numpy at module scope. _persistent_worker.py
    imports it at line ~20, BEFORE it pins CPU affinity and before the
@@ -30,53 +31,17 @@ BOUNDARY_FILES = ["_ipc_shared.py", "_persistent_worker.py"]
 
 
 @pytest.mark.parametrize("name", BOUNDARY_FILES)
-def test_parses_under_python_39(name):
+def test_parses_under_python_310(name):
     src = (WORKERS / name).read_text(encoding="utf-8")
     try:
-        ast.parse(src, feature_version=(3, 9))
+        ast.parse(src, feature_version=(3, 10))
     except SyntaxError as e:
         pytest.fail(
-            f"{name} uses syntax newer than Python 3.9 at line {e.lineno}: {e.msg}. "
-            f"This file is executed by the pack env's interpreter, which may be 3.9 "
-            f"-- the failure would appear only at worker startup, never in CI."
+            f"{name} uses syntax newer than Python 3.10 at line {e.lineno}: {e.msg}. "
+            f"This file is executed by the pack env's interpreter, which may be as "
+            f"old as 3.10 -- the failure would appear only at worker startup, "
+            f"never in CI."
         )
-
-
-@pytest.mark.parametrize("name", BOUNDARY_FILES)
-def test_no_pep604_annotations_without_future_import(name):
-    """`x: int | None` parses fine on 3.9 and raises TypeError at RUNTIME.
-
-    ast.parse cannot see this -- PEP 604 is not a syntax change -- so the
-    3.9 parse check above passes and the worker dies on import instead. An
-    editor autocompleting a modern annotation is the realistic way this file
-    loses 3.9 compatibility.
-    """
-    src = (WORKERS / name).read_text(encoding="utf-8")
-    tree = ast.parse(src)
-
-    if any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
-           and any(a.name == "annotations" for a in n.names) for n in tree.body):
-        pytest.skip("`from __future__ import annotations` makes PEP 604 safe here")
-
-    def is_pep604(node):
-        return isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr)
-
-    bad = []
-    for node in ast.walk(tree):
-        annotations = []
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            annotations = [a.annotation for a in node.args.args
-                           + node.args.posonlyargs + node.args.kwonlyargs
-                           if a.annotation] + ([node.returns] if node.returns else [])
-        elif isinstance(node, ast.AnnAssign) and node.annotation:
-            annotations = [node.annotation]
-        bad += [(node.lineno, ast.unparse(a)) for a in annotations if is_pep604(a)]
-
-    assert not bad, (
-        f"{name} uses PEP 604 `X | Y` annotations at {bad}. Valid syntax on 3.9, "
-        f"TypeError at import. Use Optional[X]/Union[X, Y], or add "
-        f"`from __future__ import annotations`."
-    )
 
 
 def test_ipc_shared_has_no_module_scope_torch_or_numpy():

@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -130,6 +131,15 @@ def parse_config(data):
                 f'lose trailing zeros: 3.10 becomes 3.1). Quote it: '
                 f'python = "{python}"')
         python = str(python)
+        # Floor: ComfyUI itself is requires-python >= 3.10, and the worker
+        # program is only kept parseable down to 3.10 (ADR-0006). A lower pin
+        # would fail at worker startup, long after a multi-GB env build.
+        m = re.search(r"3\.(\d+)", python)
+        if m and int(m.group(1)) < 10:
+            raise ValueError(
+                f'python = "{python}" pins below 3.10. comfy-env supports '
+                f'Python >= 3.10 only (ComfyUI itself requires >= 3.10, and '
+                f'the worker program is 3.10+).')
 
     cuda = data.pop("cuda", {})
     cuda_packages = cuda.get("packages", [])
