@@ -373,9 +373,9 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
             package_root = env["package_root"]
             sys_path_list = [str(env["sp"]), str(package_root)]
-            # Don't add host site-packages to sys_path -- torch is symlinked
-            # into pixi env by metadata.py/subprocess.py. Adding host sp leaks
-            # pip C-extension packages (scipy, numpy) that crash on macOS.
+            # Don't add host site-packages to sys_path -- the env has its
+            # own torch, installed by pixi/uv. Adding host sp leaks pip
+            # C-extension packages (scipy, numpy) that crash on macOS.
 
             for name, meta in root_nodes.items():
                 all_mappings[name] = build_proxy_class(
@@ -498,7 +498,7 @@ def register_nodes(nodes_package: str = "nodes") -> tuple:
 
                     package_root = env["package_root"]
                     sys_path_list = [str(env["sp"]), str(package_root)]
-                    # Don't add host site-packages -- torch is symlinked into pixi env
+                    # Don't add host site-packages -- the env has its own torch.
 
                     for name, meta in nodes_meta.items():
                         all_mappings[name] = build_proxy_class(

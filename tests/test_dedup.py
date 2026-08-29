@@ -53,9 +53,16 @@ def test_pixi_envs_hardlink_identical_packages(tmp_path):
     assert (sa.st_ino, sa.st_dev) == (sb.st_ino, sb.st_dev), \
         "identical pypi package files are separate physical copies across envs"
 
-    # conda side (linked by pixi from the rattler cache)
-    exe = "python.exe" if sys.platform == "win32" else "libpython3.11.so.1.0"
-    ca, cb = stat_of(roots[0], exe), stat_of(roots[1], exe)
+    # conda side (linked by pixi from the rattler cache). Probe a pure .py
+    # from the python package, NOT libpython/bin/python: those carry a
+    # conda-forge prefix_placeholder, so rattler rewrites the embedded build
+    # prefix per env and the file legitimately CANNOT hardlink (confirmed by
+    # byte-diff at the prefix offset; 199/200 sampled files DO link). The old
+    # libpython probe failed on exactly the one class of file the dedup
+    # contract exempts.
+    probe = "abc.py"
+    ca, cb = stat_of(roots[0], probe), stat_of(roots[1], probe)
+    assert ca.st_nlink >= 2, "conda-side file not hardlinked to any cache"
     assert (ca.st_ino, ca.st_dev) == (cb.st_ino, cb.st_dev), \
         "identical conda package files are separate physical copies across envs"
 

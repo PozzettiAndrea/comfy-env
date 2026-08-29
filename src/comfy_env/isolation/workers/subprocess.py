@@ -372,13 +372,13 @@ class SubprocessWorker(Worker):
         print(f"[{self.name}] sys_path sent to worker: {all_sys_path}", flush=True)
 
         # Launch subprocess with the venv/pixi Python, passing socket address.
-        # For pixi environments, route through `pixi run -e <env> --frozen` so
+        # For pixi environments, route through `pixi run --as-is -e <env>` so
         # pixi handles activation (PATH, CONDA_PREFIX, [activation.env] vars
         # like KMP_DUPLICATE_LIB_OK, libomp/MKL setup). Hand-rolling the
         # activation worked for PATH but missed the [activation.env] block,
         # which is what set KMP_DUPLICATE_LIB_OK=TRUE — without it, torch's
         # OMP guard or delay-loaded DLLs failed at `import torch` with
-        # WinError 127 / OMP Error #15. `--frozen` avoids re-resolving the
+        # WinError 127 / OMP Error #15. `--as-is` avoids re-resolving the
         # lockfile per worker (the original perf concern).
         is_pixi = '.pixi' in str(self.python)
         if _DBG_WORKER:
