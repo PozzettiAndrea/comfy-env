@@ -66,8 +66,9 @@ def test_info_actually_runs():
 
 
 def test_removed_commands_and_flags_are_really_gone():
-    """doctor and install --config must fail argparse, not linger half-wired
-    (doctor --config was parsed and never read for its whole life)."""
-    for args in (("doctor",), ("install", "--config", "x.toml")):
+    """doctor, debug, and install --config must fail argparse, not linger
+    half-wired (doctor --config was parsed and never read for its whole
+    life; debug was a settings alias that opened the TUI's second tab)."""
+    for args in (("doctor",), ("debug",), ("install", "--config", "x.toml")):
         r = _cli(*args)
         assert r.returncode == 2, f"{args}: rc={r.returncode} {r.stderr}"

@@ -32,9 +32,6 @@ def main(args: Optional[List[str]] = None) -> int:
     # settings
     sub.add_parser("settings", help="Configure comfy-env settings")
 
-    # debug (alias for settings, opens on Debug tab)
-    sub.add_parser("debug", help="Toggle debug logging categories")
-
     # gc (cleanup kept as a deprecated alias)
     for _name in ("gc", "cleanup"):
         p_gc = sub.add_parser(
@@ -59,7 +56,7 @@ def main(args: Optional[List[str]] = None) -> int:
     commands = {
         "init": cmd_init, "install": cmd_install,
         "info": cmd_info,
-        "settings": cmd_settings, "debug": cmd_debug,
+        "settings": cmd_settings,
         "gc": cmd_gc, "cleanup": cmd_gc,
     }
 
@@ -166,11 +163,6 @@ def _read_env_file(path):
 def cmd_settings(args) -> int:
     """Configure comfy-env settings (tabbed TUI)."""
     return _open_settings_tui(initial_tab=0)
-
-
-def cmd_debug(args) -> int:
-    """Toggle debug logging categories (alias for settings, opens on Debug tab)."""
-    return _open_settings_tui(initial_tab=1)
 
 
 def _open_settings_tui(initial_tab=0) -> int:
