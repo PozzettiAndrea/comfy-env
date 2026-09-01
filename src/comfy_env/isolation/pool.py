@@ -484,12 +484,79 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         # opt-out meant "assume every tier works, unverified").
         worker.verify_transport()
         _WORKER_POOL[key] = (worker, gen)
-        return worker, gen
+    # Deliberately outside _POOL_LOCK: this imports comfy modules and formats
+    # strings, and it is idempotent per env, so it must not be held across
+    # worker creation.
+    _report_memory_manager(worker, env_dir)
+    return worker, gen
+
+
+#: Env dirs already reported, so the routine line fires once per env rather
+#: than once per node execution.
+_MEMORY_MANAGER_REPORTED: set = set()
+
+
+
+
+def _report_memory_manager(worker, env_dir) -> None:
+    """Log which memory manager this worker resolved to, and warn on a mismatch.
+
+    A worker never runs ``main.py``, so it resolves to the legacy ledger while
+    the host is normally on aimdo. That is invisible today, and it is not even
+    stable across installs: whether a pack is isolated at all is a per-pack
+    decision, so two packs in one ComfyUI run can resolve differently with
+    nothing announcing it. See :mod:`comfy_env.memory_manager`.
+    """
+    key = str(env_dir)
+    if key in _MEMORY_MANAGER_REPORTED:
+        return
+    _MEMORY_MANAGER_REPORTED.add(key)
+    try:
+        from ..memory_manager import describe
+
+        worker_info = getattr(worker, "memory_manager", None) or {}
+        host_info = describe()
+        worker_mgr = worker_info.get("manager", "unknown")
+        host_mgr = host_info.get("manager", "unknown")
+        name = getattr(worker, "name", key)
+        if _DBG_WORKER:
+            _log(
+                f"[comfy-env] {name}: memory manager={worker_mgr} "
+                f"(aimdo {worker_info.get('aimdo_version') or 'absent'}); "
+                f"host={host_mgr} (aimdo {host_info.get('aimdo_version') or 'absent'})"
+            )
+        # Under follow-the-host a mismatch means THIS worker fell back
+        # (failed init, CPU, skew), which is noteworthy per env, so the line is
+        # ungated and carries the worker's own reason. "unknown" means the
+        # report itself failed, which is equally worth a line.
+        if worker_mgr != host_mgr or worker_mgr == "unknown":
+            reason = worker_info.get("enable_error") or worker_info.get("reason", "unknown")
+            _log(
+                f"[comfy-env] WARNING {name}: memory manager={worker_mgr}, "
+                f"host={host_mgr}; worker fell back ({reason}). "
+                f"COMFY_ENV_WORKER_AIMDO=0 to silence."
+            )
+        # Version skew is reportable even when both sides resolve to the same
+        # manager, and it happens: an unpinned `comfy-aimdo = "*"` in a pack's
+        # comfy-env.toml resolves at solve time and drifts off the host's pin.
+        worker_ver = worker_info.get("aimdo_version")
+        host_ver = host_info.get("aimdo_version")
+        if worker_ver and host_ver and worker_ver != host_ver:
+            _log(
+                f"[comfy-env] NOTE: {name} has comfy-aimdo {worker_ver}, host has "
+                f"{host_ver}. Pin it in the pack's comfy-env.toml or let comfy-env "
+                f"replicate the host's pin."
+            )
+    except Exception as exc:  # never let reporting break a worker start
+        _log(f"[comfy-env] memory manager report failed: {exc}")
 
 
 def _remove_worker(env_dir):
     """Remove a dead worker from the pool (called after crash)."""
     key = str(env_dir)
+    # A replacement worker may resolve to a different manager (for example a
+    # failed aimdo init this time), so let it be reported afresh.
+    _MEMORY_MANAGER_REPORTED.discard(key)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
@@ -517,6 +584,27 @@ def _shutdown_all_workers():
 atexit.register(_shutdown_all_workers)
 
 
+def _insert_loaded_model(p, currently_used):
+    """Insert one proxy into ComfyUI's ledger as a LoadedModel.
+
+    Shared by first registration and by the post-eviction repair, so the two
+    cannot drift. Inserting directly rather than via load_models_gpu is
+    deliberate: that would try to load every model at once and OOM.
+    """
+    import weakref
+
+    import comfy.model_management
+
+    lm = comfy.model_management.LoadedModel(p)
+    lm.currently_used = currently_used
+    # Set real_model and model_finalizer (needed by model_unload)
+    lm.real_model = weakref.ref(p.model)
+    lm.model_finalizer = weakref.finalize(
+        p.model, comfy.model_management.cleanup_models)
+    lm.model_finalizer.atexit = False
+    comfy.model_management.current_loaded_models.insert(0, lm)
+
+
 def _register_new_patchers(env_dir, worker, generation):
     """Create SubprocessModelPatchers for any models auto-detected during the last call.
 
@@ -528,6 +616,28 @@ def _register_new_patchers(env_dir, worker, generation):
     # Release stale patchers from previous worker restarts.  Safe to do here
     # because we're outside free_memory's iteration loop.
     _STALE_PATCHERS.clear()
+
+    # Repair entries free_memory removed on a FAILED eviction. Upstream's
+    # model_unload returns True even when detach() could not reach the worker
+    # (model_management.py:811-815), so the ledger loses a model that is still
+    # resident, and the skip-if-known check below would never re-add it. Safe
+    # here: outside free_memory's iteration, same guarantee as the clear above.
+    import comfy.model_management
+
+    for p in list(_WORKER_PATCHERS.get(str(env_dir), {}).values()):
+        if not getattr(p, "eviction_deferred", False):
+            continue
+        p.eviction_deferred = False
+        if p.model.model_loaded_weight_memory <= 0:
+            continue  # it drained on its own; nothing to repair
+        if any(lm.model is p
+               for lm in comfy.model_management.current_loaded_models):
+            continue  # still listed; nothing was lost
+        # Not currently_used: free_memory cleared that before popping, and
+        # recomputing it from the device would resurrect eviction priority.
+        _insert_loaded_model(p, currently_used=False)
+        _log(f"[comfy-env] restored ledger entry for '{p._model_id}': "
+             f"eviction could not reach a busy worker and upstream dropped it")
 
     # Drain: _send_request ACCUMULATES registrations (so no path drops them and
     # no interleaved command wipes them); this is the single consumer.
@@ -584,14 +694,6 @@ def _register_new_patchers(env_dir, worker, generation):
         # Register with ComfyUI memory manager.  We insert LoadedModel
         # wrappers directly instead of calling load_models_gpu (which
         # would try to load all models simultaneously and OOM).
-        import weakref
         for model_id in created:
             p = patchers[model_id]
-            lm = comfy.model_management.LoadedModel(p)
-            lm.currently_used = (p.model.device == load_device)
-            # Set real_model and model_finalizer (needed by model_unload)
-            lm.real_model = weakref.ref(p.model)
-            lm.model_finalizer = weakref.finalize(
-                p.model, comfy.model_management.cleanup_models)
-            lm.model_finalizer.atexit = False
-            comfy.model_management.current_loaded_models.insert(0, lm)
+            _insert_loaded_model(p, currently_used=(p.model.device == load_device))

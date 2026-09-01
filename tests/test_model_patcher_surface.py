@@ -86,6 +86,8 @@ def test_canary_comfyui_touches_nothing_new():
     #   __class__ etc.   -> python builtins
     not_patcher_members = {"model", "dynamic_pins", "__class__"}
     # Guarded by `is_dynamic()`; our False excludes these paths entirely.
+    # test_dynamic_exclusion_is_still_justified guards that assumption, and it
+    # runs whether or not ComfyUI is installed.
     dynamic_only = {"loaded_ram_size", "pinned_memory_size", "partially_unload_ram"}
 
     expected = touched - not_patcher_members - dynamic_only
@@ -113,3 +115,47 @@ def test_is_dynamic_is_false():
            / "model_patcher.py").read_text(encoding="utf-8")
     body = src.split("def is_dynamic", 1)[1].split("def ", 1)[0]
     assert "return False" in body
+
+
+def test_dynamic_exclusion_is_still_justified():
+    """The canary excludes the dynamic-only members BECAUSE is_dynamic() is False.
+
+    Without this test that exclusion is the canary asserting its own premise:
+    flipping ``is_dynamic()`` would leave every surface check green while five
+    new members became reachable off the proxy.
+
+    Checked at the source level with ``ast`` rather than by importing, because
+    ``isolation/model_patcher.py`` imports ``comfy.model_management`` at module
+    scope. An import-based guard would skip on exactly the machines where the
+    grep canary already skips, and this assumption must never go unwatched.
+    """
+    import ast
+
+    src_path = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "comfy_env" / "isolation" / "model_patcher.py"
+    )
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+    returns = [
+        node
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == "SubprocessModelPatcher"
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name == "is_dynamic"
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Return)
+    ]
+
+    assert returns, "SubprocessModelPatcher.is_dynamic() not found"
+    assert all(
+        isinstance(r.value, ast.Constant) and r.value.value is False for r in returns
+    ), (
+        "SubprocessModelPatcher.is_dynamic() no longer unconditionally returns "
+        "False. The dynamic-only exclusion in this module is now invalid: "
+        "upstream reads model.dynamic_pins (model_management.py:652, :1440), "
+        "loaded_ram_size (:1006), partially_unload_ram(subsets=) (:665, :1451) "
+        "and unregister_inactive_pins (:663) off a dynamic entry. Widen this "
+        "canary and extend COMFY_SURFACE first. Note also that a dynamic proxy "
+        "gains the eviction bypass at model_management.py:884, which would make "
+        "free_memory a no-op for every model."
+    )

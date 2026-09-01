@@ -180,6 +180,13 @@ import numpy as np
 # stdlib-only at module scope, so this import is safe w.r.t. the torch/numpy
 # DLL-ordering constraints above.
 import _ipc_shared
+# Staged next to this script by subprocess.py, same reason as _ipc_shared: the
+# worker must be able to report which memory manager it resolved to even when
+# comfy_env itself is not importable in its environment.
+try:
+    import memory_manager as _memmgr
+except Exception:  # pragma: no cover - the worker must start without it
+    _memmgr = None
 # Alias the local copy under its package name: a serializer module that does
 # `from comfy_env.isolation.workers import _ipc_shared` (the parent-side
 # spelling) inside a worker whose env happens to have comfy_env installed
@@ -1441,8 +1448,48 @@ def main():
     _comfy_worker.call_parent = _call_parent
     sys.modules["comfy_worker"] = _comfy_worker
 
+    # Resolve and report the memory manager. A worker never runs main.py, so
+    # this is the ledger unless COMFY_ENV_WORKER_AIMDO opted in above.
+    _mem_info = {}
+    if _memmgr is not None:
+        try:
+            _memmgr.maybe_enable_aimdo(log=wlog)
+            _mem_info = _memmgr.describe()
+            wlog(_memmgr.summary_line("[worker] "))
+        except Exception as _e:
+            wlog(f"[worker] memory manager probe failed: {_e}")
+
+
+    def _attach_new_models(resp):
+        """Attach auto-detected models to ANY outgoing frame, ok or error.
+
+        A node can move a 10GB model to CUDA and THEN raise (an OOM does exactly
+        that). The model is resident either way, and _new_models_this_call is
+        cleared on the next request, so a frame that omits it makes that VRAM
+        invisible to the host for the life of the worker. The parent harvests
+        _new_models on every response path before any status check, so
+        attaching here is sufficient.
+        """
+        if not _new_models_this_call:
+            return resp
+        # Resolve actual device at response time.  Models are auto-detected
+        # when they land on CUDA, but the subprocess may have moved them back
+        # to CPU before the call finished (or the raise interrupted a move).
+        for _nme in _new_models_this_call:
+            _nm_model = _model_registry.get(_nme["id"])
+            if _nm_model is not None:
+                try:
+                    _nm_p = next(_nm_model.parameters(), None)
+                    _nme["device"] = str(_nm_p.device) if _nm_p is not None else "cpu"
+                except Exception:
+                    _nme["device"] = "cpu"
+            else:
+                _nme["device"] = "cpu"
+        resp["_new_models"] = list(_new_models_this_call)
+        return resp
+
     # Signal ready
-    transport.send({"status": "ready"})
+    transport.send({"status": "ready", "memory_manager": _mem_info})
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---
@@ -1596,9 +1643,10 @@ def main():
                 _shm_keeper.keep(shm_registry, _current_call_id)
             except Exception as e:
                 _cleanup_shm(shm_registry)
-                transport.send({"status": "error", "call_id": _current_call_id,
-                                "error": str(e),
-                                "traceback": traceback.format_exc()})
+                transport.send(_attach_new_models(
+                    {"status": "error", "call_id": _current_call_id,
+                     "error": str(e),
+                     "traceback": traceback.format_exc()}))
             continue
 
         if "module" not in request:
@@ -1663,14 +1711,27 @@ def main():
                     instance.__dict__.update(self_state)
                 wlog(f"[worker] Calling {method_name}...")
                 method = getattr(instance, method_name)
-                with _infer_mode():
-                    result = method(**inputs)
+                try:
+                    with _infer_mode():
+                        result = method(**inputs)
+                finally:
+                    # ComfyUI runs this in a finally around every node
+                    # (execution.py:550). A worker never reaches that code, so
+                    # without this an aimdo-enabled worker would allocate cast
+                    # buffers and CUDA graph pools with nothing to free them.
+                    # No-op unless aimdo is actually live in this process.
+                    if _memmgr is not None:
+                        _memmgr.release_node_boundary(log=wlog)
                 wlog(f"[worker] Method returned")
             else:
                 func_name = request["func"]
                 func = getattr(module, func_name)
-                with _infer_mode():
-                    result = func(**inputs)
+                try:
+                    with _infer_mode():
+                        result = func(**inputs)
+                finally:
+                    if _memmgr is not None:
+                        _memmgr.release_node_boundary(log=wlog)
 
             # Serialize result to shared memory
             wlog(f"[worker] Serializing result to shm...")
@@ -1679,34 +1740,19 @@ def main():
             wlog(f"[worker] Created {len(shm_registry)} shm blocks for result")
 
             response = {"status": "ok", "call_id": _current_call_id, "result": result_meta}
-            if _new_models_this_call:
-                # Resolve actual device at response time.  Models are
-                # auto-detected when they land on CUDA, but the subprocess
-                # may have moved them back to CPU before the call finished.
-                for _nme in _new_models_this_call:
-                    _nm_model = _model_registry.get(_nme["id"])
-                    if _nm_model is not None:
-                        try:
-                            _nm_p = next(_nm_model.parameters(), None)
-                            _nme["device"] = str(_nm_p.device) if _nm_p is not None else "cpu"
-                        except Exception:
-                            _nme["device"] = "cpu"
-                    else:
-                        _nme["device"] = "cpu"
-                response["_new_models"] = list(_new_models_this_call)
-            transport.send(response)
+            transport.send(_attach_new_models(response))
             # Kept until the parent's "consumed" ack (TTL is the fallback)
             _shm_keeper.keep(shm_registry, _current_call_id)
 
         except Exception as e:
             # Cleanup shm on error since host won't read it
             _cleanup_shm(shm_registry)
-            transport.send({
+            transport.send(_attach_new_models({
                 "status": "error",
                 "call_id": _current_call_id,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
-            })
+            }))
 
     transport.close()
 

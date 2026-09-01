@@ -150,6 +150,16 @@ class SubprocessWorker(Worker):
         self._worker_script.write_text(_PERSISTENT_WORKER_SCRIPT, encoding="utf-8")
         _ipc_shared_src = Path(__file__).parent / "_ipc_shared.py"
         shutil.copy2(_ipc_shared_src, self._temp_dir / "_ipc_shared.py")
+        # Same trick for the memory-manager helper: the worker must be able to
+        # report which manager it resolved to even when comfy_env itself is not
+        # importable in its environment.
+        # Best effort: the worker already tolerates its absence (_memmgr = None),
+        # and a partial install must not stop every worker for a reporting helper.
+        try:
+            _mem_src = Path(__file__).parent.parent.parent / "memory_manager.py"
+            shutil.copy2(_mem_src, self._temp_dir / "memory_manager.py")
+        except OSError:
+            pass
 
     def _find_comfyui_base(self) -> Optional[Path]:
         """Find ComfyUI source directory (where main.py, comfy/, folder_paths.py live).
@@ -332,6 +342,39 @@ class SubprocessWorker(Worker):
         env = build_isolation_env(self.python, self.extra_env)
         env["COMFY_ENV_IPC_ADDR"] = self._socket_addr
         env["COMFY_ENV_IPC_AUTHKEY"] = self._authkey
+        # The parent's resolved aimdo version, so a worker never has to guess and
+        # its skew guard can actually fire. Exported unconditionally: reporting a
+        # version costs nothing and a guard that cannot run is worse than none.
+        try:
+            from ...memory_manager import (
+                ENABLE_ENV_VAR, HEADROOM_ENV_VAR, VERSION_ENV_VAR, aimdo_version,
+            )
+            _av = aimdo_version()
+            if _av:
+                env[VERSION_ENV_VAR] = _av
+            # The worker FOLLOWS the host: aimdo in the worker exactly when the
+            # host resolved to aimdo. A host on the ledger chose that (flags,
+            # unsupported GPU, old torch), and a worker second-guessing it would
+            # create the opposite mismatch to the one this closes. An operator
+            # override in the environment still wins.
+            if ENABLE_ENV_VAR not in env:
+                try:
+                    import comfy.memory_management as _cmm
+                    env[ENABLE_ENV_VAR] = "1" if getattr(_cmm, "aimdo_enabled", False) else "0"
+                except Exception:
+                    env[ENABLE_ENV_VAR] = "0"
+            from comfy.cli_args import args as _pa
+            _hr = getattr(_pa, "vram_headroom", None)
+            if _hr:
+                env[HEADROOM_ENV_VAR] = str(int(_hr * 1024 ** 3))
+            from ...memory_manager import NVML_ENV_VAR, SIMPLE_HEADROOM_ENV_VAR
+            _rv = getattr(_pa, "reserve_vram", None)
+            if _rv is not None:
+                env[SIMPLE_HEADROOM_ENV_VAR] = str(int(_rv * 1024 ** 3))
+            if getattr(_pa, "disable_nvml_pressure", False):
+                env[NVML_ENV_VAR] = "0"
+        except Exception:
+            pass
 
         # Propagate --cpu flag to subprocess so get_torch_device() returns cpu there too
         try:
@@ -533,6 +576,12 @@ class SubprocessWorker(Worker):
 
         if msg.get("status") != "ready":
             raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
+
+        # Which memory manager this worker resolved to. A worker never runs
+        # main.py, so this is the legacy ledger unless COMFY_ENV_WORKER_AIMDO
+        # was set. Recorded so the parent can report and compare it; see
+        # comfy_env.memory_manager.
+        self.memory_manager = msg.get("memory_manager") or {}
 
         # --- Pool IPC handshake (receive worker's shareable pool FD) ---
         # Check worker's env vars (not parent's _POOL_IPC_ENABLED which may be False)

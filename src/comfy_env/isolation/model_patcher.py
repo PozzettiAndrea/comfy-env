@@ -109,6 +109,13 @@ class SubprocessModelPatcher:
         "is_clone", "get_nested_additional_models",
     })
 
+    #: Set when an eviction command could not reach a busy worker. Upstream's
+    #: LoadedModel.model_unload returns True even when detach() freed nothing
+    #: (model_management.py:811-815), so free_memory pops the ledger entry for a
+    #: model that is still resident. _register_new_patchers reads this flag at
+    #: the next node boundary and puts the entry back.
+    eviction_deferred = False
+
     def __init__(self, worker, worker_generation, model_id, model_size,
                  load_device, offload_device, kind="other"):
         self.load_device = load_device
@@ -245,6 +252,7 @@ class SubprocessModelPatcher:
         if r is SEND_FAILED:
             # Nothing was freed, and loaded_size stays put so ComfyUI keeps
             # escalating instead of believing the bytes came back.
+            self.eviction_deferred = True
             return 0
         freed = int(r.get("freed", 0))
         resident = int(r.get("resident", max(0, resident_before - freed)))
@@ -266,6 +274,7 @@ class SubprocessModelPatcher:
         if r is SEND_FAILED:
             # Still on the card. Report nothing reclaimed rather than logging
             # an offload that did not happen.
+            self.eviction_deferred = True
             _log_vram(f"Offload '{self._model_id}' FAILED; still resident")
             return self.model
         self._mark_offloaded()

@@ -11,6 +11,7 @@ Workspace model:
 """
 
 import copy
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -68,6 +69,143 @@ def _torch_family_pypi(
         return {pkg: {"version": pin, "index": torch_index}
                 for pkg, pin in pin_map.items()}
     return dict(pin_map)
+
+
+#: Packages whose version is derived from the host ComfyUI rather than authored
+#: here. Same rule as the torch family: comfy-env replicates a pin it reads, it
+#: never invents one. comfy-aimdo ships weekly and ComfyUI pins it exactly, so a
+#: literal in this repository would be stale within the month.
+_HOST_DERIVED_PKGS = ("comfy-aimdo",)
+
+
+def read_host_pin(comfyui_dir: Optional[Path], package: str) -> Optional[str]:
+    """Read an exact ``==`` pin for `package` out of the host ComfyUI's requirements.
+
+    Returns None when the file, or the pin, is absent. Never raises: a worker
+    env that cannot resolve the host's pin is built without the package, which
+    is exactly today's behaviour.
+    """
+    # Prefer the INSTALLED distribution in the environment running this
+    # install, which is the host env: the worker's skew guard compares against
+    # the parent's installed wheel (importlib.metadata), so pinning from the
+    # requirements file while the venv lags it would make every worker refuse
+    # aimdo, silently and permanently. One source of truth, the running host.
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version(package)
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+    if comfyui_dir is None:
+        return None
+    req = Path(comfyui_dir) / "requirements.txt"
+    try:
+        text = req.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # Build the alternation explicitly: relying on whether re.escape() escapes
+    # "-" is version dependent behaviour to hang a parser on.
+    stem = "[-_]".join(re.escape(part) for part in package.split("-"))
+    pattern = re.compile(
+        r"^\s*" + stem + r"\s*==\s*([^\s#;]+)", re.IGNORECASE | re.MULTILINE
+    )
+    match = pattern.search(text)
+    return match.group(1) if match else None
+
+
+def _canonical(name: str) -> str:
+    """PEP 503 name normalisation: lowercase, any run of -_. becomes a hyphen."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _declared_spec(value: Any) -> Optional[str]:
+    """The version spec a pixi pypi entry carries, string or table form."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        got = value.get("version")
+        return got if isinstance(got, str) else None
+    return None
+
+
+def _replace_host_derived(
+    node_pypi: Dict[str, Any],
+    host_pins: Dict[str, Any],
+    name: str,
+    label: str = "[pypi-dependencies]",
+    log: Callable[[str], None] = print,
+) -> Dict[str, Any]:
+    """Remove a pack's host-derived declarations in place; return the substitutes.
+
+    Only packages the pack actually declares are returned, so this never adds a
+    dependency to an env that did not already have one.
+
+    Matching is PEP 503 canonical, so `Comfy-AIMDO`, `comfy_aimdo` and
+    `comfy.aimdo` are all caught. Missing one would be worse than doing nothing:
+    the substitute would land beside the survivor as a second key for the same
+    distribution, with conflicting specs, in a manifest nobody wrote.
+
+    Raises on a genuine conflict. A wildcard or an open range is boilerplate and
+    is normalised. An exact pin that disagrees with the host is a deliberate
+    statement the seam cannot honour. Same split as `_validate_node_config`,
+    which raises for torch while `_strip_torch_family` strips elsewhere.
+    """
+    canon_hosts = {_canonical(k): (k, v) for k, v in host_pins.items()}
+    out: Dict[str, Any] = {}
+    for key in list(node_pypi.keys()):
+        match = canon_hosts.get(_canonical(key))
+        if match is None:
+            continue
+        pkg, wanted = match
+        declared = node_pypi.pop(key)
+        spec = _declared_spec(declared)
+        if spec and spec.startswith("==") and spec != wanted:
+            raise ValueError(
+                f"[{name}] comfy-env.toml pins {key}{spec} in {label}, but the "
+                f"host ComfyUI pins {wanted}. A worker and its host must agree "
+                f"on this package. Remove the pin and comfy-env will replicate "
+                f"the host's."
+            )
+        out[pkg] = wanted
+        log(f"[{name}] {label} {key}={spec or declared!r} replaced by the host's {wanted}")
+    return out
+
+
+def _host_derived_pypi(
+    comfyui_dir: Optional[Path],
+    enabled: bool,
+    log: Callable[[str], None],
+) -> Dict[str, Any]:
+    """Pins replicated from the host ComfyUI, when the caller opted in.
+
+    On by default, for the same reason `_torch_family_pypi` is: an ABI sensitive
+    native wheel straddling a process boundary is not a per user preference.
+    Packs ship the identical boilerplate `comfy-aimdo = "*"`, pixi resolves that
+    wildcard on whatever day the env was built, and the result drifts off the
+    host. That has already happened: a worker env here holds 0.4.14 against a
+    host pinned to 0.4.13.
+
+    Replicating rather than authoring is the whole rule. When the host declares
+    no pin, this returns nothing and the pack's own spec stands, which is the
+    behaviour before this existed.
+    """
+    if not enabled:
+        return {}
+    out: Dict[str, Any] = {}
+    for pkg in _HOST_DERIVED_PKGS:
+        pin = read_host_pin(comfyui_dir, pkg)
+        if pin:
+            out[pkg] = f"=={pin}"
+            log(f"[pixi] replicating host pin {pkg}=={pin}")
+        else:
+            log(
+                f"[pixi] no `{pkg}==` pin in the host ComfyUI's requirements.txt; "
+                f"leaving whatever the pack declares. Parent and worker may "
+                f"resolve different versions."
+            )
+    return out
 
 
 def _validate_node_config(name: str, cfg: ComfyEnvConfig) -> None:
@@ -153,6 +291,8 @@ def _build_node_feature(
     log: Callable[[str], None] = print,
     macos_version: Optional[str] = None,
     cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    comfyui_dir: Optional[Path] = None,
+    host_derived: bool = True,
 ) -> Dict[str, Any]:
     """Emit a self-contained pixi `[feature.<name>.*]` block for one env.
 
@@ -178,10 +318,24 @@ def _build_node_feature(
 
     # PyPI deps: torch family pin (replicated workspace-wide) + node's own
     pypi = _torch_family_pypi(torch_pin, torch_index, log)
+    host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
     node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
     if node_pypi:
         _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
+        # Substitute in place, and ONLY where the pack already declares the
+        # package. Adding it to a pack that never asked would put a native CUDA
+        # wheel into CPU-only envs and change every env's identity, which is a
+        # far larger blast radius than the drift this exists to fix.
+        pypi.update(_replace_host_derived(node_pypi, host_pins, name, log))
         pypi.update(node_pypi)
+    # Inject for CUDA envs even when the pack never asked. The wheel is inert
+    # until a worker initialises it, and a worker cannot be made transparent
+    # later without it, so absence is the expensive mistake. Skipped for CPU
+    # envs: aimdo has no CPU path (`_vbar_get` returns None for a CPU load
+    # device) and MAX_PINNED_MEMORY stays -1 there, so it would be dead weight.
+    if torch_index and "cpu" not in str(torch_index).lower():
+        for pkg, wanted in host_pins.items():
+            pypi.setdefault(pkg, wanted)
     # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
     # which pixi records in the lock and uv verifies). The wheels' in-farm
     # METADATA declares no dependencies, so a URL dep is exactly the
@@ -206,10 +360,23 @@ def _build_node_feature(
                     cur_target[tbl], name,
                     f"[target.{current}.{tbl}]", log,
                 )
+                if tbl == "pypi-dependencies":
+                    # A target table wins over the feature table on its own
+                    # platform, so an unpinned aimdo left here would silently
+                    # beat the host pin we just substituted above.
+                    pypi.update(_replace_host_derived(
+                        cur_target[tbl], host_pins, name,
+                        f"[target.{current}.{tbl}]", log,
+                    ))
                 if not cur_target[tbl]:
                     del cur_target[tbl]
         if cur_target:
             feat.setdefault("target", {})[current] = cur_target
+    # The target loop can add host pin substitutes into `pypi` after the
+    # attachment above was skipped for being empty. Re-attach so a pack whose
+    # ONLY pypi declaration lives in [target.*] does not silently lose it.
+    if pypi and "pypi-dependencies" not in feat:
+        feat["pypi-dependencies"] = pypi
 
     pypi_options = copy.deepcopy(cfg.pixi_passthrough.get("pypi-options", {}))
     if pypi_options:
@@ -282,8 +449,10 @@ def build_env_toml(
     chosen_torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
     cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    comfyui_dir: Optional[Path] = None,
+    host_derived: bool = True,
 ) -> Dict[str, Any]:
-    """Build a self-contained pixi.toml dict for one isolated env.
+    """Build a self contained pixi.toml dict for one isolated env.
 
     Each env gets its own manifest declaring a single feature ``node``
     and a single environment ``default``. No solve-groups, no cross-env
@@ -350,6 +519,8 @@ def build_env_toml(
         macos_version=macos_version,
         log=log,
         cuda_wheel_urls=cuda_wheel_urls,
+        comfyui_dir=comfyui_dir,
+        host_derived=host_derived,
     )
 
     # Platform entry: the modern spelling of what [system-requirements]
@@ -392,6 +563,8 @@ def write_env_pixi_toml(
     chosen_torch_pin: Optional[str] = None,
     log: Callable[[str], None] = print,
     cuda_wheel_urls: Optional[Dict[str, str]] = None,
+    comfyui_dir: Optional[Path] = None,
+    host_derived: bool = True,
 ) -> Dict[str, Any]:
     """Write ``<env_manifest_dir>/pixi.toml`` for one isolated env.
 
@@ -412,6 +585,8 @@ def write_env_pixi_toml(
         chosen_torch_pin=chosen_torch_pin,
         log=log,
         cuda_wheel_urls=cuda_wheel_urls,
+        comfyui_dir=comfyui_dir,
+        host_derived=host_derived,
     )
     # Provenance header (ADR-0013): when pixi rejects a forwarded key its
     # error names THIS generated file, which the author never wrote -- the

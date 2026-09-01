@@ -762,6 +762,7 @@ def install_workspace(
                 chosen_torch_pin=chosen_torch_pin_for_override,
                 log=log,
                 cuda_wheel_urls=urls,
+                comfyui_dir=comfyui_dir,
             )
             identity = _env_identity(manifest, list(urls.values()))
             env_identity[env_name] = identity
@@ -807,6 +808,7 @@ def install_workspace(
                 chosen_torch_pin=chosen_torch_pin_for_override,
                 log=log,
                 cuda_wheel_urls=cuda_urls_by_env.get(env_name),
+                comfyui_dir=comfyui_dir,
             )
             log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
 
