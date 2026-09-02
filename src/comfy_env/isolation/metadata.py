@@ -1331,6 +1331,14 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
     _t0 = time.perf_counter()
     try:
         kwargs = {k: prepare_for_ipc_recursive(v) for k, v in kwargs.items()}
+        # In-flight marker for admission: while this worker computes, its
+        # models charge full size in _worker_held_bytes (an aimdo worker can
+        # lazily re-fault mid call with no parent-visible signal, so the
+        # ceiling must be the supremum). Incremented before any worker Python
+        # runs; decremented in the finally STRICTLY AFTER the boundary census
+        # applies, so no window opens between the flag clearing and the peak
+        # decaying to sampled truth.
+        worker._calls_in_flight = getattr(worker, "_calls_in_flight", 0) + 1
         try:
             result = worker.call_method(
                 module_name=module_name,
@@ -1361,6 +1369,10 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                         state_sync.apply_state_out(state_dict, _sso)
                 except Exception as _se:
                     _log(f"[comfy-env] state apply failed: {_se}")
+            # After the census apply above, never before: the ordering is
+            # what closes the mid-call-echo-then-idle window.
+            worker._calls_in_flight = max(
+                0, getattr(worker, "_calls_in_flight", 1) - 1)
 
         result = prepare_for_ipc_recursive(result)
 

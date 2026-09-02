@@ -377,3 +377,252 @@ class TestPinBudgetSeam:
         assert 'result.get("pin_max")' in src
         assert 'grant=result.get("pin_max")' in src
         assert 'headroom=result.get("pin_headroom")' in src
+
+
+class TestResidencyPeakSeam:
+    """The peak-decay fix's wiring: what bare CI cannot execute, pinned at
+    source level."""
+
+    def test_all_frame_harvests_precede_any_status_check(self):
+        """An erroring worker is exactly the one whose census and overhead
+        just moved; a harvest inside a success branch goes stale when it
+        matters most. Generic over every piggyback key, retroactively
+        protecting the previously unguarded ones too."""
+        subprocess_py = SRC / "isolation" / "workers" / "subprocess.py"
+        tree = _tree(subprocess_py)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_send_request")
+        keys = ("_new_models", "_model_residency", "_self_state_out",
+                "_pinned", "_vram_overhead")
+        harvest_lines = {}
+        status_line = None
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and node.args
+                    and isinstance(node.args[0], ast.Constant)):
+                val = node.args[0].value
+                if val in keys:
+                    harvest_lines.setdefault(val, node.lineno)
+                elif val == "status" and status_line is None:
+                    status_line = node.lineno
+        missing = [k for k in keys if k not in harvest_lines]
+        assert not missing, f"harvest for {missing} not found in _send_request"
+        if status_line is not None:
+            late = [k for k, ln in harvest_lines.items() if ln > status_line]
+            assert not late, (
+                f"harvests {late} sit after a status check; error frames "
+                f"drop them exactly when they matter")
+
+    def test_overhead_is_computed_from_the_census_just_built(self):
+        """The mixed-frame double count: overhead from frame N combined with
+        a residency census from frame N+1 under-books by the model size.
+        The overhead expression must reference the census list bound in the
+        same _attach_new_models pass, never a second registry walk."""
+        src = WORKER.read_text(encoding="utf-8")
+        assert "_census_list" in src and '"_vram_overhead"' in src
+        block = src[src.index("_census_list = None"):src.index('"_new_models"')]
+        assert "_residency_census()" in block
+        assert block.count("_residency_census()") == 1, (
+            "a second census walk feeds the overhead; frames can now disagree")
+
+    def test_death_clears_the_overhead_ledger(self):
+        tree = _tree(POOL)
+        for fname in ("_remove_worker", "_cleanup_stale_patchers"):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == fname)
+            assert "_OVERHEAD_REPORTS.pop" in ast.unparse(fn), (
+                f"{fname} no longer pops the overhead report; a dead worker "
+                f"books phantom scratch forever")
+
+    def test_echo_sites_route_through_apply_echo(self):
+        """The peak rules live in ONE pure function; a direct peak write at
+        an echo site is the shipped bug (unconditional reset) sneaking back."""
+        tree = _tree(PROXY)
+        for fname in ("partially_load", "partially_unload", "_mark_offloaded"):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == fname)
+            src = ast.unparse(fn)
+            assert "apply_echo" in src, f"{fname} no longer routes its echo"
+            assert "_residency_peak" not in src, (
+                f"{fname} writes the peak directly, bypassing the "
+                f"admissibility rules in state_sync.apply_echo")
+
+    def test_in_flight_decrement_follows_the_census_apply(self):
+        """The ordering that closes the mid-call-echo-then-idle window: the
+        flag may clear only AFTER _register_new_patchers applied the boundary
+        census, in the same finally."""
+        metadata_py = SRC / "isolation" / "metadata.py"
+        tree = _tree(metadata_py)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_call_in_worker")
+        src = ast.unparse(fn)
+        assert "_calls_in_flight" in src
+        reg = src.index("_register_new_patchers(env_dir")
+        dec_candidates = [i for i in range(len(src))
+                          if src.startswith("worker._calls_in_flight = max", i)]
+        assert dec_candidates, "the in-flight decrement is gone"
+        assert min(dec_candidates) > reg, (
+            "the in-flight flag clears BEFORE the boundary census applies; "
+            "a mid-call echo's low peak survives into idle unrepaired")
+
+    def test_held_bytes_goes_through_the_pure_snapshot(self):
+        """The admission arithmetic must stay bare-CI drivable. Catches: a
+        drive-by reintroducing n_workers * CONST beside the pure call."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_worker_held_bytes")
+        src = ast.unparse(fn)
+        assert "held_from_snapshot" in src
+        assert "n_workers *" not in src and "* _WORKER_FIXED_VRAM_COST" not in src
+
+
+import pytest
+
+
+class TestBootstrapSeam:
+    """Both worker bootstraps (pin, reserve) share the same ordering contract
+    and both pool env injections share the pack-[env_vars]-wins contract.
+    One parametrized guard each, closing two pre-existing coverage holes (the
+    pin bootstrap's position and the pool injections' clobber guard were
+    previously unpinned)."""
+
+    @staticmethod
+    def _main_body(tree):
+        main = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "main")
+        out = []
+        stack = list(main.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                continue
+            out.append(node)
+            stack.extend(ast.iter_child_nodes(node))
+        return out
+
+    @pytest.mark.parametrize("apply_name", ["apply_pin_budget",
+                                            "apply_reserve_bootstrap"])
+    def test_bootstrap_applies_between_comfy_import_and_ready(self, apply_name):
+        """Apply before the comfy import is silently vacuous forever (the
+        sys.modules lookup no-ops and no test fails); apply after the ready
+        send races the first dispatched call against a worker still on the
+        upstream default. Structural (executed main-body statements), never
+        lexical: nested handlers import comfy above these lines and a lexical
+        guard would bless the wrong thing."""
+        body = self._main_body(_tree(WORKER))
+        import_lines = [n.lineno for n in body
+                        if isinstance(n, ast.Import)
+                        and any(a.name == "comfy.model_management"
+                                for a in n.names)]
+        assert import_lines, "comfy.model_management import not found in main()"
+        apply_lines = [n.lineno for n in body
+                       if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == apply_name]
+        assert apply_lines, f"{apply_name} is never called at main-body level"
+        ready_lines = [n.lineno for n in body
+                       if isinstance(n, ast.Call)
+                       and isinstance(n.func, ast.Attribute)
+                       and n.func.attr == "send"
+                       and any(isinstance(a, ast.Name) and a.id == "_ready_frame"
+                               for a in n.args)]
+        assert ready_lines, "ready frame send not found"
+        assert min(import_lines) < min(apply_lines) < min(ready_lines), (
+            f"{apply_name} must run after the comfy import and before the "
+            f"ready frame; found import={min(import_lines)} "
+            f"apply={min(apply_lines)} ready={min(ready_lines)}")
+
+    def test_pool_env_injection_never_clobbers_pack_env_vars(self):
+        """Every env var the pool injects at worker creation must be guarded
+        by a `not in env_vars` membership test: pack [env_vars] outranks the
+        host-derived value. Covers the two pin vars (previously unguarded by
+        any test) and the reserve var."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_get_or_create_worker")
+        parents = {}
+        for node in ast.walk(fn):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        guarded_names = {"PIN_SHARE_ENV_VAR", "PIN_HEADROOM_ENV_VAR",
+                         "RESERVE_ENV_VAR"}
+        checked = set()
+        for node in ast.walk(fn):
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                continue
+            tgt = node.targets[0]
+            if not (isinstance(tgt, ast.Subscript)
+                    and isinstance(tgt.value, ast.Name)
+                    and tgt.value.id == "env_vars"):
+                continue
+            key = tgt.slice
+            name = key.attr if isinstance(key, ast.Attribute) else None
+            if name not in guarded_names:
+                continue
+            checked.add(name)
+            cursor, guarded = node, False
+            while cursor in parents:
+                cursor = parents[cursor]
+                if isinstance(cursor, ast.If) and \
+                        "not in" in ast.unparse(cursor.test):
+                    guarded = True
+                    break
+            assert guarded, (
+                f"pool injection of {name} at line {node.lineno} has no "
+                f"not-in guard; it clobbers a pack's [env_vars] pin")
+        assert checked == guarded_names, (
+            f"expected injections for {guarded_names}, found {checked}; the "
+            f"guard stopped seeing the block")
+
+    def test_reserve_injection_is_not_gated_on_pin_split(self):
+        """Nesting the reserve write inside the PIN_SPLIT block would make
+        the fix function only under the experimental clamp mode and stay
+        dead in the shipped default."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_get_or_create_worker")
+        parents = {}
+        for node in ast.walk(fn):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.targets[0], ast.Subscript)
+                    and isinstance(node.targets[0].slice, ast.Attribute)
+                    and node.targets[0].slice.attr == "RESERVE_ENV_VAR"):
+                cursor = node
+                while cursor in parents:
+                    cursor = parents[cursor]
+                    if isinstance(cursor, ast.If) and \
+                            "_pin_split_mode" in ast.unparse(cursor.test):
+                        raise AssertionError(
+                            "the reserve bootstrap is gated on PIN_SPLIT")
+                return
+        raise AssertionError("RESERVE_ENV_VAR injection not found")
+
+    def test_reserve_value_comes_from_the_settled_attribute(self):
+        """The injected value must be host mm.EXTRA_RESERVED_VRAM verbatim
+        bytes (the same source the budget reply reads: advance equals
+        settlement by construction). Recomputing from the GB float flag is
+        the unit trap that injects "8" where bytes are owed."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_get_or_create_worker")
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.targets[0], ast.Subscript)
+                    and isinstance(node.targets[0].slice, ast.Attribute)
+                    and node.targets[0].slice.attr == "RESERVE_ENV_VAR"):
+                src = ast.unparse(node.value)
+                assert "EXTRA_RESERVED_VRAM" in src
+                assert "1024" not in src and "reserve_vram" not in src, (
+                    "the reserve value is recomputed from the flag instead "
+                    "of read from the settled attribute")
+                return
+        raise AssertionError("RESERVE_ENV_VAR injection not found")

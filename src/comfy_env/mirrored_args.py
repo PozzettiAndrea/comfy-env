@@ -20,7 +20,10 @@ The ALLOWLIST IS THE CONTRACT. Never mirrored, each for a stated reason:
 budget RPC; a second authority can disagree with it), ``cuda_device`` (the
 worker inherits the host's already-narrowed CUDA_VISIBLE_DEVICES; the flag
 would re-index a second time), ``cpu`` (COMFY_ENV_COMFY_CPU/COMFY_CPU owns
-it), ``reserve_vram`` (already crosses twice; the budget RPC is its owner),
+it), ``reserve_vram`` (crosses three times, one owner: SIMPLE_HEADROOM at
+spawn for aimdo, EXTRA_RESERVED_VRAM at spawn as the budget owner's advance
+payment, settled and superseded by every budget reply; a cli mirror would
+add a second authority),
 ``cache_*`` (executor-side; workers run no prompt queue), and every listen,
 port, auth, and path flag (host server surface).
 """

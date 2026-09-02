@@ -74,6 +74,20 @@ _PERSISTENT_WORKER_SCRIPT = _WORKER_SCRIPT_PATH.read_text(encoding="utf-8")
 _HEALTH_PING_IDLE_SECONDS = 60.0
 
 
+
+def _current_prompt_gen():
+    """The host's prompt epoch for worker requests, or None before the first
+    prompt (or when the PromptModelTracker patch is off/failed): None routes
+    workers to the sticky-with-decay mark fallback instead of treating a
+    frozen counter as one eternal prompt."""
+    try:
+        from ...state_sync import PROMPT_GEN
+        g = PROMPT_GEN[0]
+        return g if g > 0 else None
+    except Exception:
+        return None
+
+
 def _enter_call_scope(worker):
     """Set the per-call _ipc_parent._call_state; returns the previous values.
 
@@ -619,6 +633,10 @@ class SubprocessWorker(Worker):
         # Worker's five-field pin scalar (pid, totals, errors, seq). Ready
         # frames and budget RPCs are its only carriers; hot frames stay small.
         self.pin_state = msg.get("_pin_state")
+        # Capability advertisement: the /free broadcast goes only to workers
+        # that declare the handler. An unadvertised worker would give an
+        # unknown method NO reply and die at the 60 s recv timeout.
+        self.supports_full_release = bool(msg.get("full_release"))
         # Mirror divergence check: recompute the read-back hash over the SAME
         # applied names with OUR args and compare. Log-only and fail-open,
         # always: a worker refusing to start would convert a 2x footprint
@@ -825,6 +843,12 @@ class SubprocessWorker(Worker):
         _pin = response.get("_pinned")
         if _pin is not None:
             self._last_pinned = _pin
+        # Measured VRAM overhead: REPLACES (self-measured in-frame). An
+        # erroring worker is exactly the one whose overhead just ballooned,
+        # so this too must land off error frames.
+        _ov = response.get("_vram_overhead")
+        if _ov is not None:
+            self._last_vram_overhead = _ov
         return response
 
     def call_method(
@@ -878,6 +902,7 @@ class SubprocessWorker(Worker):
                 request = {
                     "type": "call_method",
                     "call_id": call_id,
+                    "prompt_gen": _current_prompt_gen(),
                     "seed": bool(seed),
                     "state_id": state_id,
                     "module": module_name,
@@ -952,6 +977,7 @@ class SubprocessWorker(Worker):
                 request = {
                     "type": "call_module",
                     "call_id": call_id,
+                    "prompt_gen": _current_prompt_gen(),
                     "module": module,
                     "func": func,
                     "kwargs": kwargs_meta,
@@ -1148,6 +1174,33 @@ class SubprocessWorker(Worker):
                     f"{self.name}: Command '{method}' failed: "
                     f"{response.get('error', 'Unknown error')}"
                 )
+            return response
+        finally:
+            self._lock.release()
+
+    def send_command_no_spawn(self, method, lock_timeout=2.0, **params):
+        """send_command variant for broadcasts: never resurrects a worker.
+
+        ``send_command`` runs ``_ensure_started``, so broadcasting to a dead
+        pool entry would SPAWN a process in order to free its memory. This
+        path checks ``is_alive`` first and returns a sentinel string instead:
+        ``"dead"`` (its memory died with it, nothing to do) or ``"busy"``
+        (lock not won inside ``lock_timeout``; the caller defers rather than
+        queueing behind a 30 s wait). A short timeout on purpose: a release
+        is capacity work, never worth stalling the caller.
+        """
+        if not self.is_alive():
+            return "dead"
+        if not self._lock.acquire(timeout=lock_timeout):
+            return "busy"
+        try:
+            self._call_counter += 1
+            request = {"method": method, "call_id": self._call_counter, **params}
+            response = self._send_request(request, timeout=60.0)
+            if response.get("status") == "error":
+                raise RuntimeError(
+                    f"{self.name}: Command '{method}' failed: "
+                    f"{response.get('error', 'Unknown error')}")
             return response
         finally:
             self._lock.release()

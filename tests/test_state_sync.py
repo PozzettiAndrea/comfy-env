@@ -98,14 +98,186 @@ class TestApplyResidency:
         apply_residency({"m": p}, census("ghost", 1, GIB))
         assert p.model.model_loaded_weight_memory == 8 * GIB
 
-    def test_ceiling_is_peak_since_last_command(self):
-        """Admission is pessimistic while the ledger rounds down: stale-LOW in
-        _worker_held_bytes is the direction that OOMs."""
+    def test_census_is_the_decay_authority(self):
+        """A census is a present-state statement sampled at a boundary, when
+        the env is about to be idle: it decays the peak to sampled truth.
+        Catches: the old up-only ratchet, which stranded the pre-eviction
+        peak forever (the in-flight size charge in held_charge now carries
+        the mid-call pessimism this ratchet used to overpay for)."""
         p = FakePatcher(8 * GIB, loaded=0)
         apply_residency({"m": p}, census("m", 1, 6 * GIB))
         apply_residency({"m": p}, census("m", 2, 2 * GIB))
         assert p.model.model_loaded_weight_memory == 2 * GIB  # ledger: receipt
-        assert held_ceiling(p) == 6 * GIB  # admission: peak
+        assert held_ceiling(p) == 2 * GIB  # census decayed the peak
+
+    def test_census_at_equal_seq_is_applied_not_dropped(self):
+        """THE dead-letter fix. The worker bumps seq only at command echoes;
+        a census after the echo carries the SAME seq and was sampled AFTER
+        the echo's byte movement (single thread, one FIFO socket). The old
+        `<=` drop made every post-echo census a dead letter: a lazy re-fault
+        regrew VRAM the parent could never see again, and at ledger 0 detach
+        short-circuits so the bytes were unevictable too. Catches: the
+        shipped strict-`<=` comparator."""
+        p = FakePatcher(8 * GIB, loaded=0)
+        p._residency_seq = 5  # an eviction echo stamped seq 5, resident 0
+        p._residency_peak = 0
+        apply_residency({"m": p}, census("m", 5, 6 * GIB))  # post-echo re-fault
+        assert p.model.model_loaded_weight_memory == 6 * GIB
+        assert held_ceiling(p) == 6 * GIB
+
+    def test_equal_seq_replay_keeps_replace_semantics(self):
+        """Multiple equal-seq censuses arrive transport-ordered; the last one
+        wins. Catches: a tie rule that applies only the first."""
+        p = FakePatcher(8 * GIB, loaded=0)
+        p._residency_seq = 5
+        apply_residency({"m": p}, census("m", 5, 6 * GIB))
+        apply_residency({"m": p}, census("m", 5, 1 * GIB))
+        assert p.model.model_loaded_weight_memory == 1 * GIB
+        assert held_ceiling(p) == 1 * GIB
+
+
+class TestApplyEcho:
+    """The echo transition, pure. The peak rule is the admissibility
+    criterion: lower the admission ceiling only when every regrowth exit out
+    of the certified state is signaled."""
+
+    from comfy_env.state_sync import apply_echo, held_charge  # noqa: PLC0415
+
+    def test_in_flight_partial_echo_never_lowers_the_peak(self):
+        """The worker can lazily re-fault mid call with no signal, so a
+        mid-call eviction echo may not lower the ceiling. Catches: the
+        originally shipped unconditional reset (model_patcher.py:272), the
+        unbounded stale-LOW window."""
+        from comfy_env.state_sync import apply_echo
+        p = FakePatcher(8 * GIB, loaded=6 * GIB)
+        p._residency_peak = 6 * GIB
+        apply_echo(p, 2 * GIB, seq=7, in_flight=True)
+        assert p.model.model_loaded_weight_memory == 2 * GIB  # ledger: receipt
+        assert held_ceiling(p) == 6 * GIB  # window stays pessimistic
+        assert p._residency_seq == 7
+
+    def test_idle_partial_echo_releases_the_reserve_immediately(self):
+        """An idle worker cannot re-fault (faults are synchronous worker
+        Python), so its echo is authoritative and the parked env's
+        over-reserve releases NOW, not at a census that may never come.
+        Catches: the echoes-never-lower overcorrection."""
+        from comfy_env.state_sync import apply_echo
+        p = FakePatcher(8 * GIB, loaded=6 * GIB)
+        p._residency_peak = 6 * GIB
+        apply_echo(p, 2 * GIB, seq=7, in_flight=False)
+        assert held_ceiling(p) == 2 * GIB
+
+    def test_unmapped_lowers_to_zero_in_either_flag_state(self):
+        """A detach is a full-unmap receipt: every regrowth exit is signaled
+        (budget RPC, load echo, fresh registration). Also fixes the shipped
+        bug where _mark_offloaded zeroed the ledger but left the peak stuck
+        high forever."""
+        from comfy_env.state_sync import apply_echo
+        for in_flight in (False, True):
+            p = FakePatcher(8 * GIB, loaded=6 * GIB)
+            p._residency_peak = 6 * GIB
+            apply_echo(p, 0, unmapped=True, in_flight=in_flight)
+            assert held_ceiling(p) == 0
+            assert p.model.device == "cpu"
+
+    def test_echo_never_raises_on_a_broken_patcher(self):
+        from comfy_env.state_sync import apply_echo
+        apply_echo(object(), 1 * GIB)  # must not raise
+
+    def test_held_charge_is_size_in_flight_and_ceiling_idle(self):
+        """The case split itself. Catches: an additive in-flight term (which
+        would double count every resident byte) and a charge that forgets
+        the idle peak."""
+        from comfy_env.state_sync import held_charge
+        p = FakePatcher(8 * GIB, loaded=2 * GIB)
+        p._residency_peak = 3 * GIB
+        assert held_charge(p, in_flight=True) == 8 * GIB
+        assert held_charge(p, in_flight=False) == 3 * GIB
+
+
+class TestHeldFromSnapshot:
+    from comfy_env.state_sync import held_from_snapshot  # noqa: PLC0415
+
+    def test_in_flight_charge_replaces_never_adds(self):
+        """B's veto of the additive composition: an in-flight worker's model
+        charges size ONCE, not held plus an inflight term."""
+        from comfy_env.state_sync import held_from_snapshot
+        snap = {"w": {"in_flight": True, "excess": 0,
+                      "models": [{"ledger": 2 * GIB, "peak": 3 * GIB,
+                                  "size": 8 * GIB}]}}
+        assert held_from_snapshot(snap, floor=0) == 8 * GIB
+
+    def test_modelless_live_worker_books_the_floor(self):
+        """The old `if patchers:` skip booked a live worker's CUDA context at
+        zero. Presence in the snapshot IS liveness."""
+        from comfy_env.state_sync import held_from_snapshot
+        floor = 300 * 1024 * 1024
+        assert held_from_snapshot({"w": {"in_flight": False, "excess": None,
+                                         "models": []}},
+                                  floor=floor) == floor
+
+    def test_excess_adds_to_the_floor_never_maxes(self):
+        """memory_reserved cannot see the CUDA context, so floor and excess
+        partition cleanly and ADD; max(floor, reported) under-books by
+        min(floor, reported). A low report ADDS, no special casing."""
+        from comfy_env.state_sync import held_from_snapshot
+        floor = 300 * 1024 * 1024
+        low = 10 * 1024 * 1024
+        snap = {"w": {"in_flight": False, "excess": low, "models": []}}
+        assert held_from_snapshot(snap, floor=floor) == floor + low
+
+    def test_excess_clamped_to_cap(self):
+        from comfy_env.state_sync import held_from_snapshot
+        floor = 300 * 1024 * 1024
+        snap = {"w": {"in_flight": False, "excess": 99 * GIB, "models": []}}
+        assert held_from_snapshot(snap, floor=floor, cap=24 * GIB) \
+            == floor + (24 * GIB - floor)
+
+    def test_absent_worker_key_books_nothing(self):
+        """Dead workers' keys are ABSENT (the pool removes them); a ghost
+        entry would book ~1 GB per crash in a restart loop."""
+        from comfy_env.state_sync import held_from_snapshot
+        assert held_from_snapshot({}, floor=300 * 1024 * 1024) == 0
+
+
+class TestOverheadAndForward:
+    def test_stale_overhead_frame_cannot_resurrect(self):
+        from comfy_env.state_sync import update_overhead_reports
+        reports = {}
+        assert update_overhead_reports(reports, "w", 1 * GIB, seq=5)
+        assert not update_overhead_reports(reports, "w", 2 * GIB, seq=3)
+        assert reports["w"]["excess"] == 1 * GIB
+
+    def test_newer_lower_overhead_actually_lowers(self):
+        """REPLACE, no peak: the value is self-measured in-frame, so a worker
+        that tore down its streams must stop booking them. Catches: a
+        peak-forever implementation."""
+        from comfy_env.state_sync import update_overhead_reports
+        reports = {"w": {"excess": 1 * GIB, "seq": 5}}
+        assert update_overhead_reports(reports, "w", 0, seq=6)
+        assert reports["w"]["excess"] == 0
+
+    def test_absurd_overhead_warns(self):
+        from comfy_env.state_sync import update_overhead_reports
+        msgs = []
+        update_overhead_reports({}, "w", 30 * GIB, seq=1, log=msgs.append)
+        assert msgs and "overhead" in msgs[0]
+
+    def test_forward_cast_need_books_the_future_buffers_exactly(self):
+        """Cast buffers allocate lazily at the first forward, AFTER
+        admission: only the incoming load's own numbers can book them.
+        streams 2 x 600 MiB shifts need by exactly 1200 MiB vs streams 0."""
+        from comfy_env.state_sync import forward_cast_need
+        mib = 1024 * 1024
+        assert forward_cast_need(600 * mib, 2) - forward_cast_need(600 * mib, 0) \
+            == 1200 * mib
+
+    def test_forward_cast_need_degrades_to_zero(self):
+        """Old worker (no largest_tensor) or no stream info collapses the
+        need formula's max() back to min_inference, today's behavior."""
+        from comfy_env.state_sync import forward_cast_need
+        assert forward_cast_need(None, 2) == 0
+        assert forward_cast_need(600, None) == 0
 
 
 class TestStateFilter:

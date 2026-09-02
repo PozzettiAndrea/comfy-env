@@ -1060,6 +1060,127 @@ def main():
     def _bump_seq(mid):
         _residency_seq[mid] = _residency_seq.get(mid, 0) + 1
         return _residency_seq[mid]
+
+    # ----------------- prompt-epoch pin marks (current_prompt) -------------
+    # A worker runs no executor, so upstream's PromptModelTracker never marks
+    # its models and pin-eviction tier 1 (cp False, active NOT consulted)
+    # evicts this prompt's warm models like stale leftovers, including a
+    # model mid-load whose unregistered staging pages can be decommitted
+    # under an in-flight async copy. The parent forwards a prompt epoch on
+    # every request; marks clear at epoch change (preamble, before the
+    # method runs) and are set in the shim BEFORE the load (the pressure
+    # fires during the load itself). No token means the sticky-with-decay
+    # fallback, never dark.
+    _prompt_marks = [{}]
+    _mark_call_n = [0]
+    _active_prompt_gen = [None]
+    _resident_at_call_start = [set()]
+    _pin_marks_enabled = os.environ.get(
+        "COMFY_ENV_PIN_MARKS", "1").strip().lower() not in ("0", "false", "off")
+
+    def _dynamic_patcher_registry():
+        """key -> dynamic patcher, from the worker's own ledger. Keyed by the
+        inner model object's id (stable across patcher clones, the same key
+        space upstream's tracker uses)."""
+        out = {}
+        try:
+            import comfy.model_management as _mpm
+            for _lm in list(_mpm.current_loaded_models):
+                _pt = getattr(_lm, "model", None)
+                if _pt is None:
+                    continue
+                try:
+                    if _pt.is_dynamic():
+                        out[str(id(_pt.model))] = _pt
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    def _prompt_marks_preamble(request):
+        """Clear the previous prompt's marks BEFORE this call's method (and
+        therefore before any of its loads) runs."""
+        if not _pin_marks_enabled or _state_sync is None or _memmgr is None:
+            return
+        try:
+            _mark_call_n[0] += 1
+            _gen = request.get("prompt_gen")
+            if _gen is not None and _gen != _active_prompt_gen[0]:
+                _memmgr.reset_pin_churn_epoch()
+            _active_prompt_gen[0] = _gen
+            registry = _dynamic_patcher_registry()
+            # Snapshot residency so the node-end sweep marks only models that
+            # became resident DURING this call (a shim-bypassing load), never
+            # survivors of a previous call: re-marking survivors would mark
+            # everything resident to the current prompt, the blanket-marking
+            # hazard the contract forbids.
+            _resident_at_call_start[0] = set(registry.keys())
+            new_marks, to_clear = _state_sync.clear_on_epoch_change(
+                _prompt_marks[0], _gen, _mark_call_n[0], registry.keys())
+            _prompt_marks[0] = new_marks
+            if to_clear:
+                _memmgr.apply_prompt_marks(registry, [], to_clear, log=wlog)
+        except Exception as _pme:
+            wlog(f"[worker] prompt mark preamble failed: {_pme}")
+
+    def _prompt_marks_on_load(models):
+        """Mark the models a shimmed load is about to touch, before the real
+        load_models_gpu runs. Sweeps patches and nested additional models,
+        mirroring upstream tracker.add."""
+        if not _pin_marks_enabled or _state_sync is None or _memmgr is None:
+            return
+        try:
+            registry = {}
+            for _m in models:
+                sweep = [_m]
+                try:
+                    sweep.extend(_m.model_patches_models())
+                except Exception:
+                    pass
+                try:
+                    sweep.extend(_m.get_nested_additional_models())
+                except Exception:
+                    pass
+                for _sm in sweep:
+                    try:
+                        if _sm.is_dynamic():
+                            registry[str(id(_sm.model))] = _sm
+                    except Exception:
+                        continue
+            if not registry:
+                return
+            new_marks, to_set = _state_sync.mark_on_load(
+                _prompt_marks[0], _active_prompt_gen[0], _mark_call_n[0],
+                registry.keys())
+            _prompt_marks[0] = new_marks
+            if to_set:
+                _memmgr.apply_prompt_marks(registry, to_set, [], log=wlog)
+        except Exception as _pme:
+            wlog(f"[worker] prompt mark on load failed: {_pme}")
+
+    def _prompt_marks_sweep():
+        """Node-end catch-up: mark dynamic models that became resident THIS
+        call outside the shim (a load that bypassed load_models_gpu). Scoped
+        to models newly present since the preamble snapshot, so a survivor of
+        a previous call is never re-marked to the current prompt (that would
+        be blanket marking; a status call that loads nothing marks nothing)."""
+        if not _pin_marks_enabled or _state_sync is None or _memmgr is None:
+            return
+        try:
+            registry = _dynamic_patcher_registry()
+            newly = set(registry.keys()) - _resident_at_call_start[0]
+            missing = [k for k in newly if k not in _prompt_marks[0]]
+            if not missing:
+                return
+            new_marks, to_set = _state_sync.mark_on_load(
+                _prompt_marks[0], _active_prompt_gen[0], _mark_call_n[0],
+                missing)
+            _prompt_marks[0] = new_marks
+            if to_set:
+                _memmgr.apply_prompt_marks(registry, to_set, [], log=wlog)
+        except Exception:
+            pass
     _model_registry_meta = {}     # model_id -> {"size": int, "kind": str}
     _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
     _model_counter = [0]          # mutable counter in list for closure access
@@ -1494,7 +1615,27 @@ def main():
                 model_info = []
                 for m in models:
                     size = m.model_size() if hasattr(m, 'model_size') else 0
-                    model_info.append({"size": size, "key": str(id(m))})
+                    # Largest weight(+bias) of any module: what ops.py sizes a
+                    # cast buffer to. The parent's need formula books the
+                    # buffers this load will allocate lazily at its first
+                    # forward, AFTER admission -- bytes neither NVML nor a
+                    # measured field can see yet. Best effort; absent means
+                    # the parent falls back to min_inference alone.
+                    _largest = 0
+                    try:
+                        for _mod in m.model.modules():
+                            _w = getattr(_mod, "weight", None)
+                            if _w is None or not hasattr(_w, "nbytes"):
+                                continue
+                            _n = int(_w.nbytes)
+                            _b = getattr(_mod, "bias", None)
+                            if _b is not None and hasattr(_b, "nbytes"):
+                                _n += int(_b.nbytes)
+                            _largest = max(_largest, _n)
+                    except Exception:
+                        _largest = 0
+                    model_info.append({"size": size, "key": str(id(m)),
+                                       "largest_tensor": _largest})
 
                 total_size = sum(mi["size"] for mi in model_info)
                 wlog(f"[worker] load_models_gpu shim: {len(models)} models, {total_size / 1e9:.2f} GB total")
@@ -1510,10 +1651,19 @@ def main():
                         _ps = _memmgr.pin_state()
                 except Exception:
                     pass
+                # LIVE resolved stream count (never cli_mirror: this is a
+                # booking input and must be the value the cast path will
+                # actually use, read after import froze it).
+                _ns = None
+                try:
+                    _ns = int(getattr(_cmm, "NUM_STREAMS", 0))
+                except Exception:
+                    pass
                 result = _call_parent("request_vram_budget",
                              model_info=model_info,
                              total_size=total_size,
-                             pin_state=_ps)
+                             pin_state=_ps,
+                             num_streams=_ns)
 
                 # Propagate parent's VRAM constraints to subprocess
                 if result:
@@ -1566,7 +1716,9 @@ def main():
 
                     if extra_reserved is not None:
                         _cmm.EXTRA_RESERVED_VRAM = extra_reserved
-                        wlog(f"[worker] Set EXTRA_RESERVED_VRAM = {extra_reserved / 1e9:.2f} GB")
+                        wlog(f"[worker] margin now {extra_reserved / 1e9:.2f}GB "
+                             f"(host {int(result.get('extra_reserved_vram') or 0) / 1e9:.2f}GB "
+                             f"+ others; settles any bootstrap advance)")
 
                     parent_vram_state = result.get("vram_state")
                     if parent_vram_state:
@@ -1575,6 +1727,12 @@ def main():
                             wlog(f"[worker] Set vram_state = {parent_vram_state}")
                         except (KeyError, AttributeError):
                             pass
+
+                # Mark the models this load is about to touch BEFORE the real
+                # load runs: pin tier 1 ignores `active`, so pressure fired
+                # inside the load can shred the loading model's own staging
+                # pins mid-copy unless current_prompt already protects it.
+                _prompt_marks_on_load(models)
 
                 # Now run the real load_models_gpu -- it calls get_free_memory()
                 # which uses EXTRA_RESERVED_VRAM via minimum_inference_memory(),
@@ -1651,6 +1809,12 @@ def main():
     if _memmgr is not None:
         try:
             _memmgr.install_pin_error_counter()
+            # Eviction counters (observability, ungated): pin_errors is blind
+            # to the churn loop, which unregisters and re-registers pins
+            # successfully; these count what actually moved, and
+            # pins_evicted_active_bytes is the prompt-mark fix's own
+            # regression signal (must stay 0).
+            _memmgr.install_pin_eviction_counters(log=wlog)
             _bs_grant = os.environ.get("COMFY_ENV_PIN_SHARE")
             _bs_headroom = os.environ.get("COMFY_ENV_PIN_HEADROOM")
             if _bs_grant is not None or _bs_headroom is not None:
@@ -1660,6 +1824,15 @@ def main():
                     log=wlog)
         except Exception as _e:
             wlog(f"[worker] pin budget bootstrap failed: {_e}")
+        # Reserve bootstrap: the budget owner's advance payment. Parses
+        # inside apply_reserve_bootstrap (a garbage value WARNs there instead
+        # of killing this whole block); absent var is a no-op byte-identical
+        # to today; the first budget reply's plain assignment supersedes it.
+        try:
+            _memmgr.apply_reserve_bootstrap(
+                os.environ.get("COMFY_ENV_EXTRA_RESERVED_VRAM"), log=wlog)
+        except Exception as _e:
+            wlog(f"[worker] reserve bootstrap failed: {_e}")
 
 
     def _residency_census():
@@ -1703,9 +1876,26 @@ def main():
         # Census FIRST, above the early return: with no new models this call
         # (the steady state) the early-out would suppress residency in exactly
         # the case where the parent's stamp is going stale.
+        _census_list = None
         try:
             if _model_registry:
-                resp["_model_residency"] = _residency_census()
+                _census_list = _residency_census()
+                resp["_model_residency"] = _census_list
+        except Exception:
+            pass
+        # Measured VRAM overhead: allocator bytes beyond registered residency
+        # (cast buffers, allocator cache, slack). Computed from the census
+        # list JUST BUILT, same instant, so reserved and model bytes cannot
+        # disagree across frames (the mixed-frame double count). NOT gated on
+        # _model_registry: an empty-registry worker holding leaked scratch
+        # must still report. Absent on failure, never a fabricated zero.
+        try:
+            import torch as _ovt
+            if _ovt.cuda.is_initialized():
+                _resident_sum = sum(int(e.get("resident", 0))
+                                    for e in (_census_list or []))
+                resp["_vram_overhead"] = max(
+                    0, int(_ovt.cuda.memory_reserved()) - _resident_sum)
         except Exception:
             pass
         # Pin census: one bare int (hot frames stay small; the five-field
@@ -1739,8 +1929,11 @@ def main():
         resp["_new_models"] = list(_new_models_this_call)
         return resp
 
-    # Signal ready
-    _ready_frame = {"status": "ready", "memory_manager": _mem_info}
+    # Signal ready. full_release advertises the deep-release handler: the
+    # parent broadcasts /free only to advertisers (an unknown method gets no
+    # reply and the sender would eat the 60 s recv timeout).
+    _ready_frame = {"status": "ready", "memory_manager": _mem_info,
+                    "full_release": True}
     try:
         if _memmgr is not None:
             _ps = _memmgr.pin_state()
@@ -1860,6 +2053,24 @@ def main():
             _handle_model_partial(request)
             continue
 
+        # Deep release for the host's /free. MAIN LOOP ONLY, never dispatched
+        # from _call_parent's interleave: the worker is idle between requests
+        # here, so gc and empty_cache cannot fire under an active forward.
+        # Reply rides _attach_new_models so the census and _pinned converge
+        # the parent's ledgers at release time (a released worker may go
+        # quiet, so the parent must not wait for a next call).
+        if request.get("method") == "full_release":
+            _fr = {"status": "ok", "call_id": request.get("call_id")}
+            try:
+                if _memmgr is not None:
+                    _fr["receipt"] = _memmgr.full_release(log=wlog)
+                else:
+                    _fr["receipt"] = {"steps": [], "errors": ["no memory_manager"]}
+            except Exception as _fre:
+                _fr["receipt"] = {"steps": [], "errors": [str(_fre)]}
+            transport.send(_attach_new_models(_fr))
+            continue
+
         if request.get("method") == "list_models":
             # Return registered model metadata
             transport.send({"status": "ok", "call_id": _current_call_id, "models": _model_registry_meta})
@@ -1942,6 +2153,9 @@ def main():
             request_type = request.get("type", "call_module")
             module_name = request["module"]
             wlog(f"[worker] Request: {request_type} {module_name} call_id={_current_call_id}")
+            # Retire the previous prompt's pin marks before this call's
+            # method (and therefore before any of its loads) runs.
+            _prompt_marks_preamble(request)
 
             # Load inputs from shared memory
             kwargs_meta = request.get("kwargs")
@@ -2089,6 +2303,7 @@ def main():
                     # No-op unless aimdo is actually live in this process.
                     if _memmgr is not None:
                         _memmgr.release_node_boundary(log=wlog)
+                    _prompt_marks_sweep()
                 wlog(f"[worker] Method returned")
             else:
                 func_name = request["func"]
@@ -2099,6 +2314,7 @@ def main():
                 finally:
                     if _memmgr is not None:
                         _memmgr.release_node_boundary(log=wlog)
+                    _prompt_marks_sweep()
 
             # Serialize result to shared memory
             wlog(f"[worker] Serializing result to shm...")

@@ -16,6 +16,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +47,40 @@ _PIN_INGEST_SEQ = 0
 _PIN_STABLE = 0  # consecutive censuses with an unchanged consumer set
 _PIN_LAST_CONSUMERS: frozenset = frozenset()
 _PIN_ROLLUP_LAST = 0  # last logged pinned total (rollup fires on >1 GiB moves)
+
+
+#: Measured per-worker allocator excess (reserved minus census residency),
+#: keyed like _WORKER_PATCHERS; REPLACE on newer parent-side arrival seq.
+_OVERHEAD_REPORTS: Dict[str, Dict[str, int]] = {}
+_OVERHEAD_SEQ = 0
+
+_DEVICE_TOTAL_CACHE: List[Optional[int]] = []  # [] = unprobed, [None] = unknowable
+
+
+def _device_total_bytes() -> Optional[int]:
+    """Total VRAM of the torch device, probed once (it is static). Used only
+    to clamp absurd overhead reports; None (no NVML) means uncapped, and the
+    ingest WARN covers the junk-report case there."""
+    if not _DEVICE_TOTAL_CACHE:
+        total = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            try:
+                import comfy.model_management as mm
+                device = mm.get_torch_device()
+                idx = device.index if getattr(device, "index", None) is not None else 0
+                h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                total = int(pynvml.nvmlDeviceGetMemoryInfo(h).total)
+            finally:
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+        except Exception:
+            total = None
+        _DEVICE_TOTAL_CACHE.append(total)
+    return _DEVICE_TOTAL_CACHE[0]
 
 
 def _pin_split_mode() -> str:
@@ -216,10 +251,14 @@ def _handle_progress(request: dict) -> dict:
 
 
 #: Fixed VRAM cost of an extra CUDA-using process that ComfyUI's ledger never
-#: sees: CUDA context (~160 MB) + cuBLAS/cuDNN handles (~55 MB). Measured on
-#: RTX 4060 Ti / driver 581.57 / torch 2.10+cu128. Additive per live worker --
-#: unlike the model-size headroom, which is multiplicative.
-_WORKER_FIXED_VRAM_COST = 250 * 1024 * 1024
+#: sees: CUDA context + cuBLAS/cuDNN handles, all OUTSIDE the caching
+#: allocator (torch.cuda.memory_reserved structurally cannot see them, which
+#: is why the measured _vram_overhead excess ADDS to this floor instead of
+#: maxing with it). 250 MB was measured on a Windows RTX 4060 Ti; a Linux
+#: RTX 3090 measured 276 to 300 MB (2026-09), so the floor rose to cover it.
+#: Additive per live worker -- unlike the model-size headroom, which is
+#: multiplicative.
+_WORKER_FIXED_VRAM_COST = state_sync.WORKER_VRAM_FLOOR
 
 #: Multiplicative slack on the requested model bytes (allocator rounding).
 #: Small because cudaMallocAsync (the default backend) keeps slack near 1%;
@@ -274,28 +313,44 @@ def _worker_held_bytes() -> int:
     ComfyUI's view is missing without NVML. Undercounts allocations the
     Module.to()/.cuda() hooks never saw (ADR-0025 records that gap).
     """
-    held = 0
-    n_workers = 0
     # Snapshot: _register_new_patchers and _cleanup_stale_patchers mutate
     # these from the aiohttp executor thread, and _cleanup_stale_patchers runs
     # outside _POOL_LOCK. Not taking the lock here on purpose -- it is a plain
     # Lock held across verify_transport(), so re-entering would deadlock.
-    for _key, patchers in list(_WORKER_PATCHERS.items()):
-        if patchers:
-            n_workers += 1
-        for p in list(patchers.values()):
+    # The arithmetic itself is pure (state_sync.held_from_snapshot): per
+    # worker, each patcher charges size while a call is IN FLIGHT (unsignaled
+    # lazy re-faults can never exceed the supremum) and max(ledger, peak)
+    # while idle (an idle worker cannot re-fault; its receipts are
+    # authoritative), plus the context floor, plus the measured allocator
+    # excess. Every live pool entry books the floor, patchers or not (the old
+    # `if patchers:` skip booked a modelless worker's CUDA context at zero).
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    keys = set(_WORKER_POOL) | {k for k, v in _WORKER_PATCHERS.items() if v}
+    for key in keys:
+        entry = _WORKER_POOL.get(key)
+        worker = entry[0] if entry else None
+        models = []
+        for p in list(_WORKER_PATCHERS.get(key, {}).values()):
             try:
-                # Admission is pessimistic: the ledger value OR the residency
-                # peak since the last command, whichever is higher. Stale-LOW
-                # here over-states true free and admits a load that OOMs; the
-                # ledger itself stays a round-down receipt for upstream.
-                held += state_sync.held_ceiling(p)
+                models.append({
+                    "ledger": int(getattr(p.model, "model_loaded_weight_memory", 0)),
+                    "peak": int(getattr(p, "_residency_peak", 0)),
+                    "size": int(getattr(p, "size", 0)),
+                })
             except Exception:
                 try:
-                    held += int(p.loaded_size())
+                    models.append({"ledger": int(p.loaded_size()),
+                                   "peak": 0, "size": 0})
                 except Exception:
                     pass
-    return held + n_workers * _WORKER_FIXED_VRAM_COST
+        snapshot[key] = {
+            "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
+            "excess": _OVERHEAD_REPORTS.get(key, {}).get("excess"),
+            "models": models,
+        }
+    return state_sync.held_from_snapshot(snapshot,
+                                         floor=_WORKER_FIXED_VRAM_COST,
+                                         cap=_device_total_bytes())
 
 
 def _maybe_add_pin_grant(reply: dict, request: dict, worker_key) -> None:
@@ -388,13 +443,38 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
         min_inference = mm.minimum_inference_memory()
     except Exception:
         min_inference = 0
-    need = int(total_requested * _REQUEST_SLACK) + _WORKER_FIXED_VRAM_COST + min_inference
+    # The requester's booking: its context floor plus its measured allocator
+    # excess (an old worker sends no report and books the floor, today's
+    # behavior). The forward term books the CAST BUFFERS the incoming load
+    # will allocate lazily at its first forward, AFTER this admission --
+    # bytes neither NVML nor any measured field can see yet, computed from
+    # the load's own largest tensor times the worker's live stream count.
+    # max(), never sum: cast buffers are inference transients competing for
+    # the same reserve min_inference already books.
+    requester_key = str(worker_key) if worker_key else None
+    requester_excess = 0
+    if requester_key and requester_key in _OVERHEAD_REPORTS:
+        requester_excess = int(_OVERHEAD_REPORTS[requester_key].get("excess", 0))
+    largest = 0
+    for _mi in request.get("model_info") or []:
+        try:
+            largest = max(largest, int(_mi.get("largest_tensor") or 0))
+        except Exception:
+            pass
+    forward = state_sync.forward_cast_need(largest, request.get("num_streams"))
+    need = (int(total_requested * _REQUEST_SLACK)
+            + _WORKER_FIXED_VRAM_COST + requester_excess
+            + max(min_inference, forward))
 
     if _DBG_MODELS:
+        _inflight = sum(1 for _e in _WORKER_POOL.values()
+                        if getattr(_e[0], "_calls_in_flight", 0) > 0)
         _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB | "
              f"free: blind={blind_free / 1e9:.2f}GB true={true_free / 1e9:.2f}GB "
-             f"offset={offset / 1e9:.2f}GB ({offset_source}) | "
-             f"need={need / 1e9:.2f}GB -> asking free_memory for "
+             f"offset={offset / 1e9:.2f}GB ({offset_source}, "
+             f"{_inflight} in-flight worker(s) charge size) | "
+             f"need={need / 1e9:.2f}GB (forward={forward / 1e9:.2f}GB, "
+             f"excess={requester_excess / 1e9:.2f}GB) -> asking free_memory for "
              f"{(need + offset) / 1e9:.2f}GB")
 
     # Offset-compensated target: makes ComfyUI's own arithmetic behave as if
@@ -446,6 +526,7 @@ def _cleanup_stale_patchers(env_dir):
     The stale references are cleared on the next _register_new_patchers call.
     """
     key = str(env_dir)
+    _OVERHEAD_REPORTS.pop(key, None)  # the replaced process's scratch is gone
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
@@ -521,10 +602,35 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
 
             import asyncio
             loop = asyncio.get_event_loop()
+
+            def _routed_call():
+                # In-flight bracket for admission (models charge full size
+                # while the worker computes). call_module has no node
+                # boundary, so on exit run a PEAK-ONLY raise pass over the
+                # harvested census: peak writes are legal any time (upstream
+                # never reads them), but the ledger and seq stay boundary
+                # only, so the census remains in place for the full apply at
+                # the env's next call_method.
+                worker._calls_in_flight = getattr(worker, "_calls_in_flight", 0) + 1
+                try:
+                    return worker.call_module(_module, _func, 120.0, body=body)
+                finally:
+                    try:
+                        _census = getattr(worker, "_last_residency", None)
+                        _live = _WORKER_PATCHERS.get(str(_env_dir), {})
+                        for _entry in _census or []:
+                            _p = _live.get(_entry.get("id"))
+                            if _p is not None:
+                                _p._residency_peak = max(
+                                    int(getattr(_p, "_residency_peak", 0)),
+                                    int(_entry.get("resident", 0)))
+                    except Exception:
+                        pass
+                    worker._calls_in_flight = max(
+                        0, getattr(worker, "_calls_in_flight", 1) - 1)
+
             try:
-                result = await loop.run_in_executor(
-                    None, lambda: worker.call_module(_module, _func, 120.0, body=body),
-                )
+                result = await loop.run_in_executor(None, _routed_call)
             except Exception as exc:
                 _log(f"[comfy-env] Route {_path} error: {exc}")
                 return web.json_response({"error": str(exc)}, status=500)
@@ -543,6 +649,145 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
             continue
         route_method(path)(_make_proxy)
         _log(f"[comfy-env] Registered proxy route: {method} {path} -> {module_name}.{handler_func}")
+
+
+# --- /free broadcast: the host's free button crosses the process boundary ---
+
+#: Kill switch for comfy-env's first host-side function wrap. Off restores
+#: byte-identical behavior; one release with a revert path that needs no
+#: package rollback.
+FREE_BROADCAST_ENV_VAR = "COMFY_ENV_FREE_BROADCAST"
+
+_FREE_WRAP_INSTALLED = False
+_LAST_RELEASE_BROADCAST = [0.0]
+
+
+def _install_free_broadcast() -> None:
+    """Wrap comfy.model_management.unload_all_models, once.
+
+    Its exactly three upstream callers (main.py's /free flag path and
+    execution.py's OOM and DISABLE_SMART_MEMORY fallbacks) all mean "release
+    everything", which is the only honest trigger comfy-env can observe: the
+    proxy-detach hook is blind to call_module packs and to a second /free
+    (upstream pops unloaded ledger entries), and comfy-env's own admission
+    eviction calls free_memory, never this, so no self-eviction guard is
+    needed. Wrap calls the original FIRST (the sweep detaches worker models
+    and drops their pin registrations through the real unpatch path), then
+    broadcasts. Install failure logs once and degrades, never raises."""
+    global _FREE_WRAP_INSTALLED
+    if _FREE_WRAP_INSTALLED:
+        return
+    _FREE_WRAP_INSTALLED = True
+    if os.environ.get(FREE_BROADCAST_ENV_VAR, "1").strip().lower() in (
+            "0", "false", "off"):
+        return
+    try:
+        import comfy.model_management as mm
+        _original = mm.unload_all_models
+
+        def _wrapped_unload_all_models(*args, **kwargs):
+            result = _original(*args, **kwargs)
+            try:
+                broadcast_release()
+            except Exception as exc:
+                _log(f"[comfy-env] release broadcast failed: {exc}")
+            return result
+
+        mm.unload_all_models = _wrapped_unload_all_models
+    except Exception as exc:
+        _log(f"[comfy-env] free-broadcast wrap not installed: {exc}")
+
+
+# --- Prompt epoch source: the host's one observer of prompt boundaries ----
+
+_PROMPT_EPOCH_INSTALLED = False
+
+
+def _install_prompt_epoch() -> None:
+    """Class-patch comfy.model_patcher.PromptModelTracker.start, once.
+
+    start() runs exactly once per prompt on the executor; bumping a monotonic
+    counter there is the only prompt-boundary signal comfy-env can observe
+    (workers run no executor). The counter rides every worker request as
+    prompt_gen so workers can retire the PREVIOUS prompt's pin marks; the
+    counter's 0 start is translated to None by senders, so a failed or
+    switched-off patch degrades to the workers' sticky-with-decay fallback.
+    Behind the same switch that gates the worker mark writes
+    (COMFY_ENV_PIN_MARKS); install failure logs once and degrades, never
+    raises. Order-independent with the /free wrap (disjoint targets)."""
+    global _PROMPT_EPOCH_INSTALLED
+    if _PROMPT_EPOCH_INSTALLED:
+        return
+    _PROMPT_EPOCH_INSTALLED = True
+    if os.environ.get(state_sync.PIN_MARKS_ENV_VAR, "1").strip().lower() in (
+            "0", "false", "off"):
+        return
+    try:
+        import comfy.model_patcher as _cmp
+        _orig_start = _cmp.PromptModelTracker.start
+
+        def _epoch_start(self, *args, **kwargs):
+            state_sync.PROMPT_GEN[0] += 1
+            return _orig_start(self, *args, **kwargs)
+
+        _cmp.PromptModelTracker.start = _epoch_start
+    except Exception as exc:
+        _log(f"[comfy-env] prompt-epoch patch not installed: {exc} "
+             f"(workers fall back to sticky marks with decay)")
+
+
+def broadcast_release() -> None:
+    """Send full_release to every idle advertising worker, in parallel.
+
+    Busy workers get a parent-owned deferral flag drained at their next node
+    boundary (a mid-compute worker is not reading its socket, and its memory
+    is in use anyway). Dead workers are skipped, never respawned. Every send
+    binds its reply: the receipt's measured numbers are logged per worker,
+    and the reply's piggybacked census and pin scalar are INGESTED here (a
+    released worker may go quiet; waiting for a next call that never comes
+    would advertise stale pins forever)."""
+    now = time.monotonic()
+    with _POOL_LOCK:
+        entries = dict(_WORKER_POOL)
+    plan = state_sync.plan_release_broadcast(
+        {key: {"alive": worker.is_alive(),
+               "advertises": getattr(worker, "supports_full_release", False)}
+         for key, (worker, _g) in entries.items()},
+        now, _LAST_RELEASE_BROADCAST[0])
+    if plan["send"]:
+        _LAST_RELEASE_BROADCAST[0] = now
+    for key in plan["skip_dead"]:
+        _log(f"[comfy-env] /free: worker {Path(key).name} is dead, skipped")
+
+    def _release_one(key):
+        worker, gen = entries[key]
+        try:
+            r = worker.send_command_no_spawn("full_release", lock_timeout=2.0)
+            if r == "busy":
+                worker._release_deferred = True
+                _log(f"[comfy-env] /free: worker {Path(key).name} busy, "
+                     f"release deferred to its next node boundary")
+                return
+            if r == "dead":
+                return
+            receipt = (r or {}).get("receipt") or {}
+            _ingest_worker_frames(key, worker, gen)
+            _log(f"[comfy-env] /free worker {Path(key).name}: reserved "
+                 f"{receipt.get('reserved_before', 0) / 1e9:.2f}GB -> "
+                 f"{receipt.get('reserved_after', 0) / 1e9:.2f}GB, pinned "
+                 f"{receipt.get('pinned_before', 0) / 1e9:.2f}GB -> "
+                 f"{receipt.get('pinned_after', 0) / 1e9:.2f}GB"
+                 + (f", errors={receipt.get('errors')}"
+                    if receipt.get("errors") else ""))
+        except Exception as exc:
+            _log(f"[comfy-env] /free: release of {Path(key).name} failed: {exc}")
+
+    threads = [threading.Thread(target=_release_one, args=(k,), daemon=True)
+               for k in plan["send"]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=90.0)
 
 
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
@@ -587,6 +832,23 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                         int(getattr(_cmm, "RAM_CACHE_HEADROOM", 0)))
             except Exception:
                 pass
+        # Reserve bootstrap: the budget owner's advance payment, deliberately
+        # OUTSIDE the pin split gate (it is not experimental). Injected only
+        # when the host explicitly set --reserve-vram, read from the SAME
+        # attribute the budget reply forwards (never recomputed from the GB
+        # float flag: one computation, one owner, and the unit trap of
+        # exporting "8" where bytes are owed dies structurally). Guarded
+        # not-in so pack [env_vars] wins.
+        try:
+            import comfy.model_management as _rmm
+            from comfy.cli_args import args as _rargs
+            if getattr(_rargs, "reserve_vram", None) is not None \
+                    and state_sync.RESERVE_ENV_VAR not in (env_vars or {}):
+                env_vars = dict(env_vars or {})
+                env_vars[state_sync.RESERVE_ENV_VAR] = str(
+                    int(_rmm.EXTRA_RESERVED_VRAM))
+        except Exception:
+            pass
         worker = _create_worker(env_dir, working_dir, sys_path, env_vars, health_check_timeout)
         # Register bidirectional RPC callbacks. The budget callback carries
         # this worker's key so the pin allocator knows who is asking.
@@ -608,6 +870,11 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
     _report_memory_manager(worker, env_dir)
+    # Host-side patches install at first worker creation (idempotent, each
+    # behind its own kill switch): without workers there is nothing for the
+    # /free broadcast to reach and nobody to consume the prompt epoch.
+    _install_free_broadcast()
+    _install_prompt_epoch()
     return worker, gen
 
 
@@ -682,6 +949,9 @@ def _remove_worker(env_dir):
     # redistributes on the next budget RPC.
     _PIN_REPORTS.pop(key, None)
     _PIN_GRANTS.pop(key, None)
+    # Dead worker's overhead died with it; a retained entry would book ~1 GB
+    # of phantom scratch per crash in a restart loop.
+    _OVERHEAD_REPORTS.pop(key, None)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
@@ -730,22 +1000,17 @@ def _insert_loaded_model(p, currently_used):
     comfy.model_management.current_loaded_models.insert(0, lm)
 
 
-def _register_new_patchers(env_dir, worker, generation):
-    """Create SubprocessModelPatchers for any models auto-detected during the last call.
+def _ingest_worker_frames(env_dir, worker, generation):
+    """Drain and apply everything a worker's frames piggybacked: the residency
+    census, the pin scalar, and the measured VRAM overhead.
 
-    Called after each call_method.  The worker's Module.to()/cuda() hooks
-    auto-register nn.Modules that land on CUDA; the worker returns their
-    metadata in response['_new_models'].  We create patchers here and register
-    them with ComfyUI's memory manager so they participate in VRAM eviction.
+    One helper, two callers: the node boundary (_register_new_patchers) and
+    the full_release broadcast's reply path -- harvest happens in
+    _send_request for both, but harvested is not applied, and a released
+    worker may go quiet, so the broadcast must apply its receipt itself
+    rather than waiting for a next call that may never come.
     """
-    # Release stale patchers from previous worker restarts.  Safe to do here
-    # because we're outside free_memory's iteration loop.
-    _STALE_PATCHERS.clear()
-
-    # Apply the residency census FIRST, before the eviction repair and long
-    # before the `if model_id in patchers: continue` skip below: that skip is
-    # exactly what made already-known models unreachable, freezing their
-    # registration-time stamp while aimdo paged residency out from under it.
+    global _OVERHEAD_SEQ
     _mode = os.environ.get(state_sync.RESIDENCY_ENV_VAR, "boundary").lower()
     if _mode not in ("off", "command", "0", "false"):
         census = getattr(worker, "_last_residency", None)
@@ -764,6 +1029,52 @@ def _register_new_patchers(env_dir, worker, generation):
     if _pin is not None:
         worker._last_pinned = None
         _pin_ingest(str(env_dir), _pin)
+
+    # Measured VRAM overhead: allocator bytes beyond registered residency
+    # (cast buffers, cache). REPLACE on arrival order; self-measured
+    # in-frame, so no peak is needed and stale-HIGH while idle over-books,
+    # the safe direction.
+    _ov = getattr(worker, "_last_vram_overhead", None)
+    if _ov is not None:
+        worker._last_vram_overhead = None
+        _OVERHEAD_SEQ += 1
+        state_sync.update_overhead_reports(_OVERHEAD_REPORTS, str(env_dir),
+                                           _ov, _OVERHEAD_SEQ, log=_log)
+
+
+def _register_new_patchers(env_dir, worker, generation):
+    """Create SubprocessModelPatchers for any models auto-detected during the last call.
+
+    Called after each call_method.  The worker's Module.to()/cuda() hooks
+    auto-register nn.Modules that land on CUDA; the worker returns their
+    metadata in response['_new_models'].  We create patchers here and register
+    them with ComfyUI's memory manager so they participate in VRAM eviction.
+    """
+    # Release stale patchers from previous worker restarts.  Safe to do here
+    # because we're outside free_memory's iteration loop.
+    _STALE_PATCHERS.clear()
+
+    # Apply the residency census FIRST, before the eviction repair and long
+    # before the `if model_id in patchers: continue` skip below: that skip is
+    # exactly what made already-known models unreachable, freezing their
+    # registration-time stamp while aimdo paged residency out from under it.
+    _ingest_worker_frames(env_dir, worker, generation)
+
+    # Drain a /free release the broadcast deferred because this worker was
+    # mid-call: the call just ended, the worker is idle between requests, and
+    # this thread can win the lock immediately.
+    if getattr(worker, "_release_deferred", False):
+        worker._release_deferred = False
+        try:
+            r = worker.send_command_no_spawn("full_release", lock_timeout=2.0)
+            if r == "busy":
+                worker._release_deferred = True  # try again next boundary
+            elif isinstance(r, dict):
+                _ingest_worker_frames(env_dir, worker, generation)
+                _log(f"[comfy-env] /free: deferred release of "
+                     f"{Path(str(env_dir)).name} completed")
+        except Exception as _fre:
+            _log(f"[comfy-env] /free: deferred release failed: {_fre}")
 
     # Repair entries free_memory removed on a FAILED eviction. Upstream's
     # model_unload returns True even when detach() could not reach the worker

@@ -321,3 +321,74 @@ class TestParentCapturesNewModels:
                 "the _new_models harvest no longer precedes the status check; "
                 "models loaded during a raising call would be lost again"
             )
+
+
+class TestApplyReserveBootstrap:
+    """The budget owner's advance payment. Zero is a VALUE here (upstream
+    honors --reserve-vram 0 and the reply assigns it verbatim), deliberately
+    different from apply_pin_budget's disabled sentinel; a harmonizing
+    refactor of the two appliers is the named enemy."""
+
+    def _mm(self, monkeypatch, preset=400 * 1024 * 1024):
+        import sys
+        import types
+        mod = types.ModuleType("comfy.model_management")
+        mod.EXTRA_RESERVED_VRAM = preset
+        monkeypatch.setitem(sys.modules, "comfy.model_management", mod)
+        return mod
+
+    def test_absent_is_a_noop_byte_identical(self, monkeypatch):
+        """Catches: a default of 0 silently zeroing every worker's margin
+        when the pool does not inject."""
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        mod = self._mm(monkeypatch)
+        assert apply_reserve_bootstrap(None) is False
+        assert mod.EXTRA_RESERVED_VRAM == 400 * 1024 * 1024
+
+    def test_zero_is_a_value_not_absence(self, monkeypatch):
+        """Catches: an `if value:` truthiness guard, whose failure mode is a
+        --reserve-vram 0 host whose workers keep a 400 MiB phantom margin
+        until first load and then drop to 0, the exact window inconsistency
+        this fix removes."""
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        mod = self._mm(monkeypatch)
+        assert apply_reserve_bootstrap("0") is True
+        assert mod.EXTRA_RESERVED_VRAM == 0
+
+    def test_sets_exactly_the_given_bytes_never_adds(self, monkeypatch):
+        """Catches: += accumulation, under which the worker believes margin
+        equal to bootstrap plus reply and ratchets every load."""
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        mod = self._mm(monkeypatch)
+        two_gib = 2 * 1024 ** 3
+        apply_reserve_bootstrap(str(two_gib))
+        assert mod.EXTRA_RESERVED_VRAM == two_gib
+        assert mod.EXTRA_RESERVED_VRAM != two_gib + 400 * 1024 * 1024
+
+    def test_negative_crosses_verbatim_with_a_warn(self, monkeypatch):
+        """The flag is an unbounded float upstream, so negatives are
+        reachable from the CLI; both settlement legs forward them verbatim,
+        and clamping only the advance would disagree with its own
+        settlement."""
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        mod = self._mm(monkeypatch)
+        msgs = []
+        assert apply_reserve_bootstrap("-1024", log=msgs.append) is True
+        assert mod.EXTRA_RESERVED_VRAM == -1024
+        assert any("negative" in m for m in msgs)
+
+    def test_garbage_warns_and_noops(self, monkeypatch):
+        """Catches: an uncaught ValueError crashing worker startup before the
+        ready frame, turning a config typo into a dead pool."""
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        mod = self._mm(monkeypatch)
+        msgs = []
+        assert apply_reserve_bootstrap("8GB", log=msgs.append) is False
+        assert mod.EXTRA_RESERVED_VRAM == 400 * 1024 * 1024
+        assert msgs
+
+    def test_no_comfy_is_a_noop(self, monkeypatch):
+        import sys
+        from comfy_env.memory_manager import apply_reserve_bootstrap
+        monkeypatch.setitem(sys.modules, "comfy.model_management", None)
+        assert apply_reserve_bootstrap("1024") is False

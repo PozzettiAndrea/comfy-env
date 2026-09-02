@@ -36,6 +36,7 @@ import sys
 
 import comfy.model_management
 
+from .. import state_sync
 from ..debug import VRAM as _DBG_VRAM
 
 log = logging.getLogger("comfy_env.model_patcher")
@@ -144,10 +145,21 @@ class SubprocessModelPatcher:
     def _worker_gone(self):
         return not self._worker.is_alive()
 
+    def _in_flight(self) -> bool:
+        """Whether a node call is executing in this proxy's worker RIGHT NOW.
+
+        Read at echo application time; stable because node execution is
+        serialized parent side (the worker RLock is held across the call and
+        eviction commands re-enter on the same thread)."""
+        return getattr(self._worker, "_calls_in_flight", 0) > 0
+
     def _mark_offloaded(self):
-        """Local bookkeeping for 'the weights are not on the GPU any more'."""
-        self.model.device = self.offload_device
-        self.model.model_loaded_weight_memory = 0
+        """Local bookkeeping for 'the weights are not on the GPU any more'.
+
+        A full unload is an UNMAP receipt: the admission peak drops to 0 with
+        the ledger (every regrowth path out of unmapped is signaled), fixing
+        the peak that used to stay stuck high forever after a detach."""
+        state_sync.apply_echo(self, 0, unmapped=True)
         self.model.model_offload_buffer_memory = 0
 
     def _send(self, command, *, quiet_on_loss, **kwargs):
@@ -236,7 +248,10 @@ class SubprocessModelPatcher:
                        extra_bytes=want, device=str(device_to))
         loaded = int((r or {}).get("loaded", 0))
         resident = int((r or {}).get("resident", loaded))
-        self.model.model_loaded_weight_memory = resident
+        # Load echoes record seq too (they used to drop it, so a census
+        # sampled BEFORE the load could pass the guard after it).
+        state_sync.apply_echo(self, resident, seq=(r or {}).get("seq"),
+                              in_flight=self._in_flight())
         if resident > 0:
             self.model.device = device_to
         _log_vram(f"After load '{self._model_id}' (+{loaded // (1024 * 1024)} MB)")
@@ -264,15 +279,12 @@ class SubprocessModelPatcher:
             return 0
         freed = int(r.get("freed", 0))
         resident = int(r.get("resident", max(0, resident_before - freed)))
-        # A command echo is the freshest possible receipt: record its seq so a
-        # frame census that left the worker earlier cannot resurrect these
-        # bytes, and reset the admission peak to the new truth.
-        if "seq" in r:
-            self._residency_seq = int(r["seq"])
-        self._residency_peak = resident
-        self.model.model_loaded_weight_memory = resident
-        if resident <= 0:
-            self.model.device = self.offload_device
+        # A command echo is the freshest receipt for the LEDGER; whether it
+        # may lower the admission PEAK depends on whether the worker is
+        # computing (it can lazily re-fault mid call with no signal) -- the
+        # rules live in state_sync.apply_echo.
+        state_sync.apply_echo(self, resident, seq=r.get("seq"),
+                              in_flight=self._in_flight())
         _log_vram(f"After partial offload '{self._model_id}' (-{freed // (1024 * 1024)} MB)")
         return freed
 

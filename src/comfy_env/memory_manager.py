@@ -421,6 +421,9 @@ def pin_state() -> Optional[Dict[str, Any]]:
         "total_pinned": int(getattr(mm, "TOTAL_PINNED_MEMORY", 0)),
         "max_pinned": int(getattr(mm, "MAX_PINNED_MEMORY", 0)),
         "pin_errors": _PIN_ERROR_COUNTER.count if _PIN_ERROR_COUNTER else 0,
+        "pins_evicted_bytes": _PIN_EVICTED["bytes"],
+        "pins_evicted_active_bytes": _PIN_EVICTED["active_bytes"],
+        "pin_churn": _PIN_EVICTED["churn"],
         "seq": _PIN_STATE_SEQ,
     }
 
@@ -487,3 +490,268 @@ def apply_pin_budget(grant=None, headroom=None, log=None) -> bool:
     except Exception as exc:
         _log(f"[worker] pin headroom mirror failed: {exc}")
     return changed
+
+
+# ---------------------------------------------------------------------------
+# /free deep release (worker side)
+# ---------------------------------------------------------------------------
+
+def full_release(log=None, _modules=None) -> Dict[str, Any]:
+    """Deep release for the host's /free button. Never raises.
+
+    Runs AFTER the host's unload_all_models sweep already detached this
+    worker's registered models (which also dropped their pin registrations
+    through the real unpatch path), so the ladder here touches only
+    rebuildable cache and garbage, never state:
+
+    1. Node-boundary transients (cast buffers, prefetch queues, vbar
+       watermarks) -- unconditional, unlike release_node_boundary's aimdo
+       gate, because non-aimdo workers keep cast buffers forever (upstream's
+       only reset call site is aimdo-gated).
+    2. gc.collect: cycle-held tensors return their blocks to the device
+       allocator and their pinned buffers to torch's host cache; both later
+       rungs depend on running after it.
+    3. synchronize + empty_cache + ipc_collect: returns the gc-fed device
+       blocks; synchronize also guarantees no in-flight DMA still reads
+       pinned buffers before rung 4 sweeps them.
+    4. torch._C._host_emptyCache (hasattr-guarded private API): last, so it
+       sweeps the host-cache buffers rungs 2 and 3 just returned. This is
+       the ~2 GB of retained pinned RSS nothing else gives back.
+
+    Deliberately untouched: the state-sync overflow store (node STATE; loss
+    converts the next call into a pointed error), the shm/tensor keepers
+    (lifetime belongs to the consumed-ack protocol), and ComfyUI's pin
+    registration ledger (free_registrations here would desynchronize
+    TOTAL_PINNED accounting; the unload sweep already dropped what should
+    drop).
+
+    ``_modules`` defaults to sys.modules; tests inject fakes so bare CI
+    drives the whole ladder. Returns a receipt with per-rung outcomes and
+    measured before/after numbers, never assumed ones.
+    """
+    _log = log or (lambda *_: None)
+    modules = sys.modules if _modules is None else _modules
+    receipt: Dict[str, Any] = {"steps": [], "errors": []}
+    torch = modules.get("torch")
+    mm = modules.get("comfy.model_management")
+
+    def _measure(suffix: str) -> None:
+        try:
+            if torch is not None and torch.cuda.is_initialized():
+                receipt["reserved_" + suffix] = int(torch.cuda.memory_reserved())
+        except Exception:
+            pass
+        try:
+            if mm is not None:
+                receipt["pinned_" + suffix] = int(
+                    getattr(mm, "TOTAL_PINNED_MEMORY", 0))
+        except Exception:
+            pass
+
+    def _step(name: str, fn) -> None:
+        try:
+            fn()
+            receipt["steps"].append({"name": name, "ok": True})
+        except Exception as exc:
+            receipt["steps"].append({"name": name, "ok": False,
+                                     "error": str(exc)})
+            receipt["errors"].append(f"{name}: {exc}")
+
+    _measure("before")
+    if mm is not None and hasattr(mm, "reset_cast_buffers"):
+        _step("reset_cast_buffers", mm.reset_cast_buffers)
+    _prefetch = modules.get("comfy.model_prefetch")
+    if _prefetch is not None and hasattr(_prefetch, "cleanup_prefetch_queues"):
+        _step("cleanup_prefetch_queues", _prefetch.cleanup_prefetch_queues)
+    _vbar = modules.get("comfy_aimdo.model_vbar")
+    if _vbar is not None and hasattr(_vbar, "vbars_reset_watermark_limits"):
+        _step("vbars_reset_watermark_limits", _vbar.vbars_reset_watermark_limits)
+
+    import gc
+    _step("gc_collect", gc.collect)
+
+    if torch is not None:
+        try:
+            cuda_up = torch.cuda.is_initialized()
+        except Exception:
+            cuda_up = False
+        if cuda_up:
+            _step("synchronize", torch.cuda.synchronize)
+            _step("empty_cache", torch.cuda.empty_cache)
+            _step("ipc_collect", torch.cuda.ipc_collect)
+        _host_empty = getattr(getattr(torch, "_C", None),
+                              "_host_emptyCache", None)
+        if _host_empty is not None:
+            _step("host_empty_cache", _host_empty)
+
+    _measure("after")
+    try:
+        _log(f"[worker] full release: reserved "
+             f"{receipt.get('reserved_before', 0) / 1e9:.2f}GB -> "
+             f"{receipt.get('reserved_after', 0) / 1e9:.2f}GB, pinned "
+             f"{receipt.get('pinned_before', 0) / 1e9:.2f}GB -> "
+             f"{receipt.get('pinned_after', 0) / 1e9:.2f}GB, "
+             f"errors={len(receipt['errors'])}")
+    except Exception:
+        pass
+    return receipt
+
+
+def apply_reserve_bootstrap(value, log=None) -> bool:
+    """Mirror the host's resolved EXTRA_RESERVED_VRAM before the first budget
+    reply. The reply channel remains sole owner: its plain assignment
+    supersedes this on the first shimmed load, so steady state is unchanged;
+    what this fixes is the pre-reply window, whose only real consumer is the
+    dtype heuristics at model CREATION (maximum_vram_for_weights feeding
+    unet_dtype / should_use_fp16 / should_use_bf16) -- permanent choices,
+    shifted by the full host reserve (an 8 GB reserve host moves the worker's
+    threshold 7.6 GB, flipping fp8 to fp16 in that band).
+
+    Parses inside (a garbage env value must WARN here, not kill the caller's
+    whole bootstrap block). ZERO IS A VALUE: upstream honors --reserve-vram 0
+    (the guard there is `is not None`), and the reply assigns 0 verbatim, so
+    the advance must too -- deliberately DIFFERENT from apply_pin_budget,
+    where <= 0 is a disabled sentinel; a "harmonizing" refactor of the two is
+    the named enemy. Negatives also cross verbatim (reachable from the CLI:
+    the flag is an unbounded float) with one WARN, because clamping only the
+    advance would make it disagree with its own settlement. Never raises.
+    Returns True if the module value changed.
+    """
+    _log = log or (lambda *_: None)
+    if value is None:
+        return False
+    try:
+        bytes_value = int(str(value).strip())
+    except Exception:
+        _log(f"[worker] reserve bootstrap: unparseable value {value!r}, ignored")
+        return False
+    if bytes_value < 0:
+        _log(f"[worker] reserve bootstrap: negative margin {bytes_value} "
+             f"mirrored verbatim (matches what the budget reply would assign)")
+    try:
+        mm = sys.modules.get("comfy.model_management")
+        if mm is None or not hasattr(mm, "EXTRA_RESERVED_VRAM"):
+            return False
+        old = mm.EXTRA_RESERVED_VRAM
+        if old == bytes_value:
+            return False
+        mm.EXTRA_RESERVED_VRAM = bytes_value
+        _log(f"[worker] comfy margin {bytes_value / 1e9:.2f}GB (host advance, "
+             f"was {old / 1e9:.2f}GB upstream default; first budget reply "
+             f"supersedes)")
+        return True
+    except Exception as exc:
+        _log(f"[worker] reserve bootstrap failed: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Prompt-epoch pin marks (worker side)
+# ---------------------------------------------------------------------------
+
+def apply_prompt_marks(registry, to_set, to_clear, log=None) -> int:
+    """Flip ``current_prompt`` on the worker's dynamic patchers.
+
+    ``registry`` maps model key to patcher. Triple-gated per patcher, so
+    ledger-mode workers (base ModelPatcher, no dynamic_pins) and older
+    ComfyUIs (no setter) are structurally inert: ``is_dynamic()`` must be
+    true AND ``set_in_use_by_current_prompt`` must exist. Never raises;
+    returns flips applied. The marks themselves live only in worker memory,
+    so a restart clears them for free."""
+    _log = log or (lambda *_: None)
+    flips = 0
+    for keys, value in ((to_set, True), (to_clear, False)):
+        for key in keys:
+            try:
+                p = registry.get(key)
+                if p is None or not p.is_dynamic():
+                    continue
+                setter = getattr(p, "set_in_use_by_current_prompt", None)
+                if setter is None:
+                    continue
+                setter(value)
+                flips += 1
+            except Exception as exc:
+                _log(f"[worker] prompt mark {key}={value} failed: {exc}")
+    return flips
+
+
+#: Eviction counters. pin_errors (the register-failure warning counter) is
+#: provably BLIND to churn: the ping-pong loop unregisters and re-registers
+#: successfully, logging nothing. These count what actually moved.
+_PIN_EVICTED = {"bytes": 0, "active_bytes": 0, "churn": 0}
+_EVICTED_EPOCH_KEYS: set = set()
+_EVICTION_COUNTERS_INSTALLED = False
+
+
+def reset_pin_churn_epoch() -> None:
+    """Called at a prompt-epoch change: churn counts re-evictions WITHIN one
+    prompt (the ping-pong signature), not across prompts."""
+    _EVICTED_EPOCH_KEYS.clear()
+
+
+def install_pin_eviction_counters(log=None) -> None:
+    """Wrap comfy.model_management.free_model_pins, the single choke point of
+    both pin-eviction paths, with per-victim attribution via
+    pinned_memory_size deltas. Idempotent; observability only (the wrapper
+    calls the original unconditionally and returns its result verbatim).
+
+    ``active_bytes`` is the fix's own regression signal: after prompt marks
+    ship, bytes evicted from a victim whose ``active`` flag was set must be
+    ZERO (tier 1 ignoring `active` is the corruption window)."""
+    global _EVICTION_COUNTERS_INSTALLED
+    if _EVICTION_COUNTERS_INSTALLED:
+        return
+    mm = sys.modules.get("comfy.model_management")
+    if mm is None or not hasattr(mm, "free_model_pins"):
+        return
+    _EVICTION_COUNTERS_INSTALLED = True
+    _log = log or (lambda *_: None)
+    _orig = mm.free_model_pins
+
+    def _counted_free_model_pins(size, subsets, current_prompt, active,
+                                 registrations=False):
+        candidates = []
+        before = {}
+        try:
+            candidates = list(mm.models_for_pin_eviction(
+                active, current_prompt=current_prompt))
+            for m in candidates:
+                try:
+                    before[id(m)] = int(m.pinned_memory_size())
+                except Exception:
+                    pass
+        except Exception:
+            candidates = []
+        freed = _orig(size, subsets, current_prompt, active,
+                      registrations=registrations)
+        try:
+            _PIN_EVICTED["bytes"] += max(0, int(freed))
+            for m in candidates:
+                b = before.get(id(m))
+                if b is None:
+                    continue
+                try:
+                    delta = b - int(m.pinned_memory_size())
+                except Exception:
+                    continue
+                if delta <= 0:
+                    continue
+                try:
+                    st = m.model.dynamic_pins.get(m.load_device) or {}
+                    if st.get("active"):
+                        _PIN_EVICTED["active_bytes"] += delta
+                        _log(f"[worker] pin evict hit ACTIVE model "
+                             f"{type(m.model).__name__}: {delta / 1e6:.0f}MB "
+                             f"tier=({subsets},{current_prompt},{active})")
+                except Exception:
+                    pass
+                k = id(m.model)
+                if k in _EVICTED_EPOCH_KEYS:
+                    _PIN_EVICTED["churn"] += 1
+                _EVICTED_EPOCH_KEYS.add(k)
+        except Exception:
+            pass
+        return freed
+
+    mm.free_model_pins = _counted_free_model_pins

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Problem 7: residency census
@@ -64,18 +64,34 @@ def apply_residency(patchers: Dict[str, Any], census: List[Dict[str, Any]],
             continue
         try:
             seq = int(entry.get("seq", 0))
-            if seq <= getattr(p, "_residency_seq", -1):
-                continue  # stale: an eviction reply already superseded this
             resident = int(entry.get("resident", 0))
             size = int(getattr(p, "size", 0)) or resident
             resident = max(0, min(resident, size))
             old = int(getattr(p.model, "model_loaded_weight_memory", 0))
+            if seq < getattr(p, "_residency_seq", -1):
+                # Strictly older only: a census carrying the SAME seq as a
+                # command echo was sampled AFTER that echo's byte movement
+                # (the worker bumps at echo-send time, single threaded, one
+                # FIFO socket), so the tie goes to the census. The old <=
+                # drop made every post-echo census a dead letter: nothing
+                # bumps seq at a lazy re-fault, so the eviction blindness
+                # window never closed.
+                if log is not None and \
+                        abs(resident - held_ceiling(p)) > RESIDENCY_WARN_BYTES:
+                    log(f"[comfy-env] WARNING stale census dropped model={mid} "
+                        f"worker={resident / 1e9:.2f}GB "
+                        f"ceiling={held_ceiling(p) / 1e9:.2f}GB "
+                        f"(seq {seq} < {getattr(p, '_residency_seq', -1)}); "
+                        f"parent may be blind to re-faulted bytes")
+                continue
             p._residency_seq = seq
-            # admission ceiling: highest residency seen since the last direct
-            # command receipt. _worker_held_bytes reads it so a paging model
-            # cannot make true free look larger than it is.
-            p._residency_peak = max(resident,
-                                    int(getattr(p, "_residency_peak", 0)))
+            # The census is the DECAY AUTHORITY for the admission peak: it is
+            # a present-state statement sampled at a boundary, when the env is
+            # about to be idle (no unsignaled regrowth exits; while a call IS
+            # in flight the held_charge size override carries the pessimism,
+            # not the peak). A peak that only ratcheted up strands the old
+            # peak forever after real evictions.
+            p._residency_peak = resident
             if resident == old:
                 continue
             p.model.model_loaded_weight_memory = resident
@@ -91,6 +107,62 @@ def apply_residency(patchers: Dict[str, Any], census: List[Dict[str, Any]],
         except Exception:
             continue  # one bad entry must not poison the census
     return changed
+
+
+def apply_echo(p: Any, resident: int, seq: Optional[int] = None,
+               unmapped: bool = False, in_flight: bool = False) -> None:
+    """Apply a command echo (partial load/unload reply, or a detach receipt).
+
+    The ledger and seq are always written: an echo is the freshest receipt
+    for what it proves. The PEAK obeys the admissibility criterion (lower
+    the admission ceiling only when every regrowth exit out of the certified
+    state is signaled):
+
+    * ``unmapped`` (detach): peak drops to 0 in either flag state. Regrowth
+      from unmapped passes through the budget RPC, a load echo, or a fresh
+      registration; every exit signals. This also fixes the shipped bug
+      where a detach zeroed the ledger but left the peak stuck high forever.
+    * partial echo, NOT in flight: peak drops to the echoed resident. An
+      idle worker cannot re-fault (faults are synchronous worker Python), so
+      a commanded eviction of an idle env releases its over-reserve
+      immediately.
+    * partial echo, IN FLIGHT: peak only rises. The worker can lazily
+      re-fault mid call with no signal; the pessimism for that window lives
+      in ``held_charge``'s size override, but the pure layer must stay
+      admissible standing alone, so the peak is not lowered here.
+    """
+    try:
+        resident = max(0, int(resident))
+        if seq is not None:
+            p._residency_seq = int(seq)
+        if unmapped:
+            p._residency_peak = 0
+            resident = 0
+        elif not in_flight:
+            p._residency_peak = resident
+        else:
+            p._residency_peak = max(resident,
+                                    int(getattr(p, "_residency_peak", 0)))
+        p.model.model_loaded_weight_memory = resident
+        if resident <= 0:
+            p.model.device = p.offload_device
+    except Exception:
+        pass  # an echo bookkeeping failure must not fail the eviction path
+
+
+def held_charge(p: Any, in_flight: bool) -> int:
+    """Admission charge for one proxy.
+
+    Case split of the admissibility criterion: an IN FLIGHT worker charges
+    the supremum (model size), so unsignaled lazy re-faults can never exceed
+    the charge; an IDLE worker has no unsignaled regrowth exits (comfy_aimdo
+    has no fault hook or background prefetch thread; faults are synchronous
+    worker Python), so its receipts are authoritative and it charges
+    ``held_ceiling``. Residual, accepted: a pack thread that keeps computing
+    after its call returns (the ADR-0025 unhooked-allocation class)."""
+    if in_flight:
+        return max(held_ceiling(p), int(getattr(p, "size", 0)))
+    return held_ceiling(p)
 
 
 def held_ceiling(p: Any) -> int:
@@ -264,6 +336,15 @@ PIN_RESERVE_ENV_VAR = "COMFY_ENV_PIN_RESERVE"
 
 #: Matches the ensure_pin_budget floor at model_management.py:720.
 PIN_FLOOR_DEFAULT = 2 * 1024 ** 3
+
+#: The budget owner's ADVANCE PAYMENT of the reserve margin: a worker parses
+#: empty argv, so its EXTRA_RESERVED_VRAM sits on the upstream default from
+#: spawn until the first budget reply, and the dtype selectors (which read it
+#: at model creation, permanently) run in that window. The pool injects the
+#: host's resolved value verbatim; the first reply's plain assignment
+#: supersedes it. Same owner (the budget RPC), second channel for the
+#: pre-RPC window only.
+RESERVE_ENV_VAR = "COMFY_ENV_EXTRA_RESERVED_VRAM"
 PIN_RESERVE_DEFAULT = 0.5
 
 #: Damping (parent side): a grow below this delta is not emitted, so a paging
@@ -360,3 +441,229 @@ def damp_pin_grant(last_grant: Optional[int], new_grant: int,
     if stable_censuses < PIN_GROW_STABLE_CENSUSES:
         return last_grant
     return new_grant
+
+
+# ---------------------------------------------------------------------------
+# Worker VRAM overhead booking (coverage item: cast buffers vs the flat cost)
+# ---------------------------------------------------------------------------
+
+#: Per-worker fixed VRAM cost OUTSIDE the caching allocator: CUDA context plus
+#: cuBLAS/cuDNN handles. torch.cuda.memory_reserved structurally cannot see
+#: these, so the floor and the measured excess partition cleanly (floor =
+#: outside the allocator, excess = inside it beyond registered residency) and
+#: they ADD; max() would under-book by min(floor, excess). Measured 276 to
+#: 300 MiB on Linux/RTX 3090 (2026-09); the old 250 MiB figure was a Windows
+#: RTX 4060 Ti measurement.
+WORKER_VRAM_FLOOR = 300 * 1024 * 1024
+
+#: An overhead report above this WARNs at ingest (a 30 GB report on a 24 GB
+#: card is junk arithmetic worker-side; the clamp direction is still overbook,
+#: which can only starve admission, never OOM it).
+OVERHEAD_WARN_BYTES = 4 * 1024 ** 3
+
+
+def update_overhead_reports(reports: Dict[str, Dict[str, int]], key: str,
+                            excess: int, seq: int,
+                            log: Optional[Callable[[str], None]] = None) -> bool:
+    """Ingest one worker's measured overhead excess. Same stale-drop shape as
+    ``update_pin_reports``: REPLACE on newer seq (the value is self-measured
+    in-frame, so no peak is needed; stale-HIGH residue while idle is the safe
+    over-book direction), drop older whole."""
+    try:
+        seq = int(seq)
+        old = reports.get(key)
+        if old is not None and seq <= int(old.get("seq", -1)):
+            return False
+        excess = max(0, int(excess))
+        if log is not None and excess > OVERHEAD_WARN_BYTES:
+            log(f"[comfy-env] WARNING worker overhead report {key}: "
+                f"{excess / 1e9:.2f}GB exceeds {OVERHEAD_WARN_BYTES / 1e9:.0f}GB")
+        reports[key] = {"excess": excess, "seq": seq}
+        return True
+    except Exception:
+        return False
+
+
+def held_from_snapshot(snapshot: Dict[str, Dict[str, Any]],
+                       floor: int = WORKER_VRAM_FLOOR,
+                       cap: Optional[int] = None) -> int:
+    """Total worker-held VRAM from a pool snapshot. Pure; owned here so bare
+    CI drives the whole admission arithmetic.
+
+    ``snapshot`` maps worker key to ``{"in_flight": bool, "excess":
+    Optional[int], "models": [{"ledger": int, "peak": int, "size": int}]}``.
+    Dead workers' keys are ABSENT (the pool removes them); presence IS
+    liveness, so every listed worker books the floor even with zero models
+    (the old ``if patchers:`` skip booked a modelless live worker's CUDA
+    context at zero).
+
+    Per worker: sum over models of the per-patcher charge (``size`` when in
+    flight, else ``max(ledger, peak)`` -- the in-flight charge REPLACES the
+    ceiling, it never adds, or every resident byte of a computing worker
+    would be counted twice), plus ``floor``, plus the measured excess clamped
+    to ``[0, cap - floor]`` when a cap is known. The excess stays booked
+    while in flight: suppressing it would under-book cast buffers and cache
+    that physically persist through the call (the OOM direction); keeping it
+    risks at most one stale excess overlapping the size charge, which
+    over-books and heals on the completion frame.
+    """
+    total = 0
+    for w in snapshot.values():
+        in_flight = bool(w.get("in_flight"))
+        for m in w.get("models") or []:
+            if in_flight:
+                total += max(int(m.get("size", 0)),
+                             int(m.get("ledger", 0)), int(m.get("peak", 0)))
+            else:
+                total += max(int(m.get("ledger", 0)), int(m.get("peak", 0)))
+        excess = w.get("excess")
+        excess = max(0, int(excess)) if excess is not None else 0
+        if cap is not None:
+            excess = min(excess, max(0, int(cap) - int(floor)))
+        total += int(floor) + excess
+    return total
+
+
+def forward_cast_need(largest_tensor: Optional[int],
+                      num_streams: Optional[int]) -> int:
+    """The future cast-buffer bytes of the load being admitted RIGHT NOW.
+
+    Cast buffers allocate lazily at the first forward, AFTER admission, so
+    neither NVML nor the measured excess (both report the past or present)
+    can see them; only the incoming load's own numbers can. ``largest_tensor``
+    comes from the worker's shim (it holds the real patchers), and
+    ``num_streams`` is the worker's LIVE resolved value sent on the same
+    request (never cli_mirror). Degrades: either input absent means 0, which
+    collapses the need formula's max() back to min_inference, today's
+    behavior. The consumer takes max(min_inference, this), never the sum:
+    cast buffers are inference transients competing for the same reserve.
+    """
+    if not largest_tensor or not num_streams:
+        return 0
+    return max(0, int(num_streams)) * max(0, int(largest_tensor))
+
+
+# ---------------------------------------------------------------------------
+# /free broadcast planning
+# ---------------------------------------------------------------------------
+
+#: Minimum seconds between release broadcasts: absorbs OOM-recovery
+#: rebroadcasts and a /free press coinciding with one.
+RELEASE_DEBOUNCE_SECONDS = 2.0
+
+
+def plan_release_broadcast(workers: Dict[str, Dict[str, Any]], now: float,
+                           last_broadcast: float,
+                           debounce: float = RELEASE_DEBOUNCE_SECONDS
+                           ) -> Dict[str, List[str]]:
+    """Which workers get the full_release command.
+
+    ``workers`` maps key to ``{"alive": bool, "advertises": bool}``. Every
+    input key lands in exactly one output list (set equality, so a filtered
+    worker cannot hide): ``send`` (alive advertisers), ``skip_dead`` (their
+    memory died with them; the send path must NEVER resurrect one to free
+    it), ``skip_unsupported`` (no ready-frame advertisement; an unknown
+    method gets no reply and the sender eats the recv timeout). Inside the
+    debounce window everything moves to ``skip_debounced``.
+    """
+    out: Dict[str, List[str]] = {"send": [], "skip_dead": [],
+                                 "skip_unsupported": [], "skip_debounced": []}
+    if now - last_broadcast < debounce:
+        out["skip_debounced"] = sorted(workers)
+        return out
+    for key, w in workers.items():
+        if not w.get("alive"):
+            out["skip_dead"].append(key)
+        elif not w.get("advertises"):
+            out["skip_unsupported"].append(key)
+        else:
+            out["send"].append(key)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Prompt-epoch pin marks (worker current_prompt protection)
+# ---------------------------------------------------------------------------
+
+#: One kill switch, both ends: gates the host-side PromptModelTracker patch
+#: AND all worker mark writes. Off restores byte-identical behavior.
+PIN_MARKS_ENV_VAR = "COMFY_ENV_PIN_MARKS"
+
+#: Sticky-fallback decay: when no epoch token arrives (the host patch failed
+#: on an upstream refactor), marks survive this many calls and then clear.
+#: A named constant, deliberately not a knob: dark degrade would silently
+#: reopen the corruption window (tier 1 ignores `active`, and an unmarked
+#: mid-load model's staging pages can be decommitted under an in-flight
+#: async copy) exactly when protection matters most; sticky-with-decay keeps
+#: the window closed at the cost of bounded stale-mark overhang, visible in
+#: pin_churn.
+PROMPT_MARK_DECAY_CALLS = 8
+
+#: Host-side prompt epoch counter, bumped by the PromptModelTracker.start
+#: patch (once per prompt). A monotonic int, never an object id (gc reuse
+#: would alias two prompts). 0 means "no prompt observed yet"; senders
+#: translate 0 to None so workers use the sticky fallback until the first
+#: real prompt.
+PROMPT_GEN = [0]
+
+
+def clear_on_epoch_change(marks: Dict[str, Any], gen: Optional[int],
+                          call_n: int, live: Iterable[str],
+                          decay_calls: int = PROMPT_MARK_DECAY_CALLS
+                          ) -> Tuple[Dict[str, Any], List[str]]:
+    """Which marks to retire at the top of a worker call.
+
+    ``marks`` maps model key to ``(gen, call_n)`` of its last marking.
+    Returns ``(new_marks, to_clear)``; ``to_clear`` are keys whose
+    ``current_prompt`` flag must flip False. Rules:
+
+    * A mark from a DIFFERENT epoch clears: the previous prompt ended, and
+      protecting its models would demote this prompt's models behind them in
+      the tier walk (priority inversion).
+    * ``gen None`` is the sticky fallback: marks survive ``decay_calls``
+      calls from their stamping and then clear. Never indefinite (marks
+      without clears are forbidden) and never instant (dark would reopen
+      the corruption window on a host-patch failure).
+    * Keys absent from ``live`` are pruned WITHOUT a flip: the object is
+      gone; emitting a clear for it would make the applier chase ghosts.
+    """
+    live = set(live)
+    new_marks: Dict[str, Any] = {}
+    to_clear: List[str] = []
+    for key, (mgen, mcall) in marks.items():
+        if key not in live:
+            continue  # pruned silently
+        if gen is not None:
+            if mgen == gen:
+                new_marks[key] = (mgen, mcall)
+            else:
+                to_clear.append(key)
+        else:
+            if call_n - mcall < decay_calls:
+                new_marks[key] = (mgen, mcall)
+            else:
+                to_clear.append(key)
+    return new_marks, to_clear
+
+
+def mark_on_load(marks: Dict[str, Any], gen: Optional[int], call_n: int,
+                 loading_ids: Iterable[str]
+                 ) -> Tuple[Dict[str, Any], List[str]]:
+    """Mark the models a load is about to touch, BEFORE the load runs.
+
+    The pressure fires during the load itself (``ensure_pin_registerable``
+    inside ``pin_memory``), and pin tier 1 is ``(cp=False, active=None)``,
+    ``active`` NOT consulted, so marking at call end would leave every
+    model's first loaded call exposed to the decommit-under-async-copy
+    window. Returns ``(new_marks, to_set)``: ``to_set`` are keys whose flag
+    must flip True (keys already marked keep their True flag and migrate
+    epochs WITHOUT a flip; a clear/set pair there would open a one-tier gap
+    mid-walk). Every loading id gets a fresh ``(gen, call_n)`` stamp either
+    way, which is what feeds the sticky fallback's decay clock."""
+    new_marks = dict(marks)
+    to_set: List[str] = []
+    for key in loading_ids:
+        if key not in new_marks:
+            to_set.append(key)
+        new_marks[key] = (gen, call_n)
+    return new_marks, to_set
