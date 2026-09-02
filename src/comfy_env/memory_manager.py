@@ -34,6 +34,7 @@ parent and the worker can use it without touching the isolation layering.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from typing import Any, Dict, Optional
@@ -171,12 +172,18 @@ def _cuda_devices() -> list:
     Gated on real devices rather than on ``COMFY_CPU``: that variable is set
     only when the *parent* ran ``--cpu`` and says nothing about this process.
     """
-    try:
-        import comfy.model_management as mm
-
-        return [d.index for d in mm.get_all_torch_devices() if d.type == "cuda"]
-    except Exception:
-        pass
+    # Only consult ComfyUI if it is ALREADY imported: importing
+    # comfy.model_management here would pull in comfy_aimdo.host_buffer, whose
+    # module level `lib = control.lib` binds at import time. Doing that before
+    # control.init() freezes lib=None in every shim, permanently: the flag then
+    # says aimdo while the first real model load crashes with
+    # "'NoneType' object has no attribute 'hostbuf_allocate'". Observed live.
+    mm = sys.modules.get("comfy.model_management")
+    if mm is not None:
+        try:
+            return [d.index for d in mm.get_all_torch_devices() if d.type == "cuda"]
+        except Exception:
+            pass
     try:
         import torch
 
@@ -270,6 +277,34 @@ def maybe_enable_aimdo(log=None) -> bool:
             raise RuntimeError("comfy_aimdo.control.init_devices returned False")
         _log(f"[worker] aimdo devices={devices} headroom={headroom} bytes")
 
+        # Every comfy_aimdo shim does `lib = control.lib` at module import AND
+        # configures ctypes argtypes/restypes under `if lib is not None:`. A
+        # shim imported before control.init() therefore holds lib=None with NO
+        # signatures. Setting `.lib` by hand is NOT enough: the functions then
+        # default to int returns, 64-bit pointers truncate, and the first
+        # hostbuf_free segfaults (observed live, HostBuffer.__del__). Reload
+        # instead: it re-executes the module top with control.lib now set, into
+        # the SAME module object, so existing references stay valid and the
+        # signatures are configured exactly as an on-time import would have.
+        import ctypes
+        import importlib
+
+        for _name in ("host_buffer", "model_mmap", "model_vbar",
+                      "vram_buffer", "torch"):
+            _mod = sys.modules.get(f"comfy_aimdo.{_name}")
+            if _mod is not None and getattr(_mod, "lib", None) is None:
+                importlib.reload(_mod)
+        import comfy_aimdo.host_buffer as _hb
+
+        # Verify the WIRING, not just the handle: an unconfigured restype is
+        # precisely the state that segfaults later.
+        if _hb.lib is None or _hb.lib.hostbuf_allocate.restype is not ctypes.c_void_p:
+            raise RuntimeError(
+                "comfy_aimdo shims are half wired after control.init "
+                "(lib missing or ctypes signatures unconfigured); refusing, "
+                "because this state segfaults on the first model load"
+            )
+
         import comfy.memory_management as mm
         import comfy.model_patcher as model_patcher
 
@@ -329,3 +364,126 @@ def release_node_boundary(log=None) -> None:
             getattr(module, attr)()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Pinned RAM budget (worker side)
+# ---------------------------------------------------------------------------
+
+class _PinErrorCounter(logging.Filter):
+    """Counts upstream's "Pin error." warnings (model_management.py:1640).
+
+    Upstream keeps no counter, and a clamped worker fails by warning and
+    continuing, so this filter is the only machine-readable signal that a
+    grant went too low. Telemetry only: nothing anywhere derives a VERDICT
+    from this text. Always returns True (never suppresses the record)."""
+
+    def __init__(self):
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record):
+        try:
+            if record.getMessage().startswith("Pin error"):
+                self.count += 1
+        except Exception:
+            pass
+        return True
+
+
+_PIN_ERROR_COUNTER: Optional[_PinErrorCounter] = None
+_PIN_STATE_SEQ = 0
+
+
+def install_pin_error_counter() -> None:
+    """Idempotent. Attached to the ROOT logger because upstream calls
+    ``logging.warning`` directly (root-level records are the only ones a
+    root filter sees)."""
+    global _PIN_ERROR_COUNTER
+    if _PIN_ERROR_COUNTER is None:
+        _PIN_ERROR_COUNTER = _PinErrorCounter()
+        logging.getLogger().addFilter(_PIN_ERROR_COUNTER)
+
+
+def pin_state() -> Optional[Dict[str, Any]]:
+    """The worker's five-field pin scalar for ready frames and RPC requests.
+
+    Hot frames carry only the bare ``_pinned`` int; this richer shape rides
+    the low-frequency channels. None when comfy is not imported (report
+    nothing rather than a fabricated zero)."""
+    global _PIN_STATE_SEQ
+    mm = sys.modules.get("comfy.model_management")
+    if mm is None:
+        return None
+    _PIN_STATE_SEQ += 1
+    return {
+        "pid": os.getpid(),
+        "total_pinned": int(getattr(mm, "TOTAL_PINNED_MEMORY", 0)),
+        "max_pinned": int(getattr(mm, "MAX_PINNED_MEMORY", 0)),
+        "pin_errors": _PIN_ERROR_COUNTER.count if _PIN_ERROR_COUNTER else 0,
+        "seq": _PIN_STATE_SEQ,
+    }
+
+
+def total_pinned() -> Optional[int]:
+    """The bare census scalar for hot frames. None when comfy is absent."""
+    mm = sys.modules.get("comfy.model_management")
+    if mm is None:
+        return None
+    try:
+        return int(getattr(mm, "TOTAL_PINNED_MEMORY", 0))
+    except Exception:
+        return None
+
+
+def apply_pin_budget(grant=None, headroom=None, log=None) -> bool:
+    """Apply a parent pin grant and headroom mirror. CLAMP ONLY, by contract:
+
+    * No-op when the local ``MAX_PINNED_MEMORY`` is already <= 0. A mirrored
+      ``--disable-pinned-memory`` (or a platform that never enabled pinning)
+      is terminal: host intent outranks a budget, and re-enabling pinning
+      here would also strand registrations, because ``unpin_memory``
+      early-returns on ``MAX <= 0``.
+    * ``MAX = max(min(local, grant), TOTAL_PINNED)``: the grant can only
+      LOWER the ceiling, and never below what this process already holds
+      (a ceiling below current TOTAL makes the registration check at
+      model_management.py:739 a permanent shortfall, evicting forever).
+    * A ``-1`` (or any <= 0) grant is the disabled sentinel: no-op.
+
+    ``headroom`` mirrors the host's RAM_CACHE_HEADROOM by direct assignment
+    on ``comfy.memory_management`` (:176). Deliberately NOT via
+    ``set_ram_cache_release_state``, which would also stamp a None callback;
+    the only upstream setter (execution.py:748) never runs in a worker.
+    Returns True if anything changed. Never raises.
+    """
+    _log = log or (lambda *_: None)
+    changed = False
+    try:
+        mm = sys.modules.get("comfy.model_management")
+        if mm is not None and grant is not None:
+            grant = int(grant)
+            local = int(getattr(mm, "MAX_PINNED_MEMORY", 0))
+            if grant > 0 and local > 0:
+                held = int(getattr(mm, "TOTAL_PINNED_MEMORY", 0))
+                new = max(min(local, grant), held)
+                if new != local:
+                    mm.MAX_PINNED_MEMORY = new
+                    changed = True
+                    _log(f"[worker] pin budget: MAX_PINNED_MEMORY "
+                         f"{local / 1e9:.2f}GB -> {new / 1e9:.2f}GB "
+                         f"(grant {grant / 1e9:.2f}GB, held {held / 1e9:.2f}GB)")
+    except Exception as exc:
+        _log(f"[worker] pin budget apply failed: {exc}")
+    try:
+        cm = sys.modules.get("comfy.memory_management")
+        if cm is not None and headroom is not None \
+                and hasattr(cm, "RAM_CACHE_HEADROOM"):
+            headroom = max(0, int(headroom))
+            if int(getattr(cm, "RAM_CACHE_HEADROOM", 0)) != headroom:
+                cm.RAM_CACHE_HEADROOM = headroom
+                changed = True
+                _log(f"[worker] pin budget: RAM_CACHE_HEADROOM mirrored to "
+                     f"{headroom / 1e9:.2f}GB")
+    except Exception as exc:
+        _log(f"[worker] pin headroom mirror failed: {exc}")
+    return changed

@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
-from .base import Worker, WorkerError
+from .base import InterruptRequested, Worker, WorkerError
 from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 # Debug logging -- granular categories from debug.py
@@ -158,6 +158,10 @@ class SubprocessWorker(Worker):
         try:
             _mem_src = Path(__file__).parent.parent.parent / "memory_manager.py"
             shutil.copy2(_mem_src, self._temp_dir / "memory_manager.py")
+            _ss_src = Path(__file__).parent.parent.parent / "state_sync.py"
+            shutil.copy2(_ss_src, self._temp_dir / "state_sync.py")
+            _ma_src = Path(__file__).parent.parent.parent / "mirrored_args.py"
+            shutil.copy2(_ma_src, self._temp_dir / "mirrored_args.py")
         except OSError:
             pass
 
@@ -363,23 +367,53 @@ class SubprocessWorker(Worker):
                     env[ENABLE_ENV_VAR] = "1" if getattr(_cmm, "aimdo_enabled", False) else "0"
                 except Exception:
                     env[ENABLE_ENV_VAR] = "0"
+            # Every write below is guarded like ENABLE_ENV_VAR above: a pack's
+            # [env_vars] lands in `env` before this block runs, and an operator
+            # who pinned a value there outranks the host-derived one.
             from comfy.cli_args import args as _pa
             _hr = getattr(_pa, "vram_headroom", None)
-            if _hr:
+            if _hr and HEADROOM_ENV_VAR not in env:
                 env[HEADROOM_ENV_VAR] = str(int(_hr * 1024 ** 3))
             from ...memory_manager import NVML_ENV_VAR, SIMPLE_HEADROOM_ENV_VAR
             _rv = getattr(_pa, "reserve_vram", None)
-            if _rv is not None:
+            if _rv is not None and SIMPLE_HEADROOM_ENV_VAR not in env:
                 env[SIMPLE_HEADROOM_ENV_VAR] = str(int(_rv * 1024 ** 3))
-            if getattr(_pa, "disable_nvml_pressure", False):
+            if getattr(_pa, "disable_nvml_pressure", False) and NVML_ENV_VAR not in env:
                 env[NVML_ENV_VAR] = "0"
+        except Exception:
+            pass
+
+        # Mirror the host's memory-relevant CLI args (resolved VALUES as one
+        # JSON env var, never argv). The worker applies them before its first
+        # comfy import freezes the module-level reads; without this a worker
+        # parses empty argv and every flag reverts to its default (host fp8
+        # -> worker fp16 at 2x the footprint being the worst case). Guarded
+        # not-in-env so pack [env_vars] wins; COMFY_ENV_MIRROR_ARGS=0 is the
+        # global kill and COMFY_ENV_NO_MIRROR the per-flag escape.
+        try:
+            from ...mirrored_args import (
+                MIRROR_ENV_VAR, MIRROR_KILL_ENV_VAR, NO_MIRROR_ENV_VAR,
+                parse_denylist, serialize_host_args,
+            )
+            _kill = env.get(MIRROR_KILL_ENV_VAR,
+                            os.environ.get(MIRROR_KILL_ENV_VAR, "1"))
+            if str(_kill).strip().lower() not in ("0", "false", "off") \
+                    and MIRROR_ENV_VAR not in env:
+                import json as _json
+                from comfy.cli_args import args as _ma_args
+                _deny = parse_denylist(
+                    env.get(NO_MIRROR_ENV_VAR,
+                            os.environ.get(NO_MIRROR_ENV_VAR)))
+                _payload = serialize_host_args(_ma_args, deny=_deny)
+                if _payload:
+                    env[MIRROR_ENV_VAR] = _json.dumps(_payload)
         except Exception:
             pass
 
         # Propagate --cpu flag to subprocess so get_torch_device() returns cpu there too
         try:
             from comfy.cli_args import args as _parent_args
-            if getattr(_parent_args, 'cpu', False):
+            if getattr(_parent_args, 'cpu', False) and "COMFY_CPU" not in env:
                 env["COMFY_CPU"] = "1"
         except Exception:
             pass
@@ -582,6 +616,35 @@ class SubprocessWorker(Worker):
         # was set. Recorded so the parent can report and compare it; see
         # comfy_env.memory_manager.
         self.memory_manager = msg.get("memory_manager") or {}
+        # Worker's five-field pin scalar (pid, totals, errors, seq). Ready
+        # frames and budget RPCs are its only carriers; hot frames stay small.
+        self.pin_state = msg.get("_pin_state")
+        # Mirror divergence check: recompute the read-back hash over the SAME
+        # applied names with OUR args and compare. Log-only and fail-open,
+        # always: a worker refusing to start would convert a 2x footprint
+        # into an outage.
+        self.cli_mirror = msg.get("cli_mirror")
+        try:
+            if self.cli_mirror:
+                from ...mirrored_args import readback_hash, unmirrored_nondefault
+                from comfy.cli_args import args as _pmirror_args
+                names = [n for n in self.cli_mirror.get("applied", [])
+                         if n != "attention"]
+                mine = readback_hash(_pmirror_args, names)
+                theirs = self.cli_mirror.get("hash")
+                gaps = unmirrored_nondefault(_pmirror_args)
+                gap_note = f" unmirrored_nondefault={gaps}" if gaps else ""
+                if mine == theirs:
+                    print(f"[{self.name}] cli mirror ok: {mine} "
+                          f"({len(names)} flags)"
+                          f"{gap_note}", file=sys.stderr, flush=True)
+                else:
+                    print(f"[{self.name}] cli mirror MISMATCH: "
+                          f"host={mine} worker={theirs} applied={names} "
+                          f"skipped={self.cli_mirror.get('skipped')}"
+                          f"{gap_note}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
         # --- Pool IPC handshake (receive worker's shareable pool FD) ---
         # Check worker's env vars (not parent's _POOL_IPC_ENABLED which may be False)
@@ -647,6 +710,11 @@ class SubprocessWorker(Worker):
         try:
             result = handler(request)
             return {"type": "callback_response", "status": "ok", "result": result}
+        except InterruptRequested as e:
+            # Typed so the worker raises its interrupt exception from this
+            # field instead of re-deriving it from the message text.
+            return {"type": "callback_response", "status": "error",
+                    "error": str(e), "error_kind": "interrupt"}
         except Exception as e:
             return {"type": "callback_response", "status": "error", "error": str(e)}
 
@@ -742,6 +810,21 @@ class SubprocessWorker(Worker):
         _new = response.get("_new_models")
         if _new:
             self._last_new_models.extend(_new)
+        # Residency census REPLACES (it is a total); state_out REPLACES (one
+        # call, one instance). Both harvested before any status check so an
+        # error frame still lands them, same rule as _new_models.
+        _res = response.get("_model_residency")
+        if _res is not None:
+            self._last_residency = _res
+        _sso = response.get("_self_state_out")
+        if _sso is not None:
+            self._last_state_out = _sso
+        # Pin census scalar: REPLACES (it is a total). Same harvest rule as
+        # the residency census -- before any status check, so error frames
+        # still land it.
+        _pin = response.get("_pinned")
+        if _pin is not None:
+            self._last_pinned = _pin
         return response
 
     def call_method(
@@ -751,6 +834,8 @@ class SubprocessWorker(Worker):
         method_name: str,
         self_state: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
+        seed: bool = False,
+        state_id: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> Any:
         """Call a class method by module/class/method path.
@@ -793,10 +878,13 @@ class SubprocessWorker(Worker):
                 request = {
                     "type": "call_method",
                     "call_id": call_id,
+                    "seed": bool(seed),
+                    "state_id": state_id,
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
-                    "self_state": _serialize_for_ipc(self_state) if self_state else None,
+                    "self_state": _serialize_for_ipc(self_state)
+                    if self_state is not None else None,
                     "kwargs": kwargs_meta,
                 }
                 if _DBG_WORKER:
@@ -809,6 +897,8 @@ class SubprocessWorker(Worker):
                     raise WorkerError(
                         response.get("error", "Unknown"),
                         traceback=response.get("traceback"),
+                        error_kind=response.get("error_kind"),
+                        oom_stats=response.get("oom_stats"),
                     )
 
                 # (auto-registered models are captured in _send_request, on
@@ -872,6 +962,8 @@ class SubprocessWorker(Worker):
                     raise WorkerError(
                         response.get("error", "Unknown"),
                         traceback=response.get("traceback"),
+                        error_kind=response.get("error_kind"),
+                        oom_stats=response.get("oom_stats"),
                     )
 
                 result_meta = response.get("result")
@@ -906,7 +998,9 @@ class SubprocessWorker(Worker):
                 response = self._send_request(request, timeout=120.0)
                 if response.get("status") == "error":
                     raise WorkerError(response.get("error", "Unknown"),
-                                      traceback=response.get("traceback"))
+                                      traceback=response.get("traceback"),
+                                      error_kind=response.get("error_kind"),
+                                      oom_stats=response.get("oom_stats"))
                 result_meta = response.get("result")
                 result = _from_shm(result_meta) if result_meta is not None else None
                 self._send_consumed(call_id)

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
+from .. import state_sync
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
@@ -34,6 +35,48 @@ _WORKER_PATCHERS: Dict[str, Dict[str, Any]] = {}  # str(env_dir) -> {model_id: S
 _STALE_PATCHERS: List[Any] = []  # Keeps stale patchers alive until free_memory finishes
 _POOL_LOCK = threading.Lock()
 _WORKER_GENERATION = 0  # Monotonically increasing; incremented on each new worker
+
+# --- Pin budget ledger (COMFY_ENV_PIN_SPLIT) ------------------------------
+# reports: "host" plus str(env_dir) -> {"pinned": bytes, "seq": n}. seq is a
+# PARENT-side arrival stamp (one socket per worker makes arrival order causal
+# order); the worker's own _pin_state.seq is observability, not the ledger.
+_PIN_REPORTS: Dict[str, Dict[str, int]] = {}
+_PIN_GRANTS: Dict[str, int] = {}  # last grant emitted per worker key (damping)
+_PIN_INGEST_SEQ = 0
+_PIN_STABLE = 0  # consecutive censuses with an unchanged consumer set
+_PIN_LAST_CONSUMERS: frozenset = frozenset()
+_PIN_ROLLUP_LAST = 0  # last logged pinned total (rollup fires on >1 GiB moves)
+
+
+def _pin_split_mode() -> str:
+    """"off" (default, byte-identical to today) or "auto"."""
+    return os.environ.get(state_sync.PIN_SPLIT_ENV_VAR, "off").strip().lower()
+
+
+def _pin_ingest(key: str, pinned) -> None:
+    """Stamp one pin report into the ledger and track consumer-set stability
+    for the grow damping. Never raises."""
+    global _PIN_INGEST_SEQ, _PIN_STABLE, _PIN_LAST_CONSUMERS, _PIN_ROLLUP_LAST
+    try:
+        _PIN_INGEST_SEQ += 1
+        state_sync.update_pin_reports(_PIN_REPORTS, key, int(pinned),
+                                      _PIN_INGEST_SEQ)
+        consumers = frozenset(k for k, r in _PIN_REPORTS.items()
+                              if r.get("pinned", 0) > 0)
+        if consumers == _PIN_LAST_CONSUMERS:
+            _PIN_STABLE += 1
+        else:
+            _PIN_STABLE = 0
+            _PIN_LAST_CONSUMERS = consumers
+        total = sum(r.get("pinned", 0) for r in _PIN_REPORTS.values())
+        if abs(total - _PIN_ROLLUP_LAST) > 1024 ** 3:
+            _PIN_ROLLUP_LAST = total
+            _log("[comfy-env] pinned RAM rollup: "
+                 + ", ".join(f"{k}={r.get('pinned', 0) / 1e9:.2f}GB"
+                             for k, r in sorted(_PIN_REPORTS.items()))
+                 + f" (sum {total / 1e9:.2f}GB)")
+    except Exception:
+        pass
 
 
 def _cleanup_stale_workers():
@@ -148,9 +191,10 @@ def _handle_progress(request: dict) -> dict:
       `except Exception` produce a genuine error frame, which _call_parent
       turns into _InterruptedError inside the worker.
 
-    The message must keep containing "interrupted": _progress_hook matches on
-    it (_persistent_worker.py).
+    The message must keep containing "interrupted": old workers' _progress_hook
+    text-matches on it (new workers read the typed error_kind field instead).
     """
+    from .workers.base import InterruptRequested
     try:
         import comfy.model_management as mm
     except ImportError:
@@ -159,7 +203,7 @@ def _handle_progress(request: dict) -> dict:
         try:
             mm.throw_exception_if_processing_interrupted()
         except mm.InterruptProcessingException:
-            raise RuntimeError("Processing interrupted by user")
+            raise InterruptRequested("Processing interrupted by user")
     try:
         import comfy.utils
         if comfy.utils.PROGRESS_BAR_HOOK:
@@ -241,13 +285,66 @@ def _worker_held_bytes() -> int:
             n_workers += 1
         for p in list(patchers.values()):
             try:
-                held += int(p.loaded_size())
+                # Admission is pessimistic: the ledger value OR the residency
+                # peak since the last command, whichever is higher. Stale-LOW
+                # here over-states true free and admits a load that OOMs; the
+                # ledger itself stays a round-down receipt for upstream.
+                held += state_sync.held_ceiling(p)
             except Exception:
-                pass
+                try:
+                    held += int(p.loaded_size())
+                except Exception:
+                    pass
     return held + n_workers * _WORKER_FIXED_VRAM_COST
 
 
-def _handle_vram_budget(request: dict) -> dict:
+def _maybe_add_pin_grant(reply: dict, request: dict, worker_key) -> None:
+    """Attach ``pin_max``/``pin_headroom`` to a budget reply.
+
+    The reply is the ONLY grant channel (a debate verdict: censuses are
+    worker-to-parent piggybacks; no parent push exists at node boundaries).
+    Ingestion of the rider ``pin_state`` always happens (observability);
+    the grant fields appear only under ``COMFY_ENV_PIN_SPLIT=auto``, so the
+    shipped default is byte-identical to today. Never raises."""
+    try:
+        ps = request.get("pin_state")
+        if isinstance(ps, dict) and worker_key:
+            _pin_ingest(worker_key, ps.get("total_pinned", 0))
+        if _pin_split_mode() != "auto" or not worker_key:
+            return
+        import comfy.model_management as mm
+        host_max = int(getattr(mm, "MAX_PINNED_MEMORY", 0) or 0)
+        _pin_ingest("host", int(getattr(mm, "TOTAL_PINNED_MEMORY", 0) or 0))
+        if worker_key not in _PIN_REPORTS:
+            _pin_ingest(worker_key, 0)  # first contact: request IS the report
+        floor = int(os.environ.get(state_sync.PIN_FLOOR_ENV_VAR,
+                                   state_sync.PIN_FLOOR_DEFAULT))
+        reserve = float(os.environ.get(state_sync.PIN_RESERVE_ENV_VAR,
+                                       state_sync.PIN_RESERVE_DEFAULT))
+        grants = state_sync.allocate_pin_budgets(
+            host_max, _PIN_REPORTS, floor_bytes=floor, reserve=reserve,
+            requester=worker_key)
+        raw = grants.get(worker_key)
+        if raw is None:
+            return
+        damped = state_sync.damp_pin_grant(_PIN_GRANTS.get(worker_key),
+                                           int(raw), _PIN_STABLE)
+        _PIN_GRANTS[worker_key] = damped
+        reply["pin_max"] = int(damped)
+        try:
+            import comfy.memory_management as cmm
+            reply["pin_headroom"] = int(getattr(cmm, "RAM_CACHE_HEADROOM", 0))
+        except Exception:
+            pass
+        if _DBG_MODELS:
+            _log(f"[comfy-env] pin grant for {Path(worker_key).name}: "
+                 f"{reply['pin_max'] / 1e9:.2f}GB "
+                 f"(host_max {host_max / 1e9:.2f}GB, stable {_PIN_STABLE})")
+    except Exception:
+        pass
+
+
+def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     """Parent-side callback: free VRAM for subprocess model loading.
 
     Called when the worker's shimmed load_models_gpu() needs to load models.
@@ -319,12 +416,14 @@ def _handle_vram_budget(request: dict) -> dict:
     if post_true_free is None:
         post_true_free = max(0, mm.get_free_memory(device) - _worker_held_bytes())
 
-    return {
+    reply = {
         "device": str(device),
         "extra_reserved_vram": extra_reserved,
         "vram_state": vram_state_name,
         "device_free_bytes": int(post_true_free),
     }
+    _maybe_add_pin_grant(reply, request, worker_key)
+    return reply
 
 
 def _cleanup_stale_patchers(env_dir):
@@ -470,9 +569,30 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                 pass
         _WORKER_GENERATION += 1
         gen = _WORKER_GENERATION
+        # Pin budget bootstrap: a worker that has not seen a budget reply yet
+        # starts on an equal split rather than believing it owns the whole
+        # host allowance. Guarded not-in so pack [env_vars] wins; exported
+        # only under PIN_SPLIT=auto so the off default stays byte-identical.
+        if _pin_split_mode() == "auto":
+            env_vars = dict(env_vars or {})
+            try:
+                import comfy.model_management as _mm
+                _hm = int(getattr(_mm, "MAX_PINNED_MEMORY", 0) or 0)
+                if _hm > 0 and state_sync.PIN_SHARE_ENV_VAR not in env_vars:
+                    env_vars[state_sync.PIN_SHARE_ENV_VAR] = str(
+                        _hm // (len(_WORKER_POOL) + 2))
+                import comfy.memory_management as _cmm
+                if state_sync.PIN_HEADROOM_ENV_VAR not in env_vars:
+                    env_vars[state_sync.PIN_HEADROOM_ENV_VAR] = str(
+                        int(getattr(_cmm, "RAM_CACHE_HEADROOM", 0)))
+            except Exception:
+                pass
         worker = _create_worker(env_dir, working_dir, sys_path, env_vars, health_check_timeout)
-        # Register bidirectional RPC callbacks
-        worker.register_callback("request_vram_budget", _handle_vram_budget)
+        # Register bidirectional RPC callbacks. The budget callback carries
+        # this worker's key so the pin allocator knows who is asking.
+        worker.register_callback(
+            "request_vram_budget",
+            lambda req, _wk=key: _handle_vram_budget(req, worker_key=_wk))
         worker.register_callback("report_progress", _handle_progress)
         # Clean up stale patchers if worker restarts transparently via _ensure_started()
         worker._on_restart = lambda: _cleanup_stale_patchers(env_dir)
@@ -557,6 +677,11 @@ def _remove_worker(env_dir):
     # A replacement worker may resolve to a different manager (for example a
     # failed aimdo init this time), so let it be reported afresh.
     _MEMORY_MANAGER_REPORTED.discard(key)
+    # Dead worker's pin report and grant leave the ledger: its key must be
+    # ABSENT from the allocator's input (not retained at 0), so its share
+    # redistributes on the next budget RPC.
+    _PIN_REPORTS.pop(key, None)
+    _PIN_GRANTS.pop(key, None)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
@@ -616,6 +741,29 @@ def _register_new_patchers(env_dir, worker, generation):
     # Release stale patchers from previous worker restarts.  Safe to do here
     # because we're outside free_memory's iteration loop.
     _STALE_PATCHERS.clear()
+
+    # Apply the residency census FIRST, before the eviction repair and long
+    # before the `if model_id in patchers: continue` skip below: that skip is
+    # exactly what made already-known models unreachable, freezing their
+    # registration-time stamp while aimdo paged residency out from under it.
+    _mode = os.environ.get(state_sync.RESIDENCY_ENV_VAR, "boundary").lower()
+    if _mode not in ("off", "command", "0", "false"):
+        census = getattr(worker, "_last_residency", None)
+        if census:
+            worker._last_residency = None
+            live = {
+                mid: p
+                for mid, p in _WORKER_PATCHERS.get(str(env_dir), {}).items()
+                if getattr(p, "_worker_generation", generation) == generation
+            }
+            state_sync.apply_residency(live, census, log=_log)
+
+    # Pin census (observability, ungated: the rollup ships live while the
+    # clamp stays dark behind COMFY_ENV_PIN_SPLIT).
+    _pin = getattr(worker, "_last_pinned", None)
+    if _pin is not None:
+        worker._last_pinned = None
+        _pin_ingest(str(env_dir), _pin)
 
     # Repair entries free_memory removed on a FAILED eviction. Upstream's
     # model_unload returns True even when detach() could not reach the worker

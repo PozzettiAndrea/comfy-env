@@ -12,6 +12,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+
+from .. import state_sync
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1294,7 +1297,8 @@ def _splice_dynamic_options(sections: Dict[str, Any], marks) -> Dict[str, Any]:
 
 
 def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
-                    self_state, kwargs, node_name):
+                    self_state, kwargs, node_name,
+                    seed=False, state_id=None, state_dict=None):
     """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
 
     Keyword-only on purpose: the two closures this replaces took nine and
@@ -1313,6 +1317,8 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
     from .pool import (_get_or_create_worker, _remove_worker,
                        _register_new_patchers)
     from .tensor_utils import prepare_for_ipc_recursive
+    from .errors import translate_error
+    from .workers.base import WorkerError
 
     env_dir = worker_spec[0]
     if _DBG_IO:
@@ -1332,6 +1338,8 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                 method_name=method_name,
                 self_state=self_state,
                 kwargs=kwargs,
+                seed=seed,
+                state_id=state_id,
                 timeout=600.0,
             )
         finally:
@@ -1342,6 +1350,17 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                 _register_new_patchers(env_dir, worker, gen)
             except Exception as _re:
                 _log(f"[comfy-env] patcher registration failed: {_re}")
+            # Apply the state return the same way, and for the same reason: a
+            # node that mutated self and then raised keeps the mutation, like
+            # a non-isolated node would.
+            if state_dict is not None:
+                try:
+                    _sso = getattr(worker, "_last_state_out", None)
+                    if _sso is not None:
+                        worker._last_state_out = None
+                        state_sync.apply_state_out(state_dict, _sso)
+                except Exception as _se:
+                    _log(f"[comfy-env] state apply failed: {_se}")
 
         result = prepare_for_ipc_recursive(result)
 
@@ -1358,6 +1377,31 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
     except (RuntimeError, ConnectionError):
         _remove_worker(env_dir)
         raise
+    except WorkerError as we:
+        # Typed translation frontier. This clause must stay BELOW the
+        # (RuntimeError, ConnectionError) teardown: torch.OutOfMemoryError IS
+        # a RuntimeError, so raising it from inside the try body would tear
+        # down the worker on every OOM right before ComfyUI's recovery runs.
+        # Here the WorkerError has already been declined by that clause (it
+        # subclasses Exception only), the worker survives, and what we raise
+        # from this handler is out of this try's reach.
+        translated = translate_error(we)
+        if translated is we:
+            raise
+        stats = getattr(we, "oom_stats", None) or {}
+        host_free = None
+        try:
+            import comfy.model_management as _mm
+            host_free = int(_mm.get_free_memory(_mm.get_torch_device()))
+        except Exception:
+            pass
+        _log(f"[comfy-env] worker {we.error_kind} env={Path(env_dir).name} "
+             f"node={node_name} call_id={getattr(worker, '_call_counter', '?')} "
+             f"worker_allocated={stats.get('allocated')} "
+             f"worker_reserved={stats.get('reserved')} "
+             f"worker_largest_free={stats.get('largest_free_block')} "
+             f"host_free={host_free} -> raising {type(translated).__name__}")
+        raise translated
 
 
 def _build_v3_proxy_class(
@@ -1742,11 +1786,26 @@ def build_proxy_class(
                     nested[k] = v
                 kwargs = nested
 
+            _d = self.__dict__ if hasattr(self, "__dict__") else None
+            if _d is None:
+                return _call_in_worker(
+                    worker_spec=(ed, pr, sp, ev, hct),
+                    module_name=mod, class_name=cn, method_name=fn,
+                    self_state=None, kwargs=kwargs, node_name=nn,
+                )
+            # The seed sentinel and state id are parent-only bookkeeping:
+            # stripped from every outbound state, set on ingest, never written
+            # by the worker. seed=True exactly once per parent instance, which
+            # maps __init__-once onto ComfyUI's own sweep: the sweep drops
+            # this instance, the next one reseeds.
+            _sid = _d.setdefault(state_sync.STATE_ID_KEY, uuid.uuid4().hex[:12])
             return _call_in_worker(
                 worker_spec=(ed, pr, sp, ev, hct),
                 module_name=mod, class_name=cn, method_name=fn,
-                self_state=self.__dict__.copy() if hasattr(self, "__dict__") else None,
+                self_state=state_sync.outbound_state(_d),
                 kwargs=kwargs, node_name=nn,
+                seed=state_sync.SEED_SENTINEL not in _d,
+                state_id=_sid, state_dict=_d,
             )
         return proxy
 

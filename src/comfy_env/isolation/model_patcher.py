@@ -116,6 +116,13 @@ class SubprocessModelPatcher:
     #: the next node boundary and puts the entry back.
     eviction_deferred = False
 
+    #: Admission-side residency peak (state_sync.held_ceiling). Primed to full
+    #: size at construction: registration IS a receipt of full residency, and
+    #: the census that carried it rides the same frame that creates this
+    #: patcher, arriving before the patcher exists to receive it.
+    _residency_peak = 0
+    _residency_seq = -1
+
     def __init__(self, worker, worker_generation, model_id, model_size,
                  load_device, offload_device, kind="other"):
         self.load_device = load_device
@@ -126,6 +133,7 @@ class SubprocessModelPatcher:
         self.clone_base_uuid = None
         self.size = model_size
         self.model = SubprocessModel(model_size, offload_device)
+        self._residency_peak = model_size  # registration is a full-size receipt
         self._worker = worker
         self._worker_generation = worker_generation
         self._model_id = model_id
@@ -256,6 +264,12 @@ class SubprocessModelPatcher:
             return 0
         freed = int(r.get("freed", 0))
         resident = int(r.get("resident", max(0, resident_before - freed)))
+        # A command echo is the freshest possible receipt: record its seq so a
+        # frame census that left the worker earlier cannot resurrect these
+        # bytes, and reset the admission peak to the new truth.
+        if "seq" in r:
+            self._residency_seq = int(r["seq"])
+        self._residency_peak = resident
         self.model.model_loaded_weight_memory = resident
         if resident <= 0:
             self.model.device = self.offload_device

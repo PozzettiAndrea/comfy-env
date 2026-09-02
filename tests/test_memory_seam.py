@@ -240,3 +240,140 @@ def test_a_failed_call_still_reports_the_models_it_loaded():
             f"the error frame sent from the handler at line {h.lineno} does not "
             f"call _attach_new_models."
         )
+
+
+def test_worker_reserve_sums_margin_and_blindness():
+    """The blindness correction (bytes siblings hold) and the host margin
+    (extra_reserved_vram) serve different purposes and must ADD. max() let the
+    margin vanish whenever siblings held more than it, The margin does not
+    reach dynamic models (their budget is 0, rewritten to 1e32 upstream), so
+    this guards the ledger-path loads only."""
+    src = WORKER.read_text(encoding="utf-8")
+    assert "extra_reserved = int(extra_reserved or 0) + _others" in src, (
+        "the worker reserve no longer sums the host margin with the blindness "
+        "correction; under any real multi-worker load the margin vanishes and "
+        "near-capacity loads OOM in the cast path."
+    )
+    assert "extra_reserved = max(int(extra_reserved or 0), _others)" not in src
+
+
+def test_host_derived_env_writes_never_clobber_pack_env_vars():
+    """Fixed 2026-09-02: a pack's [env_vars] land in `env` before the
+    host-derived block runs, and only ENABLE_ENV_VAR was guarded; the headroom,
+    NVML and COMFY_CPU writes silently overwrote an operator's explicit pin.
+    Catches: any new env[...] write in _ensure_started for a mirrored knob that
+    is not guarded by a `not in env` membership test."""
+    subprocess_py = SRC / "isolation" / "workers" / "subprocess.py"
+    tree = _tree(subprocess_py)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "_ensure_started")
+    parents = {}
+    for node in ast.walk(fn):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    guarded_keys = {"HEADROOM_ENV_VAR", "SIMPLE_HEADROOM_ENV_VAR",
+                    "NVML_ENV_VAR", "ENABLE_ENV_VAR", "COMFY_CPU"}
+    checked = 0
+    for node in ast.walk(fn):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+            continue
+        tgt = node.targets[0]
+        if not (isinstance(tgt, ast.Subscript)
+                and isinstance(tgt.value, ast.Name) and tgt.value.id == "env"):
+            continue
+        key = tgt.slice
+        name = (key.id if isinstance(key, ast.Name)
+                else key.value if isinstance(key, ast.Constant) else None)
+        if name not in guarded_keys:
+            continue
+        checked += 1
+        cursor, guarded = node, False
+        while cursor in parents:
+            cursor = parents[cursor]
+            if isinstance(cursor, ast.If) and "not in env" in ast.unparse(cursor.test):
+                guarded = True
+                break
+        assert guarded, (
+            f"env write for {name} at line {node.lineno} has no `not in env` "
+            f"guard; it clobbers a pack's [env_vars] pin for that variable."
+        )
+    assert checked >= 5, (
+        f"only {checked} guarded host-derived env writes found; the block was "
+        f"refactored and this guard stopped seeing it."
+    )
+
+
+class TestPinBudgetSeam:
+    """The pin split's non-negotiables, pinned at source level. The clamp is
+    dark (COMFY_ENV_PIN_SPLIT=off default) but the contract must hold from
+    the first commit, because flipping the default must be a one-var change."""
+
+    def test_apply_pin_budget_is_clamp_only(self):
+        """A grant may only LOWER the ceiling, never below held bytes, and a
+        disabled local MAX stays disabled. Catches: a 'helpful' rewrite that
+        raises MAX toward the grant, re-enabling pinning against a mirrored
+        --disable-pinned-memory."""
+        tree = _tree(MEMMGR)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "apply_pin_budget")
+        src = ast.unparse(fn)
+        assert "max(min(local, grant), held)" in src, (
+            "the clamp formula changed; grants can now RAISE the ceiling")
+        assert "grant > 0 and local > 0" in src, (
+            "the disabled-stays-disabled gate is gone; a grant now re-enables "
+            "pinning against host intent")
+
+    def test_headroom_mirror_assigns_directly_never_via_setter(self):
+        """set_ram_cache_release_state also stamps a None callback; the only
+        legitimate write is direct assignment on comfy.memory_management."""
+        src = MEMMGR.read_text(encoding="utf-8")
+        assert "RAM_CACHE_HEADROOM = headroom" in src.replace("cm.", ""), (
+            "the headroom mirror no longer assigns RAM_CACHE_HEADROOM directly")
+        calls = {n.func.attr for n in ast.walk(_tree(MEMMGR))
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)}
+        assert "set_ram_cache_release_state" not in calls, (
+            "the mirror now goes through the setter, stamping a None callback")
+
+    def test_grant_fields_only_under_auto_mode(self):
+        """COMFY_ENV_PIN_SPLIT=off (the shipped default) must be
+        byte-identical to today: no pin_max in any reply. Catches: the mode
+        gate quietly dropped from the reply builder."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_maybe_add_pin_grant")
+        src = ast.unparse(fn)
+        assert "_pin_split_mode() != 'auto'" in src
+        assert "pin_max" in src
+
+    def test_reply_is_the_only_grant_channel(self):
+        """Grants ride the request_vram_budget reply and nothing else: no
+        parent push exists at node boundaries, and a second channel would be
+        a second clock. Catches: a grant write sneaking into the census
+        ingest path."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_pin_ingest")
+        src = ast.unparse(fn)
+        assert "pin_max" not in src and "apply_pin_budget" not in src
+
+    def test_dead_worker_report_leaves_the_ledger(self):
+        """_remove_worker must pop the pin report: a retained key keeps
+        splitting the pool with a ghost."""
+        tree = _tree(POOL)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_remove_worker")
+        src = ast.unparse(fn)
+        assert "_PIN_REPORTS.pop" in src and "_PIN_GRANTS.pop" in src
+
+    def test_worker_applies_grants_from_the_budget_reply(self):
+        """The worker must read pin_max/pin_headroom off the reply and route
+        them through apply_pin_budget (grow before load). Catches: the reply
+        fields shipping with no consumer."""
+        src = WORKER.read_text(encoding="utf-8")
+        assert 'result.get("pin_max")' in src
+        assert 'grant=result.get("pin_max")' in src
+        assert 'headroom=result.get("pin_headroom")' in src

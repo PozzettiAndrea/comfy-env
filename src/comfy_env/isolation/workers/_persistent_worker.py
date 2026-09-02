@@ -1,5 +1,6 @@
 
 import sys
+import json
 import os
 import socket
 import traceback
@@ -187,6 +188,14 @@ try:
     import memory_manager as _memmgr
 except Exception:  # pragma: no cover - the worker must start without it
     _memmgr = None
+try:
+    import state_sync as _state_sync
+except Exception:  # pragma: no cover - the worker must start without it
+    _state_sync = None
+try:
+    import mirrored_args as _mirrored_args
+except Exception:  # pragma: no cover - the worker must start without it
+    _mirrored_args = None
 # Alias the local copy under its package name: a serializer module that does
 # `from comfy_env.isolation.workers import _ipc_shared` (the parent-side
 # spelling) inside a worker whose env happens to have comfy_env installed
@@ -885,6 +894,27 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
+    # Mirror the host's CLI args BEFORE anything imports comfy. This must sit
+    # here, in main's direct body: `import folder_paths` below transitively
+    # runs `from comfy.cli_args import args`, and the memory-relevant reads
+    # (DISABLE_SMART_MEMORY, NUM_STREAMS, the MAX_PINNED gate, DISABLE_MMAP)
+    # execute ONCE at comfy.model_management/comfy.utils import, so a later
+    # apply is unrecoverable. Earlier is impossible: comfy.cli_args is not
+    # importable until the parent's sys_paths (just above) land. The ast
+    # guard in tests/test_mirrored_args.py pins this ordering.
+    _mirror_payload = None
+    _mirror_report = {"applied": [], "skipped": []}
+    if _mirrored_args is not None:
+        try:
+            _mp_raw = os.environ.get(_mirrored_args.MIRROR_ENV_VAR)
+            if _mp_raw:
+                _mirror_payload = json.loads(_mp_raw)
+                from comfy.cli_args import args as _host_args
+                _mirror_report = _mirrored_args.apply_host_args(
+                    _host_args, _mirror_payload, log=wlog)
+        except Exception as _me:
+            wlog(f"[worker] host args mirror failed: {_me}")
+
     # Load pack-declared custom serializers ([types] "custom" entries in
     # comfy-env-root.toml, forwarded as serialization.py file paths --
     # ADR-0015). Runs after sys.path setup so lazy imports inside the
@@ -1004,6 +1034,32 @@ def main():
     # module that lands on CUDA.  No manual registration needed.
     # ---------------------------------------------------------------
     _model_registry = {}          # model_id -> nn.Module
+    # Per-model residency sequence. Bumped at every byte-moving site so the
+    # parent can order frame censuses against command echoes and drop stale
+    # ones: the only defence against a census resurrecting freed bytes.
+    _residency_seq = {}
+
+    # ------------- node state overflow tier (state_sync design) -------------
+    # Values that cannot cross the wire (device resident, unpicklable, over
+    # cap) stay HERE, keyed by a monotonic handle, represented parent-side by
+    # a marker. _STATE_GEN changes on every worker start so a marker from a
+    # dead worker raises a pointed error instead of a silent fresh default.
+    import uuid as _uuid
+    _STATE_GEN = _uuid.uuid4().hex[:8]
+    _overflow_store = {}          # handle -> (owner_state_id, value)
+    _overflow_counter = [0]
+
+    def _mint_handle():
+        _overflow_counter[0] += 1
+        return _overflow_counter[0]
+
+    # the state_out computed by the current call, attached to whichever frame
+    # goes out (ok or error), then cleared at the next request
+    _pending_state_out = [None]
+
+    def _bump_seq(mid):
+        _residency_seq[mid] = _residency_seq.get(mid, 0) + 1
+        return _residency_seq[mid]
     _model_registry_meta = {}     # model_id -> {"size": int, "kind": str}
     _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
     _model_counter = [0]          # mutable counter in list for closure access
@@ -1032,6 +1088,7 @@ def main():
         size = _compute_model_size(model)
         _model_registry_meta[model_id] = {"size": size, "kind": kind}
         _new_models_this_call.append({"id": model_id, "size": size, "kind": kind})
+        _bump_seq(model_id)
         wlog(f"[worker] Registered model '{model_id}': {size / 1e9:.2f} GB, kind={kind}")
         return size
 
@@ -1062,6 +1119,7 @@ def main():
             _model_registry_meta[model_id] = {"size": size, "kind": "other"}
             _model_id_by_obj[obj_id] = model_id
             _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
+            _bump_seq(model_id)
         wlog(f"[worker] {label} '{model_id}': {size / 1e9:.2f} GB")
         return model_id
 
@@ -1159,7 +1217,8 @@ def main():
                     _moved = max(0, _after - _before)
                 transport.send({"status": "ok", "call_id": _req_call_id,
                                 "freed" if _partial_unload else "loaded": _moved,
-                                "resident": _after})
+                                "resident": _after,
+                                "seq": _bump_seq(_mid)})
                 return
 
             # No patcher: plain module. Whole-model move, report honestly.
@@ -1247,6 +1306,60 @@ def main():
             wlog(f"[worker] model_to_device error: {_e}")
             transport.send({"status": "error", "call_id": _req_call_id, "error": str(_e)})
 
+    class _InterruptedError(RuntimeError):
+        """Raised when the user cancels the current run.
+
+        Defined at main scope, not inside the progress-hook try: the error
+        frame stamper does an isinstance check against it, and a name that
+        only exists when comfy.utils imported would NameError the error path
+        of every worker whose env lacks comfy."""
+        pass
+
+    def _oom_stats():
+        """Three allocator-level integers for an OOM error frame.
+
+        Defined as raw torch.cuda reads on purpose: mirrored flags (async
+        offload, dtypes) change what sits INSIDE reserved, but never how
+        these are measured, so the numbers stay comparable across mirror
+        settings. largest_free_block is the biggest inactive contiguous
+        block, the fragmentation signal the host cannot reconstruct."""
+        stats = {"allocated": None, "reserved": None, "largest_free_block": None}
+        try:
+            import torch
+            stats["allocated"] = int(torch.cuda.memory_allocated())
+            stats["reserved"] = int(torch.cuda.memory_reserved())
+            largest = 0
+            for seg in torch.cuda.memory_snapshot():
+                for blk in seg.get("blocks", []):
+                    if blk.get("state") == "inactive":
+                        largest = max(largest, int(blk.get("size", 0)))
+            stats["largest_free_block"] = largest
+        except Exception:
+            pass
+        return stats
+
+    def _error_kind_fields(e):
+        """Typed verdict for an error frame, from the LIVE exception object.
+
+        The verdict is computed here, at the raise site, where the object
+        still exists: the parent only ever sees strings. mm.is_oom is
+        ComfyUI's own function (isinstance plus the AcceleratorError code 2
+        case), so the worker and a non-isolated node agree by construction.
+        Never derived from message text. Any failure omits the keys, which
+        degrades to today's untyped WorkerError."""
+        fields = {}
+        try:
+            if isinstance(e, _InterruptedError):
+                fields["error_kind"] = "interrupt"
+                return fields
+            import comfy.model_management as _emm
+            if _emm.is_oom(e):
+                fields["error_kind"] = "oom"
+                fields["oom_stats"] = _oom_stats()
+        except Exception:
+            return {}
+        return fields
+
     def _call_parent(method, **params):
         """Call a method on the parent process and wait for result.
 
@@ -1283,36 +1396,70 @@ def main():
             # Check for actual callback_response
             if response.get("type") == "callback_response":
                 if response.get("status") == "error":
+                    # Typed field first; a new parent stamps interrupts so the
+                    # verdict never has to be recovered from message text.
+                    if response.get("error_kind") == "interrupt":
+                        raise _InterruptedError(
+                            response.get("error", "Processing interrupted by user"))
                     raise RuntimeError(response.get("error", "Callback failed"))
                 return response.get("result")
             # Unknown message — log and skip
             wlog(f"[worker] _call_parent: unexpected message type={response.get('type')}, keys={list(response.keys())}")
 
     # ---------------------------------------------------------------
-    # Auto-enable fastest attention backend before comfy modules are
-    # imported.  In the subprocess, comfy.cli_args.args is parsed with
-    # empty argv so --use-sage-attention / --use-flash-attention are
-    # False.  Setting them here lets comfy.ldm.modules.attention pick
-    # up sage/flash when it is first imported below.
+    # Attention backend: the worker FOLLOWS the host (same rule as aimdo).
+    # The mirrored key is the host's RESOLVED backend, not a store_true flag
+    # (host-False is indistinguishable from host-default on the wire), and a
+    # host that could import sage yet resolved pytorch attention made a
+    # deliberate choice the worker must not upgrade past. The old auto-probe
+    # guessed over that known answer -- an operator who removed sage because
+    # it broke on their card got it back in every worker -- so it now runs
+    # only under COMFY_ENV_WORKER_ATTENTION=auto (for pack envs richer than
+    # the host). A mirrored backend this env cannot import is skipped and
+    # reported, never silently substituted. Still before the first
+    # comfy.model_management import below, so comfy.ldm.modules.attention
+    # sees the flags when it is first imported.
     # ---------------------------------------------------------------
     try:
-        import torch as _torch_check
-        if _torch_check.cuda.is_available() and _torch_check.cuda.get_device_capability()[0] >= 8:
-            from comfy.cli_args import args as _cli_args
-            try:
-                import sageattention  # noqa: F401
-                _cli_args.use_sage_attention = True
-                wlog("[worker] Auto-enabled sage attention")
-            except ImportError:
-                pass
-            try:
-                import flash_attn  # noqa: F401
-                _cli_args.use_flash_attention = True
-                wlog("[worker] Auto-enabled flash attention")
-            except ImportError:
-                pass
-    except Exception:
-        pass
+        _att_mode = os.environ.get("COMFY_ENV_WORKER_ATTENTION", "").strip().lower()
+        if _att_mode == "auto":
+            import torch as _torch_check
+            if _torch_check.cuda.is_available() and _torch_check.cuda.get_device_capability()[0] >= 8:
+                from comfy.cli_args import args as _cli_args
+                try:
+                    import sageattention  # noqa: F401
+                    _cli_args.use_sage_attention = True
+                    wlog("[worker] Auto-enabled sage attention (WORKER_ATTENTION=auto)")
+                except ImportError:
+                    pass
+                try:
+                    import flash_attn  # noqa: F401
+                    _cli_args.use_flash_attention = True
+                    wlog("[worker] Auto-enabled flash attention (WORKER_ATTENTION=auto)")
+                except ImportError:
+                    pass
+        else:
+            _want_att = (_mirror_payload or {}).get(
+                _mirrored_args.ATTENTION_KEY) if _mirrored_args else None
+            if _want_att in ("sage", "flash"):
+                from comfy.cli_args import args as _cli_args
+                try:
+                    if _want_att == "sage":
+                        import sageattention  # noqa: F401
+                        _cli_args.use_sage_attention = True
+                    else:
+                        import flash_attn  # noqa: F401
+                        _cli_args.use_flash_attention = True
+                    _mirror_report["applied"].append("attention")
+                    wlog(f"[worker] Mirrored host attention backend: {_want_att}")
+                except ImportError:
+                    _mirror_report["skipped"].append(
+                        {"name": "attention",
+                         "reason": "unimportable:" + _want_att})
+                    wlog(f"[worker] host attention backend '{_want_att}' not "
+                         f"importable in this env; using comfy's default")
+    except Exception as _ae:
+        wlog(f"[worker] attention setup failed: {_ae}")
 
     # ---------------------------------------------------------------
     # Propagate --cpu flag from parent process.  When the parent is
@@ -1352,14 +1499,38 @@ def main():
                 total_size = sum(mi["size"] for mi in model_info)
                 wlog(f"[worker] load_models_gpu shim: {len(models)} models, {total_size / 1e9:.2f} GB total")
 
-                # Ask parent to evict its models and make room
+                # Ask parent to evict its models and make room. The pin state
+                # rides along: this is the low-frequency channel the parent's
+                # allocator reads, and the reply is the ONLY grant channel
+                # (censuses are worker-to-parent piggybacks; no parent push
+                # exists at node boundaries).
+                _ps = None
+                try:
+                    if _memmgr is not None:
+                        _ps = _memmgr.pin_state()
+                except Exception:
+                    pass
                 result = _call_parent("request_vram_budget",
                              model_info=model_info,
-                             total_size=total_size)
+                             total_size=total_size,
+                             pin_state=_ps)
 
                 # Propagate parent's VRAM constraints to subprocess
                 if result:
                     extra_reserved = result.get("extra_reserved_vram")
+                    # Pin grant (present only under COMFY_ENV_PIN_SPLIT=auto).
+                    # Clamp-only by contract; grow before load is the point of
+                    # applying it here, before the real load_models_gpu runs.
+                    if _memmgr is not None and (
+                            result.get("pin_max") is not None
+                            or result.get("pin_headroom") is not None):
+                        try:
+                            _memmgr.apply_pin_budget(
+                                grant=result.get("pin_max"),
+                                headroom=result.get("pin_headroom"),
+                                log=wlog)
+                        except Exception as _pe:
+                            wlog(f"[worker] pin grant apply failed: {_pe}")
 
                     # Correct OUR OWN blindness. get_free_memory() here reports
                     # this process's budget on WDDM -- it cannot see the parent
@@ -1374,11 +1545,22 @@ def main():
                         try:
                             _my_blind = _cmm.get_free_memory(_cmm.get_torch_device())
                             _others = max(0, int(_my_blind) - int(_dev_free))
-                            extra_reserved = max(int(extra_reserved or 0), _others)
+                            # SUM, not max. The blindness term (bytes siblings
+                            # hold) and the host margin (extra_reserved_vram)
+                            # serve different purposes: one makes our view
+                            # honest, the other keeps a buffer ABOVE the honest
+                            # view for cast transients and other apps. max()
+                            # collapsed them: whenever siblings held more than
+                            # the margin, the margin vanished. Note: the margin
+                            # does NOT protect dynamic models, whose budget is 0
+                            # and rewritten to 1e32 upstream (model_load), so an
+                            # unpageable load path can still fill the card.
+                            extra_reserved = int(extra_reserved or 0) + _others
                             wlog(f"[worker] blindness correction: my_free="
                                  f"{_my_blind / 1e9:.2f}GB device_free="
                                  f"{_dev_free / 1e9:.2f}GB -> reserve "
-                                 f"{_others / 1e9:.2f}GB for other processes")
+                                 f"{_others / 1e9:.2f}GB for others + "
+                                 f"{int(result.get('extra_reserved_vram') or 0) / 1e9:.2f}GB margin")
                         except Exception as _be:
                             wlog(f"[worker] blindness correction skipped: {_be}")
 
@@ -1424,13 +1606,15 @@ def main():
     # automatically forward updates to the parent, which relays to the ComfyUI frontend.
     try:
         import comfy.utils as _cu
-        class _InterruptedError(RuntimeError):
-            """Raised when the user cancels the current run."""
-            pass
         def _progress_hook(value, total, preview=None, node_id=None):
             try:
                 _call_parent("report_progress", value=value, total=total)
+            except _InterruptedError:
+                raise
             except RuntimeError as e:
+                # OLD-PARENT FALLBACK ONLY: parents predating the typed
+                # error_kind field send a bare RuntimeError whose text is the
+                # only signal. New code paths never match message text.
                 if "interrupted" in str(e).lower():
                     raise _InterruptedError(str(e))
             except Exception:
@@ -1459,6 +1643,52 @@ def main():
         except Exception as _e:
             wlog(f"[worker] memory manager probe failed: {_e}")
 
+    # Pin budget bootstrap. The counter installs unconditionally (telemetry);
+    # the grant and headroom apply only when the parent exported them, which
+    # it does only under COMFY_ENV_PIN_SPLIT=auto -- absent vars are a no-op,
+    # keeping the off default byte-identical to today. apply_pin_budget is
+    # clamp-only, so a mirrored --disable-pinned-memory stays disabled.
+    if _memmgr is not None:
+        try:
+            _memmgr.install_pin_error_counter()
+            _bs_grant = os.environ.get("COMFY_ENV_PIN_SHARE")
+            _bs_headroom = os.environ.get("COMFY_ENV_PIN_HEADROOM")
+            if _bs_grant is not None or _bs_headroom is not None:
+                _memmgr.apply_pin_budget(
+                    grant=int(_bs_grant) if _bs_grant is not None else None,
+                    headroom=int(_bs_headroom) if _bs_headroom is not None else None,
+                    log=wlog)
+        except Exception as _e:
+            wlog(f"[worker] pin budget bootstrap failed: {_e}")
+
+
+    def _residency_census():
+        """Worker-measured residency for every registered model. The same
+        number _handle_model_partial trusts, sampled at the node boundary.
+        Never raises: the census is advisory and a failed read keeps the
+        parent's last receipt (missing means unknown, not zero)."""
+        out = []
+        for _mid, _model in list(_model_registry.items()):
+            try:
+                _lm = _find_loaded_model(_model)
+                if _lm is not None:
+                    _res = int(_lm.model.loaded_size())
+                else:
+                    _prm = next(_model.parameters(), None)
+                    _on = _prm is not None and _prm.device.type == "cuda"
+                    _res = int(_model_registry_meta.get(_mid, {}).get("size", 0)) if _on else 0
+                _dev = "cpu"
+                try:
+                    _prm = next(_model.parameters(), None)
+                    if _prm is not None:
+                        _dev = str(_prm.device)
+                except Exception:
+                    pass
+                out.append({"id": _mid, "seq": _residency_seq.get(_mid, 0),
+                            "resident": _res, "device": _dev})
+            except Exception:
+                continue
+        return out
 
     def _attach_new_models(resp):
         """Attach auto-detected models to ANY outgoing frame, ok or error.
@@ -1470,6 +1700,27 @@ def main():
         _new_models on every response path before any status check, so
         attaching here is sufficient.
         """
+        # Census FIRST, above the early return: with no new models this call
+        # (the steady state) the early-out would suppress residency in exactly
+        # the case where the parent's stamp is going stale.
+        try:
+            if _model_registry:
+                resp["_model_residency"] = _residency_census()
+        except Exception:
+            pass
+        # Pin census: one bare int (hot frames stay small; the five-field
+        # _pin_state rides the low-frequency channels). None means comfy is
+        # not imported here -- report nothing, never a fabricated zero.
+        try:
+            if _memmgr is not None:
+                _tp = _memmgr.total_pinned()
+                if _tp is not None:
+                    resp["_pinned"] = _tp
+        except Exception:
+            pass
+        if _pending_state_out[0] is not None:
+            resp["_self_state_out"] = _pending_state_out[0]
+            _pending_state_out[0] = None
         if not _new_models_this_call:
             return resp
         # Resolve actual device at response time.  Models are auto-detected
@@ -1489,7 +1740,38 @@ def main():
         return resp
 
     # Signal ready
-    transport.send({"status": "ready", "memory_manager": _mem_info})
+    _ready_frame = {"status": "ready", "memory_manager": _mem_info}
+    try:
+        if _memmgr is not None:
+            _ps = _memmgr.pin_state()
+            if _ps is not None:
+                _ready_frame["_pin_state"] = _ps
+    except Exception:
+        pass
+    # Mirror divergence report: the hash is READ BACK off this process's args
+    # object after apply (never the received payload, which would compare a
+    # copy to itself and detect nothing). num_streams is read back from the
+    # frozen module constant, never recomputed -- it is Group A's budget
+    # input for cast-buffer VRAM.
+    try:
+        if _mirrored_args is not None and _mirror_payload is not None:
+            from comfy.cli_args import args as _ra_args
+            _applied_names = [n for n in _mirror_report.get("applied", [])
+                              if n != "attention"]
+            _cm = {
+                "hash": _mirrored_args.readback_hash(_ra_args, _applied_names),
+                "applied": _mirror_report.get("applied", []),
+                "skipped": _mirror_report.get("skipped", []),
+            }
+            _cmm_ready = sys.modules.get("comfy.model_management")
+            if _cmm_ready is not None:
+                _ns = getattr(_cmm_ready, "NUM_STREAMS", None)
+                if _ns is not None:
+                    _cm["num_streams"] = int(_ns)
+            _ready_frame["cli_mirror"] = _cm
+    except Exception as _cme:
+        wlog(f"[worker] mirror report failed: {_cme}")
+    transport.send(_ready_frame)
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---
@@ -1609,6 +1891,7 @@ def main():
 
         # Clear new-models tracker for this call
         _new_models_this_call.clear()
+        _pending_state_out[0] = None
 
         # Defensive: skip stale callback_responses or unknown messages
         if request.get("type") == "callback_response":
@@ -1643,10 +1926,11 @@ def main():
                 _shm_keeper.keep(shm_registry, _current_call_id)
             except Exception as e:
                 _cleanup_shm(shm_registry)
-                transport.send(_attach_new_models(
-                    {"status": "error", "call_id": _current_call_id,
-                     "error": str(e),
-                     "traceback": traceback.format_exc()}))
+                _frame = {"status": "error", "call_id": _current_call_id,
+                          "error": str(e),
+                          "traceback": traceback.format_exc()}
+                _frame.update(_error_kind_fields(e))
+                transport.send(_attach_new_models(_frame))
             continue
 
         if "module" not in request:
@@ -1701,20 +1985,103 @@ def main():
                 class_name = request["class_name"]
                 method_name = request["method_name"]
                 self_state = request.get("self_state")
+                _state_sync_on = (
+                    _state_sync is not None
+                    and self_state is not None
+                    and os.environ.get(_state_sync.STATE_ENV_VAR, "sync").lower()
+                    not in ("off", "0", "false")
+                )
                 wlog(f"[worker] Getting class {class_name}...")
 
                 cls = getattr(module, class_name)
                 wlog(f"[worker] Creating instance...")
-                instance = object.__new__(cls)
+                if _state_sync_on and request.get("seed"):
+                    # Run the REAL __init__ once per parent instance: upstream
+                    # parity is class_def() (execution.py:499). Today no
+                    # __init__ ever runs anywhere, so a node reading an
+                    # __init__-set attribute raises. Falls back to the old
+                    # path with a WARN rather than breaking the node.
+                    try:
+                        instance = cls()
+                    except Exception as _se:
+                        wlog(f"[worker] WARNING: {class_name}() raised during "
+                             f"seeding ({_se}); falling back to object.__new__")
+                        instance = object.__new__(cls)
+                else:
+                    instance = object.__new__(cls)
                 if self_state:
                     self_state = _deserialize_isolated_objects(self_state)
+                    if _state_sync_on:
+                        # resolve overflow markers back into live values; a
+                        # marker from a previous worker generation is state
+                        # this process never held, and pretending otherwise is
+                        # the silent-wrong-default this design refuses.
+                        for _k in list(self_state.keys()):
+                            _v = self_state[_k]
+                            if _state_sync.is_overflow_marker(_v):
+                                if _v.get("gen") != _STATE_GEN:
+                                    raise RuntimeError(
+                                        f"node attribute '{_k}' was held in a "
+                                        f"worker that has restarted; its value "
+                                        f"is gone and will be recomputed. "
+                                        f"(gen {_v.get('gen')} != {_STATE_GEN})"
+                                    )
+                                _held = _overflow_store.get(int(_v.get("handle", -1)))
+                                if _held is None:
+                                    raise RuntimeError(
+                                        f"node attribute '{_k}' overflow handle "
+                                        f"{_v.get('handle')} is unknown (evicted?)"
+                                    )
+                                self_state[_k] = _held[1]
                     instance.__dict__.update(self_state)
+                # The diff baseline is what the PARENT sent, not the post-seed
+                # instance dict: on a seeding call, __init__-set values are new
+                # to the parent and must ship, which they cannot if they count
+                # as "already known".
+                _pre_state = (dict(self_state) if self_state else {}) \
+                    if _state_sync_on else None
+                _state_owner = (request.get("state_id") or "?") if _state_sync_on else None
                 wlog(f"[worker] Calling {method_name}...")
                 method = getattr(instance, method_name)
                 try:
                     with _infer_mode():
                         result = method(**inputs)
                 finally:
+                    # State diff FIRST, in the finally: a non-isolated node
+                    # that mutates self and then raises keeps the mutation, so
+                    # an isolated one must too. Never raises: losing the state
+                    # return must not mask the node's own outcome.
+                    if _state_sync_on and _pre_state is not None:
+                        try:
+                            _cap = int(os.environ.get(
+                                _state_sync.STATE_MAX_BYTES_ENV_VAR,
+                                _state_sync.STATE_MAX_BYTES_DEFAULT))
+                            _inbound_handles = {
+                                int(v.get("handle", -1))
+                                for v in _pre_state.values()
+                                if _state_sync.is_overflow_marker(v)
+                            }
+                            _minted = set()
+
+                            def _store(h, v):
+                                _minted.add(h)
+                                _overflow_store[h] = (_state_owner, v)
+
+                            _pending_state_out[0] = _state_sync.diff_state(
+                                _pre_state, dict(instance.__dict__), _cap,
+                                _STATE_GEN, _mint_handle, _store)
+                            # owner-scoped reap: a handle of THIS instance that
+                            # the parent no longer references (and that this
+                            # call did not just mint) has been deleted or swept
+                            # parent-side; holding it would leak until restart.
+                            for _h in list(_overflow_store.keys()):
+                                _own, _ = _overflow_store[_h]
+                                if (_own == _state_owner
+                                        and _h not in _inbound_handles
+                                        and _h not in _minted):
+                                    del _overflow_store[_h]
+                        except Exception as _de:
+                            wlog(f"[worker] state diff failed: {_de}")
                     # ComfyUI runs this in a finally around every node
                     # (execution.py:550). A worker never reaches that code, so
                     # without this an aimdo-enabled worker would allocate cast
@@ -1747,12 +2114,14 @@ def main():
         except Exception as e:
             # Cleanup shm on error since host won't read it
             _cleanup_shm(shm_registry)
-            transport.send(_attach_new_models({
+            _frame = {
                 "status": "error",
                 "call_id": _current_call_id,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
-            }))
+            }
+            _frame.update(_error_kind_fields(e))
+            transport.send(_attach_new_models(_frame))
 
     transport.close()
 
