@@ -96,19 +96,20 @@ def _pin_ingest(key: str, pinned) -> None:
         _PIN_INGEST_SEQ += 1
         state_sync.update_pin_reports(_PIN_REPORTS, key, int(pinned),
                                       _PIN_INGEST_SEQ)
-        consumers = frozenset(k for k, r in _PIN_REPORTS.items()
+        reports = list(_PIN_REPORTS.items())  # snapshot: pops race this
+        consumers = frozenset(k for k, r in reports
                               if r.get("pinned", 0) > 0)
         if consumers == _PIN_LAST_CONSUMERS:
             _PIN_STABLE += 1
         else:
             _PIN_STABLE = 0
             _PIN_LAST_CONSUMERS = consumers
-        total = sum(r.get("pinned", 0) for r in _PIN_REPORTS.values())
+        total = sum(r.get("pinned", 0) for _k, r in reports)
         if abs(total - _PIN_ROLLUP_LAST) > 1024 ** 3:
             _PIN_ROLLUP_LAST = total
             _log("[comfy-env] pinned RAM rollup: "
                  + ", ".join(f"{k}={r.get('pinned', 0) / 1e9:.2f}GB"
-                             for k, r in sorted(_PIN_REPORTS.items()))
+                             for k, r in sorted(reports))
                  + f" (sum {total / 1e9:.2f}GB)")
     except Exception:
         pass
@@ -325,7 +326,12 @@ def _worker_held_bytes() -> int:
     # excess. Every live pool entry books the floor, patchers or not (the old
     # `if patchers:` skip booked a modelless worker's CUDA context at zero).
     snapshot: Dict[str, Dict[str, Any]] = {}
-    keys = set(_WORKER_POOL) | {k for k, v in _WORKER_PATCHERS.items() if v}
+    # list() first: a single C-level call, GIL-atomic, so a concurrent
+    # setdefault from the aiohttp thread cannot raise "dictionary changed
+    # size during iteration" mid-comprehension (which was swallowed into
+    # a failed budget reply: no eviction, then OOM). A one-tick-stale
+    # snapshot is benign here.
+    keys = set(_WORKER_POOL) | {k for k, v in list(_WORKER_PATCHERS.items()) if v}
     for key in keys:
         entry = _WORKER_POOL.get(key)
         worker = entry[0] if entry else None
@@ -377,7 +383,7 @@ def _maybe_add_pin_grant(reply: dict, request: dict, worker_key) -> None:
         reserve = float(os.environ.get(state_sync.PIN_RESERVE_ENV_VAR,
                                        state_sync.PIN_RESERVE_DEFAULT))
         grants = state_sync.allocate_pin_budgets(
-            host_max, _PIN_REPORTS, floor_bytes=floor, reserve=reserve,
+            host_max, dict(_PIN_REPORTS), floor_bytes=floor, reserve=reserve,
             requester=worker_key)
         raw = grants.get(worker_key)
         if raw is None:
@@ -467,7 +473,7 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
             + max(min_inference, forward))
 
     if _DBG_MODELS:
-        _inflight = sum(1 for _e in _WORKER_POOL.values()
+        _inflight = sum(1 for _e in list(_WORKER_POOL.values())
                         if getattr(_e[0], "_calls_in_flight", 0) > 0)
         _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB | "
              f"free: blind={blind_free / 1e9:.2f}GB true={true_free / 1e9:.2f}GB "
@@ -527,6 +533,8 @@ def _cleanup_stale_patchers(env_dir):
     """
     key = str(env_dir)
     _OVERHEAD_REPORTS.pop(key, None)  # the replaced process's scratch is gone
+    _PIN_REPORTS.pop(key, None)       # and its pins; parity with _remove_worker
+    _PIN_GRANTS.pop(key, None)
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
@@ -607,27 +615,24 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
                 # In-flight bracket for admission (models charge full size
                 # while the worker computes). call_module has no node
                 # boundary, so on exit run a PEAK-ONLY raise pass over the
-                # harvested census: peak writes are legal any time (upstream
-                # never reads them), but the ledger and seq stay boundary
-                # only, so the census remains in place for the full apply at
-                # the env's next call_method.
-                worker._calls_in_flight = getattr(worker, "_calls_in_flight", 0) + 1
+                # harvested census (state_sync.apply_peak_raise, under the
+                # worker's leaf mutex like every residency writer): peak
+                # writes are legal any time (upstream never reads them), but
+                # the ledger and seq stay boundary only, so the census
+                # remains in place for the full apply at the env's next
+                # call_method.
+                worker.begin_call()
                 try:
                     return worker.call_module(_module, _func, 120.0, body=body)
                 finally:
                     try:
                         _census = getattr(worker, "_last_residency", None)
-                        _live = _WORKER_PATCHERS.get(str(_env_dir), {})
-                        for _entry in _census or []:
-                            _p = _live.get(_entry.get("id"))
-                            if _p is not None:
-                                _p._residency_peak = max(
-                                    int(getattr(_p, "_residency_peak", 0)),
-                                    int(_entry.get("resident", 0)))
+                        _live = dict(_WORKER_PATCHERS.get(str(_env_dir), {}))
+                        with worker._mem_lock:
+                            state_sync.apply_peak_raise(_live, _census)
                     except Exception:
                         pass
-                    worker._calls_in_flight = max(
-                        0, getattr(worker, "_calls_in_flight", 1) - 1)
+                    worker.end_call()
 
             try:
                 result = await loop.run_in_executor(None, _routed_call)
@@ -661,6 +666,13 @@ FREE_BROADCAST_ENV_VAR = "COMFY_ENV_FREE_BROADCAST"
 _FREE_WRAP_INSTALLED = False
 _LAST_RELEASE_BROADCAST = [0.0]
 
+#: Serializes both one-shot host patches. A plain-bool check-then-set let two
+#: concurrent first-worker creations both read False and the loser capture
+#: the winner's WRAPPER as "_original", nesting permanently. Nothing else
+#: ever takes this lock, so holding it across the comfy import inside an
+#: install cannot deadlock.
+_INSTALL_LOCK = threading.Lock()
+
 
 def _install_free_broadcast() -> None:
     """Wrap comfy.model_management.unload_all_models, once.
@@ -675,27 +687,29 @@ def _install_free_broadcast() -> None:
     and drops their pin registrations through the real unpatch path), then
     broadcasts. Install failure logs once and degrades, never raises."""
     global _FREE_WRAP_INSTALLED
-    if _FREE_WRAP_INSTALLED:
-        return
-    _FREE_WRAP_INSTALLED = True
-    if os.environ.get(FREE_BROADCAST_ENV_VAR, "1").strip().lower() in (
-            "0", "false", "off"):
-        return
-    try:
-        import comfy.model_management as mm
-        _original = mm.unload_all_models
+    with _INSTALL_LOCK:
+        if _FREE_WRAP_INSTALLED:
+            return
+        _FREE_WRAP_INSTALLED = True
+        if os.environ.get(FREE_BROADCAST_ENV_VAR, "1").strip().lower() in (
+                "0", "false", "off"):
+            return
+        try:
+            import comfy.model_management as mm
+            _original = mm.unload_all_models
 
-        def _wrapped_unload_all_models(*args, **kwargs):
-            result = _original(*args, **kwargs)
-            try:
-                broadcast_release()
-            except Exception as exc:
-                _log(f"[comfy-env] release broadcast failed: {exc}")
-            return result
+            def _wrapped_unload_all_models(*args, **kwargs):
+                result = _original(*args, **kwargs)
+                try:
+                    broadcast_release()
+                except Exception as exc:
+                    _log(f"[comfy-env] release broadcast failed: {exc}")
+                return result
 
-        mm.unload_all_models = _wrapped_unload_all_models
-    except Exception as exc:
-        _log(f"[comfy-env] free-broadcast wrap not installed: {exc}")
+            _wrapped_unload_all_models._comfy_env_wrap = True
+            mm.unload_all_models = _wrapped_unload_all_models
+        except Exception as exc:
+            _log(f"[comfy-env] free-broadcast wrap not installed: {exc}")
 
 
 # --- Prompt epoch source: the host's one observer of prompt boundaries ----
@@ -716,24 +730,120 @@ def _install_prompt_epoch() -> None:
     (COMFY_ENV_PIN_MARKS); install failure logs once and degrades, never
     raises. Order-independent with the /free wrap (disjoint targets)."""
     global _PROMPT_EPOCH_INSTALLED
-    if _PROMPT_EPOCH_INSTALLED:
-        return
-    _PROMPT_EPOCH_INSTALLED = True
-    if os.environ.get(state_sync.PIN_MARKS_ENV_VAR, "1").strip().lower() in (
-            "0", "false", "off"):
-        return
-    try:
-        import comfy.model_patcher as _cmp
-        _orig_start = _cmp.PromptModelTracker.start
+    with _INSTALL_LOCK:
+        if _PROMPT_EPOCH_INSTALLED:
+            return
+        _PROMPT_EPOCH_INSTALLED = True
+        if os.environ.get(state_sync.PIN_MARKS_ENV_VAR, "1").strip().lower() in (
+                "0", "false", "off"):
+            return
+        try:
+            import comfy.model_patcher as _cmp
+            _orig_start = _cmp.PromptModelTracker.start
 
-        def _epoch_start(self, *args, **kwargs):
-            state_sync.PROMPT_GEN[0] += 1
-            return _orig_start(self, *args, **kwargs)
+            def _epoch_start(self, *args, **kwargs):
+                state_sync.PROMPT_GEN[0] += 1
+                return _orig_start(self, *args, **kwargs)
 
-        _cmp.PromptModelTracker.start = _epoch_start
-    except Exception as exc:
-        _log(f"[comfy-env] prompt-epoch patch not installed: {exc} "
-             f"(workers fall back to sticky marks with decay)")
+            _epoch_start._comfy_env_wrap = True
+            _cmp.PromptModelTracker.start = _epoch_start
+        except Exception as exc:
+            _log(f"[comfy-env] prompt-epoch patch not installed: {exc} "
+                 f"(workers fall back to sticky marks with decay)")
+
+
+# --- Host RAM-pressure pin reclaim (coverage gap: execution.py's periodic
+# --- free_pins sweep cannot see worker pinned RAM) -------------------------
+
+PIN_PRESSURE_ENV_VAR = "COMFY_ENV_PIN_PRESSURE"
+
+_PIN_PRESSURE_INSTALLED = False
+_LAST_PIN_PRESSURE_SWEEP = [0.0]
+
+
+def _install_pin_pressure() -> None:
+    """Wrap comfy.model_management.should_free_pins_for_ram_pressure, once.
+
+    Its ONLY upstream caller is the execution loop's post-node RAM path
+    (execution.py, via the ram_release_callback), it runs once per completed
+    node only under the RAM_PRESSURE cache, and a True return means the host
+    is in genuine RAM pressure with the shortfall in hand -- the one honest
+    trigger. Wrapping free_pins instead would fire on every pin attempt
+    (ensure_pin_budget calls it constantly). The wrap calls the original
+    first and returns its result verbatim; the broadcast is a side effect.
+    Reads only the ungated pin census: this reclaim needs nothing from the
+    dark COMFY_ENV_PIN_SPLIT machinery."""
+    global _PIN_PRESSURE_INSTALLED
+    with _INSTALL_LOCK:
+        if _PIN_PRESSURE_INSTALLED:
+            return
+        _PIN_PRESSURE_INSTALLED = True
+        if os.environ.get(PIN_PRESSURE_ENV_VAR, "1").strip().lower() in (
+                "0", "false", "off"):
+            return
+        try:
+            import comfy.model_management as mm
+            _original = mm.should_free_pins_for_ram_pressure
+
+            def _wrapped_should_free_pins(ram_shortfall, *args, **kwargs):
+                result = _original(ram_shortfall, *args, **kwargs)
+                if result:
+                    try:
+                        broadcast_pin_release(
+                            int(ram_shortfall) + 512 * 1024 * 1024)
+                    except Exception as exc:
+                        _log(f"[comfy-env] pin pressure broadcast failed: {exc}")
+                return result
+
+            _wrapped_should_free_pins._comfy_env_wrap = True
+            mm.should_free_pins_for_ram_pressure = _wrapped_should_free_pins
+        except Exception as exc:
+            _log(f"[comfy-env] pin-pressure wrap not installed: {exc}")
+
+
+def broadcast_pin_release(target_bytes: int) -> None:
+    """Ask workers to release pinned RAM, proportional to their census.
+
+    NO thread join, unlike broadcast_release: this fires from the execution
+    loop between nodes and must never block it. Daemon threads send, replies
+    converge the ledgers, busy workers get a parent-owned deferral drained at
+    their next node boundary, dead workers are skipped."""
+    now = time.monotonic()
+    asks = state_sync.plan_pin_pressure(dict(_PIN_REPORTS), int(target_bytes),
+                                        now, _LAST_PIN_PRESSURE_SWEEP[0])
+    if not asks:
+        return
+    _LAST_PIN_PRESSURE_SWEEP[0] = now
+    with _POOL_LOCK:
+        entries = dict(_WORKER_POOL)
+
+    def _ask_one(key, size):
+        entry = entries.get(key)
+        if entry is None:
+            return
+        worker, gen = entry
+        if not worker.is_alive() or                 not getattr(worker, "supports_release_pins", False):
+            return
+        try:
+            r = worker.send_command_no_spawn("release_pins", size=size,
+                                             lock_timeout=2.0)
+            if r == "busy":
+                worker._pin_release_deferred = size
+                return
+            if isinstance(r, dict):
+                _ingest_worker_frames(key, worker, gen)
+                receipt = r.get("receipt") or {}
+                _log(f"[comfy-env] RAM pressure: worker {Path(key).name} "
+                     f"released pins "
+                     f"{receipt.get('pinned_before', 0) / 1e9:.2f}GB -> "
+                     f"{receipt.get('pinned_after', 0) / 1e9:.2f}GB"
+                     + (f", errors={receipt.get('errors')}"
+                        if receipt.get("errors") else ""))
+        except Exception as exc:
+            _log(f"[comfy-env] pin release of {Path(key).name} failed: {exc}")
+
+    for key, size in asks.items():
+        threading.Thread(target=_ask_one, args=(key, size), daemon=True).start()
 
 
 def broadcast_release() -> None:
@@ -875,6 +985,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # /free broadcast to reach and nobody to consume the prompt epoch.
     _install_free_broadcast()
     _install_prompt_epoch()
+    _install_pin_pressure()
     return worker, gen
 
 
@@ -1018,10 +1129,17 @@ def _ingest_worker_frames(env_dir, worker, generation):
             worker._last_residency = None
             live = {
                 mid: p
-                for mid, p in _WORKER_PATCHERS.get(str(env_dir), {}).items()
+                for mid, p in list(_WORKER_PATCHERS.get(str(env_dir), {}).items())
                 if getattr(p, "_worker_generation", generation) == generation
             }
-            state_sync.apply_residency(live, census, log=_log)
+            # Whole census under one _mem_lock hold: it is dict math over a
+            # handful of entries, microseconds, zero IPC. Per-entry holds
+            # would let a concurrent echo interleave mid-census and produce
+            # mixed-epoch state. The seq guard inside apply_residency IS the
+            # in-critical-section recheck once every competing writer
+            # serializes on this lock.
+            with worker._mem_lock:
+                state_sync.apply_residency(live, census, log=_log)
 
     # Pin census (observability, ungated: the rollup ships live while the
     # clamp stays dark behind COMFY_ENV_PIN_SPLIT).
@@ -1063,6 +1181,20 @@ def _register_new_patchers(env_dir, worker, generation):
     # Drain a /free release the broadcast deferred because this worker was
     # mid-call: the call just ended, the worker is idle between requests, and
     # this thread can win the lock immediately.
+    _deferred_pins = getattr(worker, "_pin_release_deferred", None)
+    if _deferred_pins:
+        worker._pin_release_deferred = None
+        try:
+            r = worker.send_command_no_spawn("release_pins",
+                                             size=int(_deferred_pins),
+                                             lock_timeout=2.0)
+            if r == "busy":
+                worker._pin_release_deferred = _deferred_pins
+            elif isinstance(r, dict):
+                _ingest_worker_frames(env_dir, worker, generation)
+        except Exception as _ppe:
+            _log(f"[comfy-env] deferred pin release failed: {_ppe}")
+
     if getattr(worker, "_release_deferred", False):
         worker._release_deferred = False
         try:

@@ -140,6 +140,18 @@ class SubprocessWorker(Worker):
         self._process: Optional[subprocess.Popen] = None
         self._shutdown = False
         self._lock = threading.RLock()  # Reentrant: VRAM eviction callbacks re-enter via send_command
+        self._calls_in_flight = 0
+        # LEAF MUTEX, acquired LAST in any lock order. Guards _calls_in_flight
+        # and all patcher _residency_seq/_residency_peak/ledger writes (the
+        # residency design), with the seq guard re-checked inside the critical
+        # section. Deliberately NOT self._lock: that RLock is held across the
+        # entire node call (up to 600 s), so a route thread's boundary apply
+        # would stall behind it. Never hold this across IPC or any Python
+        # call that can block. Created here so it exists before the first
+        # patcher is constructed against this worker; parent side only, never
+        # staged to the worker. Foreign threads (aiohttp executor, another
+        # worker's budget callback evicting this worker's proxy) acquire it.
+        self._mem_lock = threading.Lock()
         self._last_new_models = []  # Auto-detected models from last call
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
@@ -637,6 +649,7 @@ class SubprocessWorker(Worker):
         # that declare the handler. An unadvertised worker would give an
         # unknown method NO reply and die at the 60 s recv timeout.
         self.supports_full_release = bool(msg.get("full_release"))
+        self.supports_release_pins = bool(msg.get("release_pins"))
         # Mirror divergence check: recompute the read-back hash over the SAME
         # applied names with OUR args and compare. Log-only and fail-open,
         # always: a worker refusing to start would convert a 2x footprint
@@ -1177,6 +1190,21 @@ class SubprocessWorker(Worker):
             return response
         finally:
             self._lock.release()
+
+    def begin_call(self) -> None:
+        """Enter the admission in-flight bracket. Pair with end_call in a
+        finally. While the counter is above zero, admission charges this
+        worker's models at full size (an aimdo worker can lazily re-fault mid
+        call with no signal). The locked form exists for 3.9/3.10 parents and
+        free-threaded builds, where the bare read-modify-write statement is
+        interruptible; on 3.11-3.13 with the GIL it is incidentally atomic,
+        which is not a contract."""
+        with self._mem_lock:
+            self._calls_in_flight += 1
+
+    def end_call(self) -> None:
+        with self._mem_lock:
+            self._calls_in_flight = max(0, self._calls_in_flight - 1)
 
     def send_command_no_spawn(self, method, lock_timeout=2.0, **params):
         """send_command variant for broadcasts: never resurrects a worker.

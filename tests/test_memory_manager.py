@@ -114,8 +114,36 @@ def test_enable_refuses_without_a_cuda_device(monkeypatch):
     assert any("no CUDA device" in m for m in messages)
 
 
-def test_release_node_boundary_is_a_noop_without_aimdo(fake_comfy):
-    """Must never raise: a failed release cannot fail the node that succeeded."""
+def test_cast_epoch_boundary_resets_per_prompt_non_aimdo(
+        fake_comfy, monkeypatch):
+    """The old form was a full noop without aimdo, which let a non-aimdo
+    worker on the lowvram cast path ratchet STREAM_CAST_BUFFERS to
+    NUM_STREAMS x its largest-ever layer for the life of the process
+    (measured: 2 x 512 MiB held through unloads). Now the cast rung runs on
+    prompt-epoch changes (and per node when no token arrives, the safe
+    default), while the prefetch/vbar rungs stay aimdo only."""
+    import sys
+    import types
+    from comfy_env import memory_manager
+    fake_comfy(aimdo_enabled=False)
+    calls = []
+    mmm = types.ModuleType("comfy.model_management")
+    mmm.reset_cast_buffers = lambda: calls.append("reset")
+    monkeypatch.setitem(sys.modules, "comfy.model_management", mmm)
+    monkeypatch.setattr(memory_manager, "_CAST_EPOCH", [object()])
+    memory_manager.cast_epoch_boundary(1)     # first sight of epoch 1: reset
+    memory_manager.cast_epoch_boundary(1)     # same epoch: no churn
+    memory_manager.cast_epoch_boundary(2)     # epoch changed: reset
+    memory_manager.cast_epoch_boundary(None)  # no token: per-call safe default
+    assert calls == ["reset", "reset", "reset"]
+    # and the per-node finally hook stays aimdo-gated (no double churn)
+    release_node_boundary()
+    assert calls == ["reset", "reset", "reset"]
+
+
+def test_release_node_boundary_never_raises_without_aimdo(fake_comfy):
+    """Must never raise: a failed release cannot fail the node that
+    succeeded (here comfy.model_management is absent entirely)."""
     fake_comfy(aimdo_enabled=False)
     release_node_boundary()  # no exception is the assertion
 

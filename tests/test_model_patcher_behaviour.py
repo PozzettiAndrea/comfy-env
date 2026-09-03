@@ -42,8 +42,11 @@ class FakeWorker:
     """Records commands; can play dead or fail."""
 
     def __init__(self, alive=True, reply=None, boom=False):
+        import threading
         self._alive, self._reply, self._boom = alive, reply or {}, boom
         self.sent = []
+        self._mem_lock = threading.Lock()   # the real worker's leaf mutex
+        self._calls_in_flight = 0
 
     def is_alive(self):
         return self._alive

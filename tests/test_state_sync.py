@@ -534,3 +534,106 @@ def test_state_sync_stays_pure():
             root = n.split(".")[0]
             assert root not in ("comfy", "torch", "psutil", "comfy_aimdo"), (
                 f"state_sync imports {n}; the pure layer just died")
+
+
+class TestDetachSeqAndPeakRaise:
+    """The detach seq gap: model_to_device echoes used to carry no seq, so a
+    census sampled BEFORE a detach could win the tie AFTER it and re-inflate
+    a correctly zeroed model, stickily (nothing else bumped seq)."""
+
+    def test_detach_with_seq_supersedes_an_earlier_census(self):
+        """The fixed path: detach records the worker's echo seq, so a stale
+        census carrying a LOWER seq drops."""
+        from comfy_env.state_sync import apply_echo
+        p = FakePatcher(8 * GIB, loaded=6 * GIB)
+        p._residency_peak = 6 * GIB
+        apply_echo(p, 0, unmapped=True, seq=7)
+        apply_residency({"m": p}, census("m", 6, 6 * GIB))  # sampled pre-detach
+        assert held_ceiling(p) == 0
+        assert p.model.model_loaded_weight_memory == 0
+
+    def test_equal_seq_census_after_detach_resurrects_legitimately(self):
+        """A census carrying the SAME seq was sampled AFTER the detach's byte
+        movement (worker bumps at echo-send): if it reports bytes, the detach
+        did not fully free (or the model re-faulted) and the books must say
+        so. This is the intended repair, not the bug."""
+        from comfy_env.state_sync import apply_echo
+        p = FakePatcher(8 * GIB, loaded=6 * GIB)
+        apply_echo(p, 0, unmapped=True, seq=7)
+        apply_residency({"m": p}, census("m", 7, 3 * GIB))
+        assert p.model.model_loaded_weight_memory == 3 * GIB
+
+    def test_seqless_detach_still_zeroes_but_cannot_block_stale_census(self):
+        """Old worker degrade: no seq on the echo means today's behavior, the
+        zero lands but an equal-seq census can still apply. Documented, not
+        fixed, for old workers; the WORKER_GONE path relies on the
+        generation filter instead."""
+        from comfy_env.state_sync import apply_echo
+        p = FakePatcher(8 * GIB, loaded=6 * GIB)
+        p._residency_seq = 5
+        apply_echo(p, 0, unmapped=True, seq=None)
+        assert held_ceiling(p) == 0
+        assert p._residency_seq == 5  # unchanged: nothing to record
+
+    def test_apply_peak_raise_raises_only_the_peak(self):
+        """The route path's peak-only pass: never lowers, never touches
+        ledger or seq, never consumes the census. Catches: the old bare
+        `_residency_peak = max(...)` write drifting back into pool.py with
+        ledger or seq side effects."""
+        from comfy_env.state_sync import apply_peak_raise
+        p = FakePatcher(8 * GIB, loaded=2 * GIB)
+        p._residency_peak = 3 * GIB
+        p._residency_seq = 4
+        apply_peak_raise({"m": p}, census("m", 9, 5 * GIB))
+        assert p._residency_peak == 5 * GIB
+        assert p.model.model_loaded_weight_memory == 2 * GIB  # ledger untouched
+        assert p._residency_seq == 4                          # seq untouched
+        apply_peak_raise({"m": p}, census("m", 10, 1 * GIB))
+        assert p._residency_peak == 5 * GIB                   # never lowers
+
+    def test_apply_peak_raise_never_raises_on_garbage(self):
+        from comfy_env.state_sync import apply_peak_raise
+        apply_peak_raise({}, [{"id": "ghost", "resident": "junk"}])
+        apply_peak_raise({"m": object()}, census("m", 1, GIB))
+
+
+class TestPlanPinPressure:
+    """The host RAM-pressure reclaim planner. The trigger fires once per
+    completed node under genuine pressure; the plan must spread the ask, skip
+    trivial holders, and rate-limit so sustained pressure cannot shred and
+    repin worker buffers every node (~200 ms per GiB repin cost)."""
+
+    def test_proportional_ask_never_all_from_one_victim(self):
+        from comfy_env.state_sync import plan_pin_pressure
+        asks = plan_pin_pressure(
+            {"host": {"pinned": 4 * GIB},
+             "a": {"pinned": 3 * GIB}, "b": {"pinned": 1 * GIB}},
+            target=2 * GIB, now=100.0, last_sweep=0.0)
+        assert set(asks) == {"a", "b"}  # the host is never asked
+        assert asks["a"] == 3 * asks["b"]  # proportional to holdings
+
+    def test_rate_limit_returns_empty(self):
+        """Catches: a sweep per node under sustained pressure."""
+        from comfy_env.state_sync import plan_pin_pressure
+        assert plan_pin_pressure({"a": {"pinned": 4 * GIB}}, 1 * GIB,
+                                 now=5.0, last_sweep=0.0) == {}
+
+    def test_small_holders_are_skipped(self):
+        """A sub-slice reclaim costs more in repin than it returns."""
+        from comfy_env.state_sync import plan_pin_pressure
+        asks = plan_pin_pressure(
+            {"tiny": {"pinned": 10 * 1024 * 1024},
+             "big": {"pinned": 2 * GIB}},
+            target=1 * GIB, now=100.0, last_sweep=0.0)
+        assert "tiny" not in asks and "big" in asks
+
+    def test_ask_never_exceeds_holdings(self):
+        from comfy_env.state_sync import plan_pin_pressure
+        asks = plan_pin_pressure({"a": {"pinned": 1 * GIB}},
+                                 target=50 * GIB, now=100.0, last_sweep=0.0)
+        assert asks["a"] <= 1 * GIB
+
+    def test_nothing_reclaimable_is_a_noop(self):
+        from comfy_env.state_sync import plan_pin_pressure
+        assert plan_pin_pressure({"host": {"pinned": 4 * GIB}}, 1 * GIB,
+                                 now=100.0, last_sweep=0.0) == {}

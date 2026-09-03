@@ -1391,7 +1391,12 @@ def main():
                 pass
             if _current_dev is not None and _current_dev == _target_dev:
                 wlog(f"[worker] model_to_device: '{_mid}' already on {_target}")
-                transport.send({"status": "ok", "call_id": _req_call_id, "device": _target, "moved": False})
+                # seq even on moved False: the parent still zeroes its
+                # books, and the fresh seq lets that zero supersede any
+                # census sampled before this command.
+                transport.send({"status": "ok", "call_id": _req_call_id,
+                                "device": _target, "moved": False,
+                                "seq": _bump_seq(_mid)})
                 return
             _was_cuda = _current_dev is not None and _current_dev.type == "cuda"
             wlog(f"[worker] model_to_device: '{_mid}' -> {_target}")
@@ -1422,7 +1427,9 @@ def main():
                 _model.to(_target_dev)
             if _was_cuda and _target_dev.type == "cpu":
                 _torch.cuda.empty_cache()
-            transport.send({"status": "ok", "call_id": _req_call_id, "device": _target, "moved": True})
+            transport.send({"status": "ok", "call_id": _req_call_id,
+                            "device": _target, "moved": True,
+                            "seq": _bump_seq(_mid)})
         except Exception as _e:
             wlog(f"[worker] model_to_device error: {_e}")
             transport.send({"status": "error", "call_id": _req_call_id, "error": str(_e)})
@@ -1933,7 +1940,7 @@ def main():
     # parent broadcasts /free only to advertisers (an unknown method gets no
     # reply and the sender would eat the 60 s recv timeout).
     _ready_frame = {"status": "ready", "memory_manager": _mem_info,
-                    "full_release": True}
+                    "full_release": True, "release_pins": True}
     try:
         if _memmgr is not None:
             _ps = _memmgr.pin_state()
@@ -2071,6 +2078,23 @@ def main():
             transport.send(_attach_new_models(_fr))
             continue
 
+        # Host RAM-pressure pin reclaim: release N pinned bytes through the
+        # worker's OWN free_pins ladder (tiers, hysteresis, prompt marks all
+        # apply, same as a non-isolated node's pins). Main loop only, like
+        # full_release.
+        if request.get("method") == "release_pins":
+            _pr = {"status": "ok", "call_id": request.get("call_id")}
+            try:
+                if _memmgr is not None:
+                    _pr["receipt"] = _memmgr.release_pins(
+                        int(request.get("size", 0)), log=wlog)
+                else:
+                    _pr["receipt"] = {"errors": ["no memory_manager"]}
+            except Exception as _pre:
+                _pr["receipt"] = {"errors": [str(_pre)]}
+            transport.send(_attach_new_models(_pr))
+            continue
+
         if request.get("method") == "list_models":
             # Return registered model metadata
             transport.send({"status": "ok", "call_id": _current_call_id, "models": _model_registry_meta})
@@ -2156,6 +2180,12 @@ def main():
             # Retire the previous prompt's pin marks before this call's
             # method (and therefore before any of its loads) runs.
             _prompt_marks_preamble(request)
+            # New prompt starts with clean cast buffers (the non-aimdo
+            # ratchet fix); same epoch is a no-op, so intra-prompt reuse
+            # never reallocs.
+            if _memmgr is not None:
+                _memmgr.cast_epoch_boundary(request.get("prompt_gen"),
+                                            log=wlog)
 
             # Load inputs from shared memory
             kwargs_meta = request.get("kwargs")

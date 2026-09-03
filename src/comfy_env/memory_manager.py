@@ -330,19 +330,55 @@ def maybe_enable_aimdo(log=None) -> bool:
         return False
 
 
+#: Cast-buffer reset epoch for non-aimdo workers. The initial sentinel never
+#: equals a prompt gen, so the first call always resets.
+_CAST_EPOCH = [object()]
+
+
+def cast_epoch_boundary(prompt_gen, log=None) -> None:
+    """Reset STREAM_CAST_BUFFERS when the PROMPT epoch changes. Runs at the
+    START of a worker request, so the new prompt begins clean instead of
+    inheriting the previous prompt's buffers for its first node.
+
+    Why this exists: both upstream's reset and release_node_boundary were
+    aimdo gated, so a non-aimdo worker on the lowvram cast path ratcheted
+    STREAM_CAST_BUFFERS to NUM_STREAMS x its largest-ever casted layer for
+    the life of the process (measured: 2 x 512 MiB held through unloads and
+    four small-model nodes needing 256 MiB). Epoch scoping bounds the
+    ratchet to one prompt with zero intra-prompt realloc churn; a missing
+    token (host patch off or pre-first-prompt) degrades to a reset per call,
+    the safe default. Safe at call start: the worker is idle between
+    requests, no forward is in flight. ``reset_cast_buffers`` is safe
+    non-aimdo (its aimdo-only branch is gated on ``is_dynamic()``, False for
+    base ModelPatcher) and idempotent against the aimdo per-node reset in
+    release_node_boundary. Never raises."""
+    epoch_changed = prompt_gen is None or prompt_gen != _CAST_EPOCH[0]
+    _CAST_EPOCH[0] = prompt_gen
+    if not epoch_changed:
+        return
+    try:
+        import comfy.model_management as model_management
+
+        model_management.reset_cast_buffers()
+    except Exception as exc:
+        if log is not None:
+            log(f"[worker] cast epoch reset failed: {exc}")
+
+
 def release_node_boundary(log=None) -> None:
     """The worker's equivalent of ComfyUI's per node release.
 
     ComfyUI runs this in a ``finally`` around every node (``execution.py:550``),
     gated on ``aimdo_enabled``. A worker never reaches that code, so without
     this hook an aimdo enabled worker would allocate cast buffers, CUDA graph
-    pools and cross step tensors with nothing to ever free them. Never raises:
-    a release that fails must not fail the node that just succeeded.
+    pools and cross step tensors with nothing to ever free them. The
+    non-aimdo cast-buffer ratchet is handled separately, per prompt, by
+    ``cast_epoch_boundary`` at request start. Never raises: a release that
+    fails must not fail the node that just succeeded.
     """
     # Hot path: this runs in a finally around every worker node call, so the
-    # module is resolved from sys.modules rather than re-imported. When aimdo is
-    # off (CPU workers, failed init, or COMFY_ENV_WORKER_AIMDO=0), this costs
-    # one dict lookup and a getattr.
+    # module is resolved from sys.modules rather than re-imported. When aimdo
+    # is off this costs one dict lookup and a getattr.
     mm = sys.modules.get("comfy.memory_management")
     if mm is None or not getattr(mm, "aimdo_enabled", False):
         return
@@ -457,6 +493,18 @@ def apply_pin_budget(grant=None, headroom=None, log=None) -> bool:
     on ``comfy.memory_management`` (:176). Deliberately NOT via
     ``set_ram_cache_release_state``, which would also stamp a None callback;
     the only upstream setter (execution.py:748) never runs in a worker.
+
+    What the mirrored headroom actually buys here, stated honestly: the
+    "RAM cache" behind the release callback is the PromptExecutor's OUTPUT
+    cache, an object a worker does not have, and ``extra_ram_release`` is a
+    verified no-op when the callback is None -- so on those two call sites
+    the mirrored value is inert in workers, BY DESIGN (a worker callback
+    would have nothing safe to release that full_release and the pin ladder
+    do not already cover, and firing gc on every pressured pin would thrash
+    the allocator pinning depends on). The mirror's REAL consumer is the
+    pin floor: ``ensure_pin_budget`` (model_management.py:720) reads
+    ``RAM_CACHE_HEADROOM / 2`` on every hostbuf pin, so the mirror stops a
+    worker from pinning into RAM the host reserved for its cache.
     Returns True if anything changed. Never raises.
     """
     _log = log or (lambda *_: None)
@@ -755,3 +803,45 @@ def install_pin_eviction_counters(log=None) -> None:
         return freed
 
     mm.free_model_pins = _counted_free_model_pins
+
+
+def release_pins(size, log=None, _modules=None) -> Dict[str, Any]:
+    """Release ``size`` bytes of this worker's pinned host RAM, for the
+    host's RAM-pressure sweep. Never raises.
+
+    The worker owns its own current_loaded_models and pin ledger, so
+    ``mm.free_pins`` runs the SAME eviction ladder a non-isolated node's
+    pins face under host pressure (tiers, hysteresis, current_prompt marks
+    included). ``torch._C._host_emptyCache`` afterwards returns the unpinned
+    buffers from torch's host caching allocator as actual RSS, which is the
+    whole point under RAM pressure. Returns a measured receipt.
+    """
+    _log = log or (lambda *_: None)
+    modules = sys.modules if _modules is None else _modules
+    receipt: Dict[str, Any] = {"errors": []}
+    mm = sys.modules.get("comfy.model_management") if _modules is None \
+        else modules.get("comfy.model_management")
+    torch = modules.get("torch")
+    try:
+        if mm is not None:
+            receipt["pinned_before"] = int(getattr(mm, "TOTAL_PINNED_MEMORY", 0))
+            freed = mm.free_pins(int(size))
+            receipt["freed"] = int(freed)
+            receipt["pinned_after"] = int(getattr(mm, "TOTAL_PINNED_MEMORY", 0))
+        else:
+            receipt["errors"].append("no comfy.model_management")
+    except Exception as exc:
+        receipt["errors"].append(f"free_pins: {exc}")
+    try:
+        host_empty = getattr(getattr(torch, "_C", None), "_host_emptyCache", None)
+        if host_empty is not None:
+            host_empty()
+    except Exception as exc:
+        receipt["errors"].append(f"host_empty_cache: {exc}")
+    try:
+        _log(f"[worker] pressure pin release: asked {int(size) / 1e9:.2f}GB, "
+             f"pinned {receipt.get('pinned_before', 0) / 1e9:.2f}GB -> "
+             f"{receipt.get('pinned_after', 0) / 1e9:.2f}GB")
+    except Exception:
+        pass
+    return receipt

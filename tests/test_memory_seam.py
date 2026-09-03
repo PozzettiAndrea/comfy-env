@@ -457,10 +457,10 @@ class TestResidencyPeakSeam:
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "_call_in_worker")
         src = ast.unparse(fn)
-        assert "_calls_in_flight" in src
+        assert "worker.begin_call()" in src, "the in-flight increment is gone"
         reg = src.index("_register_new_patchers(env_dir")
         dec_candidates = [i for i in range(len(src))
-                          if src.startswith("worker._calls_in_flight = max", i)]
+                          if src.startswith("worker.end_call()", i)]
         assert dec_candidates, "the in-flight decrement is gone"
         assert min(dec_candidates) > reg, (
             "the in-flight flag clears BEFORE the boundary census applies; "
@@ -626,3 +626,76 @@ class TestBootstrapSeam:
                     "of read from the settled attribute")
                 return
         raise AssertionError("RESERVE_ENV_VAR injection not found")
+
+
+class TestResidencyWriterSerialization:
+    """The residency writer cluster fix: every writer of _residency_* fields
+    serializes on the worker's leaf mutex, and detach carries a seq."""
+
+    def test_no_bare_peak_writes_anywhere(self):
+        """Extends the model_patcher-only ban to pool.py: the route thread's
+        old bare `_p._residency_peak = max(...)` was a lost-update racing a
+        concurrent detach (resurrecting a peak the detach just zeroed).
+        state_sync owns every peak write."""
+        for path in (POOL, PROXY):
+            tree = _tree(path)
+            init_spans = [(n.lineno, n.end_lineno) for n in ast.walk(tree)
+                          if isinstance(n, ast.FunctionDef)
+                          and n.name == "__init__"]
+
+            def in_init(lineno):
+                return any(lo <= lineno <= hi for lo, hi in init_spans)
+
+            for node in ast.walk(tree):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = node.targets
+                elif isinstance(node, ast.AugAssign):
+                    targets = [node.target]
+                for t in targets:
+                    if in_init(node.lineno):
+                        continue  # priming an UNPUBLISHED object is legal
+                    assert not (isinstance(t, ast.Attribute)
+                                and t.attr == "_residency_peak"), (
+                        f"{path.name}:{node.lineno} writes _residency_peak "
+                        f"directly; route it through state_sync under the "
+                        f"worker's _mem_lock")
+
+    def test_residency_writers_run_under_the_leaf_mutex(self):
+        """Every apply_residency/apply_echo/apply_peak_raise call in pool.py
+        and model_patcher.py must sit inside a `with ..._mem_lock` block:
+        an unlocked writer is the equal-seq clobber reopening."""
+        for path in (POOL, PROXY):
+            tree = _tree(path)
+            parents = {}
+            for node in ast.walk(tree):
+                for child in ast.iter_child_nodes(node):
+                    parents[child] = node
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ("apply_residency", "apply_echo",
+                                               "apply_peak_raise")):
+                    continue
+                cursor, locked = node, False
+                while cursor in parents:
+                    cursor = parents[cursor]
+                    if isinstance(cursor, ast.With) and \
+                            "_mem_lock" in ast.unparse(cursor.items[0].context_expr):
+                        locked = True
+                        break
+                assert locked, (
+                    f"{path.name}:{node.lineno} calls {node.func.attr} "
+                    f"outside the worker _mem_lock")
+
+    def test_model_to_device_echoes_carry_seq(self):
+        """Both ok frames (moved True AND moved False) must bump and send
+        seq: without it, a census sampled before a detach wins the tie after
+        it and re-inflates a correctly zeroed model, stickily."""
+        src = WORKER.read_text(encoding="utf-8")
+        start = src.index("def _handle_model_to_device")
+        end = src.index("def _call_parent")
+        body = src[start:end]
+        assert body.count('"seq": _bump_seq(_mid)') >= 2, (
+            "a model_to_device ok frame lost its seq; detach-to-zero can be "
+            "resurrected by a stale census again")

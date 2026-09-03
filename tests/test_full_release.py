@@ -155,10 +155,17 @@ class TestPlanReleaseBroadcast:
                                       now=100.0, last_broadcast=0.0)
         assert plan["send"] == [] and plan["skip_dead"] == ["d"]
 
-    def test_debounce_absorbs_oom_recovery_rebroadcasts(self):
+    def test_debounce_suppresses_same_burst_duplicates_only(self):
+        """The window is deliberately SHORT (0.5 s): the wrap site cannot
+        tell a human /free from OOM recovery, so a long window would swallow
+        a genuine press right after an OOM broadcast. Inside the window a
+        nested duplicate is skipped; just outside it a fresh press sends."""
         plan = plan_release_broadcast({"a": {"alive": True, "advertises": True}},
-                                      now=100.0, last_broadcast=99.5)
+                                      now=100.0, last_broadcast=99.7)
         assert plan["send"] == [] and plan["skip_debounced"] == ["a"]
+        plan = plan_release_broadcast({"a": {"alive": True, "advertises": True}},
+                                      now=100.0, last_broadcast=99.0)
+        assert plan["send"] == ["a"]
 
     def test_empty_pool_is_a_noop(self):
         plan = plan_release_broadcast({}, now=1.0, last_broadcast=0.0)
@@ -228,3 +235,67 @@ class TestFreeSeamGuards:
         src = WORKER.read_text(encoding="utf-8")
         ready = src[src.index("_ready_frame = {"):src.index("transport.send(_ready_frame)")]
         assert '"full_release": True' in ready
+
+
+class TestPinPressureSeam:
+    """The RAM-pressure reclaim wiring (gap 6): the one honest trigger is
+    should_free_pins_for_ram_pressure (single upstream caller, fires only
+    under genuine pressure); the broadcast must never block the execution
+    loop and never respawn the dead."""
+
+    def test_wrap_calls_original_first_and_returns_it_verbatim(self):
+        """The wrap is observability plus a side effect, never a behavior
+        change: the host's own free_pins must still run on the True path."""
+        tree = ast.parse(POOL.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_wrapped_should_free_pins")
+        src = ast.unparse(fn)
+        assert src.index("_original(") < src.index("broadcast_pin_release")
+        assert "return result" in src
+
+    def test_pressure_broadcast_never_joins(self):
+        """broadcast_release may join (a human pressed /free and waits);
+        the pressure sweep fires from the execution loop BETWEEN NODES and a
+        join would stall every prompt under sustained pressure."""
+        tree = ast.parse(POOL.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "broadcast_pin_release")
+        src = _body_src(fn)
+        assert ".join(" not in src, (
+            "broadcast_pin_release joins its threads; the execution loop "
+            "stalls under sustained pressure")
+        assert "send_command_no_spawn" in src
+
+    def test_pressure_installer_holds_the_install_lock(self):
+        tree = ast.parse(POOL.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_install_pin_pressure")
+        assert "with _INSTALL_LOCK" in ast.unparse(fn)
+
+    def test_release_pins_never_touches_the_ladder_exclusions(self):
+        """Same OUT list as full_release: keepers, overflow store, and it
+        must go through mm.free_pins (the real tier ladder, prompt marks
+        included), never a side-channel unpin."""
+        memmgr = SRC / "memory_manager.py"
+        tree = ast.parse(memmgr.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "release_pins")
+        src = _body_src(fn)
+        assert "free_pins" in src
+        for banned in ("unpin_memory", "_shm_keeper", "_overflow_store",
+                       "free_registrations"):
+            assert banned not in src
+
+    def test_worker_advertises_and_dispatches_release_pins(self):
+        src = WORKER.read_text(encoding="utf-8")
+        assert '"release_pins": True' in src
+        assert 'request.get("method") == "release_pins"' in src
+        call_parent = next(n for n in ast.walk(ast.parse(src))
+                           if isinstance(n, ast.FunctionDef)
+                           and n.name == "_call_parent")
+        assert "release_pins" not in ast.unparse(call_parent), (
+            "release_pins dispatched from the interleave; it would free "
+            "pins under an active forward")

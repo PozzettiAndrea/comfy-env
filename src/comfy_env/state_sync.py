@@ -150,6 +150,26 @@ def apply_echo(p: Any, resident: int, seq: Optional[int] = None,
         pass  # an echo bookkeeping failure must not fail the eviction path
 
 
+def apply_peak_raise(patchers: Dict[str, Any],
+                     census: List[Dict[str, Any]]) -> None:
+    """Peak-ONLY raise pass for call paths with no node boundary (the aiohttp
+    route path): admission pessimism may rise at any time, but the ledger and
+    seq stay boundary-only, so the census remains in place for the full apply
+    at the env's next call_method. Never lowers, never writes seq or ledger,
+    never consumes the census. Callers hold the worker's _mem_lock; a bare
+    peak write outside this function is the lost-update the seam guard bans.
+    Never raises."""
+    for entry in census or []:
+        try:
+            p = patchers.get(entry.get("id"))
+            if p is None:
+                continue
+            p._residency_peak = max(int(getattr(p, "_residency_peak", 0)),
+                                    int(entry.get("resident", 0)))
+        except Exception:
+            continue
+
+
 def held_charge(p: Any, in_flight: bool) -> int:
     """Admission charge for one proxy.
 
@@ -547,9 +567,14 @@ def forward_cast_need(largest_tensor: Optional[int],
 # /free broadcast planning
 # ---------------------------------------------------------------------------
 
-#: Minimum seconds between release broadcasts: absorbs OOM-recovery
-#: rebroadcasts and a /free press coinciding with one.
-RELEASE_DEBOUNCE_SECONDS = 2.0
+#: Minimum seconds between release broadcasts. Suppresses SAME-BURST
+#: duplicates only (a nested double-wrap, an OOM retry storm): deliberately
+#: short, because the wrap site cannot distinguish a human /free from OOM
+#: recovery (both call unload_all_models), so a long window would swallow a
+#: genuine press arriving right after an OOM broadcast, leaving those
+#: workers with only the shallow detach and not the deep ladder. Accepted
+#: residual: a human press within this window still gets the shallow pass.
+RELEASE_DEBOUNCE_SECONDS = 0.5
 
 
 def plan_release_broadcast(workers: Dict[str, Dict[str, Any]], now: float,
@@ -667,3 +692,40 @@ def mark_on_load(marks: Dict[str, Any], gen: Optional[int], call_n: int,
             to_set.append(key)
         new_marks[key] = (gen, call_n)
     return new_marks, to_set
+
+
+# ---------------------------------------------------------------------------
+# Host RAM-pressure pin reclaim planning
+# ---------------------------------------------------------------------------
+
+#: Workers pinning less than this are skipped by a pressure sweep: the repin
+#: cost (~200 ms per GiB measured) is not worth sub-slice reclaims.
+PIN_PRESSURE_MIN_SLICE = 256 * 1024 * 1024
+
+#: Minimum seconds between pressure sweeps. The host's own sweep runs once
+#: per completed node; without a limit a sustained-pressure prompt would
+#: shred and repin worker buffers every node.
+PIN_PRESSURE_INTERVAL = 10.0
+
+
+def plan_pin_pressure(reports: Dict[str, Dict[str, int]], target: int,
+                      now: float, last_sweep: float,
+                      min_slice: int = PIN_PRESSURE_MIN_SLICE,
+                      interval: float = PIN_PRESSURE_INTERVAL
+                      ) -> Dict[str, int]:
+    """How many pinned bytes to ask each worker to release under host RAM
+    pressure. Proportional to each worker's pinned census (never all of it
+    from one victim), skipping workers under ``min_slice``; empty inside the
+    rate-limit window or when nothing is reclaimable. The "host" key is the
+    host's own report and is never asked (upstream's own free_pins handles
+    the host side on the same trigger)."""
+    if now - last_sweep < interval or target <= 0:
+        return {}
+    candidates = {k: int(r.get("pinned", 0)) for k, r in reports.items()
+                  if k != "host" and int(r.get("pinned", 0)) >= min_slice}
+    total = sum(candidates.values())
+    if total <= 0:
+        return {}
+    ask_total = min(int(target), total)
+    return {k: max(min_slice, ask_total * pinned // total)
+            for k, pinned in candidates.items()}

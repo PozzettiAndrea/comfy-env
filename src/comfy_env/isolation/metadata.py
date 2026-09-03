@@ -1338,7 +1338,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
         # runs; decremented in the finally STRICTLY AFTER the boundary census
         # applies, so no window opens between the flag clearing and the peak
         # decaying to sampled truth.
-        worker._calls_in_flight = getattr(worker, "_calls_in_flight", 0) + 1
+        worker.begin_call()
         try:
             result = worker.call_method(
                 module_name=module_name,
@@ -1371,8 +1371,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                     _log(f"[comfy-env] state apply failed: {_se}")
             # After the census apply above, never before: the ordering is
             # what closes the mid-call-echo-then-idle window.
-            worker._calls_in_flight = max(
-                0, getattr(worker, "_calls_in_flight", 1) - 1)
+            worker.end_call()
 
         result = prepare_for_ipc_recursive(result)
 

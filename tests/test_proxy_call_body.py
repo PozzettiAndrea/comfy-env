@@ -59,6 +59,13 @@ class _RecordingWorker:
     def __init__(self, boom=False):
         self.boom = boom
         self.seen = []
+        self._calls_in_flight = 0
+
+    def begin_call(self):
+        self._calls_in_flight += 1
+
+    def end_call(self):
+        self._calls_in_flight = max(0, self._calls_in_flight - 1)
 
     def call_method(self, **kw):
         self.seen.append(kw)

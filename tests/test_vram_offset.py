@@ -124,3 +124,52 @@ def test_worker_held_bytes_counts_fixed_cost_per_worker(pool_mod):
     pool._WORKER_PATCHERS["a"] = {"m": FakePatcher(1 * GB)}
     pool._WORKER_PATCHERS["b"] = {"m": FakePatcher(2 * GB)}
     assert pool._worker_held_bytes() == 3 * GB + 2 * pool._WORKER_FIXED_VRAM_COST
+
+
+def test_budget_branches_agree_for_identical_device_state(pool_mod, monkeypatch):
+    """NVML and the ledger fallback are two coordinate systems for ONE device
+    state: the offset translates blind free into device-wide free, and `need`
+    re-books the requester's floor plus excess ONCE on top, in BOTH branches.
+    Catches: any one-sided edit that treats the ledger offset as a second
+    booking (subtracting the requester's booking out of held, an exclude_key
+    on _worker_held_bytes, or stripping requester terms from need on one
+    branch only). Each makes the two branches evict different amounts and
+    report different device_free_bytes for the same card."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+
+    def setup():
+        pool._WORKER_PATCHERS.clear()
+        pool._OVERHEAD_REPORTS.clear()
+        pool._WORKER_PATCHERS["req"] = {"m": FakePatcher(2 * GB)}
+        pool._OVERHEAD_REPORTS["req"] = {"excess": 700 * 1024 ** 2, "seq": 1}
+        pool._WORKER_PATCHERS["other"] = {"m": FakePatcher(5 * GB)}
+
+    setup()
+    held = pool._worker_held_bytes()
+    assert held > 7 * GB, "guard: books must be non-trivial or 0 == 0 passes"
+
+    # NVML branch: an accurate driver sees exactly what the books record.
+    monkeypatch.setattr(pool, "_true_device_free",
+                        lambda dev: mm._blind_free - held)
+    calls["free_memory"].clear()
+    reply = pool._handle_vram_budget({"total_size": 8 * GB}, worker_key="req")
+    assert calls["free_memory"], "guard: free_memory must be called"
+    target_nvml, free_nvml = calls["free_memory"][0], reply["device_free_bytes"]
+
+    # Ledger branch: same device state, NVML ladder exhausted.
+    setup()
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: None)
+    calls["free_memory"].clear()
+    reply = pool._handle_vram_budget({"total_size": 8 * GB}, worker_key="req")
+    assert calls["free_memory"], "guard: free_memory must be called"
+    target_ledger = calls["free_memory"][0]
+    free_ledger = reply["device_free_bytes"]
+
+    assert target_nvml == target_ledger, (
+        "branches must demand the same eviction for the same device state")
+    assert free_nvml == free_ledger, (
+        "branches must report the same device_free_bytes to the worker")
+    assert target_nvml > mm._blind_free, (
+        "guard: the scenario must actually demand eviction past the blind "
+        "view, or the equality never exercises the offset")

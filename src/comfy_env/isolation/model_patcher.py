@@ -146,20 +146,29 @@ class SubprocessModelPatcher:
         return not self._worker.is_alive()
 
     def _in_flight(self) -> bool:
-        """Whether a node call is executing in this proxy's worker RIGHT NOW.
+        """Whether a call is executing in this proxy's worker RIGHT NOW.
 
-        Read at echo application time; stable because node execution is
-        serialized parent side (the worker RLock is held across the call and
-        eviction commands re-enter on the same thread)."""
+        The counter is mutated only through the worker's locked
+        begin_call/end_call helpers; this read happens inside the same
+        _mem_lock hold as the apply_echo it parameterizes, so the bit cannot
+        flip mid-echo. A stale read across echoes is benign (it only decides
+        whether the peak may lower; the next boundary census is the decay
+        authority either way)."""
         return getattr(self._worker, "_calls_in_flight", 0) > 0
 
-    def _mark_offloaded(self):
+    def _mark_offloaded(self, seq=None):
         """Local bookkeeping for 'the weights are not on the GPU any more'.
 
         A full unload is an UNMAP receipt: the admission peak drops to 0 with
         the ledger (every regrowth path out of unmapped is signaled), fixing
-        the peak that used to stay stuck high forever after a detach."""
-        state_sync.apply_echo(self, 0, unmapped=True)
+        the peak that used to stay stuck high forever after a detach.
+        ``seq`` is the worker's model_to_device echo seq when the reply
+        carried one: recording it makes detach-to-zero strictly supersede
+        any census sampled before the detach. The WORKER_GONE path passes
+        None, which is fine: a dead process sends no further censuses and
+        the generation filter excludes its patchers from the next apply."""
+        with self._worker._mem_lock:
+            state_sync.apply_echo(self, 0, unmapped=True, seq=seq)
         self.model.model_offload_buffer_memory = 0
 
     def _send(self, command, *, quiet_on_loss, **kwargs):
@@ -250,8 +259,9 @@ class SubprocessModelPatcher:
         resident = int((r or {}).get("resident", loaded))
         # Load echoes record seq too (they used to drop it, so a census
         # sampled BEFORE the load could pass the guard after it).
-        state_sync.apply_echo(self, resident, seq=(r or {}).get("seq"),
-                              in_flight=self._in_flight())
+        with self._worker._mem_lock:
+            state_sync.apply_echo(self, resident, seq=(r or {}).get("seq"),
+                                  in_flight=self._in_flight())
         if resident > 0:
             self.model.device = device_to
         _log_vram(f"After load '{self._model_id}' (+{loaded // (1024 * 1024)} MB)")
@@ -283,8 +293,9 @@ class SubprocessModelPatcher:
         # may lower the admission PEAK depends on whether the worker is
         # computing (it can lazily re-fault mid call with no signal) -- the
         # rules live in state_sync.apply_echo.
-        state_sync.apply_echo(self, resident, seq=r.get("seq"),
-                              in_flight=self._in_flight())
+        with self._worker._mem_lock:
+            state_sync.apply_echo(self, resident, seq=r.get("seq"),
+                                  in_flight=self._in_flight())
         _log_vram(f"After partial offload '{self._model_id}' (-{freed // (1024 * 1024)} MB)")
         return freed
 
@@ -303,7 +314,7 @@ class SubprocessModelPatcher:
             self.eviction_deferred = True
             _log_vram(f"Offload '{self._model_id}' FAILED; still resident")
             return self.model
-        self._mark_offloaded()
+        self._mark_offloaded(seq=r.get("seq") if isinstance(r, dict) else None)
         _log_vram(f"After offload '{self._model_id}' ({size_mb} MB)")
         return self.model
 
