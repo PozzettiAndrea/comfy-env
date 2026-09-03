@@ -509,6 +509,20 @@ OVERHEAD_WARN_BYTES = 4 * 1024 ** 3
 OVERHEAD_WARN_SHARE = 0.15
 
 
+def blind_free_is_process_local(platform: str) -> bool:
+    """Whether ``torch.cuda.mem_get_info``'s free number is the calling
+    process's budget (Windows/WDDM) or the whole device (everything else).
+
+    Measured both ways: a WDDM sibling holding 13 GiB moved the parent's
+    number 75 MiB (process-local, see ``_true_device_free``); a Linux parent
+    with 12 GiB in three workers read 10.25 GiB, identical to NVML
+    (device-wide, experiment B1). Subtracting the worker ledger from a
+    device-wide number double-books every worker byte: live, that verdict
+    called free_memory for 16 GiB on a card with 10 GiB free and evicted
+    8 GiB of executing worker models to admit a 4 GiB load."""
+    return str(platform or "").lower().startswith("win")
+
+
 def overhead_warn_threshold(device_total: Optional[int]) -> int:
     """Warn threshold for one worker's measured overhead: the lesser of the
     absolute cap and a share of the device. Catches: a fixed 4 GiB threshold

@@ -43,6 +43,9 @@ def pool_mod(monkeypatch):
 
     from comfy_env.isolation import pool
     pool._WORKER_PATCHERS.clear()
+    # The ledger fallback is a WDDM instrument: these scenarios model a
+    # process-local blind number (mm._blind_free counts only this process).
+    monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: True)
     return pool, mm, calls
 
 
@@ -173,3 +176,42 @@ def test_budget_branches_agree_for_identical_device_state(pool_mod, monkeypatch)
     assert target_nvml > mm._blind_free, (
         "guard: the scenario must actually demand eviction past the blind "
         "view, or the equality never exercises the offset")
+
+
+def test_device_wide_blind_free_is_never_ledger_corrected(pool_mod, monkeypatch):
+    """Linux/macOS with the NVML ladder exhausted: mem_get_info is already
+    device-wide there, so the ledger subtraction double-books every worker
+    byte. Catches: the B1 live verdict (free_memory asked for 16 GiB on a
+    card with 10 GiB free; 8 GiB of executing worker models evicted for a
+    4 GiB load). The two platforms must differ by exactly the ledger."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {})  # no leftover floors from other tests
+    pool._WORKER_PATCHERS.clear()
+    pool._WORKER_PATCHERS["other"] = {"m": FakePatcher(5 * GB)}
+    held = pool._worker_held_bytes()
+    assert 5 * GB < held < mm._blind_free, "guard: the offset must not clamp at zero"
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: None)
+    req = {"total_size": 8 * GB}
+
+    monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: True)
+    calls["free_memory"].clear()
+    wddm = pool._handle_vram_budget(req, worker_key="req")
+    target_wddm = calls["free_memory"][0]
+
+    monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: False)
+    calls["free_memory"].clear()
+    linux = pool._handle_vram_budget(req, worker_key="req")
+    target_linux = calls["free_memory"][0]
+
+    assert target_wddm - target_linux == held, (
+        "device-wide platforms must not carry the ledger offset")
+    assert linux["device_free_bytes"] == mm._blind_free
+    assert wddm["device_free_bytes"] == max(0, mm._blind_free - held)
+
+
+def test_platform_verdict_is_pure_and_windows_only():
+    from comfy_env.state_sync import blind_free_is_process_local
+    assert blind_free_is_process_local("win32") is True
+    for plat in ("linux", "linux2", "darwin", "", None):
+        assert blind_free_is_process_local(plat) is False

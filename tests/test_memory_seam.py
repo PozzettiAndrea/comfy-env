@@ -799,3 +799,25 @@ class TestObservabilitySeam:
                   if isinstance(n, ast.FunctionDef) and n.name == "wlog")
         assert "_WLOG_PREFIX" in ast.unparse(fn)
         assert "os.getpid()" in src[:src.index("def wlog")]
+
+
+class TestLedgerFallbackSeam:
+    def test_every_ledger_subtraction_is_gated_on_the_platform_verdict(self):
+        """Catches: someone restoring an unconditional subtraction at either
+        site (pre-eviction true_free, post-eviction device_free_bytes). Every
+        _worker_held_bytes() call in _handle_vram_budget must sit under a
+        test that names _blind_free_is_process_local (an `if` branch or a
+        conditional expression)."""
+        fn = next(n for n in ast.walk(_tree(POOL))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_handle_vram_budget")
+        gated = set()
+        for node in ast.walk(fn):
+            if isinstance(node, (ast.If, ast.IfExp)) and \
+                    "_blind_free_is_process_local" in ast.unparse(node.test):
+                for inner in ast.walk(node):
+                    gated.add(id(inner))
+        held_calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                      and ast.unparse(n.func) == "_worker_held_bytes"]
+        assert len(held_calls) >= 2, "guard: both fallback sites must still exist"
+        ungated = [n.lineno for n in held_calls if id(n) not in gated]
+        assert not ungated, f"ungated ledger subtraction at pool.py:{ungated}"

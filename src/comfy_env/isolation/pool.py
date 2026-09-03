@@ -268,6 +268,11 @@ _WORKER_FIXED_VRAM_COST = state_sync.WORKER_VRAM_FLOOR
 _REQUEST_SLACK = 1.02
 
 
+def _blind_free_is_process_local() -> bool:
+    """Platform seam for the ledger fallback; the verdict itself is pure."""
+    return state_sync.blind_free_is_process_local(sys.platform)
+
+
 def _true_device_free(device) -> "int | None":
     """Device-wide free VRAM, across processes. None if unobtainable.
 
@@ -440,9 +445,17 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     blind_free = mm.get_free_memory(device)
     true_free = _true_device_free(device)
     if true_free is None:
-        # No NVML/nvidia-smi: reconstruct from comfy-env's own ledger.
-        true_free = max(0, blind_free - _worker_held_bytes())
-        offset_source = "ledger"
+        if _blind_free_is_process_local():
+            # WDDM, no NVML/nvidia-smi: the blind number excludes every
+            # other process, so reconstruct from comfy-env's own ledger.
+            true_free = max(0, blind_free - _worker_held_bytes())
+            offset_source = "ledger"
+        else:
+            # Device-wide mem_get_info (Linux, macOS): the blind number
+            # already counts the workers; subtracting the ledger again
+            # double-books them (state_sync.blind_free_is_process_local).
+            true_free = blind_free
+            offset_source = "blind"
     else:
         offset_source = "nvml"
     offset = max(0, blind_free - true_free)
@@ -516,7 +529,11 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     # this (its get_free_memory - device_free = what everyone else holds).
     post_true_free = _true_device_free(device)
     if post_true_free is None:
-        post_true_free = max(0, mm.get_free_memory(device) - _worker_held_bytes())
+        post_blind = mm.get_free_memory(device)
+        # Same platform verdict as above: the ledger corrects a process-local
+        # number only (a device-wide one already counts the workers).
+        post_true_free = (max(0, post_blind - _worker_held_bytes())
+                          if _blind_free_is_process_local() else post_blind)
 
     reply = {
         "device": str(device),
