@@ -1385,7 +1385,12 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
         if _DBG_VRAM:
             _log_vram(f"After {node_name}")
         return result
-    except (RuntimeError, ConnectionError):
+    except (RuntimeError, ConnectionError) as te:
+        # Always on: a worker teardown is the single most consequential
+        # event in this file and used to be silent. Name the env and the
+        # exception class so a user's log shows WHICH worker died and why.
+        _log(f"[comfy-env] worker teardown env={Path(env_dir).name} "
+             f"node={node_name} cause={type(te).__name__}: {str(te)[:200]}")
         _remove_worker(env_dir)
         raise
     except WorkerError as we:

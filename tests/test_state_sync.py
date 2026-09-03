@@ -20,6 +20,7 @@ from comfy_env.state_sync import (
     held_ceiling,
     is_overflow_marker,
     make_marker,
+    merge_vram_report,
     outbound_state,
 )
 
@@ -637,3 +638,88 @@ class TestPlanPinPressure:
         from comfy_env.state_sync import plan_pin_pressure
         assert plan_pin_pressure({"host": {"pinned": 4 * GIB}}, 1 * GIB,
                                  now=100.0, last_sweep=0.0) == {}
+
+
+class TestMergeVramReport:
+    def test_absent_field_keeps_the_stored_value(self):
+        """Catches: whole-dict replace. A frame whose overhead sample threw
+        must not erase the last measured overhead."""
+        prev = {"residency": [{"id": 1}], "overhead": 700, "pinned": 5}
+        out = merge_vram_report(prev, {"residency": [{"id": 2}]})
+        assert out == {"residency": [{"id": 2}], "overhead": 700, "pinned": 5}
+
+    def test_none_is_unknown_not_a_value(self):
+        """Catches: dict.update semantics, which would store a fabricated
+        None and later crash int() in the admission formula."""
+        assert merge_vram_report({"overhead": 700}, {"overhead": None}) == {"overhead": 700}
+
+    def test_zero_is_a_value(self):
+        """Catches: `if val:` truthiness. A worker that just released all
+        pins reports pinned=0 and that MUST land."""
+        assert merge_vram_report({"pinned": 5}, {"pinned": 0})["pinned"] == 0
+
+    def test_never_mutates_the_previous_dict(self):
+        """The stored report is read lock-free on the route path; in-place
+        mutation would hand that reader a half-merged dict."""
+        prev = {"pinned": 5}
+        merge_vram_report(prev, {"pinned": 9})
+        assert prev == {"pinned": 5}
+
+    def test_unknown_keys_are_dropped(self):
+        """A newer worker with a richer report must not smuggle arbitrary
+        keys into a dict the parent indexes by a fixed vocabulary."""
+        assert merge_vram_report(None, {"pinned": 1, "future": 2}) == {"pinned": 1}
+
+
+class TestObservabilityHelpers:
+    def test_overhead_warn_threshold_scales_down_on_small_cards(self):
+        """Catches: a fixed 4 GiB threshold that never fires on an 8 GiB card."""
+        from comfy_env.state_sync import overhead_warn_threshold, OVERHEAD_WARN_BYTES
+        assert overhead_warn_threshold(8 * GIB) == int(8 * GIB * 0.15)
+        assert overhead_warn_threshold(80 * GIB) == OVERHEAD_WARN_BYTES
+        assert overhead_warn_threshold(None) == OVERHEAD_WARN_BYTES
+        assert overhead_warn_threshold(0) == OVERHEAD_WARN_BYTES
+
+    def test_update_overhead_reports_honors_the_caller_threshold(self):
+        """Catches: the pool computing a device-shaped threshold that the
+        helper then ignores in favor of the module constant."""
+        from comfy_env.state_sync import update_overhead_reports
+        msgs = []
+        update_overhead_reports({}, "w", 2 * GIB, seq=1, log=msgs.append,
+                                warn_bytes=1 * GIB)
+        assert len(msgs) == 1 and "1.07GB" in msgs[0]
+        msgs.clear()
+        update_overhead_reports({}, "w", 2 * GIB, seq=1, log=msgs.append)
+        assert msgs == []
+
+    def test_pin_regression_fires_on_growth_only(self):
+        """Catches: logging on every budget request while the counter is
+        merely nonzero (spam), and logging on idle-model churn (not a
+        regression)."""
+        from comfy_env.state_sync import pin_regression_line
+        seen = {}
+        idle_churn = {"pins_evicted_bytes": 5 * GIB,
+                      "pins_evicted_active_bytes": 0, "pin_churn": 3}
+        assert pin_regression_line("a", idle_churn, seen) is None
+        hit = {"pins_evicted_bytes": 6 * GIB,
+               "pins_evicted_active_bytes": 1 * GIB, "pin_churn": 4}
+        line = pin_regression_line("a", hit, seen)
+        assert line and "PIN REGRESSION env=a" in line and "churn=4" in line
+        assert pin_regression_line("a", hit, seen) is None, "flat counter re-logged"
+        assert seen["a"] == 1 * GIB
+
+    def test_pin_regression_rearms_after_an_epoch_reset(self):
+        """Catches: `if active > prev` with last_seen never lowered, which
+        mutes every regression after the worker's counters reset."""
+        from comfy_env.state_sync import pin_regression_line
+        seen = {"a": 3 * GIB}
+        reset = {"pins_evicted_active_bytes": 0}
+        assert pin_regression_line("a", reset, seen) is None
+        assert pin_regression_line(
+            "a", {"pins_evicted_active_bytes": 1024}, seen) is not None
+
+    def test_pin_regression_is_per_worker(self):
+        from comfy_env.state_sync import pin_regression_line
+        seen = {}
+        pin_regression_line("a", {"pins_evicted_active_bytes": 9}, seen)
+        assert pin_regression_line("b", {"pins_evicted_active_bytes": 9}, seen)

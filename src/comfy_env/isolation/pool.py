@@ -47,6 +47,7 @@ _PIN_INGEST_SEQ = 0
 _PIN_STABLE = 0  # consecutive censuses with an unchanged consumer set
 _PIN_LAST_CONSUMERS: frozenset = frozenset()
 _PIN_ROLLUP_LAST = 0  # last logged pinned total (rollup fires on >1 GiB moves)
+_PIN_REGRESSION_SEEN: Dict[str, int] = {}  # active-eviction bytes last logged per worker
 
 
 #: Measured per-worker allocator excess (reserved minus census residency),
@@ -371,6 +372,12 @@ def _maybe_add_pin_grant(reply: dict, request: dict, worker_key) -> None:
         ps = request.get("pin_state")
         if isinstance(ps, dict) and worker_key:
             _pin_ingest(worker_key, ps.get("total_pinned", 0))
+            # Always on: an active-pin eviction is the regression the marks
+            # exist to prevent, so it must be visible without a debug flag.
+            line = state_sync.pin_regression_line(
+                Path(worker_key).name, ps, _PIN_REGRESSION_SEEN)
+            if line:
+                _log(line)
         if _pin_split_mode() != "auto" or not worker_key:
             return
         import comfy.model_management as mm
@@ -472,9 +479,18 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
             + _WORKER_FIXED_VRAM_COST + requester_excess
             + max(min_inference, forward))
 
+    _inflight = sum(1 for _e in list(_WORKER_POOL.values())
+                    if getattr(_e[0], "_calls_in_flight", 0) > 0)
+    if need > true_free:
+        # Always on: this is the moment the host is about to evict on a
+        # worker's behalf (or fail to). Silent, it is indistinguishable from
+        # a plain host OOM in a user's log.
+        _log(f"[comfy-env] admission tight env={Path(str(worker_key)).name} "
+             f"need={need / 1e9:.2f}GB true_free={true_free / 1e9:.2f}GB "
+             f"in_flight={_inflight} forward={forward / 1e9:.2f}GB "
+             f"excess={requester_excess / 1e9:.2f}GB offset={offset / 1e9:.2f}GB "
+             f"({offset_source})")
     if _DBG_MODELS:
-        _inflight = sum(1 for _e in list(_WORKER_POOL.values())
-                        if getattr(_e[0], "_calls_in_flight", 0) > 0)
         _log(f"[comfy-env] VRAM request: {total_requested / 1e9:.2f}GB | "
              f"free: blind={blind_free / 1e9:.2f}GB true={true_free / 1e9:.2f}GB "
              f"offset={offset / 1e9:.2f}GB ({offset_source}, "
@@ -626,7 +642,8 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
                     return worker.call_module(_module, _func, 120.0, body=body)
                 finally:
                     try:
-                        _census = getattr(worker, "_last_residency", None)
+                        _census = (getattr(worker, "_last_vram_report", None)
+                                   or {}).get("residency")
                         _live = dict(_WORKER_PATCHERS.get(str(_env_dir), {}))
                         with worker._mem_lock:
                             state_sync.apply_peak_raise(_live, _census)
@@ -742,7 +759,8 @@ def _install_prompt_epoch() -> None:
             _orig_start = _cmp.PromptModelTracker.start
 
             def _epoch_start(self, *args, **kwargs):
-                state_sync.PROMPT_GEN[0] += 1
+                from .workers.base import PROMPT_GEN
+                PROMPT_GEN[0] += 1
                 return _orig_start(self, *args, **kwargs)
 
             _epoch_start._comfy_env_wrap = True
@@ -900,6 +918,23 @@ def broadcast_release() -> None:
         t.join(timeout=90.0)
 
 
+def _install_host_patches() -> None:
+    """The one host-integration install point. comfy-env patches exactly
+    three upstream functions, each install-once under _INSTALL_LOCK, each
+    behind its own kill switch (blast radii differ), each calling the
+    original first and degrading on failure:
+
+    * unload_all_models wrap  -> /free broadcast   (COMFY_ENV_FREE_BROADCAST)
+    * PromptModelTracker.start -> prompt epoch     (COMFY_ENV_PIN_MARKS)
+    * should_free_pins_for_ram_pressure -> reclaim (COMFY_ENV_PIN_PRESSURE)
+
+    Called at first worker creation: without workers there is nothing for
+    any of them to reach."""
+    _install_free_broadcast()
+    _install_prompt_epoch()
+    _install_pin_pressure()
+
+
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -980,12 +1015,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
     _report_memory_manager(worker, env_dir)
-    # Host-side patches install at first worker creation (idempotent, each
-    # behind its own kill switch): without workers there is nothing for the
-    # /free broadcast to reach and nobody to consume the prompt epoch.
-    _install_free_broadcast()
-    _install_prompt_epoch()
-    _install_pin_pressure()
+    _install_host_patches()
     return worker, gen
 
 
@@ -1122,11 +1152,15 @@ def _ingest_worker_frames(env_dir, worker, generation):
     rather than waiting for a next call that may never come.
     """
     global _OVERHEAD_SEQ
+    report = getattr(worker, "_last_vram_report", None)
+    if not report:
+        return
+    worker._last_vram_report = None
+
     _mode = os.environ.get(state_sync.RESIDENCY_ENV_VAR, "boundary").lower()
     if _mode not in ("off", "command", "0", "false"):
-        census = getattr(worker, "_last_residency", None)
+        census = report.get("residency")
         if census:
-            worker._last_residency = None
             live = {
                 mid: p
                 for mid, p in list(_WORKER_PATCHERS.get(str(env_dir), {}).items())
@@ -1143,21 +1177,20 @@ def _ingest_worker_frames(env_dir, worker, generation):
 
     # Pin census (observability, ungated: the rollup ships live while the
     # clamp stays dark behind COMFY_ENV_PIN_SPLIT).
-    _pin = getattr(worker, "_last_pinned", None)
+    _pin = report.get("pinned")
     if _pin is not None:
-        worker._last_pinned = None
         _pin_ingest(str(env_dir), _pin)
 
     # Measured VRAM overhead: allocator bytes beyond registered residency
     # (cast buffers, cache). REPLACE on arrival order; self-measured
     # in-frame, so no peak is needed and stale-HIGH while idle over-books,
     # the safe direction.
-    _ov = getattr(worker, "_last_vram_overhead", None)
+    _ov = report.get("overhead")
     if _ov is not None:
-        worker._last_vram_overhead = None
         _OVERHEAD_SEQ += 1
-        state_sync.update_overhead_reports(_OVERHEAD_REPORTS, str(env_dir),
-                                           _ov, _OVERHEAD_SEQ, log=_log)
+        state_sync.update_overhead_reports(
+            _OVERHEAD_REPORTS, str(env_dir), _ov, _OVERHEAD_SEQ, log=_log,
+            warn_bytes=state_sync.overhead_warn_threshold(_device_total_bytes()))
 
 
 def _register_new_patchers(env_dir, worker, generation):

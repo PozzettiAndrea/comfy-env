@@ -80,12 +80,18 @@ if _DBG_WATCHDOG:
 # File-based logging for debugging (persists even if stdout/stderr are swallowed)
 import tempfile
 _worker_log_file = os.path.join(tempfile.gettempdir(), "comfy_worker_debug.log")
+# Every worker appends to the SAME file; without an identity prefix two
+# envs' lines interleave indistinguishably. basename(cwd) is the pack dir
+# the pool spawned us in; pid disambiguates a restarted generation.
+_WLOG_PREFIX = "%s:%d" % (os.path.basename(os.getcwd()) or "?", os.getpid())
+
+
 def wlog(msg):
     """Log to file only - stdout causes pipe buffer deadlock after many requests."""
     try:
         with open(_worker_log_file, "a", encoding="utf-8") as f:
             import time
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+            f.write(f"{time.strftime('%H:%M:%S')} [{_WLOG_PREFIX}] {msg}\n")
             f.flush()
             # No os.fsync: it cost 2.78 ms per line vs 0.02 ms without (measured,
             # ext4). With 92 call sites -- 13 of them inside _from_shm's
@@ -1880,41 +1886,40 @@ def main():
         _new_models on every response path before any status check, so
         attaching here is sufficient.
         """
-        # Census FIRST, above the early return: with no new models this call
-        # (the steady state) the early-out would suppress residency in exactly
-        # the case where the parent's stamp is going stale.
+        # ONE VRAM report, above the early return: with no new models this
+        # call (the steady state) the early-out would suppress residency in
+        # exactly the case where the parent's stamp is going stale. The
+        # three fields always co-travel and are sampled in ONE pass, so
+        # residency and overhead cannot disagree across frames (the
+        # mixed-frame double count). Per field, absent means unknown, never
+        # a fabricated zero. Overhead is NOT gated on _model_registry: an
+        # empty-registry worker holding leaked scratch must still report.
+        _vram_report = {}
         _census_list = None
         try:
             if _model_registry:
                 _census_list = _residency_census()
-                resp["_model_residency"] = _census_list
+                _vram_report["residency"] = _census_list
         except Exception:
             pass
-        # Measured VRAM overhead: allocator bytes beyond registered residency
-        # (cast buffers, allocator cache, slack). Computed from the census
-        # list JUST BUILT, same instant, so reserved and model bytes cannot
-        # disagree across frames (the mixed-frame double count). NOT gated on
-        # _model_registry: an empty-registry worker holding leaked scratch
-        # must still report. Absent on failure, never a fabricated zero.
         try:
             import torch as _ovt
             if _ovt.cuda.is_initialized():
                 _resident_sum = sum(int(e.get("resident", 0))
                                     for e in (_census_list or []))
-                resp["_vram_overhead"] = max(
+                _vram_report["overhead"] = max(
                     0, int(_ovt.cuda.memory_reserved()) - _resident_sum)
         except Exception:
             pass
-        # Pin census: one bare int (hot frames stay small; the five-field
-        # _pin_state rides the low-frequency channels). None means comfy is
-        # not imported here -- report nothing, never a fabricated zero.
         try:
             if _memmgr is not None:
                 _tp = _memmgr.total_pinned()
                 if _tp is not None:
-                    resp["_pinned"] = _tp
+                    _vram_report["pinned"] = _tp
         except Exception:
             pass
+        if _vram_report:
+            resp["_vram_report"] = _vram_report
         if _pending_state_out[0] is not None:
             resp["_self_state_out"] = _pending_state_out[0]
             _pending_state_out[0] = None
@@ -2063,7 +2068,7 @@ def main():
         # Deep release for the host's /free. MAIN LOOP ONLY, never dispatched
         # from _call_parent's interleave: the worker is idle between requests
         # here, so gc and empty_cache cannot fire under an active forward.
-        # Reply rides _attach_new_models so the census and _pinned converge
+        # Reply rides _attach_new_models so the vram report converges
         # the parent's ledgers at release time (a released worker may go
         # quiet, so the parent must not wait for a next call).
         if request.get("method") == "full_release":

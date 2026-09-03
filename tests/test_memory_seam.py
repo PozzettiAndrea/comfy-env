@@ -392,8 +392,7 @@ class TestResidencyPeakSeam:
         tree = _tree(subprocess_py)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "_send_request")
-        keys = ("_new_models", "_model_residency", "_self_state_out",
-                "_pinned", "_vram_overhead")
+        keys = ("_new_models", "_vram_report", "_self_state_out")
         harvest_lines = {}
         status_line = None
         for node in ast.walk(fn):
@@ -417,14 +416,47 @@ class TestResidencyPeakSeam:
     def test_overhead_is_computed_from_the_census_just_built(self):
         """The mixed-frame double count: overhead from frame N combined with
         a residency census from frame N+1 under-books by the model size.
-        The overhead expression must reference the census list bound in the
-        same _attach_new_models pass, never a second registry walk."""
+        The unified _vram_report samples all three fields in ONE pass, and
+        the overhead expression must reference the census list bound in that
+        same pass, never a second registry walk."""
         src = WORKER.read_text(encoding="utf-8")
-        assert "_census_list" in src and '"_vram_overhead"' in src
+        assert "_vram_report" in src and '"overhead"' in src
         block = src[src.index("_census_list = None"):src.index('"_new_models"')]
         assert "_residency_census()" in block
         assert block.count("_residency_census()") == 1, (
             "a second census walk feeds the overhead; frames can now disagree")
+        for field in ('"residency"', '"overhead"', '"pinned"'):
+            assert field in block, (
+                f"{field} left the unified report; the co-traveling fields "
+                f"have split back into separate frame keys")
+
+    def test_parent_merges_the_report_per_field_and_route_path_never_pops(self):
+        """Catches: (a) subprocess.py replacing the whole stored report
+        (a frame that failed one sample erases the last good value of the
+        others), pinned by requiring the pure merge helper; (b) the route
+        path draining the report, which would starve the boundary ingest
+        that follows the same frame."""
+        sub = SRC / "isolation" / "workers" / "subprocess.py"
+        tree = _tree(sub)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "_send_request")
+        calls = [ast.unparse(n.func) for n in ast.walk(fn)
+                 if isinstance(n, ast.Call)]
+        assert "merge_vram_report" in calls, (
+            "_send_request no longer folds _vram_report through "
+            "merge_vram_report; per-field replace is the contract")
+        pool_src = POOL.read_text(encoding="utf-8")
+        rt = pool_src[pool_src.index("def _routed_call"):]
+        rt = rt[:rt.index("\ndef ", 1)]
+        assert '.get("residency")' in rt
+        assert "_last_vram_report = None" not in rt, (
+            "the route path pops the report; boundary ingest then never "
+            "sees pinned/overhead from that frame")
+        ingest = pool_src[pool_src.index("def _ingest_worker_frames"):]
+        ingest = ingest[:ingest.index("\ndef ", 1)]
+        assert "_last_vram_report = None" in ingest, (
+            "boundary ingest must drain the report or every boundary "
+            "re-applies a stale census")
 
     def test_death_clears_the_overhead_ledger(self):
         tree = _tree(POOL)
@@ -699,3 +731,71 @@ class TestResidencyWriterSerialization:
         assert body.count('"seq": _bump_seq(_mid)') >= 2, (
             "a model_to_device ok frame lost its seq; detach-to-zero can be "
             "resurrected by a stale census again")
+
+
+class TestObservabilitySeam:
+    """The always-on lines: each must sit OUTSIDE any debug-flag gate, or
+    the user who needs it most (no flags set, one OOM) never sees it."""
+
+    @staticmethod
+    def _log_calls_outside_debug_gates(fn):
+        gated = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.If) and "_DBG_" in ast.unparse(node.test):
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call):
+                        gated.add(id(inner))
+        out = []
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and id(node) not in gated
+                    and ast.unparse(node.func) == "_log"):
+                out.append(ast.unparse(node))
+        return out
+
+    def test_admission_tight_line_is_not_debug_gated(self):
+        fn = next(n for n in ast.walk(_tree(POOL))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_handle_vram_budget")
+        ungated = self._log_calls_outside_debug_gates(fn)
+        assert any("admission tight" in c for c in ungated), ungated
+        # and it carries the fields a reader needs to reproduce the verdict
+        line = next(c for c in ungated if "admission tight" in c)
+        for field in ("need=", "true_free=", "in_flight=", "forward=", "excess="):
+            assert field in line, f"admission line lost {field}"
+
+    def test_pin_regression_line_is_not_debug_gated(self):
+        fn = next(n for n in ast.walk(_tree(POOL))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_maybe_add_pin_grant")
+        src = ast.unparse(fn)
+        assert "pin_regression_line" in src
+        assert "_log(line)" in src
+        ungated = self._log_calls_outside_debug_gates(fn)
+        assert any("line" in c for c in ungated)
+
+    def test_teardown_logs_before_removing_the_worker(self):
+        """Catches: the line placed after _remove_worker (a raise inside
+        removal would skip it) or missing entirely."""
+        meta = SRC / "isolation" / "metadata.py"
+        fn = next(n for n in ast.walk(_tree(meta))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_call_in_worker")
+        handler = next(h for t in ast.walk(fn) if isinstance(t, ast.Try)
+                       for h in t.handlers
+                       if h.type is not None and "ConnectionError" in ast.unparse(h.type))
+        body = [ast.unparse(st) for st in handler.body]
+        log_idx = next(i for i, st in enumerate(body) if "worker teardown" in st)
+        rm_idx = next(i for i, st in enumerate(body) if "_remove_worker" in st)
+        assert log_idx < rm_idx
+
+    def test_overhead_warning_threshold_is_device_shaped(self):
+        fn = next(n for n in ast.walk(_tree(POOL))
+                  if isinstance(n, ast.FunctionDef) and n.name == "_ingest_worker_frames")
+        src = ast.unparse(fn)
+        assert "overhead_warn_threshold(_device_total_bytes())" in src
+
+    def test_worker_log_lines_carry_an_identity_prefix(self):
+        """Every worker appends to one shared file; an unprefixed line from
+        two envs is unattributable."""
+        src = WORKER.read_text(encoding="utf-8")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "wlog")
+        assert "_WLOG_PREFIX" in ast.unparse(fn)
+        assert "os.getpid()" in src[:src.index("def wlog")]

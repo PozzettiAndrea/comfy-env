@@ -109,6 +109,28 @@ def apply_residency(patchers: Dict[str, Any], census: List[Dict[str, Any]],
     return changed
 
 
+#: Fields of the unified per-frame VRAM report. Each is a TOTAL (replaces),
+#: never a delta; a field absent from a frame means "unknown this frame".
+VRAM_REPORT_FIELDS = ("residency", "overhead", "pinned")
+
+
+def merge_vram_report(prev, frame):
+    """Fold one worker frame's ``_vram_report`` into the stored one.
+
+    Per field REPLACE; absent or None fields keep the stored value. Wrong
+    implementations this pins: whole-dict replace (a frame that failed to
+    sample overhead would erase the last good overhead, and the admission
+    formula would silently drop the excess term); and treating None as a
+    value (a fabricated zero). Returns a NEW dict; never mutates ``prev``.
+    """
+    merged = dict(prev or {})
+    for key in VRAM_REPORT_FIELDS:
+        val = (frame or {}).get(key)
+        if val is not None:
+            merged[key] = val
+    return merged
+
+
 def apply_echo(p: Any, resident: int, seq: Optional[int] = None,
                unmapped: bool = False, in_flight: bool = False) -> None:
     """Apply a command echo (partial load/unload reply, or a detach receipt).
@@ -482,22 +504,68 @@ WORKER_VRAM_FLOOR = 300 * 1024 * 1024
 OVERHEAD_WARN_BYTES = 4 * 1024 ** 3
 
 
+#: Share of the device an overhead report may reach before the warning
+#: fires on small cards (the absolute cap is OVERHEAD_WARN_BYTES).
+OVERHEAD_WARN_SHARE = 0.15
+
+
+def overhead_warn_threshold(device_total: Optional[int]) -> int:
+    """Warn threshold for one worker's measured overhead: the lesser of the
+    absolute cap and a share of the device. Catches: a fixed 4 GiB threshold
+    that never fires on an 8 GiB card where 2 GiB of allocator residue is
+    already a quarter of everything. Unknown total keeps the absolute cap."""
+    try:
+        total = int(device_total or 0)
+    except Exception:
+        total = 0
+    if total <= 0:
+        return OVERHEAD_WARN_BYTES
+    return min(OVERHEAD_WARN_BYTES, int(total * OVERHEAD_WARN_SHARE))
+
+
+def pin_regression_line(name: str, state: Dict[str, Any],
+                        last_seen: Dict[str, int]) -> Optional[str]:
+    """Always-on pin-regression notice: one line each time a worker's
+    ACTIVE-pin eviction counter grows, else None. Active evictions are the
+    signal that the host's pin-pressure sweep stole pins from the model
+    still executing (the thing prompt marks exist to prevent); plain
+    evictions of idle models are normal churn and stay silent. Mutates
+    ``last_seen[name]`` so a flat counter never re-logs, and a counter that
+    went DOWN (epoch reset) re-arms instead of staying muted forever."""
+    try:
+        active = int(state.get("pins_evicted_active_bytes", 0) or 0)
+    except Exception:
+        return None
+    prev = int(last_seen.get(name, 0))
+    last_seen[name] = active
+    if active <= prev:
+        return None
+    churn = state.get("pin_churn", 0)
+    evicted = int(state.get("pins_evicted_bytes", 0) or 0)
+    return (f"[comfy-env] PIN REGRESSION env={name} "
+            f"active_evicted={active / 1e6:.0f}MB "
+            f"(+{(active - prev) / 1e6:.0f}MB) total_evicted={evicted / 1e6:.0f}MB "
+            f"churn={churn}")
+
+
 def update_overhead_reports(reports: Dict[str, Dict[str, int]], key: str,
                             excess: int, seq: int,
-                            log: Optional[Callable[[str], None]] = None) -> bool:
+                            log: Optional[Callable[[str], None]] = None,
+                            warn_bytes: int = OVERHEAD_WARN_BYTES) -> bool:
     """Ingest one worker's measured overhead excess. Same stale-drop shape as
     ``update_pin_reports``: REPLACE on newer seq (the value is self-measured
     in-frame, so no peak is needed; stale-HIGH residue while idle is the safe
-    over-book direction), drop older whole."""
+    over-book direction), drop older whole. ``warn_bytes`` is the caller's
+    device-shaped threshold (see ``overhead_warn_threshold``)."""
     try:
         seq = int(seq)
         old = reports.get(key)
         if old is not None and seq <= int(old.get("seq", -1)):
             return False
         excess = max(0, int(excess))
-        if log is not None and excess > OVERHEAD_WARN_BYTES:
+        if log is not None and excess > int(warn_bytes):
             log(f"[comfy-env] WARNING worker overhead report {key}: "
-                f"{excess / 1e9:.2f}GB exceeds {OVERHEAD_WARN_BYTES / 1e9:.0f}GB")
+                f"{excess / 1e9:.2f}GB exceeds {warn_bytes / 1e9:.2f}GB")
         reports[key] = {"excess": excess, "seq": seq}
         return True
     except Exception:
@@ -623,14 +691,6 @@ PIN_MARKS_ENV_VAR = "COMFY_ENV_PIN_MARKS"
 #: the window closed at the cost of bounded stale-mark overhang, visible in
 #: pin_churn.
 PROMPT_MARK_DECAY_CALLS = 8
-
-#: Host-side prompt epoch counter, bumped by the PromptModelTracker.start
-#: patch (once per prompt). A monotonic int, never an object id (gc reuse
-#: would alias two prompts). 0 means "no prompt observed yet"; senders
-#: translate 0 to None so workers use the sticky fallback until the first
-#: real prompt.
-PROMPT_GEN = [0]
-
 
 def clear_on_epoch_change(marks: Dict[str, Any], gen: Optional[int],
                           call_n: int, live: Iterable[str],

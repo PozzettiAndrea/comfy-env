@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import InterruptRequested, Worker, WorkerError
+from ...state_sync import merge_vram_report
 from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
 
 # Debug logging -- granular categories from debug.py
@@ -81,7 +82,7 @@ def _current_prompt_gen():
     workers to the sticky-with-decay mark fallback instead of treating a
     frozen counter as one eternal prompt."""
     try:
-        from ...state_sync import PROMPT_GEN
+        from .base import PROMPT_GEN
         g = PROMPT_GEN[0]
         return g if g > 0 else None
     except Exception:
@@ -841,27 +842,19 @@ class SubprocessWorker(Worker):
         _new = response.get("_new_models")
         if _new:
             self._last_new_models.extend(_new)
-        # Residency census REPLACES (it is a total); state_out REPLACES (one
-        # call, one instance). Both harvested before any status check so an
-        # error frame still lands them, same rule as _new_models.
-        _res = response.get("_model_residency")
-        if _res is not None:
-            self._last_residency = _res
+        # The unified VRAM report REPLACES per field (each field is a
+        # total; a field absent from one frame means unknown, so it must not
+        # clobber a stored value). state_out REPLACES (one call, one
+        # instance). Both harvested before any status check so an error
+        # frame still lands them, same rule as _new_models: an erroring
+        # worker is exactly the one whose numbers just moved.
+        _vr = response.get("_vram_report")
+        if _vr is not None:
+            self._last_vram_report = merge_vram_report(
+                getattr(self, "_last_vram_report", None), _vr)
         _sso = response.get("_self_state_out")
         if _sso is not None:
             self._last_state_out = _sso
-        # Pin census scalar: REPLACES (it is a total). Same harvest rule as
-        # the residency census -- before any status check, so error frames
-        # still land it.
-        _pin = response.get("_pinned")
-        if _pin is not None:
-            self._last_pinned = _pin
-        # Measured VRAM overhead: REPLACES (self-measured in-frame). An
-        # erroring worker is exactly the one whose overhead just ballooned,
-        # so this too must land off error frames.
-        _ov = response.get("_vram_overhead")
-        if _ov is not None:
-            self._last_vram_overhead = _ov
         return response
 
     def call_method(

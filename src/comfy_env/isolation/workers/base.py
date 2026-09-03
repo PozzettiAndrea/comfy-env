@@ -62,6 +62,18 @@ class WorkerError(Exception):
         return msg
 
 
+#: Host-side prompt epoch counter, bumped by the PromptModelTracker.start
+#: patch (once per prompt) and read by the request builders. A monotonic
+#: int, never an object id (gc reuse would alias two prompts). 0 means "no
+#: prompt observed yet"; senders translate 0 to None so workers use the
+#: sticky-with-decay mark fallback until the first real prompt. Lives HERE,
+#: not in state_sync: it is process state with one writer (the pool's
+#: monkeypatch) and one reader (the senders), and the pure module's charter
+#: is dict math only. Single-writer on ComfyUI's one executor thread; the
+#: bare += is safe under that assumption and documented as such.
+PROMPT_GEN = [0]
+
+
 class InterruptRequested(RuntimeError):
     """The user cancelled the run; the in-flight worker call must stop.
 
