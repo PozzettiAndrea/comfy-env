@@ -57,8 +57,13 @@ ENABLE_ENV_VAR = "COMFY_ENV_WORKER_AIMDO"
 DISABLE_VALUES = ("0", "false", "no", "off")
 
 #: The aimdo version the parent resolved, exported to the worker so it never
-#: has to guess. A worker that disagrees refuses to initialise.
+#: has to guess. Reported for diagnostics only: the COMPATIBILITY decision is
+#: made on the protocol level below, never on this string.
 VERSION_ENV_VAR = "COMFY_ENV_AIMDO_VERSION"
+
+#: The parent's aimdo PROTOCOL LEVEL (see ``aimdo_protocol_level``). This, not
+#: the version string, is what the worker compares against.
+LEVEL_ENV_VAR = "COMFY_ENV_AIMDO_LEVEL"
 
 #: Per device VRAM headroom in bytes, as the parent resolved it from
 #: ``--vram-headroom``. A worker paging with no headroom against a host that
@@ -194,6 +199,92 @@ def _cuda_devices() -> list:
         return []
 
 
+#: comfy-aimdo protocol levels. Compatibility is a property of the PROTOCOL,
+#: not of the version string: comfy-aimdo ships about three releases a month
+#: (18 in six months, measured) while the protocol moved twice in twelve.
+#: Exact-version equality therefore drops workers to the legacy ledger on
+#: every host patch bump, silently and permanently -- observed live on two of
+#: nineteen worker envs whose Python shims were byte identical to the host's
+#: apart from ``_version.py``.
+#:
+#: 1: ``init()`` takes neither policy kwarg; ``init_devices`` takes bare ints.
+#: 2: ``simple_vram_headroom`` accepted; ``init_devices`` takes (index, bytes)
+#:    tuples. Arrived in 0.4.10.
+#: 3: ``nvml_pressure`` accepted as well. Arrived in 0.4.11.
+AIMDO_LEVEL_MIN = 1
+AIMDO_LEVEL_TUPLE_DEVICES = 2
+AIMDO_LEVEL_NVML = 3
+
+
+def aimdo_protocol_level(init_params, devices_accept_tuples) -> int:
+    """Capability level of an installed comfy-aimdo, from what it accepts.
+
+    Pure: ``init_params`` is the parameter-name collection of
+    ``control.init`` and ``devices_accept_tuples`` says whether
+    ``control.init_devices`` understands (index, headroom) pairs. Both are
+    read from the installed wheel by the caller, never from a version string,
+    because a version-to-level table would be stale within the month.
+    """
+    params = set(init_params or ())
+    level = AIMDO_LEVEL_MIN
+    if "simple_vram_headroom" in params or devices_accept_tuples:
+        level = AIMDO_LEVEL_TUPLE_DEVICES
+    if "nvml_pressure" in params:
+        level = AIMDO_LEVEL_NVML
+    return level
+
+
+def aimdo_skew_verdict(worker_level, parent_level, worker_version=None,
+                       parent_version=None):
+    """Whether a worker may enable aimdo against this parent.
+
+    Returns ``(ok, reason)``; ``reason`` is None when ok. The rule is: lag
+    WITHIN a protocol level is fine, a difference ACROSS one is not. Same
+    level means both sides accept the same policy kwargs and the same device
+    argument shape, so they page under the same policy whatever their patch
+    versions. A level difference means one side would silently run a
+    different policy, which is the failure this guard exists to prevent.
+
+    An unknown parent level (an older parent that exported no level) is not
+    a verdict: it degrades to allowing, exactly as before this guard existed.
+    """
+    if parent_level is None:
+        return True, None
+    if worker_level == parent_level:
+        return True, None
+    return False, (
+        "aimdo protocol skew: worker level {} ({}), parent level {} ({})"
+        .format(worker_level, worker_version or "unknown",
+                parent_level, parent_version or "unknown")
+    )
+
+
+def aimdo_installed_level(control, log=None) -> int:
+    """Protocol level of the comfy_aimdo bound to ``control``. Never raises.
+
+    Reads ``init``'s signature and, because ``init_devices`` keeps one
+    parameter at every level, its source for the tuple branch. Falls back to
+    the lowest level when neither can be read, which refuses rather than
+    over-claiming.
+    """
+    import inspect
+
+    params = ()
+    try:
+        params = tuple(inspect.signature(control.init).parameters)
+    except Exception as exc:  # pragma: no cover - defensive
+        if log is not None:
+            log("[worker] aimdo init signature unreadable: {}".format(exc))
+    tuples = False
+    try:
+        src = inspect.getsource(control.init_devices)
+        tuples = "tuple" in src
+    except Exception as exc:  # pragma: no cover - defensive
+        if log is not None:
+            log("[worker] aimdo init_devices source unreadable: {}".format(exc))
+    return aimdo_protocol_level(params, tuples)
+
+
 def maybe_enable_aimdo(log=None) -> bool:
     """Initialise aimdo in this process. On by default, opt out with the env var.
 
@@ -246,10 +337,19 @@ def maybe_enable_aimdo(log=None) -> bool:
 
         installed = aimdo_version()
         wanted = os.environ.get(VERSION_ENV_VAR, "")
-        if wanted and installed != wanted:
-            raise RuntimeError(
-                f"aimdo version skew: worker has {installed}, parent has {wanted}"
-            )
+        _my_level = aimdo_installed_level(control, log=_log)
+        _parent_level = None
+        _raw_level = os.environ.get(LEVEL_ENV_VAR, "")
+        if _raw_level:
+            try:
+                _parent_level = int(_raw_level)
+            except ValueError:
+                _parent_level = None
+        _ok, _why = aimdo_skew_verdict(
+            _my_level, _parent_level, installed, wanted
+        )
+        if not _ok:
+            raise RuntimeError(_why)
 
         try:
             simple = os.environ.get(SIMPLE_HEADROOM_ENV_VAR)

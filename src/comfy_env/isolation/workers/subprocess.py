@@ -378,11 +378,22 @@ class SubprocessWorker(Worker):
         # version costs nothing and a guard that cannot run is worse than none.
         try:
             from ...memory_manager import (
-                ENABLE_ENV_VAR, HEADROOM_ENV_VAR, VERSION_ENV_VAR, aimdo_version,
+                ENABLE_ENV_VAR, HEADROOM_ENV_VAR, LEVEL_ENV_VAR, VERSION_ENV_VAR,
+                aimdo_installed_level, aimdo_version,
             )
             _av = aimdo_version()
-            if _av:
+            if _av and VERSION_ENV_VAR not in env:
                 env[VERSION_ENV_VAR] = _av
+            # The compatibility signal is the protocol level, not the version:
+            # a patch bump must not strand the worker on the legacy ledger.
+            # Guarded like every host-derived write below, so an operator (or
+            # a test) who pinned a value outranks the one we resolved.
+            if LEVEL_ENV_VAR not in env:
+                try:
+                    import comfy_aimdo.control as _ctl
+                    env[LEVEL_ENV_VAR] = str(aimdo_installed_level(_ctl))
+                except Exception:
+                    pass
             # The worker FOLLOWS the host: aimdo in the worker exactly when the
             # host resolved to aimdo. A host on the ledger chose that (flags,
             # unsupported GPU, old torch), and a worker second-guessing it would
