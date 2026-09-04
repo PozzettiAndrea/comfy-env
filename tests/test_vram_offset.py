@@ -217,3 +217,48 @@ def test_platform_verdict_is_pure_and_windows_only():
     assert blind_free_is_process_local("win32") is True
     for plat in ("linux", "linux2", "darwin", "", None):
         assert blind_free_is_process_local(plat) is False
+
+
+def test_ask_includes_the_hosts_own_reserve(pool_mod, monkeypatch):
+    """Catches: dropping extra_reserved_memory() from the ask, which is the
+    term upstream books and comfy-env did not. Without it the host frees
+    strictly less for a worker load than it would for an identical
+    in-process one, by exactly the operator's own --reserve-vram."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {})
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
+    pool._WORKER_PATCHERS.clear()
+
+    mm.extra_reserved_memory = lambda: 0
+    calls["free_memory"].clear()
+    pool._handle_vram_budget({"total_size": 4 * GB}, worker_key="req")
+    without = calls["free_memory"][0]
+
+    mm.extra_reserved_memory = lambda: 4 * GB
+    calls["free_memory"].clear()
+    pool._handle_vram_budget({"total_size": 4 * GB}, worker_key="req")
+    with_reserve = calls["free_memory"][0]
+
+    # min_inference is 1 GB in the fixture, so a 4 GB reserve moves the max()
+    # from the inference floor to the reserve term: +3 GB.
+    assert with_reserve - without == 3 * GB
+
+
+def test_ask_uses_upstreams_multiplier_on_the_weights(pool_mod, monkeypatch):
+    """Catches: a slack below upstream's reappearing anywhere in the chain.
+    Asserted on the delta between two model sizes, so it holds whatever the
+    additive terms are."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {})
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
+    pool._WORKER_PATCHERS.clear()
+    mm.extra_reserved_memory = lambda: 0
+
+    asks = []
+    for size in (4 * GB, 8 * GB):
+        calls["free_memory"].clear()
+        pool._handle_vram_budget({"total_size": size}, worker_key="req")
+        asks.append(calls["free_memory"][0])
+    assert asks[1] - asks[0] == int(8 * GB * 1.1) - int(4 * GB * 1.1)

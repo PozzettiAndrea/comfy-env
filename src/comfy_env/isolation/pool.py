@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
-from .. import state_sync
+from .. import reserve, state_sync
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
@@ -484,9 +484,28 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
         except Exception:
             pass
     forward = state_sync.forward_cast_need(largest, request.get("num_streams"))
-    need = (int(total_requested * state_sync.WEIGHT_SLACK)
-            + _WORKER_FIXED_VRAM_COST + requester_excess
-            + max(min_inference, forward))
+    # Upstream's own expression, not a comfy-env invention. ComfyUI frees
+    # `weights * 1.1 + max(inference_memory, memory_required + reserved)` for
+    # its own loads (model_management.py load_models_gpu), and every place
+    # comfy-env re-derived that shape it drifted: the shipped 1.02 slack
+    # under-freed by 680 MiB on a 12 GiB model. `forward` plays the part of
+    # upstream's `memory_required`, being what the incoming load will want
+    # for cast buffers at its first forward.
+    try:
+        _host_reserved = int(mm.extra_reserved_memory())
+    except Exception:
+        _host_reserved = 0
+    need = reserve.ask_target(
+        weights=total_requested,
+        slack=state_sync.WEIGHT_SLACK,
+        min_inference=min_inference,
+        extra_reserved=_host_reserved,
+        want_inference=forward,
+    )
+    # Two terms upstream has no analogue for, because an in-process load has
+    # neither: the worker's own CUDA context, and the allocator overhead it
+    # measured and reported. Additive, never folded into the multiplier.
+    need += _WORKER_FIXED_VRAM_COST + requester_excess
 
     _inflight = sum(1 for _e in list(_WORKER_POOL.values())
                     if getattr(_e[0], "_calls_in_flight", 0) > 0)
