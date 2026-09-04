@@ -192,24 +192,32 @@ class TestPromptMarkSeam:
         assert all(isinstance(r.value, ast.Constant) and r.value.value is False
                    for r in returns)
 
-    def test_one_switch_gates_both_ends(self):
-        """COMFY_ENV_PIN_MARKS off must silence the host patch AND the worker
-        writes; a half-off state would be sticky marks with no epoch source,
-        permanently."""
-        pool_src = POOL.read_text(encoding="utf-8")
-        worker_src = WORKER.read_text(encoding="utf-8")
-        assert "PIN_MARKS_ENV_VAR" in pool_src
-        assert "COMFY_ENV_PIN_MARKS" in worker_src
+    def test_the_epoch_is_read_and_never_patched(self):
+        """The prompt epoch came from class-patching PromptModelTracker.start.
+        It now comes from reading ComfyUI's own progress registry, which
+        carries the real prompt id, cannot be undone by ComfyUI's custom-node
+        unhooking pass, and works on far older ComfyUI.
 
-    def test_host_patch_bumps_before_calling_the_original(self):
-        """The epoch must be visible to requests dispatched DURING the prompt
-        it names; bumping after the original start would race the first
-        node."""
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
+        Catches: the patch coming back, or the reader being replaced by a
+        counter comfy-env increments itself."""
+        sub_src = (SRC / "isolation" / "workers" / "subprocess.py").read_text(
+            encoding="utf-8")
+        tree = ast.parse(sub_src)
         fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "_epoch_start")
-        src = ast.unparse(fn)
-        assert src.index("PROMPT_GEN[0] += 1") < src.index("_orig_start")
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_current_prompt_gen")
+        body = ast.unparse(fn)
+        assert "get_progress_state" in body and "prompt_id" in body
+        assert "PROMPT_GEN" not in body, "the counter is back"
+        pool_src = POOL.read_text(encoding="utf-8")
+        assert "PromptModelTracker" not in pool_src, (
+            "the class patch is back; the epoch must be read, not hooked")
+
+    def test_the_worker_switch_still_gates_the_mark_writes(self):
+        """The reader needs no switch (reading is free), but the worker's
+        mark WRITES must stay defeatable without a code change."""
+        worker_src = WORKER.read_text(encoding="utf-8")
+        assert "COMFY_ENV_PIN_MARKS" in worker_src
 
     def test_counter_wrapper_calls_the_original_unconditionally(self):
         """The eviction counters are observability only: the wrapper must

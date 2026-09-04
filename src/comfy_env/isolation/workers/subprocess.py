@@ -89,14 +89,29 @@ _HEALTH_PING_IDLE_SECONDS = 60.0
 
 
 def _current_prompt_gen():
-    """The host's prompt epoch for worker requests, or None before the first
-    prompt (or when the PromptModelTracker patch is off/failed): None routes
-    workers to the sticky-with-decay mark fallback instead of treating a
-    frozen counter as one eternal prompt."""
+    """The host's prompt epoch for worker requests, or None before the first.
+
+    Read, never patched. ComfyUI keeps the running prompt's id on a global
+    progress registry that it replaces on every prompt
+    (comfy_execution/progress.py, execution.py reset_progress_state), and
+    comfy-env's own node code runs inside prompt execution, so reading it at
+    a call boundary gives the true prompt identity with no hook installed
+    anywhere.
+
+    This is strictly better than the class patch it replaces: it carries
+    ComfyUI's real prompt id rather than a counter comfy-env increments, it
+    cannot be reverted by ComfyUI's own custom-node unhooking pass, and the
+    mechanism is 383 days older than PromptModelTracker, so it works on far
+    more ComfyUI versions.
+
+    None means no prompt is running or the registry is not there, which
+    routes workers to the sticky-with-decay mark fallback rather than
+    treating one frozen value as an eternal prompt.
+    """
     try:
-        from .base import PROMPT_GEN
-        g = PROMPT_GEN[0]
-        return g if g > 0 else None
+        from comfy_execution.progress import get_progress_state
+        prompt_id = getattr(get_progress_state(), "prompt_id", None)
+        return prompt_id or None
     except Exception:
         return None
 

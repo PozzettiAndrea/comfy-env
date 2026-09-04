@@ -32,6 +32,7 @@ compared.
 |---|---|---|
 | `p1_aimdo_skew.py` | Does a comfy-aimdo patch bump on the host strand a worker on the legacy ledger? | yes |
 | `p2_reserve_levers.py` | Which VRAM levers actually change host behaviour, on each memory path? | yes |
+| `p3_prompt_epoch.py` | Can the prompt epoch be read instead of patched for? | no |
 
 ## What was measured
 
@@ -57,3 +58,8 @@ RTX 3090 (24576 MiB), ComfyUI 2026-08-24, comfy-aimdo 0.4.13.
   Any test of these levers must create genuine pressure. Three earlier
   versions of P2 reported a working lever as inert purely because the model
   still fitted, or because the eviction target was below free memory.
+
+- **P3**, 2026-09-04: yes. `get_progress_state().prompt_id` reads None with
+  no prompt running, carries ComfyUI's real prompt id once one starts, is
+  stable within a prompt and changes across one. No hook installed. This
+  replaced a class patch of `PromptModelTracker.start`.

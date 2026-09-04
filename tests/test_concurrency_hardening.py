@@ -238,7 +238,7 @@ class TestInstallLock:
 
     def test_both_installers_hold_the_install_lock(self):
         tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        for fname in ("_install_free_broadcast", "_install_prompt_epoch"):
+        for fname in ("_install_free_broadcast", "_install_pin_pressure"):
             fn = next(n for n in ast.walk(tree)
                       if isinstance(n, ast.FunctionDef) and n.name == fname)
             src = ast.unparse(fn)

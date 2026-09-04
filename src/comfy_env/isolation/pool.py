@@ -809,43 +809,6 @@ def _install_free_broadcast() -> None:
 
 # --- Prompt epoch source: the host's one observer of prompt boundaries ----
 
-_PROMPT_EPOCH_INSTALLED = False
-
-
-def _install_prompt_epoch() -> None:
-    """Class-patch comfy.model_patcher.PromptModelTracker.start, once.
-
-    start() runs exactly once per prompt on the executor; bumping a monotonic
-    counter there is the only prompt-boundary signal comfy-env can observe
-    (workers run no executor). The counter rides every worker request as
-    prompt_gen so workers can retire the PREVIOUS prompt's pin marks; the
-    counter's 0 start is translated to None by senders, so a failed or
-    switched-off patch degrades to the workers' sticky-with-decay fallback.
-    Behind the same switch that gates the worker mark writes
-    (COMFY_ENV_PIN_MARKS); install failure logs once and degrades, never
-    raises. Order-independent with the /free wrap (disjoint targets)."""
-    global _PROMPT_EPOCH_INSTALLED
-    with _INSTALL_LOCK:
-        if _PROMPT_EPOCH_INSTALLED:
-            return
-        _PROMPT_EPOCH_INSTALLED = True
-        if os.environ.get(state_sync.PIN_MARKS_ENV_VAR, "1").strip().lower() in (
-                "0", "false", "off"):
-            return
-        try:
-            import comfy.model_patcher as _cmp
-            _orig_start = _cmp.PromptModelTracker.start
-
-            def _epoch_start(self, *args, **kwargs):
-                from .workers.base import PROMPT_GEN
-                PROMPT_GEN[0] += 1
-                return _orig_start(self, *args, **kwargs)
-
-            _epoch_start._comfy_env_wrap = True
-            _cmp.PromptModelTracker.start = _epoch_start
-        except Exception as exc:
-            _log(f"[comfy-env] prompt-epoch patch not installed: {exc} "
-                 f"(workers fall back to sticky marks with decay)")
 
 
 # --- Host RAM-pressure pin reclaim (coverage gap: execution.py's periodic
@@ -1031,19 +994,22 @@ def _check_host_contract() -> None:
 
 
 def _install_host_patches() -> None:
-    """The one host-integration install point. comfy-env patches exactly
-    three upstream functions, each install-once under _INSTALL_LOCK, each
-    behind its own kill switch (blast radii differ), each calling the
-    original first and degrading on failure:
+    """The one host-integration install point. comfy-env wraps exactly two
+    upstream functions, each install-once under _INSTALL_LOCK, each behind
+    its own kill switch (blast radii differ), each calling the original
+    first and degrading on failure:
 
     * unload_all_models wrap  -> /free broadcast   (COMFY_ENV_FREE_BROADCAST)
-    * PromptModelTracker.start -> prompt epoch     (COMFY_ENV_PIN_MARKS)
     * should_free_pins_for_ram_pressure -> reclaim (COMFY_ENV_PIN_PRESSURE)
 
+    A third wrap used to live here, class-patching the prompt tracker to
+    learn the prompt epoch. It is gone: the epoch is now READ from ComfyUI's
+    own progress registry, which carries the real prompt id and needs no
+    hook (see subprocess._current_prompt_gen).
+
     Called at first worker creation: without workers there is nothing for
-    any of them to reach."""
+    either of them to reach."""
     _install_free_broadcast()
-    _install_prompt_epoch()
     _install_pin_pressure()
 
 
