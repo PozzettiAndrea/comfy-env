@@ -31,6 +31,7 @@ compared.
 | script | question it answers | needs a GPU |
 |---|---|---|
 | `p1_aimdo_skew.py` | Does a comfy-aimdo patch bump on the host strand a worker on the legacy ledger? | yes |
+| `p2_reserve_levers.py` | Which VRAM levers actually change host behaviour, on each memory path? | yes |
 
 ## What was measured
 
@@ -42,3 +43,17 @@ RTX 3090 (24576 MiB), ComfyUI 2026-08-24, comfy-aimdo 0.4.13.
   `aimdo protocol skew: worker level 3 (0.4.13), parent level 4 (9.9.9)`.
   Before the fix the version strings were compared directly and two of
   nineteen environments on this machine were silently on the ledger.
+
+- **P2**, 2026-09-04: the reserve is preventive on the legacy path and inert
+  on the paged one. A 20.13 GiB reserve takes a 6 GiB model from 6.00 GiB
+  resident to 1.38 GiB on the legacy path; on the paged path neither the
+  ComfyUI reserve nor aimdo's own headroom setter moves residency at all
+  (6.03 GiB in every case). aimdo's headroom is fixed at `init_devices`:
+  the setter is inert once running, a second `init_devices` returns False,
+  and a second `control.init` segfaults. The lever that does work there is
+  reactive, `free_memory(target, device)`, which took the same model from
+  6.03 GiB to 0.03 GiB.
+
+  Any test of these levers must create genuine pressure. Three earlier
+  versions of P2 reported a working lever as inert purely because the model
+  still fitted, or because the eviction target was below free memory.
