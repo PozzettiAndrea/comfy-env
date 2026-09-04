@@ -262,10 +262,6 @@ def _handle_progress(request: dict) -> dict:
 #: multiplicative.
 _WORKER_FIXED_VRAM_COST = state_sync.WORKER_VRAM_FLOOR
 
-#: Multiplicative slack on the requested model bytes (allocator rounding).
-#: Small because cudaMallocAsync (the default backend) keeps slack near 1%;
-#: the dominant hidden cost is the per-process constant above.
-_REQUEST_SLACK = 1.02
 
 
 def _blind_free_is_process_local() -> bool:
@@ -488,7 +484,7 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
         except Exception:
             pass
     forward = state_sync.forward_cast_need(largest, request.get("num_streams"))
-    need = (int(total_requested * _REQUEST_SLACK)
+    need = (int(total_requested * state_sync.WEIGHT_SLACK)
             + _WORKER_FIXED_VRAM_COST + requester_excess
             + max(min_inference, forward))
 

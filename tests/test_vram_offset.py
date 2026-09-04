@@ -19,6 +19,8 @@ import types
 
 import pytest
 
+from comfy_env import state_sync
+
 GB = 1024 ** 3
 
 
@@ -68,7 +70,7 @@ def test_offset_compensates_the_blind_view(pool_mod, monkeypatch):
     assert calls["free_memory"], "free_memory must be called"
     asked = calls["free_memory"][0]
     offset = 15 * GB - 2 * GB
-    need = int(4 * GB * pool._REQUEST_SLACK) + pool._WORKER_FIXED_VRAM_COST + 1 * GB
+    need = int(4 * GB * state_sync.WEIGHT_SLACK) + pool._WORKER_FIXED_VRAM_COST + 1 * GB
     assert asked == need + offset
     # Without compensation ComfyUI computes need - 15GB < 0 and evicts nothing.
     assert asked > mm._blind_free, (
@@ -87,7 +89,7 @@ def test_ledger_fallback_when_nvml_unavailable(pool_mod, monkeypatch):
     pool._handle_vram_budget({"total_size": 1 * GB})
 
     held = 8 * GB + pool._WORKER_FIXED_VRAM_COST      # one live worker
-    need = int(1 * GB * pool._REQUEST_SLACK) + pool._WORKER_FIXED_VRAM_COST + 1 * GB
+    need = int(1 * GB * state_sync.WEIGHT_SLACK) + pool._WORKER_FIXED_VRAM_COST + 1 * GB
     assert calls["free_memory"][0] == need + held
 
 

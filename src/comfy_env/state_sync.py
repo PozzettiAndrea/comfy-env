@@ -498,6 +498,16 @@ def damp_pin_grant(last_grant: Optional[int], new_grant: int,
 #: RTX 4060 Ti measurement.
 WORKER_VRAM_FLOOR = 300 * 1024 * 1024
 
+#: Multiplicative headroom on the WEIGHT bytes of an incoming load. Mirrors
+#: upstream verbatim: comfy/model_management.py load_models_gpu calls
+#: `free_memory(total_memory_required[device] * 1.1 + extra_mem, ...)`. It is
+#: NOT an allocator-slack estimate and must not be "tuned" below upstream's
+#: figure: the parent asks the host to evict on a worker's behalf, so a
+#: smaller multiplier makes the host free LESS than it would for an
+#: equivalent in-process load, and the shortfall grows linearly with model
+#: size (680 MiB short on a 12 GiB model at the shipped 1.02).
+WEIGHT_SLACK = 1.1
+
 #: An overhead report above this WARNs at ingest (a 30 GB report on a 24 GB
 #: card is junk arithmetic worker-side; the clamp direction is still overbook,
 #: which can only starve admission, never OOM it).

@@ -723,3 +723,25 @@ class TestObservabilityHelpers:
         seen = {}
         pin_regression_line("a", {"pins_evicted_active_bytes": 9}, seen)
         assert pin_regression_line("b", {"pins_evicted_active_bytes": 9}, seen)
+
+
+class TestWeightSlack:
+    def test_matches_upstreams_own_multiplier(self):
+        """Catches: any value below upstream's 1.1 in load_models_gpu.
+
+        The parent asks the HOST to evict on a worker's behalf, so this
+        number decides how much the host frees for a worker load versus an
+        identical in-process one. The shipped 1.02 under-freed by
+        weights * 0.08, 680 MiB on a 12 GiB model, growing linearly, in the
+        OOM direction.
+        """
+        from comfy_env.state_sync import WEIGHT_SLACK
+        assert WEIGHT_SLACK == 1.1
+
+    def test_no_shortfall_against_upstream_at_any_size(self):
+        """Catches: a "tuned" multiplier that looks harmless on small models
+        while diverging without bound as they grow."""
+        from comfy_env.state_sync import WEIGHT_SLACK
+        for gib in (1, 4, 12, 40):
+            weights = gib * 1024 ** 3
+            assert int(weights * WEIGHT_SLACK) >= int(weights * 1.1) - 1
