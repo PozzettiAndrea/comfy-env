@@ -307,6 +307,63 @@ _RESERVE_PUBLISHED = 0
 _RESERVE_HIGHWATER: Dict[str, int] = {}
 
 
+#: When each worker last finished a call, for the idle release policy.
+_LAST_ACTIVITY: Dict[str, float] = {}
+
+
+def _note_activity(env_dir) -> None:
+    """Mark a worker as active now. Cheap enough for every node boundary."""
+    _LAST_ACTIVITY[str(env_dir)] = time.monotonic()
+
+
+def _release_idle_workers() -> None:
+    """Ask workers that have been idle a while to give their VRAM back.
+
+    This is the whole replacement for host-driven reclaim. comfy-env no
+    longer registers a proxy that ComfyUI can evict, so nothing can take a
+    worker's memory from outside; instead the worker lets go on its own and
+    the reserve follows it down.
+
+    A successful release is the measured receipt that permits the reserve to
+    SHRINK: the worker has told us what it freed, so the space is provably
+    back and its high-water forecast starts again from nothing.
+    """
+    try:
+        with _POOL_LOCK:
+            entries = dict(_WORKER_POOL)
+        states = {}
+        for key, (worker, _gen) in entries.items():
+            states[key] = {
+                "alive": worker.is_alive(),
+                "advertises": getattr(worker, "supports_full_release", False),
+                "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
+                "idle_since": _LAST_ACTIVITY.get(key),
+                "holding": _RESERVE_HIGHWATER.get(key, 0) > 0,
+            }
+        due = state_sync.plan_idle_release(states, time.monotonic())
+        for key in due:
+            worker, _gen = entries[key]
+            try:
+                reply = worker.send_command_no_spawn("full_release",
+                                                     lock_timeout=2.0)
+            except Exception as exc:
+                _log(f"[comfy-env] idle release of {Path(key).name} failed: {exc}")
+                continue
+            if reply == "busy":
+                continue
+            receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
+            _RESERVE_HIGHWATER[key] = 0
+            _LAST_ACTIVITY[key] = time.monotonic()
+            _log(f"[comfy-env] idle release: {Path(key).name} gave back "
+                 f"{(receipt or {}).get('freed_bytes', 0) / 1e9:.2f}GB "
+                 f"after {state_sync.IDLE_RELEASE_SECONDS:.0f}s idle")
+        if due:
+            # The receipts are the evidence a shrink needs.
+            _publish_reserve(shrink_allowed=True)
+    except Exception as exc:
+        _log(f"[comfy-env] idle release sweep failed: {exc}")
+
+
 def _publish_reserve(shrink_allowed: bool = False) -> int:
     """Tell ComfyUI the card is smaller by what workers hold. Never raises.
 
@@ -1159,6 +1216,7 @@ def _remove_worker(env_dir):
     # Its reserve high-water goes too, and this is the one place a SHRINK is
     # allowed: the process is gone, so the memory is provably back.
     _forget_reserve(key)
+    _LAST_ACTIVITY.pop(key, None)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
@@ -1327,6 +1385,11 @@ def _register_new_patchers(env_dir, worker, generation):
         _insert_loaded_model(p, currently_used=False)
         _log(f"[comfy-env] restored ledger entry for '{p._model_id}': "
              f"eviction could not reach a busy worker and upstream dropped it")
+
+    _note_activity(env_dir)
+    # Workers that have been quiet a while give their VRAM back here. This
+    # is what replaces the host reaching into a worker to take it.
+    _release_idle_workers()
 
     # Republish the reserve now that this boundary's residency has landed.
     # Grow only: a worker whose ledger dropped may not have released yet, and

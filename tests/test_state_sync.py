@@ -630,3 +630,56 @@ class TestWeightSlack:
         for gib in (1, 4, 12, 40):
             weights = gib * 1024 ** 3
             assert int(weights * WEIGHT_SLACK) >= int(weights * 1.1) - 1
+
+
+class TestPlanIdleRelease:
+    """Idle release is what replaces host-driven reclaim, so its refusals
+    matter as much as its selections."""
+
+    @staticmethod
+    def _w(**kw):
+        base = {"alive": True, "advertises": True, "in_flight": False,
+                "idle_since": 0.0, "holding": True}
+        base.update(kw)
+        return base
+
+    def test_an_idle_holding_worker_is_selected(self):
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w()}, now=120.0) == ["a"]
+
+    def test_a_worker_mid_call_is_never_asked(self):
+        """Catches: releasing under a running node, which would evict the
+        model the worker is computing with."""
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w(in_flight=True)}, 120.0) == []
+
+    def test_a_worker_holding_nothing_is_not_asked(self):
+        """Catches: a round trip for no memory that also resets a high-water
+        which is still the right forecast for the next call."""
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w(holding=False)}, 120.0) == []
+
+    def test_the_timeout_is_respected(self):
+        """Catches: releasing on every boundary, which costs 2 seconds of
+        fault-back on the very next call for nothing."""
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w(idle_since=100.0)}, 120.0) == []
+        assert plan_idle_release({"a": self._w(idle_since=100.0)}, 200.0) == ["a"]
+
+    def test_never_seen_is_not_idle(self):
+        """Catches: treating a missing timestamp as "idle forever", which
+        would release a worker that has only just started."""
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w(idle_since=None)}, 1e9) == []
+
+    def test_dead_or_silent_workers_are_skipped(self):
+        from comfy_env.state_sync import plan_idle_release
+        assert plan_idle_release({"a": self._w(alive=False)}, 120.0) == []
+        assert plan_idle_release({"a": self._w(advertises=False)}, 120.0) == []
+
+    def test_selection_is_deterministic(self):
+        """Catches: dict-order dependence, which makes a partial failure
+        release a different worker each run."""
+        from comfy_env.state_sync import plan_idle_release
+        workers = {k: self._w() for k in ("c", "a", "b")}
+        assert plan_idle_release(workers, 120.0) == ["a", "b", "c"]

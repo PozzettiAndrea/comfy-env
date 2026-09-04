@@ -581,6 +581,42 @@ def forward_cast_need(largest_tensor: Optional[int],
 RELEASE_DEBOUNCE_SECONDS = 0.5
 
 
+#: How long a worker may sit idle before it is asked to give its VRAM back.
+#: This is what replaces host-driven reclaim: the host cannot reach into a
+#: worker, so the worker lets go on its own and the reserve follows.
+#:
+#: 60 s is chosen against the measured cost of being wrong in each
+#: direction. Releasing costs 0.67 s to return 8.6 GB and 2.0 s to fault it
+#: back (research/memory-floor), so releasing too eagerly costs seconds of
+#: latency on the next call. Holding too long costs the host that VRAM for
+#: the whole idle period, which is the case this exists to fix.
+IDLE_RELEASE_SECONDS = 60.0
+
+
+def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS):
+    """Which idle workers should be asked to release. Pure.
+
+    ``workers`` maps key to {"alive", "advertises", "in_flight", "idle_since",
+    "holding"}. A worker is a candidate only when it is alive, advertises the
+    command, is not mid call, has been idle long enough, and actually holds
+    something: asking a worker that holds nothing is a round trip for no
+    memory, and it would reset a high-water that is still the right forecast.
+    """
+    out = []
+    for key, state in sorted((workers or {}).items()):
+        if not state.get("alive") or not state.get("advertises"):
+            continue
+        if state.get("in_flight"):
+            continue
+        if not state.get("holding"):
+            continue
+        since = state.get("idle_since")
+        if since is None or (now - since) < min_idle:
+            continue
+        out.append(key)
+    return out
+
+
 def plan_release_broadcast(workers: Dict[str, Dict[str, Any]], now: float,
                            last_broadcast: float,
                            debounce: float = RELEASE_DEBOUNCE_SECONDS
