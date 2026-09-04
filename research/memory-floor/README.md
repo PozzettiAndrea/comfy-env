@@ -34,6 +34,7 @@ compared.
 | `p2_reserve_levers.py` | Which VRAM levers actually change host behaviour, on each memory path? | yes |
 | `p3_prompt_epoch.py` | Can the prompt epoch be read instead of patched for? | no |
 | `p4_held_truth.py` | Is the number the host reserves against physical truth? | yes |
+| `sweep_contract.py` | Which ComfyUI versions satisfy the contract? | no |
 
 ## What was measured
 
@@ -72,3 +73,36 @@ RTX 3090 (24576 MiB), ComfyUI 2026-08-24, comfy-aimdo 0.4.13.
   worker. They overlap when a model is torch-allocated and partition when
   aimdo pages it, so max is exact in the first case and correct in the
   second, where ComfyUI's own ledger reads zero.
+
+## Supported range, computed
+
+`sweep_contract.py` evaluates `comfy_env.contract` statically against any
+number of ComfyUI trees. No imports, no torch, no GPU, so it runs on every
+commit. Re-run it rather than trusting the table below, which is a snapshot:
+
+```
+sweep_contract.py --history <ComfyUI clone> --before 2026-09-01 2026-07-01 ...
+```
+
+Measured 2026-09-04 against 5866 upstream commits:
+
+| tier | satisfied from | bounded by |
+|---|---|---|
+| floor | between 2024-08-15 and 2024-09-01 | `model_management.EXTRA_RESERVED_VRAM`, fatal before it |
+| paged | between 2025-09-01 and 2026-03-01 | `model_patcher.ModelPatcherDynamic` |
+| shared | between 2026-05-15 and 2026-07-01 | `model_management.free_pins` |
+
+The point of the floor design is that first row: the always-on layer works
+against roughly two years of ComfyUI, because it depends on the reserve and
+nothing else. The features that need recent ComfyUI degrade to it by name
+rather than failing.
+
+A regression shows up here as the floor's date moving FORWARD. That is the
+signal to watch, not a pass or fail.
+
+Static resolution answers a narrower question than the runtime check: it
+asks whether a module binds a name at import time. A MISSING verdict is
+evidence; a PRESENT one is the absence of evidence to the contrary. An early
+version reported `comfy.cli_args.args` absent from every version because it
+is assigned inside a module-level conditional, which the resolver did not
+descend into.
