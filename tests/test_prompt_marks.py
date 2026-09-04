@@ -209,8 +209,7 @@ class TestPromptMarkSeam:
         body = ast.unparse(fn)
         assert "get_progress_state" in body and "prompt_id" in body
         assert "PROMPT_GEN" not in body, "the counter is back"
-        pool_src = POOL.read_text(encoding="utf-8")
-        assert "PromptModelTracker" not in pool_src, (
+        assert not _patched_comfy_attributes(POOL, only="PromptModelTracker"), (
             "the class patch is back; the epoch must be read, not hooked")
 
     def test_the_worker_switch_still_gates_the_mark_writes(self):
@@ -271,3 +270,108 @@ class TestSweepScope:
         fn = src[fn_start:src.index("\n    def ", fn_start + 10)]
         assert "_resident_at_call_start[0]" in fn, (
             "the sweep marks all resident models, not the newly present ones")
+
+
+def _patched_comfy_attributes(path, only=None):
+    """Attributes of a comfy module that this file ASSIGNS to.
+
+    Reading `hasattr(cmp, "PromptModelTracker")` to detect support is not a
+    patch; `cmp.PromptModelTracker.start = ...` is. A substring check cannot
+    tell them apart, and conflated them the first time this guard was
+    written. Returns the assigned dotted names.
+    """
+    import ast
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    comfy_aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in ("comfy", "comfy_execution",
+                                                "comfy_aimdo", "comfy_api"):
+                    comfy_aliases.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in ("comfy", "comfy_execution",
+                                             "comfy_aimdo", "comfy_api"):
+                for alias in node.names:
+                    comfy_aliases.add(alias.asname or alias.name)
+    found = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for target in targets:
+            if not isinstance(target, ast.Attribute):
+                continue
+            text = ast.unparse(target)
+            root = text.split(".")[0]
+            if root in comfy_aliases:
+                found.append(text)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr" and node.args):
+            root = ast.unparse(node.args[0]).split(".")[0]
+            if root in comfy_aliases:
+                found.append(ast.unparse(node))
+    if only:
+        found = [f for f in found if only in f]
+    return found
+
+
+class TestNoHostPatchingRule:
+    """The architectural rule: comfy-env does not patch its host.
+
+    Two wraps remain by deliberate exception, each behind a kill switch and
+    each calling the original first. Everything else must be a read. This
+    guard exists so that set shrinks and never grows by accident.
+    """
+
+    ALLOWED = {
+        "mm.unload_all_models",
+        "mm.should_free_pins_for_ram_pressure",
+        # the reserve is a VALUE comfy-env publishes into ComfyUI's own
+        # knob, the same one --reserve-vram writes; it replaces no behaviour
+        "mm.EXTRA_RESERVED_VRAM",
+    }
+
+    def test_the_pool_patches_nothing_outside_the_allowed_set(self):
+        found = set(_patched_comfy_attributes(POOL))
+        assert found <= self.ALLOWED, (
+            "new host patching in pool.py: {}. comfy-env reads its host; "
+            "the two remaining wraps are a deliberate, switched exception."
+            .format(sorted(found - self.ALLOWED)))
+
+    def test_the_guard_would_catch_a_new_patch(self):
+        """Counterexample, so the guard cannot go vacuous when a refactor
+        moves things: the first version of this check was a substring match
+        and could not tell a hasattr probe from an assignment."""
+        import tempfile
+        src = (
+            "import comfy.model_management as mm\n"
+            "def install():\n"
+            "    orig = mm.free_memory\n"
+            "    mm.free_memory = lambda *a: orig(*a)\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+            fh.write(src)
+            name = fh.name
+        try:
+            assert "mm.free_memory" in _patched_comfy_attributes(name)
+        finally:
+            Path(name).unlink()
+
+    def test_a_read_is_not_a_patch(self):
+        """The false positive that broke the first version of this rule."""
+        import tempfile
+        src = (
+            "import comfy.model_patcher as cmp\n"
+            "def supported():\n"
+            "    return hasattr(cmp, 'PromptModelTracker')\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+            fh.write(src)
+            name = fh.name
+        try:
+            assert _patched_comfy_attributes(name) == []
+        finally:
+            Path(name).unlink()
