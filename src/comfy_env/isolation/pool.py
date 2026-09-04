@@ -308,6 +308,86 @@ def _true_device_free(device) -> "int | None":
     return None
 
 
+#: The reserve comfy-env has published into ComfyUI's own EXTRA_RESERVED_VRAM,
+#: and the base it found there first. The base is the operator's own
+#: --reserve-vram instruction: comfy-env ADDS to it and must never lose it.
+_RESERVE_BASE = None
+_RESERVE_PUBLISHED = 0
+#: Per-worker high-water residency. High-water rather than current, because
+#: the reserve exists to stop the host taking space a worker is about to need
+#: again; see reserve.entitlement.
+_RESERVE_HIGHWATER: Dict[str, int] = {}
+
+
+def _publish_reserve(shrink_allowed: bool = False) -> int:
+    """Tell ComfyUI the card is smaller by what workers hold. Never raises.
+
+    This is the whole preventive half of the floor. It replaces nothing that
+    ComfyUI does: its own load path reads extra_reserved_memory() live on
+    every call and backs off using its own arithmetic.
+
+    Measured (research/memory-floor/p2): effective on the legacy path, where
+    a reserve took a 6 GiB model from fully resident to 1.38 GiB, and inert
+    under aimdo, where residency is decided at page-fault time. It is
+    published on both paths regardless, because a paged host still performs
+    non-paged loads and the number is correct for those.
+    """
+    global _RESERVE_BASE, _RESERVE_PUBLISHED
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return 0
+    try:
+        if _RESERVE_BASE is None:
+            # Read once, before comfy-env has ever written it, or the base
+            # compounds: every republish would add the previous reserve back.
+            _RESERVE_BASE = int(mm.EXTRA_RESERVED_VRAM)
+
+        process_local = _blind_free_is_process_local()
+        charges = []
+        for key, entry in list(_WORKER_POOL.items()):
+            worker = entry[0] if entry else None
+            if worker is not None and not worker.is_alive():
+                continue
+            residency = 0
+            for patcher in list(_WORKER_PATCHERS.get(key, {}).values()):
+                try:
+                    residency += int(
+                        getattr(patcher.model, "model_loaded_weight_memory", 0))
+                except Exception:
+                    pass
+            high = max(_RESERVE_HIGHWATER.get(key, 0), residency)
+            _RESERVE_HIGHWATER[key] = high
+            charges.append(reserve.charge(
+                reserve.entitlement(high, floor=_WORKER_FIXED_VRAM_COST),
+                residency, process_local))
+
+        proposed = reserve.total_reserve(
+            _RESERVE_BASE, charges, device_total=_device_total_bytes())
+        value = reserve.next_reserve(
+            _RESERVE_PUBLISHED, proposed, shrink_allowed)
+        if value != _RESERVE_PUBLISHED:
+            mm.EXTRA_RESERVED_VRAM = value
+            _RESERVE_PUBLISHED = value
+            if _DBG_MODELS:
+                _log(f"[comfy-env] reserve published {value / 1e9:.2f}GB "
+                     f"(base {_RESERVE_BASE / 1e9:.2f}GB, "
+                     f"{len(charges)} worker(s))")
+        return value
+    except Exception as exc:
+        _log(f"[comfy-env] reserve publish failed: {exc}")
+        return _RESERVE_PUBLISHED
+
+
+def _forget_reserve(env_dir) -> None:
+    """Drop a dead worker's high-water so its space returns to the host.
+
+    Called on real worker removal only. A restart keeps nothing: the new
+    worker starts at the context floor and earns its high-water again.
+    """
+    _RESERVE_HIGHWATER.pop(str(env_dir), None)
+
+
 def _worker_held_bytes() -> int:
     """Bytes this process's workers hold on the GPU, from comfy-env's own books.
 
@@ -1160,6 +1240,9 @@ def _remove_worker(env_dir):
     # Dead worker's overhead died with it; a retained entry would book ~1 GB
     # of phantom scratch per crash in a restart loop.
     _OVERHEAD_REPORTS.pop(key, None)
+    # Its reserve high-water goes too, and this is the one place a SHRINK is
+    # allowed: the process is gone, so the memory is provably back.
+    _forget_reserve(key)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
@@ -1329,6 +1412,12 @@ def _register_new_patchers(env_dir, worker, generation):
         _insert_loaded_model(p, currently_used=False)
         _log(f"[comfy-env] restored ledger entry for '{p._model_id}': "
              f"eviction could not reach a busy worker and upstream dropped it")
+
+    # Republish the reserve now that this boundary's residency has landed.
+    # Grow only: a worker whose ledger dropped may not have released yet, and
+    # a reserve that falls before the memory is back is space the host loads
+    # straight into. Shrinking waits for _forget_reserve on a real removal.
+    _publish_reserve(shrink_allowed=False)
 
     # Drain: _send_request ACCUMULATES registrations (so no path drops them and
     # no interleaved command wipes them); this is the single consumer.
