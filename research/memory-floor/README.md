@@ -33,6 +33,7 @@ compared.
 | `p1_aimdo_skew.py` | Does a comfy-aimdo patch bump on the host strand a worker on the legacy ledger? | yes |
 | `p2_reserve_levers.py` | Which VRAM levers actually change host behaviour, on each memory path? | yes |
 | `p3_prompt_epoch.py` | Can the prompt epoch be read instead of patched for? | no |
+| `p4_held_truth.py` | Is the number the host reserves against physical truth? | yes |
 
 ## What was measured
 
@@ -63,3 +64,11 @@ RTX 3090 (24576 MiB), ComfyUI 2026-08-24, comfy-aimdo 0.4.13.
   no prompt running, carries ComfyUI's real prompt id once one starts, is
   stable within a prompt and changes across one. No hook installed. This
   replaced a class patch of `PromptModelTracker.start`.
+
+- **P4**, 2026-09-04: the worker reports one measured scalar of what it
+  holds, and it must be the MAX of aimdo's accounting and torch's reserved,
+  never their sum. Measured on a 4 GiB model: torch 4.02 GiB and aimdo
+  4.03 GiB at the same moment, so summing reserved 8.05 GiB for a 4 GiB
+  worker. They overlap when a model is torch-allocated and partition when
+  aimdo pages it, so max is exact in the first case and correct in the
+  second, where ComfyUI's own ledger reads zero.

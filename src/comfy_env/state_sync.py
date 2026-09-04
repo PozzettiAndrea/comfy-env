@@ -111,7 +111,7 @@ def apply_residency(patchers: Dict[str, Any], census: List[Dict[str, Any]],
 
 #: Fields of the unified per-frame VRAM report. Each is a TOTAL (replaces),
 #: never a delta; a field absent from a frame means "unknown this frame".
-VRAM_REPORT_FIELDS = ("residency", "overhead", "pinned")
+VRAM_REPORT_FIELDS = ("residency", "overhead", "pinned", "held")
 
 
 def merge_vram_report(prev, frame):

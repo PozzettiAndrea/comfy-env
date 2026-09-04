@@ -394,13 +394,22 @@ def _publish_reserve(shrink_allowed: bool = False) -> int:
             worker = entry[0] if entry else None
             if worker is not None and not worker.is_alive():
                 continue
+            # What the worker MEASURED it holds, not what our proxies
+            # believe. ComfyUI's ledger reads zero for a paged model and
+            # torch cannot see aimdo at all, so a ledger sum is wrong in
+            # exactly the configuration the reserve exists for.
             residency = 0
-            for patcher in list(_WORKER_PATCHERS.get(key, {}).values()):
-                try:
-                    residency += int(
-                        getattr(patcher.model, "model_loaded_weight_memory", 0))
-                except Exception:
-                    pass
+            report = getattr(worker, "_last_vram_report", None) or {}
+            measured = report.get("held")
+            if measured is not None:
+                residency = max(0, int(measured))
+            else:
+                for patcher in list(_WORKER_PATCHERS.get(key, {}).values()):
+                    try:
+                        residency += int(getattr(
+                            patcher.model, "model_loaded_weight_memory", 0))
+                    except Exception:
+                        pass
             high = max(_RESERVE_HIGHWATER.get(key, 0), residency)
             _RESERVE_HIGHWATER[key] = high
             charges.append(reserve.charge(

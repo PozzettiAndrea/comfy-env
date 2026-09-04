@@ -1899,6 +1899,34 @@ def main():
                     _vram_report["pinned"] = _tp
         except Exception:
             pass
+        # What this process actually holds on the device, as ONE measured
+        # number. This is what the host reserves against, so it must be
+        # physical truth rather than a bookkeeping figure: ComfyUI's own
+        # ledger reads zero for a partially paged model, and torch cannot
+        # see comfy-aimdo's allocations at all when it pages (about 20 MB
+        # reported against 6.4 GB resident).
+        #
+        # MAX, not sum. The two sources were measured overlapping: a 4 GiB
+        # model read 4.02 GiB in torch and 4.03 GiB in aimdo at the same
+        # moment, so adding them reserved 8 GiB for a 4 GiB worker. max()
+        # never double counts, and it is exact whenever one source is blind,
+        # which is the case the ledger cannot handle.
+        try:
+            _held = 0
+            try:
+                import comfy_aimdo.control as _actl
+                _held = max(_held, int(_actl.get_total_vram_usage()))
+            except Exception:
+                pass
+            try:
+                import torch as _ht
+                if _ht.cuda.is_initialized():
+                    _held = max(_held, int(_ht.cuda.memory_reserved()))
+            except Exception:
+                pass
+            _vram_report["held"] = _held
+        except Exception:
+            pass
         if _vram_report:
             resp["_vram_report"] = _vram_report
         if _pending_state_out[0] is not None:
