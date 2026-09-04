@@ -392,96 +392,6 @@ def test_fingerprint_uses_pickle_stability():
     assert pickle.dumps({"k": [1, 2]}) == pickle.dumps({"k": [1, 2]})
 
 
-class TestAllocatePinBudgets:
-    """The per-process pin split. Every rule below is an invariant from the
-    design debate; each test names the wrong implementation it catches."""
-
-    from comfy_env.state_sync import (  # noqa: PLC0415
-        allocate_pin_budgets, damp_pin_grant, update_pin_reports,
-    )
-
-    def test_disabled_host_yields_sentinel_never_zero(self):
-        """host_max <= 0 means pinning was never enabled: every key gets -1
-        unchanged. Catches: granting 0, which strands registrations because
-        unpin_memory early-returns on MAX <= 0."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(0, {"host": {"pinned": 0},
-                                       "w1": {"pinned": 5 * GIB}})
-        assert out == {"host": -1, "w1": -1}
-        assert 0 not in out.values()
-
-    def test_grant_never_below_current_pinned(self):
-        """The drain bound beats conservation: a ceiling below a holder's
-        TOTAL_PINNED makes model_management.py:739 a permanent shortfall
-        (evict-forever). Catches: a conservation-first allocator."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(
-            10 * GIB,
-            {"host": {"pinned": 0},
-             "w1": {"pinned": 9 * GIB}, "w2": {"pinned": 8 * GIB}},
-            floor_bytes=GIB)
-        assert out["w1"] >= 9 * GIB and out["w2"] >= 8 * GIB
-
-    def test_idle_worker_lands_on_floor_without_draining_the_share(self):
-        """The denominator counts LIVE pinners plus the requester. Catches:
-        equal division over all keys, which starves the loader to feed
-        workers that pin nothing."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(
-            20 * GIB,
-            {"host": {"pinned": 0},
-             "loader": {"pinned": 4 * GIB}, "idle": {"pinned": 0}},
-            floor_bytes=GIB, reserve=0.5)
-        # (20 - 10) GiB over ONE live pinner, not two
-        assert out["loader"] == 10 * GIB
-        assert out["idle"] == GIB
-
-    def test_requester_counts_as_live_before_its_first_pin(self):
-        """A worker asking for budget is about to pin. Catches: a denominator
-        that only sees past pinners, granting the whole remainder to a
-        requester that then double-books it."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(
-            20 * GIB,
-            {"host": {"pinned": 0},
-             "vet": {"pinned": 4 * GIB}, "newcomer": {"pinned": 0}},
-            floor_bytes=GIB, reserve=0.5, requester="newcomer")
-        assert out["newcomer"] == 5 * GIB  # (20-10)/2, not (20-10)/1
-        assert out["vet"] == 5 * GIB
-
-    def test_dead_worker_key_absent_not_retained_at_zero(self):
-        """The pool removes a dead worker's report; its key must not appear in
-        the output either. Catches: an allocator that remembers ghosts and
-        keeps splitting the pool with them."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(10 * GIB, {"host": {"pinned": 0},
-                                              "alive": {"pinned": GIB}})
-        assert "dead" not in out and set(out) == {"host", "alive"}
-
-    def test_grant_overage_is_exactly_the_floors(self):
-        """Grants may exceed host_max ONLY by the floor and drain-bound terms.
-        Catches: an allocator that quietly oversubscribes beyond the two
-        documented exceptions."""
-        from comfy_env.state_sync import allocate_pin_budgets
-        host_max, floor = 10 * GIB, 2 * GIB
-        reports = {"host": {"pinned": 0},
-                   "w1": {"pinned": 0}, "w2": {"pinned": 0}}
-        out = allocate_pin_budgets(host_max, reports, floor_bytes=floor,
-                                   reserve=0.5)
-        # share = (10-5)/1 = 5 GiB... but no live pinner and no requester:
-        # everyone idle lands on the floor; host keeps its reserve.
-        assert out["w1"] == out["w2"] == floor
-        overage = sum(out.values()) - host_max
-        assert overage == (out["host"] + 2 * floor) - host_max
-
-    def test_host_grant_is_reserve_or_its_own_pinned(self):
-        from comfy_env.state_sync import allocate_pin_budgets
-        out = allocate_pin_budgets(10 * GIB, {"host": {"pinned": 7 * GIB},
-                                              "w1": {"pinned": GIB}},
-                                   floor_bytes=GIB, reserve=0.5)
-        assert out["host"] == 7 * GIB  # drain bound beats the 50% reserve
-
-
 class TestPinReportsAndDamping:
     def test_stale_report_is_dropped_whole(self):
         """Same rule as apply_residency: an out-of-order frame must not
@@ -491,31 +401,6 @@ class TestPinReportsAndDamping:
         assert update_pin_reports(reports, "w1", 5 * GIB, seq=10)
         assert not update_pin_reports(reports, "w1", 99 * GIB, seq=9)
         assert reports["w1"]["pinned"] == 5 * GIB
-
-    def test_shrink_applies_immediately(self):
-        """Shrink-fast is half the anti-oscillation contract; deferring a
-        shrink is the direction that oversubscribes RAM."""
-        from comfy_env.state_sync import damp_pin_grant
-        assert damp_pin_grant(10 * GIB, 4 * GIB, stable_censuses=0) == 4 * GIB
-
-    def test_grow_waits_for_stability(self):
-        """Grow only after 2 consecutive censuses with an unchanged consumer
-        set. Catches: a paging worker retuning the pool every node boundary."""
-        from comfy_env.state_sync import damp_pin_grant
-        assert damp_pin_grant(4 * GIB, 10 * GIB, stable_censuses=1) == 4 * GIB
-        assert damp_pin_grant(4 * GIB, 10 * GIB, stable_censuses=2) == 10 * GIB
-
-    def test_grow_below_deadband_is_swallowed(self):
-        """No grant delta below 512 MiB is emitted: each emitted delta retunes
-        every worker, and sub-deadband jitter is census noise."""
-        from comfy_env.state_sync import damp_pin_grant
-        small = 4 * GIB + 100 * 1024 * 1024
-        assert damp_pin_grant(4 * GIB, small, stable_censuses=5) == 4 * GIB
-
-    def test_first_grant_passes_undamped(self):
-        from comfy_env.state_sync import damp_pin_grant
-        assert damp_pin_grant(None, 4 * GIB, stable_censuses=0) == 4 * GIB
-
 
 def test_state_sync_stays_pure():
     """The whole module must keep importable under bare CI: no comfy, no

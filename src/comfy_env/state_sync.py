@@ -360,24 +360,7 @@ def apply_state_out(instance_dict: Dict[str, Any],
 # Pinned RAM budgets (coverage sweep item 1)
 # ---------------------------------------------------------------------------
 
-#: Gate for the whole split. "off" (the shipped default) is byte-identical to
-#: today; "auto" clamps worker pin ceilings from the host allowance. The
-#: default flips only after the measurement gates re-run on real census data.
-PIN_SPLIT_ENV_VAR = "COMFY_ENV_PIN_SPLIT"
 
-#: Bootstrap grant for a worker that has not seen a budget reply yet (bytes).
-PIN_SHARE_ENV_VAR = "COMFY_ENV_PIN_SHARE"
-
-#: Mirror of the host's RAM_CACHE_HEADROOM (bytes). Workers otherwise sit on
-#: the flat 2 GB floor at model_management.py:720 forever, because the only
-#: setter (execution.py:748) never runs in a worker.
-PIN_HEADROOM_ENV_VAR = "COMFY_ENV_PIN_HEADROOM"
-
-PIN_FLOOR_ENV_VAR = "COMFY_ENV_PIN_FLOOR"
-PIN_RESERVE_ENV_VAR = "COMFY_ENV_PIN_RESERVE"
-
-#: Matches the ensure_pin_budget floor at model_management.py:720.
-PIN_FLOOR_DEFAULT = 2 * 1024 ** 3
 
 #: The budget owner's ADVANCE PAYMENT of the reserve margin: a worker parses
 #: empty argv, so its EXTRA_RESERVED_VRAM sits on the upstream default from
@@ -387,8 +370,6 @@ PIN_FLOOR_DEFAULT = 2 * 1024 ** 3
 #: supersedes it. Same owner (the budget RPC), second channel for the
 #: pre-RPC window only.
 RESERVE_ENV_VAR = "COMFY_ENV_EXTRA_RESERVED_VRAM"
-PIN_RESERVE_DEFAULT = 0.5
-
 #: Damping (parent side): a grow below this delta is not emitted, so a paging
 #: worker cannot retune the pool every node boundary.
 PIN_DEADBAND_BYTES = 512 * 1024 * 1024
@@ -414,75 +395,6 @@ def update_pin_reports(reports: Dict[str, Dict[str, int]], key: str,
         return True
     except Exception:
         return False
-
-
-def allocate_pin_budgets(host_max: int, reports: Dict[str, Dict[str, int]],
-                         floor_bytes: int = PIN_FLOOR_DEFAULT,
-                         reserve: float = PIN_RESERVE_DEFAULT,
-                         requester: Optional[str] = None) -> Dict[str, int]:
-    """Split the host pin allowance across the processes that share its RAM.
-
-    ``reports`` maps ``"host"`` plus worker keys to ``{"pinned": bytes,
-    "seq": n}``. Dead workers' keys are ABSENT from the input (the pool
-    removes them), so they are absent from the output; a missing census from
-    a live worker keeps its last report, mirroring ``apply_residency``.
-
-    Rules, each an invariant from the design debate:
-
-    * ``host_max <= 0`` means pinning was never enabled anywhere: every key
-      gets the ``-1`` sentinel unchanged, and nothing can be stranded.
-    * The drain bound beats conservation: no grant ever lands below a
-      holder's current pinned total (a lower ceiling makes the registration
-      check at model_management.py:739 a permanent shortfall, evicting
-      forever), and never 0 for anyone (unpin_memory early-returns on
-      ``MAX <= 0``, stranding registrations). Grants may therefore exceed
-      ``host_max`` by at most the sum of the floor and pinned overages;
-      that is the documented exception, not a bug.
-    * The share denominator counts LIVE pinners (pinned > 0) plus the
-      requester, so idle workers land on the floor without draining the
-      pool's working shares.
-    """
-    if host_max <= 0:
-        return {k: -1 for k in reports}
-    host_pinned = int(reports.get("host", {}).get("pinned", 0))
-    grant_host = max(int(floor_bytes), host_pinned, int(host_max * reserve))
-    workers = [k for k in reports if k != "host"]
-    live = {w for w in workers
-            if int(reports[w].get("pinned", 0)) > 0 or w == requester}
-    share = (int(host_max) - grant_host) // max(1, len(live))
-    out: Dict[str, int] = {}
-    for k in reports:
-        if k == "host":
-            out[k] = grant_host
-        elif k in live:
-            out[k] = max(int(floor_bytes),
-                         int(reports[k].get("pinned", 0)), share)
-        else:
-            # Idle and not asking: the floor (or what it still holds while
-            # draining), never the share -- handing the live remainder to
-            # every idle worker would multiply it, not split it.
-            out[k] = max(int(floor_bytes), int(reports[k].get("pinned", 0)))
-    return out
-
-
-def damp_pin_grant(last_grant: Optional[int], new_grant: int,
-                   stable_censuses: int) -> int:
-    """Parent-side damping for one worker's grant.
-
-    Shrink applies immediately (the drain bound in the allocator already
-    keeps it above held bytes). Grow waits for ``PIN_GROW_STABLE_CENSUSES``
-    consecutive censuses with an unchanged consumer set, and a grow smaller
-    than the deadband is swallowed entirely, because each emitted delta
-    retunes every worker's allocator behavior."""
-    if last_grant is None:
-        return new_grant
-    if new_grant <= last_grant:
-        return new_grant
-    if new_grant - last_grant < PIN_DEADBAND_BYTES:
-        return last_grant
-    if stable_censuses < PIN_GROW_STABLE_CENSUSES:
-        return last_grant
-    return new_grant
 
 
 # ---------------------------------------------------------------------------

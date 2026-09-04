@@ -606,71 +606,6 @@ def total_pinned() -> Optional[int]:
         return None
 
 
-def apply_pin_budget(grant=None, headroom=None, log=None) -> bool:
-    """Apply a parent pin grant and headroom mirror. CLAMP ONLY, by contract:
-
-    * No-op when the local ``MAX_PINNED_MEMORY`` is already <= 0. A mirrored
-      ``--disable-pinned-memory`` (or a platform that never enabled pinning)
-      is terminal: host intent outranks a budget, and re-enabling pinning
-      here would also strand registrations, because ``unpin_memory``
-      early-returns on ``MAX <= 0``.
-    * ``MAX = max(min(local, grant), TOTAL_PINNED)``: the grant can only
-      LOWER the ceiling, and never below what this process already holds
-      (a ceiling below current TOTAL makes the registration check at
-      model_management.py:739 a permanent shortfall, evicting forever).
-    * A ``-1`` (or any <= 0) grant is the disabled sentinel: no-op.
-
-    ``headroom`` mirrors the host's RAM_CACHE_HEADROOM by direct assignment
-    on ``comfy.memory_management`` (:176). Deliberately NOT via
-    ``set_ram_cache_release_state``, which would also stamp a None callback;
-    the only upstream setter (execution.py:748) never runs in a worker.
-
-    What the mirrored headroom actually buys here, stated honestly: the
-    "RAM cache" behind the release callback is the PromptExecutor's OUTPUT
-    cache, an object a worker does not have, and ``extra_ram_release`` is a
-    verified no-op when the callback is None -- so on those two call sites
-    the mirrored value is inert in workers, BY DESIGN (a worker callback
-    would have nothing safe to release that full_release and the pin ladder
-    do not already cover, and firing gc on every pressured pin would thrash
-    the allocator pinning depends on). The mirror's REAL consumer is the
-    pin floor: ``ensure_pin_budget`` (model_management.py:720) reads
-    ``RAM_CACHE_HEADROOM / 2`` on every hostbuf pin, so the mirror stops a
-    worker from pinning into RAM the host reserved for its cache.
-    Returns True if anything changed. Never raises.
-    """
-    _log = log or (lambda *_: None)
-    changed = False
-    try:
-        mm = sys.modules.get("comfy.model_management")
-        if mm is not None and grant is not None:
-            grant = int(grant)
-            local = int(getattr(mm, "MAX_PINNED_MEMORY", 0))
-            if grant > 0 and local > 0:
-                held = int(getattr(mm, "TOTAL_PINNED_MEMORY", 0))
-                new = max(min(local, grant), held)
-                if new != local:
-                    mm.MAX_PINNED_MEMORY = new
-                    changed = True
-                    _log(f"[worker] pin budget: MAX_PINNED_MEMORY "
-                         f"{local / 1e9:.2f}GB -> {new / 1e9:.2f}GB "
-                         f"(grant {grant / 1e9:.2f}GB, held {held / 1e9:.2f}GB)")
-    except Exception as exc:
-        _log(f"[worker] pin budget apply failed: {exc}")
-    try:
-        cm = sys.modules.get("comfy.memory_management")
-        if cm is not None and headroom is not None \
-                and hasattr(cm, "RAM_CACHE_HEADROOM"):
-            headroom = max(0, int(headroom))
-            if int(getattr(cm, "RAM_CACHE_HEADROOM", 0)) != headroom:
-                cm.RAM_CACHE_HEADROOM = headroom
-                changed = True
-                _log(f"[worker] pin budget: RAM_CACHE_HEADROOM mirrored to "
-                     f"{headroom / 1e9:.2f}GB")
-    except Exception as exc:
-        _log(f"[worker] pin headroom mirror failed: {exc}")
-    return changed
-
-
 # ---------------------------------------------------------------------------
 # /free deep release (worker side)
 # ---------------------------------------------------------------------------
@@ -789,7 +724,7 @@ def apply_reserve_bootstrap(value, log=None) -> bool:
     Parses inside (a garbage env value must WARN here, not kill the caller's
     whole bootstrap block). ZERO IS A VALUE: upstream honors --reserve-vram 0
     (the guard there is `is not None`), and the reply assigns 0 verbatim, so
-    the advance must too -- deliberately DIFFERENT from apply_pin_budget,
+    the advance must too -- deliberately NOT a clamp,
     where <= 0 is a disabled sentinel; a "harmonizing" refactor of the two is
     the named enemy. Negatives also cross verbatim (reachable from the CLI:
     the flag is an unbounded float) with one WARN, because clamping only the

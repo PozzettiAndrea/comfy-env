@@ -1681,20 +1681,6 @@ def main():
                 # Propagate parent's VRAM constraints to subprocess
                 if result:
                     extra_reserved = result.get("extra_reserved_vram")
-                    # Pin grant (present only under COMFY_ENV_PIN_SPLIT=auto).
-                    # Clamp-only by contract; grow before load is the point of
-                    # applying it here, before the real load_models_gpu runs.
-                    if _memmgr is not None and (
-                            result.get("pin_max") is not None
-                            or result.get("pin_headroom") is not None):
-                        try:
-                            _memmgr.apply_pin_budget(
-                                grant=result.get("pin_max"),
-                                headroom=result.get("pin_headroom"),
-                                log=wlog)
-                        except Exception as _pe:
-                            wlog(f"[worker] pin grant apply failed: {_pe}")
-
                     # Correct OUR OWN blindness. get_free_memory() here reports
                     # this process's budget on WDDM -- it cannot see the parent
                     # or sibling workers, so the real load_models_gpu below
@@ -1815,10 +1801,12 @@ def main():
             wlog(f"[worker] memory manager probe failed: {_e}")
 
     # Pin budget bootstrap. The counter installs unconditionally (telemetry);
-    # the grant and headroom apply only when the parent exported them, which
-    # it does only under COMFY_ENV_PIN_SPLIT=auto -- absent vars are a no-op,
-    # keeping the off default byte-identical to today. apply_pin_budget is
-    # clamp-only, so a mirrored --disable-pinned-memory stays disabled.
+    # The per-worker pin CEILING is gone with the pin-split allocation half:
+    # comfy's own ensure_pin_budget already stops pinning from the global
+    # available-RAM figure, and the same ceiling sizes each model's host
+    # buffer via pinned_hostbuf_size, so a grant would have capped large
+    # models silently. The counters below stay: they are observability, and
+    # pins_evicted_active_bytes is the prompt marks' own regression signal.
     if _memmgr is not None:
         try:
             _memmgr.install_pin_error_counter()
@@ -1828,13 +1816,6 @@ def main():
             # pins_evicted_active_bytes is the prompt-mark fix's own
             # regression signal (must stay 0).
             _memmgr.install_pin_eviction_counters(log=wlog)
-            _bs_grant = os.environ.get("COMFY_ENV_PIN_SHARE")
-            _bs_headroom = os.environ.get("COMFY_ENV_PIN_HEADROOM")
-            if _bs_grant is not None or _bs_headroom is not None:
-                _memmgr.apply_pin_budget(
-                    grant=int(_bs_grant) if _bs_grant is not None else None,
-                    headroom=int(_bs_headroom) if _bs_headroom is not None else None,
-                    log=wlog)
         except Exception as _e:
             wlog(f"[worker] pin budget bootstrap failed: {_e}")
         # Reserve bootstrap: the budget owner's advance payment. Parses

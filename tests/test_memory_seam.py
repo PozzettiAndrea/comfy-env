@@ -352,82 +352,6 @@ def test_host_derived_env_writes_never_clobber_pack_env_vars():
     )
 
 
-class TestPinBudgetSeam:
-    """The pin split's non-negotiables, pinned at source level. The clamp is
-    dark (COMFY_ENV_PIN_SPLIT=off default) but the contract must hold from
-    the first commit, because flipping the default must be a one-var change."""
-
-    def test_apply_pin_budget_is_clamp_only(self):
-        """A grant may only LOWER the ceiling, never below held bytes, and a
-        disabled local MAX stays disabled. Catches: a 'helpful' rewrite that
-        raises MAX toward the grant, re-enabling pinning against a mirrored
-        --disable-pinned-memory."""
-        tree = _tree(MEMMGR)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "apply_pin_budget")
-        src = ast.unparse(fn)
-        assert "max(min(local, grant), held)" in src, (
-            "the clamp formula changed; grants can now RAISE the ceiling")
-        assert "grant > 0 and local > 0" in src, (
-            "the disabled-stays-disabled gate is gone; a grant now re-enables "
-            "pinning against host intent")
-
-    def test_headroom_mirror_assigns_directly_never_via_setter(self):
-        """set_ram_cache_release_state also stamps a None callback; the only
-        legitimate write is direct assignment on comfy.memory_management."""
-        src = MEMMGR.read_text(encoding="utf-8")
-        assert "RAM_CACHE_HEADROOM = headroom" in src.replace("cm.", ""), (
-            "the headroom mirror no longer assigns RAM_CACHE_HEADROOM directly")
-        calls = {n.func.attr for n in ast.walk(_tree(MEMMGR))
-                 if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute)}
-        assert "set_ram_cache_release_state" not in calls, (
-            "the mirror now goes through the setter, stamping a None callback")
-
-    def test_grant_fields_only_under_auto_mode(self):
-        """COMFY_ENV_PIN_SPLIT=off (the shipped default) must be
-        byte-identical to today: no pin_max in any reply. Catches: the mode
-        gate quietly dropped from the reply builder."""
-        tree = _tree(POOL)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_maybe_add_pin_grant")
-        src = ast.unparse(fn)
-        assert "_pin_split_mode() != 'auto'" in src
-        assert "pin_max" in src
-
-    def test_reply_is_the_only_grant_channel(self):
-        """Grants ride the request_vram_budget reply and nothing else: no
-        parent push exists at node boundaries, and a second channel would be
-        a second clock. Catches: a grant write sneaking into the census
-        ingest path."""
-        tree = _tree(POOL)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "_pin_ingest")
-        src = ast.unparse(fn)
-        assert "pin_max" not in src and "apply_pin_budget" not in src
-
-    def test_dead_worker_report_leaves_the_ledger(self):
-        """_remove_worker must pop the pin report: a retained key keeps
-        splitting the pool with a ghost."""
-        tree = _tree(POOL)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_remove_worker")
-        src = ast.unparse(fn)
-        assert "_PIN_REPORTS.pop" in src and "_PIN_GRANTS.pop" in src
-
-    def test_worker_applies_grants_from_the_budget_reply(self):
-        """The worker must read pin_max/pin_headroom off the reply and route
-        them through apply_pin_budget (grow before load). Catches: the reply
-        fields shipping with no consumer."""
-        src = WORKER.read_text(encoding="utf-8")
-        assert 'result.get("pin_max")' in src
-        assert 'grant=result.get("pin_max")' in src
-        assert 'headroom=result.get("pin_headroom")' in src
-
-
 class TestResidencyPeakSeam:
     """The peak-decay fix's wiring: what bare CI cannot execute, pinned at
     source level."""
@@ -584,8 +508,7 @@ class TestBootstrapSeam:
             stack.extend(ast.iter_child_nodes(node))
         return out
 
-    @pytest.mark.parametrize("apply_name", ["apply_pin_budget",
-                                            "apply_reserve_bootstrap"])
+    @pytest.mark.parametrize("apply_name", ["apply_reserve_bootstrap"])
     def test_bootstrap_applies_between_comfy_import_and_ready(self, apply_name):
         """Apply before the comfy import is silently vacuous forever (the
         sys.modules lookup no-ops and no test fails); apply after the ready
@@ -619,8 +542,10 @@ class TestBootstrapSeam:
     def test_pool_env_injection_never_clobbers_pack_env_vars(self):
         """Every env var the pool injects at worker creation must be guarded
         by a `not in env_vars` membership test: pack [env_vars] outranks the
-        host-derived value. Covers the two pin vars (previously unguarded by
-        any test) and the reserve var."""
+        host-derived value. The two pin vars this also covered went with the
+        pin-split allocation half; the rule is unchanged for what remains,
+        and the final equality keeps this honest if an injection is added
+        without a guard."""
         tree = _tree(POOL)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
@@ -629,8 +554,7 @@ class TestBootstrapSeam:
         for node in ast.walk(fn):
             for child in ast.iter_child_nodes(node):
                 parents[child] = node
-        guarded_names = {"PIN_SHARE_ENV_VAR", "PIN_HEADROOM_ENV_VAR",
-                         "RESERVE_ENV_VAR"}
+        guarded_names = {"RESERVE_ENV_VAR"}
         checked = set()
         for node in ast.walk(fn):
             if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
@@ -659,10 +583,11 @@ class TestBootstrapSeam:
             f"expected injections for {guarded_names}, found {checked}; the "
             f"guard stopped seeing the block")
 
-    def test_reserve_injection_is_not_gated_on_pin_split(self):
-        """Nesting the reserve write inside the PIN_SPLIT block would make
-        the fix function only under the experimental clamp mode and stay
-        dead in the shipped default."""
+    def test_reserve_injection_is_unconditional(self):
+        """The reserve advance must reach every worker, not sit behind a
+        feature gate. It was previously nested beside the PIN_SPLIT block,
+        which is now deleted; this asserts it did not inherit a gate on the
+        way out."""
         tree = _tree(POOL)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
@@ -671,20 +596,20 @@ class TestBootstrapSeam:
         for node in ast.walk(fn):
             for child in ast.iter_child_nodes(node):
                 parents[child] = node
+        target = None
         for node in ast.walk(fn):
             if (isinstance(node, ast.Assign)
-                    and isinstance(node.targets[0], ast.Subscript)
-                    and isinstance(node.targets[0].slice, ast.Attribute)
-                    and node.targets[0].slice.attr == "RESERVE_ENV_VAR"):
-                cursor = node
-                while cursor in parents:
-                    cursor = parents[cursor]
-                    if isinstance(cursor, ast.If) and \
-                            "_pin_split_mode" in ast.unparse(cursor.test):
-                        raise AssertionError(
-                            "the reserve bootstrap is gated on PIN_SPLIT")
-                return
-        raise AssertionError("RESERVE_ENV_VAR injection not found")
+                    and "RESERVE_ENV_VAR" in ast.unparse(node.targets[0])):
+                target = node
+                break
+        assert target is not None, "the reserve advance is no longer injected"
+        node = target
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.If):
+                test = ast.unparse(node.test)
+                assert "not in env_vars" in test or "RESERVE" in test, (
+                    "the reserve advance sits behind an unrelated gate: " + test)
 
     def test_reserve_value_comes_from_the_settled_attribute(self):
         """The injected value must be host mm.EXTRA_RESERVED_VRAM verbatim
@@ -813,7 +738,7 @@ class TestObservabilitySeam:
 
     def test_pin_regression_line_is_not_debug_gated(self):
         fn = next(n for n in ast.walk(_tree(POOL))
-                  if isinstance(n, ast.FunctionDef) and n.name == "_maybe_add_pin_grant")
+                  if isinstance(n, ast.FunctionDef) and n.name == "_ingest_pin_state")
         src = ast.unparse(fn)
         assert "pin_regression_line" in src
         assert "_log(line)" in src

@@ -37,15 +37,12 @@ _STALE_PATCHERS: List[Any] = []  # Keeps stale patchers alive until free_memory 
 _POOL_LOCK = threading.Lock()
 _WORKER_GENERATION = 0  # Monotonically increasing; incremented on each new worker
 
-# --- Pin budget ledger (COMFY_ENV_PIN_SPLIT) ------------------------------
+# --- Pin census (observability and the reclaim path) ----------------------
 # reports: "host" plus str(env_dir) -> {"pinned": bytes, "seq": n}. seq is a
 # PARENT-side arrival stamp (one socket per worker makes arrival order causal
 # order); the worker's own _pin_state.seq is observability, not the ledger.
 _PIN_REPORTS: Dict[str, Dict[str, int]] = {}
-_PIN_GRANTS: Dict[str, int] = {}  # last grant emitted per worker key (damping)
 _PIN_INGEST_SEQ = 0
-_PIN_STABLE = 0  # consecutive censuses with an unchanged consumer set
-_PIN_LAST_CONSUMERS: frozenset = frozenset()
 _PIN_ROLLUP_LAST = 0  # last logged pinned total (rollup fires on >1 GiB moves)
 _PIN_REGRESSION_SEEN: Dict[str, int] = {}  # active-eviction bytes last logged per worker
 
@@ -84,27 +81,18 @@ def _device_total_bytes() -> Optional[int]:
     return _DEVICE_TOTAL_CACHE[0]
 
 
-def _pin_split_mode() -> str:
-    """"off" (default, byte-identical to today) or "auto"."""
-    return os.environ.get(state_sync.PIN_SPLIT_ENV_VAR, "off").strip().lower()
-
-
 def _pin_ingest(key: str, pinned) -> None:
-    """Stamp one pin report into the ledger and track consumer-set stability
-    for the grow damping. Never raises."""
-    global _PIN_INGEST_SEQ, _PIN_STABLE, _PIN_LAST_CONSUMERS, _PIN_ROLLUP_LAST
+    """Stamp one pin report into the ledger. Never raises.
+
+    Consumer-set stability used to be tracked here to damp the grant's
+    growth. With the allocation half deleted there is no grant to damp.
+    """
+    global _PIN_INGEST_SEQ, _PIN_ROLLUP_LAST
     try:
         _PIN_INGEST_SEQ += 1
         state_sync.update_pin_reports(_PIN_REPORTS, key, int(pinned),
                                       _PIN_INGEST_SEQ)
         reports = list(_PIN_REPORTS.items())  # snapshot: pops race this
-        consumers = frozenset(k for k, r in reports
-                              if r.get("pinned", 0) > 0)
-        if consumers == _PIN_LAST_CONSUMERS:
-            _PIN_STABLE += 1
-        else:
-            _PIN_STABLE = 0
-            _PIN_LAST_CONSUMERS = consumers
         total = sum(r.get("pinned", 0) for _k, r in reports)
         if abs(total - _PIN_ROLLUP_LAST) > 1024 ** 3:
             _PIN_ROLLUP_LAST = total
@@ -441,54 +429,33 @@ def _worker_held_bytes() -> int:
                                          cap=_device_total_bytes())
 
 
-def _maybe_add_pin_grant(reply: dict, request: dict, worker_key) -> None:
-    """Attach ``pin_max``/``pin_headroom`` to a budget reply.
+def _ingest_pin_state(request: dict, worker_key) -> None:
+    """Take the pin census riding a budget request. Never raises.
 
-    The reply is the ONLY grant channel (a debate verdict: censuses are
-    worker-to-parent piggybacks; no parent push exists at node boundaries).
-    Ingestion of the rider ``pin_state`` always happens (observability);
-    the grant fields appear only under ``COMFY_ENV_PIN_SPLIT=auto``, so the
-    shipped default is byte-identical to today. Never raises."""
+    This used to also hand back a per-worker pin CEILING split from the
+    host's own. That half is gone. It never shipped (dark behind
+    COMFY_ENV_PIN_SPLIT) and three separate findings said it should not:
+    comfy's own ensure_pin_budget already stops pinning from the global
+    available-RAM figure, so the ceiling was never the binding guard; the
+    same ceiling sizes each model's host buffer through pinned_hostbuf_size,
+    so a small grant would have silently capped a large model's buffer; and
+    it re-derived an upstream number, which is the coupling this redesign
+    exists to remove.
+
+    The census stays, because the reclaim path and the regression line read
+    it and neither re-derives anything.
+    """
     try:
         ps = request.get("pin_state")
-        if isinstance(ps, dict) and worker_key:
-            _pin_ingest(worker_key, ps.get("total_pinned", 0))
-            # Always on: an active-pin eviction is the regression the marks
-            # exist to prevent, so it must be visible without a debug flag.
-            line = state_sync.pin_regression_line(
-                Path(worker_key).name, ps, _PIN_REGRESSION_SEEN)
-            if line:
-                _log(line)
-        if _pin_split_mode() != "auto" or not worker_key:
+        if not isinstance(ps, dict) or not worker_key:
             return
-        import comfy.model_management as mm
-        host_max = int(getattr(mm, "MAX_PINNED_MEMORY", 0) or 0)
-        _pin_ingest("host", int(getattr(mm, "TOTAL_PINNED_MEMORY", 0) or 0))
-        if worker_key not in _PIN_REPORTS:
-            _pin_ingest(worker_key, 0)  # first contact: request IS the report
-        floor = int(os.environ.get(state_sync.PIN_FLOOR_ENV_VAR,
-                                   state_sync.PIN_FLOOR_DEFAULT))
-        reserve = float(os.environ.get(state_sync.PIN_RESERVE_ENV_VAR,
-                                       state_sync.PIN_RESERVE_DEFAULT))
-        grants = state_sync.allocate_pin_budgets(
-            host_max, dict(_PIN_REPORTS), floor_bytes=floor, reserve=reserve,
-            requester=worker_key)
-        raw = grants.get(worker_key)
-        if raw is None:
-            return
-        damped = state_sync.damp_pin_grant(_PIN_GRANTS.get(worker_key),
-                                           int(raw), _PIN_STABLE)
-        _PIN_GRANTS[worker_key] = damped
-        reply["pin_max"] = int(damped)
-        try:
-            import comfy.memory_management as cmm
-            reply["pin_headroom"] = int(getattr(cmm, "RAM_CACHE_HEADROOM", 0))
-        except Exception:
-            pass
-        if _DBG_MODELS:
-            _log(f"[comfy-env] pin grant for {Path(worker_key).name}: "
-                 f"{reply['pin_max'] / 1e9:.2f}GB "
-                 f"(host_max {host_max / 1e9:.2f}GB, stable {_PIN_STABLE})")
+        _pin_ingest(worker_key, ps.get("total_pinned", 0))
+        # Always on: an active-pin eviction is the regression the prompt
+        # marks exist to prevent, so it must be visible without a debug flag.
+        line = state_sync.pin_regression_line(
+            Path(worker_key).name, ps, _PIN_REGRESSION_SEEN)
+        if line:
+            _log(line)
     except Exception:
         pass
 
@@ -636,7 +603,7 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
         "vram_state": vram_state_name,
         "device_free_bytes": int(post_true_free),
     }
-    _maybe_add_pin_grant(reply, request, worker_key)
+    _ingest_pin_state(request, worker_key)
     return reply
 
 
@@ -662,7 +629,6 @@ def _cleanup_stale_patchers(env_dir):
     key = str(env_dir)
     _OVERHEAD_REPORTS.pop(key, None)  # the replaced process's scratch is gone
     _PIN_REPORTS.pop(key, None)       # and its pins; parity with _remove_worker
-    _PIN_GRANTS.pop(key, None)
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
@@ -902,7 +868,7 @@ def _install_pin_pressure() -> None:
     (ensure_pin_budget calls it constantly). The wrap calls the original
     first and returns its result verbatim; the broadcast is a side effect.
     Reads only the ungated pin census: this reclaim needs nothing from the
-    dark COMFY_ENV_PIN_SPLIT machinery."""
+    deleted pin-split allocation machinery."""
     global _PIN_PRESSURE_INSTALLED
     with _INSTALL_LOCK:
         if _PIN_PRESSURE_INSTALLED:
@@ -1105,31 +1071,16 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                 pass
         _WORKER_GENERATION += 1
         gen = _WORKER_GENERATION
-        # Pin budget bootstrap: a worker that has not seen a budget reply yet
-        # starts on an equal split rather than believing it owns the whole
-        # host allowance. Guarded not-in so pack [env_vars] wins; exported
-        # only under PIN_SPLIT=auto so the off default stays byte-identical.
-        if _pin_split_mode() == "auto":
-            env_vars = dict(env_vars or {})
-            try:
-                import comfy.model_management as _mm
-                _hm = int(getattr(_mm, "MAX_PINNED_MEMORY", 0) or 0)
-                if _hm > 0 and state_sync.PIN_SHARE_ENV_VAR not in env_vars:
-                    env_vars[state_sync.PIN_SHARE_ENV_VAR] = str(
-                        _hm // (len(_WORKER_POOL) + 2))
-                import comfy.memory_management as _cmm
-                if state_sync.PIN_HEADROOM_ENV_VAR not in env_vars:
-                    env_vars[state_sync.PIN_HEADROOM_ENV_VAR] = str(
-                        int(getattr(_cmm, "RAM_CACHE_HEADROOM", 0)))
-            except Exception:
-                pass
-        # Reserve bootstrap: the budget owner's advance payment, deliberately
-        # OUTSIDE the pin split gate (it is not experimental). Injected only
-        # when the host explicitly set --reserve-vram, read from the SAME
-        # attribute the budget reply forwards (never recomputed from the GB
-        # float flag: one computation, one owner, and the unit trap of
-        # exporting "8" where bytes are owed dies structurally). Guarded
+        # Reserve bootstrap: the budget owner's advance payment. Injected
+        # only when the host explicitly set --reserve-vram, read from the
+        # SAME attribute the budget reply forwards (never recomputed from
+        # the GB float flag: one computation, one owner, and the unit trap
+        # of exporting "8" where bytes are owed dies structurally). Guarded
         # not-in so pack [env_vars] wins.
+        #
+        # This block was previously adjacent to the pin-split bootstrap and
+        # was deleted along with it on the first attempt; the seam tests
+        # caught it. It is unrelated to the pin split and has no gate.
         try:
             import comfy.model_management as _rmm
             from comfy.cli_args import args as _rargs
@@ -1236,7 +1187,6 @@ def _remove_worker(env_dir):
     # ABSENT from the allocator's input (not retained at 0), so its share
     # redistributes on the next budget RPC.
     _PIN_REPORTS.pop(key, None)
-    _PIN_GRANTS.pop(key, None)
     # Dead worker's overhead died with it; a retained entry would book ~1 GB
     # of phantom scratch per crash in a restart loop.
     _OVERHEAD_REPORTS.pop(key, None)
@@ -1325,8 +1275,7 @@ def _ingest_worker_frames(env_dir, worker, generation):
             with worker._mem_lock:
                 state_sync.apply_residency(live, census, log=_log)
 
-    # Pin census (observability, ungated: the rollup ships live while the
-    # clamp stays dark behind COMFY_ENV_PIN_SPLIT).
+    # Pin census: what the reclaim path and the regression line read.
     _pin = report.get("pinned")
     if _pin is not None:
         _pin_ingest(str(env_dir), _pin)
