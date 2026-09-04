@@ -941,7 +941,15 @@ def install_workspace(
         # silently loaded into torch's private multiprocessing ABI with no
         # handshake anywhere downstream (see _ipc_parent.py). The stamp turns
         # that into a loud mismatch instead.
-        from ..environment.cache import write_env_stamp
+        from ..environment.cache import read_comfyui_version, write_env_stamp
+        from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
+
+        _cv = read_comfyui_version(comfyui_dir)
+        _hd = {}
+        for _pkg in _HOST_DERIVED_PKGS:
+            _pin = read_host_pin(comfyui_dir, _pkg)
+            if _pin:
+                _hd[_pkg] = _pin
         for env_name, _plugin, cf, _cfg in to_install:
             # Provenance carries the combo tier for cuda envs: envs stamped
             # ":fallback" are re-derived on every install run so they upgrade
@@ -957,6 +965,8 @@ def install_workspace(
                 torch_pin=stamp_pin,
                 provenance=prov,
                 accel_imports=_resolve_accel_imports(env_name, _cfg.cuda_packages),
+                comfyui_version=_cv,
+                host_derived=_hd,
                 log=log,
             )
 

@@ -73,3 +73,77 @@ def test_pin_rule_is_shared_and_wildcarded():
     assert _bootstrap_torch_pin("2.10.3") == "==2.10.*"
     assert _bootstrap_torch_pin("2.8.0") == "==2.8.*"
     assert _bootstrap_torch_pin(None) is None
+
+
+class TestStampRecordsWhatItWasBuiltAgainst:
+    """Nothing recorded the ComfyUI or the host-derived pins an env was built
+    against, so no env could say what it expected and nothing could report
+    drift. Two envs on the development machine ran a different memory manager
+    than their host for exactly this reason."""
+
+    def test_reads_comfyuis_own_generated_version_file(self, tmp_path):
+        from comfy_env.environment.cache import read_comfyui_version
+        (tmp_path / "comfyui_version.py").write_text(
+            '# generated\n__version__ = "0.33.0"\n', encoding="utf-8")
+        assert read_comfyui_version(tmp_path) == "0.33.0"
+
+    def test_absent_or_unreadable_version_is_none_not_a_raise(self, tmp_path):
+        """Catches: assuming every ComfyUI is a git checkout or ships the
+        file. A missing identity must degrade, never take out install."""
+        from comfy_env.environment.cache import read_comfyui_version
+        assert read_comfyui_version(tmp_path) is None
+        assert read_comfyui_version(None) is None
+        (tmp_path / "comfyui_version.py").write_text("nonsense", encoding="utf-8")
+        assert read_comfyui_version(tmp_path) is None
+
+    def test_stamp_carries_the_new_fields(self, tmp_path):
+        import json
+        from comfy_env.environment.cache import write_env_stamp
+        write_env_stamp(tmp_path, torch_pin="==2.8.*",
+                        comfyui_version="0.33.0",
+                        host_derived={"comfy-aimdo": "0.4.13"})
+        stamp = json.loads((tmp_path / "env.stamp.json").read_text())
+        assert stamp["comfyui_version"] == "0.33.0"
+        assert stamp["host_derived"]["comfy-aimdo"] == "0.4.13"
+
+    def test_drift_is_reported_but_never_fatal(self, tmp_path):
+        """Catches: promoting drift to a hard failure. An env built against a
+        different ComfyUI usually still works, and whether it does is decided
+        at runtime by the protocol level, not by a string in a file."""
+        from comfy_env.environment.cache import (
+            describe_env_stamp_drift, validate_env_stamp, write_env_stamp,
+        )
+        write_env_stamp(tmp_path, comfyui_version="0.33.0",
+                        host_derived={"comfy-aimdo": "0.4.13"})
+        (tmp_path / "comfyui_version.py").write_text(
+            '__version__ = "0.34.1"\n', encoding="utf-8")
+        drift = describe_env_stamp_drift(
+            tmp_path, tmp_path, {"comfy-aimdo": "0.4.15"})
+        assert "0.33.0" in drift and "0.34.1" in drift
+        assert "0.4.13" in drift and "0.4.15" in drift
+        assert validate_env_stamp(tmp_path)[0] is True
+
+    def test_no_drift_reports_nothing(self, tmp_path):
+        """Catches: a reporter that always has something to say, which trains
+        the operator to ignore it."""
+        from comfy_env.environment.cache import (
+            describe_env_stamp_drift, write_env_stamp,
+        )
+        write_env_stamp(tmp_path, comfyui_version="0.33.0",
+                        host_derived={"comfy-aimdo": "0.4.13"})
+        (tmp_path / "comfyui_version.py").write_text(
+            '__version__ = "0.33.0"\n', encoding="utf-8")
+        assert describe_env_stamp_drift(
+            tmp_path, tmp_path, {"comfy-aimdo": "0.4.13"}) is None
+
+    def test_old_stamps_without_the_fields_report_no_drift(self, tmp_path):
+        """Catches: treating a missing field as a mismatch, which would make
+        every pre-existing env look drifted on the first run after upgrade."""
+        import json
+        from comfy_env.environment.cache import describe_env_stamp_drift
+        (tmp_path / "env.stamp.json").write_text(
+            json.dumps({"abi_tag": "py313-torch2.8-cu128"}), encoding="utf-8")
+        (tmp_path / "comfyui_version.py").write_text(
+            '__version__ = "0.34.1"\n', encoding="utf-8")
+        assert describe_env_stamp_drift(
+            tmp_path, tmp_path, {"comfy-aimdo": "0.4.15"}) is None
