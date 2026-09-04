@@ -29,6 +29,15 @@ WORKERS = Path(_workers_pkg.__file__).parent
 # _ipc_shared.py copied alongside it (see subprocess.py's worker staging).
 BOUNDARY_FILES = ["_ipc_shared.py", "_persistent_worker.py"]
 
+#: Everything else copied beside the worker program. Read from the shipping
+#: constant rather than repeated here: the guard covered only the two files
+#: above while three more were being staged, so a syntax error in any of them
+#: would have surfaced at worker startup on an old interpreter and never in CI.
+def _staged_module_paths():
+    from comfy_env.isolation.workers.subprocess import STAGED_WORKER_MODULES
+    root = Path(_workers_pkg.__file__).parent.parent.parent
+    return [(name, root / name) for name in STAGED_WORKER_MODULES]
+
 
 @pytest.mark.parametrize("name", BOUNDARY_FILES)
 def test_parses_under_python_310(name):
@@ -42,6 +51,35 @@ def test_parses_under_python_310(name):
             f"old as 3.10 -- the failure would appear only at worker startup, "
             f"never in CI."
         )
+
+
+@pytest.mark.parametrize(
+    "name,path", _staged_module_paths(),
+    ids=[n for n, _ in _staged_module_paths()])
+def test_staged_modules_parse_under_python_310(name, path):
+    """Every module copied beside the worker runs on the PACK env's
+    interpreter, which may be older than the host's. Catches: staging a new
+    module and guarding only the original two, which is the state this
+    replaced."""
+    src = path.read_text(encoding="utf-8")
+    try:
+        ast.parse(src, feature_version=(3, 10))
+    except SyntaxError as e:
+        pytest.fail(
+            f"{name} uses syntax newer than Python 3.10 at line {e.lineno}: "
+            f"{e.msg}. Staged into every worker, so this would appear only at "
+            f"worker startup, never in CI."
+        )
+
+
+def test_the_guard_covers_everything_actually_staged():
+    """Catches the guard going out of date: the staged list and the guarded
+    list must be the same list, not two lists that agree today."""
+    from comfy_env.isolation.workers import subprocess as sp
+    src = Path(sp.__file__).read_text(encoding="utf-8")
+    assert "for _name in STAGED_WORKER_MODULES" in src, (
+        "staging no longer iterates the named constant, so the parse guard "
+        "can silently miss a file again")
 
 
 def test_ipc_shared_has_no_module_scope_torch_or_numpy():

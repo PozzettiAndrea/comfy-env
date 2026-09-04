@@ -931,6 +931,40 @@ def broadcast_release() -> None:
         t.join(timeout=90.0)
 
 
+_CONTRACT_CHECKED = False
+
+
+def _check_host_contract() -> None:
+    """Verify the host satisfies what comfy-env requires of it, once.
+
+    Runs before the first worker exists, so a host that cannot support the
+    floor says so at that moment rather than as a wrong number later. FATAL
+    gaps raise, because they produce wrong VRAM arithmetic; everything else
+    is one named line carrying the ComfyUI version that introduced it.
+
+    Never patches, wraps or otherwise touches ComfyUI: this only reads.
+    """
+    global _CONTRACT_CHECKED
+    with _INSTALL_LOCK:
+        if _CONTRACT_CHECKED:
+            return
+        _CONTRACT_CHECKED = True
+    try:
+        from .. import contract
+        ok, failures, notes = contract.check(
+            side=contract.HOST, tiers=(contract.FLOOR,))
+    except Exception as exc:
+        _log(f"[comfy-env] contract check skipped: {exc}")
+        return
+    for note in notes:
+        _log(f"[comfy-env] host contract: {note}")
+    if not ok:
+        raise RuntimeError(
+            "comfy-env cannot manage memory against this ComfyUI: "
+            + "; ".join(failures)
+        )
+
+
 def _install_host_patches() -> None:
     """The one host-integration install point. comfy-env patches exactly
     three upstream functions, each install-once under _INSTALL_LOCK, each
@@ -1028,6 +1062,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
     _report_memory_manager(worker, env_dir)
+    _check_host_contract()
     _install_host_patches()
     return worker, gen
 

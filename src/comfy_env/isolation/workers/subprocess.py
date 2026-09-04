@@ -18,6 +18,18 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import InterruptRequested, Worker, WorkerError
+
+#: Pure leaf modules copied beside the worker program so the worker can use
+#: them even when comfy_env itself is not importable in its environment.
+#: Named rather than inline because every one of them must also satisfy the
+#: worker-interpreter parse guard, and a list the guard can read is the only
+#: way that stays true as the set grows.
+STAGED_WORKER_MODULES = (
+    "memory_manager.py",
+    "state_sync.py",
+    "mirrored_args.py",
+    "contract.py",
+)
 from ...state_sync import merge_vram_report
 from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
 
@@ -183,12 +195,9 @@ class SubprocessWorker(Worker):
         # Best effort: the worker already tolerates its absence (_memmgr = None),
         # and a partial install must not stop every worker for a reporting helper.
         try:
-            _mem_src = Path(__file__).parent.parent.parent / "memory_manager.py"
-            shutil.copy2(_mem_src, self._temp_dir / "memory_manager.py")
-            _ss_src = Path(__file__).parent.parent.parent / "state_sync.py"
-            shutil.copy2(_ss_src, self._temp_dir / "state_sync.py")
-            _ma_src = Path(__file__).parent.parent.parent / "mirrored_args.py"
-            shutil.copy2(_ma_src, self._temp_dir / "mirrored_args.py")
+            _pkg_root = Path(__file__).parent.parent.parent
+            for _name in STAGED_WORKER_MODULES:
+                shutil.copy2(_pkg_root / _name, self._temp_dir / _name)
         except OSError:
             pass
 

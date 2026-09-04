@@ -24,7 +24,9 @@ authoritative "why"; this file is just orientation.**
 - `src/comfy_env/isolation/workers/_persistent_worker.py` -- the worker
   program. Never imported by the parent: read as text and run by the
   isolated interpreter (ADR-0006), with `_ipc_shared.py` copied
-  alongside. Must stay parseable by the OLDEST worker-env Python (3.9).
+  alongside. Must stay parseable by the OLDEST worker-env Python (3.10;
+  the 3.9 floor was retired in 0.4.36). Everything staged beside it
+  (`STAGED_WORKER_MODULES`) carries the same constraint.
 - `src/comfy_env/isolation/workers/_ipc_shared.py` -- the shared
   serialization core both sides import: `_to_shm_generic` walker,
   serializer registry (`register_serializer`), `OpaquePayload`/
