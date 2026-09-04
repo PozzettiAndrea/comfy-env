@@ -259,6 +259,24 @@ def aimdo_skew_verdict(worker_level, parent_level, worker_version=None,
     )
 
 
+def aimdo_device_args(devices, headroom, level):
+    """Argument shape for ``control.init_devices`` at this protocol level.
+
+    Level 2 introduced (index, headroom) pairs; before that the call took
+    bare ints and a tuple raises TypeError inside a comprehension, which is
+    how a worker on comfy-aimdo older than 0.4.10 silently landed on the
+    legacy ledger. ComfyUI's own main.py carries the equivalent fallback for
+    its own call; comfy-env did not.
+
+    Returns ``(args, dropped)`` where ``dropped`` names the policy this wheel
+    cannot carry, so the caller can say so rather than losing it in silence.
+    """
+    ids = [int(d) for d in devices]
+    if level >= AIMDO_LEVEL_TUPLE_DEVICES:
+        return [(i, int(headroom)) for i in ids], None
+    return ids, ("per-device headroom" if headroom else None)
+
+
 def aimdo_installed_level(control, log=None) -> int:
     """Protocol level of the comfy_aimdo bound to ``control``. Never raises.
 
@@ -357,6 +375,10 @@ def maybe_enable_aimdo(log=None) -> bool:
         except ValueError:
             simple_headroom = None
         nvml = os.environ.get(NVML_ENV_VAR, "1") not in ("0", "false")
+        # Each rung down drops a policy the parent asked for. Say which one:
+        # a worker paging under a different policy than its host is the exact
+        # divergence this seam exists to prevent, and it used to happen with
+        # no line at all.
         try:
             control.init(
                 simple_vram_headroom=simple_headroom, nvml_pressure=nvml
@@ -364,8 +386,13 @@ def maybe_enable_aimdo(log=None) -> bool:
         except TypeError:
             try:
                 control.init(simple_vram_headroom=simple_headroom)
+                _log("[worker] aimdo {}: no nvml_pressure, host policy "
+                     "nvml={} not applied".format(installed, nvml))
             except TypeError:
                 control.init()
+                _log("[worker] aimdo {}: no simple_vram_headroom and no "
+                     "nvml_pressure; host reserve and pressure policy not "
+                     "applied".format(installed))
 
         # Mirror the parent's per device headroom. Zero here would let a worker
         # page right up against a card the host believes it has reserved room on.
@@ -373,8 +400,12 @@ def maybe_enable_aimdo(log=None) -> bool:
             headroom = int(os.environ.get(HEADROOM_ENV_VAR, "0"))
         except ValueError:
             headroom = 0
-        if not control.init_devices((index, headroom) for index in devices):
+        _dev_args, _dropped = aimdo_device_args(devices, headroom, _my_level)
+        if not control.init_devices(_dev_args):
             raise RuntimeError("comfy_aimdo.control.init_devices returned False")
+        if _dropped:
+            _log("[worker] aimdo {}: init_devices takes bare ints, {} not "
+                 "applied".format(installed, _dropped))
         _log(f"[worker] aimdo devices={devices} headroom={headroom} bytes")
 
         # Every comfy_aimdo shim does `lib = control.lib` at module import AND

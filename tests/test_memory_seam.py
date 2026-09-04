@@ -192,8 +192,12 @@ class TestAimdoIsDefeatable:
     def test_headroom_is_mirrored_not_zeroed(self):
         """A worker paging with zero headroom against a host that reserves some
         is the admission problem this seam exists to prevent. Asserted on the
-        ast: the init_devices argument must reference the mirrored headroom, so
-        a constant cannot sneak back in under a different spelling."""
+        ast so a constant cannot sneak back in under a different spelling.
+
+        The device arguments are built by ``aimdo_device_args`` rather than
+        inline, so follow one hop: whatever init_devices receives must be a
+        name bound from a call that passes the mirrored headroom.
+        """
         tree = _tree(MEMMGR)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "maybe_enable_aimdo")
@@ -202,12 +206,57 @@ class TestAimdoIsDefeatable:
                  and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "init_devices"]
         assert calls, "init_devices call not found"
+        # names bound from a call that itself references `headroom`
+        derived = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            src_names = {x.id for x in ast.walk(node.value)
+                         if isinstance(x, ast.Name)}
+            if "headroom" not in src_names:
+                continue
+            for target in node.targets:
+                derived |= {x.id for x in ast.walk(target)
+                            if isinstance(x, ast.Name)}
         for call in calls:
             names = {x.id for a in call.args for x in ast.walk(a)
                      if isinstance(x, ast.Name)}
-            assert "headroom" in names, (
-                "init_devices no longer passes the mirrored headroom variable."
+            assert names & ({"headroom"} | derived), (
+                "init_devices no longer passes the mirrored headroom, "
+                "directly or through a value derived from it."
             )
+
+    def test_headroom_guard_would_catch_a_zeroed_argument(self):
+        """Counterexample for the guard above: a refactor that moved the
+        argument out of reach would make it vacuous, so prove it still fails
+        on the shape it exists to reject."""
+        bad = (
+            "def maybe_enable_aimdo():\n"
+            "    headroom = int(os.environ.get('H', '0'))\n"
+            "    args = [(i, 0) for i in devices]\n"
+            "    control.init_devices(args)\n"
+        )
+        tree = ast.parse(bad)
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        derived = set()
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            src_names = {x.id for x in ast.walk(node.value)
+                         if isinstance(x, ast.Name)}
+            if "headroom" not in src_names:
+                continue
+            for target in node.targets:
+                derived |= {x.id for x in ast.walk(target)
+                            if isinstance(x, ast.Name)}
+        call = next(n for n in ast.walk(fn)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "init_devices")
+        names = {x.id for a in call.args for x in ast.walk(a)
+                 if isinstance(x, ast.Name)}
+        assert not (names & ({"headroom"} | derived)), (
+            "the guard would pass a zeroed headroom; it is vacuous")
 
 
 def _call_error_handlers():

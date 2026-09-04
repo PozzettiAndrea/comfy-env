@@ -522,3 +522,56 @@ class TestAimdoSkewSeam:
                 if isinstance(a, ast.If) and node in ast.walk(a)
             )
             assert guarded, "unguarded host-derived write: " + target
+
+
+class TestAimdoDeviceArgs:
+    def test_level_two_and_above_gets_tuples(self):
+        from comfy_env.memory_manager import aimdo_device_args
+        args, dropped = aimdo_device_args([0, 1], 512, 3)
+        assert args == [(0, 512), (1, 512)] and dropped is None
+
+    def test_level_one_gets_bare_ints_and_says_what_it_lost(self):
+        """Catches the shipped bug: comfy-env passed (index, headroom) tuples
+        unconditionally, and comfy-aimdo before 0.4.10 does int(device_id) on
+        each, so the call raised TypeError and the worker fell to the legacy
+        ledger. ComfyUI's own main.py has this fallback; comfy-env did not."""
+        from comfy_env.memory_manager import aimdo_device_args
+        args, dropped = aimdo_device_args([0], 512, 1)
+        assert args == [0]
+        assert dropped and "headroom" in dropped
+
+    def test_level_one_with_no_headroom_loses_nothing(self):
+        """Catches: reporting a dropped policy that was never requested, which
+        would make an ordinary old-wheel worker look misconfigured."""
+        from comfy_env.memory_manager import aimdo_device_args
+        assert aimdo_device_args([0], 0, 1) == ([0], None)
+
+    def test_generator_is_not_returned(self):
+        """Catches: handing init_devices a generator, which cannot be
+        inspected, logged, or retried after a TypeError."""
+        from comfy_env.memory_manager import aimdo_device_args
+        args, _ = aimdo_device_args([0, 1], 0, 3)
+        assert isinstance(args, list) and len(args) == 2
+
+
+class TestAimdoPolicyDrops:
+    def test_every_init_ladder_rung_logs_what_it_dropped(self):
+        """Catches: a silent TypeError ladder. A worker paging under a
+        different policy than its host is the divergence this seam exists to
+        prevent, and each fallback rung drops one."""
+        import ast
+        src = Path("src/comfy_env/memory_manager.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "maybe_enable_aimdo")
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Try):
+                continue
+            for handler in node.handlers:
+                if handler.type is None or "TypeError" not in ast.unparse(handler.type):
+                    continue
+                body = ast.unparse(handler)
+                if "control.init(" not in body:
+                    continue
+                assert "_log(" in body, (
+                    "a TypeError rung around control.init drops a policy "
+                    "without saying so")
