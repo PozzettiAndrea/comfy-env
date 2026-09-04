@@ -75,7 +75,19 @@ def _torch_family_pypi(
 #: here. Same rule as the torch family: comfy-env replicates a pin it reads, it
 #: never invents one. comfy-aimdo ships weekly and ComfyUI pins it exactly, so a
 #: literal in this repository would be stale within the month.
-_HOST_DERIVED_PKGS = ("comfy-aimdo",)
+_HOST_DERIVED_PKGS = ("comfy-aimdo", "comfy-kitchen")
+
+#: Of those, the ones that only make sense on a CUDA stack. comfy-aimdo has
+#: no CPU path (``_vbar_get`` returns None for a CPU load device and
+#: MAX_PINNED_MEMORY stays -1), so injecting it into a CPU env is dead
+#: weight. comfy-kitchen is NOT in this set: the host's ComfyUI imports it
+#: unguarded from four modules on the ``comfy.model_patcher`` import chain
+#: (comfy/ldm/modules/attention.py:13, ldm/joyimage/model.py:5,
+#: ldm/lightricks/vae/na_diffusion_decoder.py:30, text_encoders/llama.py:8),
+#: so ANY worker that imports comfy needs it, CPU included. Four of nineteen
+#: worker envs on the development machine could not import
+#: comfy.model_patcher at all for exactly this reason.
+_HOST_CUDA_ONLY_PKGS = frozenset({"comfy-aimdo"})
 
 
 def read_host_pin(comfyui_dir: Optional[Path], package: str) -> Optional[str]:
@@ -328,13 +340,17 @@ def _build_node_feature(
         # far larger blast radius than the drift this exists to fix.
         pypi.update(_replace_host_derived(node_pypi, host_pins, name, log))
         pypi.update(node_pypi)
-    # Inject for CUDA envs even when the pack never asked. The wheel is inert
-    # until a worker initialises it, and a worker cannot be made transparent
-    # later without it, so absence is the expensive mistake. Skipped for CPU
-    # envs: aimdo has no CPU path (`_vbar_get` returns None for a CPU load
-    # device) and MAX_PINNED_MEMORY stays -1 there, so it would be dead weight.
-    if torch_index and "cpu" not in str(torch_index).lower():
+    # Inject even when the pack never asked. These are not the pack's
+    # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
+    # worker that lacks one cannot import comfy at all, and a worker cannot be
+    # made transparent later without them. Absence is the expensive mistake.
+    # Only envs that have torch at all are candidates; within those, the
+    # CUDA-only set is skipped on a CPU stack.
+    if torch_pin:
+        _is_cpu = not torch_index or "cpu" in str(torch_index).lower()
         for pkg, wanted in host_pins.items():
+            if _is_cpu and pkg in _HOST_CUDA_ONLY_PKGS:
+                continue
             pypi.setdefault(pkg, wanted)
     # CUDA wheels, inlined as direct-URL deps (may carry a #sha256= fragment,
     # which pixi records in the lock and uv verifies). The wheels' in-farm
