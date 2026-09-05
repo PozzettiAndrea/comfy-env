@@ -269,6 +269,40 @@ class TestPinPressureSeam:
 GIB = 1024 ** 3
 
 
+class TestFullReleaseUnloadsModels:
+    def test_rung_zero_unloads_the_workers_own_models(self):
+        """Catches the premise that expired when the proxy went away: this
+        ladder was written to run AFTER the host's sweep had already detached
+        the worker's models, so without rung 0 the Free button reaches the
+        worker and frees only caches. Measured: a 6 GiB paged model survived
+        the whole ladder untouched."""
+        import types
+        from comfy_env import memory_manager as mm_mod
+        called = []
+        mm = types.SimpleNamespace(
+            unload_all_models=lambda: called.append("unload_all_models"),
+            reset_cast_buffers=lambda: called.append("reset_cast_buffers"),
+            TOTAL_PINNED_MEMORY=0)
+        mm_mod.full_release(_modules={"comfy.model_management": mm})
+        assert called[0] == "unload_all_models"
+
+    def test_it_runs_before_the_cache_sweep(self):
+        """Catches: unloading after empty_cache, which leaves the blocks the
+        unload just returned sitting in torch's allocator."""
+        import ast
+        import inspect
+        from comfy_env import memory_manager as mm_mod
+        src = ast.unparse(ast.parse(inspect.getsource(mm_mod.full_release)))
+        assert src.index("unload_all_models") < src.index("empty_cache")
+
+    def test_an_old_comfy_without_it_is_skipped_not_crashed(self):
+        import types
+        from comfy_env import memory_manager as mm_mod
+        mm = types.SimpleNamespace(TOTAL_PINNED_MEMORY=0)
+        receipt = mm_mod.full_release(_modules={"comfy.model_management": mm})
+        assert receipt["errors"] == []
+
+
 class TestPartialReleaseSeam:
     """The admission time shrink. Unlike full_release it keeps the model
     loaded, so the pages come back from pinned RAM rather than from disk;

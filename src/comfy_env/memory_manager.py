@@ -613,11 +613,19 @@ def total_pinned() -> Optional[int]:
 def full_release(log=None, _modules=None) -> Dict[str, Any]:
     """Deep release for the host's /free button. Never raises.
 
-    Runs AFTER the host's unload_all_models sweep already detached this
-    worker's registered models (which also dropped their pin registrations
-    through the real unpatch path), so the ladder here touches only
-    rebuildable cache and garbage, never state:
+    Rung 0 unloads this worker's own models. That used to be the host's job:
+    a registered proxy meant ComfyUI's unload_all_models sweep detached them
+    before this ran, and the ladder below deliberately touched only cache.
+    comfy-env registers nothing now, so nothing outside this process can
+    reach these models and the worker has to let go itself, which is what
+    the button means. Measured: without rung 0 a 6 GiB paged model survived
+    the whole ladder untouched (research/memory-floor/p8_free_button).
 
+    The rest touches only rebuildable cache and garbage, never state:
+
+    0. The worker's own unload_all_models: detaches its models and drops
+       their pin registrations through the real unpatch path, exactly as the
+       host does to its own.
     1. Node-boundary transients (cast buffers, prefetch queues, vbar
        watermarks) -- unconditional, unlike release_node_boundary's aimdo
        gate, because non-aimdo workers keep cast buffers forever (upstream's
@@ -672,6 +680,8 @@ def full_release(log=None, _modules=None) -> Dict[str, Any]:
             receipt["errors"].append(f"{name}: {exc}")
 
     _measure("before")
+    if mm is not None and hasattr(mm, "unload_all_models"):
+        _step("unload_all_models", mm.unload_all_models)
     if mm is not None and hasattr(mm, "reset_cast_buffers"):
         _step("reset_cast_buffers", mm.reset_cast_buffers)
     _prefetch = modules.get("comfy.model_prefetch")
