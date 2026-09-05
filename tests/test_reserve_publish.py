@@ -320,3 +320,55 @@ class TestIdleSweepTimer:
         called = {n.func.id for n in ast.walk(tree)
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         assert "_release_idle_workers" in called
+
+
+class TestObserverInstall:
+    """Wiring the listener. Off by default; on, it must not be able to stall
+    the host."""
+
+    @pytest.fixture()
+    def obs_env(self, pool_mod, monkeypatch):
+        pool, mm = pool_mod
+        mm.current_loaded_models = []
+        monkeypatch.setattr(pool, "_OBSERVER", None)
+        return pool, mm
+
+    def test_off_by_default(self, obs_env, monkeypatch):
+        """Catches: planting an object in ComfyUI's list without being asked.
+        The floor needs nothing from it, and it is the one piece with a
+        breakage history."""
+        pool, mm = obs_env
+        monkeypatch.delenv("COMFY_ENV_MEMORY_OBSERVER", raising=False)
+        assert pool._install_observer() is False
+        assert mm.current_loaded_models == []
+
+    def test_on_it_joins_the_ledger_once(self, obs_env, monkeypatch):
+        """Catches: one entry per worker. The signals are per process."""
+        pool, mm = obs_env
+        monkeypatch.setenv("COMFY_ENV_MEMORY_OBSERVER", "1")
+        assert pool._install_observer() is True
+        assert pool._install_observer() is True
+        assert len(mm.current_loaded_models) == 1
+
+    def test_the_callbacks_never_block_the_host(self, obs_env, monkeypatch):
+        """Catches THE way this breaks a user's ComfyUI: the callbacks run on
+        the host's thread, inside free_memory, inside a node. A synchronous
+        IPC round trip to a busy worker there stalls every host load."""
+        import ast
+        import inspect
+        pool, mm = obs_env
+        src = inspect.getsource(pool._install_observer)
+        tree = ast.parse(src.lstrip())
+        for name in ("_on_free_all", "_on_pressure"):
+            fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+            body = ast.unparse(fn)
+            assert "Thread" in body and "daemon=True" in body, name
+            assert "join" not in body, name
+
+    def test_a_broken_ledger_never_breaks_startup(self, obs_env, monkeypatch):
+        """Catches: letting an optional listener take worker creation down."""
+        pool, mm = obs_env
+        monkeypatch.setenv("COMFY_ENV_MEMORY_OBSERVER", "1")
+        del mm.current_loaded_models
+        assert pool._install_observer() is False

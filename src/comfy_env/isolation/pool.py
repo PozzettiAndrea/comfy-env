@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from .. import reserve, state_sync
+from . import observer
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
@@ -504,6 +505,61 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
         _log(f"[comfy-env] pager headroom {headroom / 1e9:.2f}GB "
              f"(seed {_aimdo_headroom_seed() / 1e9:.2f}GB + reserve added)")
     return True
+
+
+#: The optional listener in ComfyUI's loaded-model list, if an operator
+#: turned it on. One per process, planted at first worker creation.
+_OBSERVER = None
+
+
+def _install_observer() -> bool:
+    """Plant the read-only listener, once, if COMFY_ENV_MEMORY_OBSERVER is on.
+
+    comfy-env patches nothing, so two signals it would like are simply not
+    delivered: the Free-memory button and the host's OOM handler both reach
+    ComfyUI's own eviction loop and never leave the process. An entry in the
+    list is asked, and that is the only way to hear them without replacing a
+    function.
+
+    Off by default because it is still a coupling: an object of ours inside
+    their bookkeeping, which is the surface both of comfy-env's loud breaks
+    came through. This one reports holding nothing, so no upstream decision
+    depends on its answers; see isolation/observer.py for why that is the
+    difference that matters.
+
+    Both callbacks POST and return. They run on ComfyUI's thread inside
+    free_memory inside a node, so waiting on a worker here would stall every
+    host load.
+    """
+    global _OBSERVER
+    if _OBSERVER is not None:
+        return True
+    if not observer.enabled(os.environ):
+        return False
+    try:
+        import comfy.model_management as mm
+    except ImportError:
+        return False
+    try:
+        def _on_free_all():
+            threading.Thread(target=broadcast_release,
+                             name="comfy-env-free-all", daemon=True).start()
+
+        def _on_pressure(nbytes):
+            threading.Thread(target=_ask_idle_workers, args=(int(nbytes),),
+                             name="comfy-env-pressure", daemon=True).start()
+
+        obs = observer.MemoryObserver(device=mm.get_torch_device(),
+                                      on_free_all=_on_free_all,
+                                      on_pressure=_on_pressure)
+        mm.current_loaded_models.append(obs)
+        _OBSERVER = obs
+        _log("[comfy-env] memory observer on: the Free button and OOM now "
+             "reach workers (COMFY_ENV_MEMORY_OBSERVER)")
+        return True
+    except Exception as exc:
+        _log(f"[comfy-env] memory observer not installed: {exc}")
+        return False
 
 
 def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
@@ -1281,6 +1337,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     _report_memory_manager(worker, env_dir)
     _check_host_contract()
     _start_idle_sweep()
+    _install_observer()
     return worker, gen
 
 

@@ -112,3 +112,96 @@ class TestSignals:
         obs = O.MemoryObserver(on_free_all=boom, on_pressure=boom)
         assert obs.model_unload(1e30) is False
         assert obs.model_unload(1024) is False
+
+
+class TestSurvivesTheLedger:
+    """The entry has to survive ComfyUI's own housekeeping. Every attribute
+    below is one the manager reads on entries, and the catch-all answers a
+    CALLABLE, which is the wrong answer for all of them."""
+
+    def test_it_is_not_pruned_when_a_host_model_is_collected(self):
+        """Catches THE defect that made the observer useless: cleanup_models
+        pops every entry whose real_model() is None, and __getattr__ handed
+        back a function returning None. It fired the first time any host
+        model was garbage collected, which is precisely when the Free button
+        or an OOM had just run."""
+        obs = O.MemoryObserver()
+        assert obs.real_model() is not None
+
+    def test_currently_used_cannot_be_flipped(self):
+        """Catches: an attribute a later upstream write can set True.
+        loaded_models(only_currently_used=True) hands entries straight back
+        into load_models_gpu (controlnet.py, three extras nodes), which would
+        run the whole admission path against this object."""
+        obs = O.MemoryObserver()
+        assert obs.currently_used is False
+        obs.currently_used = True
+        assert obs.currently_used is False
+
+    def test_it_is_never_a_clone_of_anything(self):
+        """Catches: clone_base_uuid left to __getattr__ (protection by
+        accident) or set to None. unload_model_and_clones keeps entries whose
+        uuid differs from the target's; None would MATCH a target whose own
+        uuid is None and the observer would be asked to free everything for a
+        single model eviction."""
+        obs = O.MemoryObserver()
+        assert obs.clone_base_uuid is not None
+        assert obs.clone_base_uuid != "any-uuid"
+        assert obs.is_clone(object()) is False
+
+    def test_cloning_it_raises_instead_of_returning_none(self):
+        """Catches: multigpu.py calling .clone() on list entries and using
+        the None the catch-all would return."""
+        obs = O.MemoryObserver()
+        try:
+            obs.clone()
+        except RuntimeError:
+            return
+        raise AssertionError("clone() returned instead of raising")
+
+    def test_the_finalizer_can_be_detached(self):
+        """Catches: model_finalizer.detach() landing on the catch-all, which
+        works by luck; upstream calls it when it drops an entry."""
+        obs = O.MemoryObserver()
+        obs.model_finalizer.detach()
+
+    def test_devices_are_real_values_not_callables(self):
+        """Catches: load_device answering a function, which multigpu.py
+        compares against a torch device."""
+        obs = O.MemoryObserver(device="cuda:0")
+        assert obs.load_device == "cuda:0"
+        assert obs.offload_device == "cuda:0"
+
+
+class TestDisableSmartMemory:
+    """Under --disable-smart-memory every request is 1e32, so the sentinel
+    stops meaning "the button"."""
+
+    def test_ordinary_pressure_is_not_read_as_the_button(self):
+        """Catches: the shipped threshold, which under that flag reads EVERY
+        host load as the Free button and broadcasts a full release each time."""
+        assert O.is_free_all(8 * 1024 ** 3, smart_memory=True) is False
+
+    def test_with_the_flag_every_request_means_release(self):
+        """Catches: trying to tell them apart. The flag means "forget every
+        model after each run", so release is the honest answer to all of
+        them, and the pressure callback must not also fire."""
+        assert O.is_free_all(8 * 1024 ** 3, smart_memory=False) is True
+        assert O.is_free_all(1e32, smart_memory=False) is True
+
+    def test_the_flag_is_read_from_comfyui_not_guessed(self, monkeypatch):
+        """Catches: hardcoding smart memory on. The observer must ask the
+        host, because the flag is the host's."""
+        import sys
+        import types
+        mm = types.ModuleType("comfy.model_management")
+        mm.DISABLE_SMART_MEMORY = True
+        pkg = types.ModuleType("comfy")
+        pkg.model_management = mm
+        monkeypatch.setitem(sys.modules, "comfy", pkg)
+        monkeypatch.setitem(sys.modules, "comfy.model_management", mm)
+        fired = []
+        obs = O.MemoryObserver(on_free_all=lambda: fired.append("free"),
+                               on_pressure=lambda n: fired.append("pressure"))
+        obs.model_unload(8 * 1024 ** 3)
+        assert fired == ["free"]
