@@ -262,3 +262,36 @@ def test_ask_uses_upstreams_multiplier_on_the_weights(pool_mod, monkeypatch):
         pool._handle_vram_budget({"total_size": size}, worker_key="req")
         asks.append(calls["free_memory"][0])
     assert asks[1] - asks[0] == int(8 * GB * 1.1) - int(4 * GB * 1.1)
+
+
+def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
+    """Catches: passing extra_reserved_memory() straight into the ask. The
+    published reserve already holds the requester's own growth, and this
+    load IS that growth, so the host would evict its models for the same
+    bytes twice. A stranger's charge stays in."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
+    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {})
+    pool._WORKER_PATCHERS.clear()
+
+    class _W:
+        _last_vram_report = {"held": 2 * GB}
+        _calls_in_flight = 0
+
+        def is_alive(self):
+            return True
+    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": (_W(), 1)})
+    mm.extra_reserved_memory = lambda: 8 * GB
+
+    calls["free_memory"].clear()
+    pool._handle_vram_budget({"total_size": 4 * GB}, worker_key="stranger")
+    stranger = calls["free_memory"][0]
+    calls["free_memory"].clear()
+    pool._handle_vram_budget({"total_size": 4 * GB}, worker_key="req")
+    own = calls["free_memory"][0]
+
+    # Fixture is process local (WDDM branch), so the charge is the whole
+    # entitlement: context floor plus the 2 GB high water.
+    expected_charge = pool._WORKER_FIXED_VRAM_COST + 2 * GB
+    assert stranger - own == expected_charge

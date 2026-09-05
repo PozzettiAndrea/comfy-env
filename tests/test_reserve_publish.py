@@ -177,3 +177,146 @@ def test_publish_never_raises_without_comfy(monkeypatch):
     from comfy_env.isolation import pool
     monkeypatch.setattr(pool, "_RESERVE_BASE", None)
     assert pool._publish_reserve() == 0
+
+
+class _HeldWorker:
+    def __init__(self, held):
+        self._last_vram_report = {"held": held}
+        self._calls_in_flight = 0
+
+    def is_alive(self):
+        return True
+
+
+@pytest.fixture()
+def aimdo_stub(monkeypatch):
+    """A host running the pager, with a recording headroom setter."""
+    import sys as _sys
+    import types as _types
+    cmm = _types.ModuleType("comfy.memory_management")
+    cmm.aimdo_enabled = True
+    monkeypatch.setitem(_sys.modules, "comfy.memory_management", cmm)
+    control = _types.ModuleType("comfy_aimdo.control")
+    control.calls = []
+    control.set_simple_vram_headroom = lambda b: control.calls.append(int(b))
+    pkg = _types.ModuleType("comfy_aimdo")
+    pkg.control = control
+    monkeypatch.setitem(_sys.modules, "comfy_aimdo", pkg)
+    monkeypatch.setitem(_sys.modules, "comfy_aimdo.control", control)
+    cli = _types.ModuleType("comfy.cli_args")
+    cli.args = types.SimpleNamespace(reserve_vram=None)
+    monkeypatch.setitem(_sys.modules, "comfy.cli_args", cli)
+    return cmm, control, cli
+
+
+class TestPagerForward:
+    """The paged path: EXTRA_RESERVED_VRAM is inert there (measured), the
+    pager's own headroom is live at the next fault (measured), so the
+    reserve has to be mirrored into it or the default NVIDIA host never
+    backs off for a worker."""
+
+    def test_publish_forwards_seed_plus_the_added_reserve(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: forwarding nothing (the P2 era), or forwarding the whole
+        published number (base counted twice on the pager)."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+        monkeypatch.setattr(pool, "_AIMDO_SEED", None)
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        published = pool._publish_reserve()
+        from comfy_env.reserve import AIMDO_DEFAULT_HEADROOM
+        assert published == mm.EXTRA_RESERVED_VRAM
+        assert control.calls == [AIMDO_DEFAULT_HEADROOM + (published - 400 * 1024 ** 2)]
+
+    def test_the_seed_is_the_operators_reserve_vram_when_set(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: seeding from EXTRA_RESERVED_VRAM, which ComfyUI does NOT
+        pass to the pager; main.py seeds from --reserve-vram alone."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+        cli.args.reserve_vram = 2.0
+        monkeypatch.setattr(pool, "_AIMDO_SEED", None)
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(1 * GB), 1)})
+        published = pool._publish_reserve()
+        assert control.calls == [2 * GB + (published - 400 * 1024 ** 2)]
+
+    def test_no_forward_when_the_host_is_not_paging(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: touching the pager on a legacy host, where the published
+        reserve already does the job and aimdo may not even be initialised."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+        cmm.aimdo_enabled = False
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        pool._publish_reserve()
+        assert control.calls == []
+        assert mm.EXTRA_RESERVED_VRAM > 400 * 1024 ** 2
+
+    def test_falls_back_to_the_raw_export_before_aimdo_107(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: requiring the Python wrapper (comfy-aimdo #107). Every
+        wheel since 0.4.10 carries the C export; the pinned 0.5.2 has no
+        wrapper."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+        del control.set_simple_vram_headroom
+        control.lib = types.SimpleNamespace(
+            set_simple_vram_headroom=lambda b: control.calls.append(("lib", int(b))))
+        monkeypatch.setattr(pool, "_AIMDO_SEED", None)
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        pool._publish_reserve()
+        assert len(control.calls) == 1 and control.calls[0][0] == "lib"
+
+    def test_a_failing_setter_never_loses_the_published_reserve(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: letting the pager write take the ComfyUI write down with
+        it. The legacy knob is written first and stays written."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+
+        def boom(b):
+            raise RuntimeError("comfy-aimdo is not initialized")
+        control.set_simple_vram_headroom = boom
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        published = pool._publish_reserve()
+        assert published > 400 * 1024 ** 2
+        assert mm.EXTRA_RESERVED_VRAM == published
+
+    def test_forward_fires_only_when_the_reserve_moves(self, pool_mod, aimdo_stub, monkeypatch):
+        """Catches: a pager write on every node boundary. Same rule as the
+        ComfyUI write: only on change."""
+        pool, mm = pool_mod
+        cmm, control, cli = aimdo_stub
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        pool._publish_reserve()
+        pool._publish_reserve()
+        assert len(control.calls) == 1
+
+
+class TestIdleSweepTimer:
+    """The sweep used to run only at worker call boundaries, so a host-only
+    prompt after a worker prompt never released the worker."""
+
+    def test_starts_exactly_one_daemon_thread(self, pool_mod, monkeypatch):
+        """Catches: a non daemon thread (keeps ComfyUI alive at exit) and a
+        thread per worker."""
+        pool, mm = pool_mod
+        started = []
+
+        class _T:
+            def __init__(self, target=None, name=None, daemon=None):
+                started.append((target, daemon))
+
+            def start(self):
+                pass
+        monkeypatch.setattr(pool, "_IDLE_SWEEP_STARTED", False)
+        monkeypatch.setattr(pool.threading, "Thread", _T)
+        pool._start_idle_sweep()
+        pool._start_idle_sweep()
+        assert started == [(pool._idle_sweep_loop, True)]
+
+    def test_the_loop_body_is_the_sweep(self):
+        """Catches: the timer calling something other than the boundary sweep,
+        so the two paths drift."""
+        import ast
+        import inspect
+        from comfy_env.isolation import pool
+        tree = ast.parse(inspect.getsource(pool._idle_sweep_loop))
+        called = {n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        assert "_release_idle_workers" in called

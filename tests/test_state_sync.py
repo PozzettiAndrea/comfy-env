@@ -666,6 +666,34 @@ class TestPlanIdleRelease:
         assert plan_idle_release({"a": self._w(idle_since=100.0)}, 120.0) == []
         assert plan_idle_release({"a": self._w(idle_since=100.0)}, 200.0) == ["a"]
 
+    def test_a_finished_prompt_releases_before_the_timer(self):
+        """Catches: waiting the full idle window for a worker whose prompt is
+        already over, which leaves the host on a smaller card for a minute
+        after every worker prompt."""
+        from comfy_env.state_sync import plan_idle_release
+        w = self._w(idle_since=100.0, last_prompt="p1")
+        assert plan_idle_release({"a": w}, now=101.0, current_prompt="p2") == ["a"]
+
+    def test_the_running_prompt_keeps_its_worker(self):
+        """Catches: releasing a worker between two nodes of the SAME prompt,
+        which reloads its model mid workflow."""
+        from comfy_env.state_sync import plan_idle_release
+        w = self._w(idle_since=100.0, last_prompt="p1")
+        assert plan_idle_release({"a": w}, now=101.0, current_prompt="p1") == []
+
+    def test_an_unknown_prompt_falls_back_to_the_timer(self):
+        """Catches: treating "no prompt running" as "prompt over". Between
+        prompts the registry may read None; only the clock applies then."""
+        from comfy_env.state_sync import plan_idle_release
+        w = self._w(idle_since=100.0, last_prompt="p1")
+        assert plan_idle_release({"a": w}, now=101.0, current_prompt=None) == []
+        assert plan_idle_release({"a": w}, now=200.0, current_prompt=None) == ["a"]
+
+    def test_a_worker_with_no_prompt_recorded_waits_for_the_timer(self):
+        from comfy_env.state_sync import plan_idle_release
+        w = self._w(idle_since=100.0)
+        assert plan_idle_release({"a": w}, now=101.0, current_prompt="p2") == []
+
     def test_never_seen_is_not_idle(self):
         """Catches: treating a missing timestamp as "idle forever", which
         would release a worker that has only just started."""

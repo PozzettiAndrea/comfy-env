@@ -136,3 +136,53 @@ def test_module_imports_nothing_at_top_level():
     for node in tree.body:
         assert not isinstance(node, (ast.Import, ast.ImportFrom)), (
             "reserve.py imports at module scope: " + ast.unparse(node))
+
+
+class TestAimdoHeadroom:
+    """The paged path only sees the reserve through the pager's own headroom,
+    and the pager's budget is seed plus what comfy-env added, never the base
+    twice."""
+
+    def test_forwards_seed_plus_what_comfy_env_added(self):
+        """Catches: forwarding the published reserve as is, which books the
+        operator's --reserve-vram a second time on the paged path."""
+        from comfy_env.reserve import aimdo_headroom
+        seed, base = 2 * GIB, 400 * 1024 ** 2
+        published = base + 3 * GIB
+        assert aimdo_headroom(seed, published, base) == seed + 3 * GIB
+
+    def test_no_seed_means_aimdos_own_default(self):
+        """Catches: treating an absent --reserve-vram as zero. aimdo starts
+        at its compile time floor, and a forward below it would LOWER the
+        host's headroom the moment a worker appears."""
+        from comfy_env.reserve import aimdo_headroom, AIMDO_DEFAULT_HEADROOM
+        assert aimdo_headroom(None, 1 * GIB, 1 * GIB) == AIMDO_DEFAULT_HEADROOM
+        assert aimdo_headroom(None, 0, 0) == AIMDO_DEFAULT_HEADROOM
+
+    def test_a_reserve_below_the_base_adds_nothing(self):
+        """Catches: a negative addition when the published number is capped
+        or has not been written yet."""
+        from comfy_env.reserve import aimdo_headroom
+        assert aimdo_headroom(1 * GIB, 100, 4 * GIB) == 1 * GIB
+
+
+class TestReserveForRequester:
+    """A worker's own growth charge must not be asked for on top of the load
+    that IS that growth."""
+
+    def test_excludes_the_requesters_own_charge(self):
+        """Catches: passing extra_reserved_memory() straight into the ask,
+        which evicts host models for the same bytes twice."""
+        from comfy_env.reserve import reserve_for_requester
+        assert reserve_for_requester(6 * GIB, 2 * GIB) == 4 * GIB
+
+    def test_a_charge_larger_than_the_reserve_floors_at_zero(self):
+        """Catches: a negative reserve term, which would SHRINK the ask below
+        what an identical in-process load gets."""
+        from comfy_env.reserve import reserve_for_requester
+        assert reserve_for_requester(1 * GIB, 3 * GIB) == 0
+
+    def test_no_charge_leaves_the_reserve_whole(self):
+        from comfy_env.reserve import reserve_for_requester
+        assert reserve_for_requester(6 * GIB, 0) == 6 * GIB
+        assert reserve_for_requester(6 * GIB, None) == 6 * GIB

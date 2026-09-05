@@ -31,6 +31,12 @@ deliberately NOT in STAGED_WORKER_MODULES.
 #: for every live worker, busy or idle, because it is there either way.
 CONTEXT_FLOOR_BYTES = 300 * 1024 * 1024
 
+#: comfy-aimdo's compile time simple headroom (VRAM_HEADROOM in its plat.h):
+#: what a host that never passed --reserve-vram runs its pager with. The
+#: pager's budget is "this process may use capacity minus headroom", so the
+#: reserve reaches the paged path only by being ADDED to this seed.
+AIMDO_DEFAULT_HEADROOM = 256 * 1024 * 1024
+
 
 def entitlement(highwater, floor=CONTEXT_FLOOR_BYTES):
     """What one worker is entitled to hold: its context plus its high-water
@@ -108,3 +114,35 @@ def ask_target(weights, slack, min_inference, extra_reserved, want_inference=0):
         int(min_inference or 0),
         int(want_inference or 0) + int(extra_reserved or 0),
     )
+
+
+def aimdo_headroom(seed, published, base):
+    """The pager headroom that mirrors the published reserve.
+
+    ComfyUI seeds the pager once at startup from --reserve-vram and never
+    again, and the pager ignores EXTRA_RESERVED_VRAM entirely, so on the
+    paged path the published reserve is inert unless it is forwarded. What
+    is forwarded is the host's own seed plus what comfy-env ADDED on top of
+    ComfyUI's base: never the base itself, which the seed already carries.
+
+    Catches the wrong implementation of forwarding ``published`` as is,
+    which double books the operator's reserve on the paged path.
+    """
+    if seed is None:
+        seed = AIMDO_DEFAULT_HEADROOM
+    added = max(0, int(published or 0) - max(0, int(base or 0)))
+    return max(0, int(seed)) + added
+
+
+def reserve_for_requester(published, own_charge):
+    """The part of the published reserve that applies to a worker's own load.
+
+    The reserve holds space for every worker's growth, the requester's
+    included. When the requester loads, that growth is the load itself, so
+    asking the host to keep the requester's own charge free ON TOP of the
+    weights being loaded evicts host models for bytes counted twice.
+
+    Catches the wrong implementation of passing ``extra_reserved_memory()``
+    straight into the ask.
+    """
+    return max(0, int(published or 0) - max(0, int(own_charge or 0)))

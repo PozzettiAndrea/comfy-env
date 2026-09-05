@@ -593,14 +593,22 @@ RELEASE_DEBOUNCE_SECONDS = 0.5
 IDLE_RELEASE_SECONDS = 60.0
 
 
-def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS):
+def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
+                      current_prompt=None):
     """Which idle workers should be asked to release. Pure.
 
     ``workers`` maps key to {"alive", "advertises", "in_flight", "idle_since",
-    "holding"}. A worker is a candidate only when it is alive, advertises the
-    command, is not mid call, has been idle long enough, and actually holds
-    something: asking a worker that holds nothing is a round trip for no
-    memory, and it would reset a high-water that is still the right forecast.
+    "holding", "last_prompt"}. A worker is a candidate only when it is alive,
+    advertises the command, is not mid call, and actually holds something:
+    asking a worker that holds nothing is a round trip for no memory, and it
+    would reset a high-water that is still the right forecast.
+
+    Two clocks say when. The idle timer: quiet for ``min_idle``. The prompt:
+    if ``current_prompt`` is known and differs from the prompt the worker
+    last served, the prompt that needed its memory is over, so it is asked
+    at once rather than a minute later while the host runs on a smaller
+    card. A worker with no recorded prompt, or an unknown current prompt,
+    falls back to the timer.
     """
     out = []
     for key, state in sorted((workers or {}).items()):
@@ -610,8 +618,12 @@ def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS):
             continue
         if not state.get("holding"):
             continue
+        last_prompt = state.get("last_prompt")
+        prompt_over = (current_prompt is not None and last_prompt is not None
+                       and last_prompt != current_prompt)
         since = state.get("idle_since")
-        if since is None or (now - since) < min_idle:
+        timer_due = since is not None and (now - since) >= min_idle
+        if not prompt_over and not timer_due:
             continue
         out.append(key)
     return out

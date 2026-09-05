@@ -309,11 +309,60 @@ _RESERVE_HIGHWATER: Dict[str, int] = {}
 
 #: When each worker last finished a call, for the idle release policy.
 _LAST_ACTIVITY: Dict[str, float] = {}
+#: Which prompt each worker last served, so a worker whose prompt is over is
+#: released at once instead of after the idle timer.
+_LAST_PROMPT: Dict[str, Any] = {}
+
+#: The host pager's own headroom seed (--reserve-vram, else aimdo's default),
+#: read once: the reserve is forwarded into the pager as seed plus what
+#: comfy-env added, and the seed must not drift with our own writes.
+_AIMDO_SEED = None
+
+#: The idle sweep used to run only at worker call boundaries, so a prompt
+#: made of host nodes after a worker prompt never released anything: the
+#: worker sat on its VRAM until the next worker call. A daemon timer runs
+#: the same sweep on a clock instead.
+IDLE_SWEEP_INTERVAL_SECONDS = 10.0
+_IDLE_SWEEP_STARTED = False
+
+
+def _current_prompt():
+    """The running prompt's id, read from ComfyUI's progress registry.
+
+    Same source as workers/subprocess._current_prompt_gen, kept separate so
+    pool never imports the worker module. None outside a prompt or on trees
+    that predate the registry.
+    """
+    try:
+        from comfy_execution.progress import get_progress_state
+        return getattr(get_progress_state(), "prompt_id", None) or None
+    except Exception:
+        return None
 
 
 def _note_activity(env_dir) -> None:
     """Mark a worker as active now. Cheap enough for every node boundary."""
     _LAST_ACTIVITY[str(env_dir)] = time.monotonic()
+    prompt = _current_prompt()
+    if prompt is not None:
+        _LAST_PROMPT[str(env_dir)] = prompt
+
+
+def _idle_sweep_loop() -> None:
+    while True:
+        time.sleep(IDLE_SWEEP_INTERVAL_SECONDS)
+        _release_idle_workers()
+
+
+def _start_idle_sweep() -> None:
+    """Start the clock driven idle sweep, once per process. Daemon: it must
+    never keep ComfyUI alive at shutdown."""
+    global _IDLE_SWEEP_STARTED
+    if _IDLE_SWEEP_STARTED:
+        return
+    _IDLE_SWEEP_STARTED = True
+    threading.Thread(target=_idle_sweep_loop, name="comfy-env-idle-sweep",
+                     daemon=True).start()
 
 
 def _release_idle_workers() -> None:
@@ -339,8 +388,10 @@ def _release_idle_workers() -> None:
                 "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
                 "idle_since": _LAST_ACTIVITY.get(key),
                 "holding": _RESERVE_HIGHWATER.get(key, 0) > 0,
+                "last_prompt": _LAST_PROMPT.get(key),
             }
-        due = state_sync.plan_idle_release(states, time.monotonic())
+        due = state_sync.plan_idle_release(states, time.monotonic(),
+                                           current_prompt=_current_prompt())
         for key in due:
             worker, _gen = entries[key]
             try:
@@ -354,9 +405,9 @@ def _release_idle_workers() -> None:
             receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
             _RESERVE_HIGHWATER[key] = 0
             _LAST_ACTIVITY[key] = time.monotonic()
+            _LAST_PROMPT.pop(key, None)
             _log(f"[comfy-env] idle release: {Path(key).name} gave back "
-                 f"{(receipt or {}).get('freed_bytes', 0) / 1e9:.2f}GB "
-                 f"after {state_sync.IDLE_RELEASE_SECONDS:.0f}s idle")
+                 f"{(receipt or {}).get('freed_bytes', 0) / 1e9:.2f}GB")
         if due:
             # The receipts are the evidence a shrink needs.
             _publish_reserve(shrink_allowed=True)
@@ -364,18 +415,110 @@ def _release_idle_workers() -> None:
         _log(f"[comfy-env] idle release sweep failed: {exc}")
 
 
+def _worker_charges() -> Dict[str, int]:
+    """Each live worker's charge against the reserve, from what it MEASURED.
+
+    Not from our proxies: ComfyUI's ledger reads zero for a paged model and
+    torch cannot see aimdo at all, so a ledger sum is wrong in exactly the
+    configuration the reserve exists for. The high-water is updated here as
+    a side effect, because this is the one place residency is read.
+    """
+    process_local = _blind_free_is_process_local()
+    charges: Dict[str, int] = {}
+    for key, entry in list(_WORKER_POOL.items()):
+        worker = entry[0] if entry else None
+        if worker is not None and not worker.is_alive():
+            continue
+        residency = 0
+        report = getattr(worker, "_last_vram_report", None) or {}
+        measured = report.get("held")
+        if measured is not None:
+            residency = max(0, int(measured))
+        else:
+            for patcher in list(_WORKER_PATCHERS.get(key, {}).values()):
+                try:
+                    residency += int(getattr(
+                        patcher.model, "model_loaded_weight_memory", 0))
+                except Exception:
+                    pass
+        high = max(_RESERVE_HIGHWATER.get(key, 0), residency)
+        _RESERVE_HIGHWATER[key] = high
+        charges[key] = reserve.charge(
+            reserve.entitlement(high, floor=_WORKER_FIXED_VRAM_COST),
+            residency, process_local)
+    return charges
+
+
+def _aimdo_headroom_seed() -> int:
+    """The pager's startup headroom, read once: --reserve-vram in bytes the
+    way main.py seeds it, else aimdo's compile time default."""
+    global _AIMDO_SEED
+    if _AIMDO_SEED is None:
+        seed = None
+        try:
+            from comfy.cli_args import args as _args
+            rv = getattr(_args, "reserve_vram", None)
+            if rv is not None:
+                seed = int(float(rv) * 1024 ** 3)
+        except Exception:
+            seed = None
+        _AIMDO_SEED = reserve.AIMDO_DEFAULT_HEADROOM if seed is None else seed
+    return _AIMDO_SEED
+
+
+def _forward_reserve_to_aimdo(published: int) -> bool:
+    """Mirror the published reserve into the host pager's headroom.
+
+    ComfyUI's EXTRA_RESERVED_VRAM never reaches comfy-aimdo: the pager is
+    seeded once at startup (main.py) and decides residency at fault time
+    from its own headroom. Measured on the paged path (research/memory-floor
+    P2 and its 2026-09-05 replication): the published reserve is inert, the
+    pager's own setter is live at the next fault. So the second of the two
+    writes comfy-env makes is this one, a value into the knob the library
+    exports for it, the same knob ComfyUI seeds from --reserve-vram.
+
+    Bound lazily: the Python wrapper is comfy-aimdo #107; every wheel since
+    0.4.10 carries the raw export. Gated on the host actually running the
+    pager; on the legacy path the published reserve already does the job.
+    """
+    try:
+        import comfy.memory_management as _cmm
+        if not getattr(_cmm, "aimdo_enabled", False):
+            return False
+        import comfy_aimdo.control as _control
+    except Exception:
+        return False
+    setter = getattr(_control, "set_simple_vram_headroom", None)
+    if setter is None:
+        lib = getattr(_control, "lib", None)
+        setter = getattr(lib, "set_simple_vram_headroom", None) if lib is not None else None
+    if setter is None:
+        return False
+    headroom = reserve.aimdo_headroom(_aimdo_headroom_seed(), published, _RESERVE_BASE)
+    try:
+        setter(int(headroom))
+    except Exception as exc:
+        _log(f"[comfy-env] pager headroom forward failed: {exc}")
+        return False
+    if _DBG_MODELS:
+        _log(f"[comfy-env] pager headroom {headroom / 1e9:.2f}GB "
+             f"(seed {_aimdo_headroom_seed() / 1e9:.2f}GB + reserve added)")
+    return True
+
+
 def _publish_reserve(shrink_allowed: bool = False) -> int:
-    """Tell ComfyUI the card is smaller by what workers hold. Never raises.
+    """Tell ComfyUI the card is smaller by what workers will take.
 
-    This is the whole preventive half of the floor. It replaces nothing that
-    ComfyUI does: its own load path reads extra_reserved_memory() live on
-    every call and backs off using its own arithmetic.
+    Writes ComfyUI's own EXTRA_RESERVED_VRAM, the knob --reserve-vram sets,
+    which its admission reads live on every load, and mirrors the same
+    reserve into the host pager's headroom (see _forward_reserve_to_aimdo).
+    Preventive on the legacy path, where the partial load budget shrinks
+    with it; on the paged path only the pager forward moves residency.
 
-    Measured (research/memory-floor/p2): effective on the legacy path, where
-    a reserve took a 6 GiB model from fully resident to 1.38 GiB, and inert
-    under aimdo, where residency is decided at page-fault time. It is
-    published on both paths regardless, because a paged host still performs
-    non-paged loads and the number is correct for those.
+    The base is read once, before comfy-env has ever written it, or every
+    republish would add the previous reserve back. Grow at once; shrink only
+    with ``shrink_allowed``, which callers pass with a measured release
+    receipt in hand (reserve.next_reserve).
     """
     global _RESERVE_BASE, _RESERVE_PUBLISHED
     try:
@@ -388,41 +531,15 @@ def _publish_reserve(shrink_allowed: bool = False) -> int:
             # compounds: every republish would add the previous reserve back.
             _RESERVE_BASE = int(mm.EXTRA_RESERVED_VRAM)
 
-        process_local = _blind_free_is_process_local()
-        charges = []
-        for key, entry in list(_WORKER_POOL.items()):
-            worker = entry[0] if entry else None
-            if worker is not None and not worker.is_alive():
-                continue
-            # What the worker MEASURED it holds, not what our proxies
-            # believe. ComfyUI's ledger reads zero for a paged model and
-            # torch cannot see aimdo at all, so a ledger sum is wrong in
-            # exactly the configuration the reserve exists for.
-            residency = 0
-            report = getattr(worker, "_last_vram_report", None) or {}
-            measured = report.get("held")
-            if measured is not None:
-                residency = max(0, int(measured))
-            else:
-                for patcher in list(_WORKER_PATCHERS.get(key, {}).values()):
-                    try:
-                        residency += int(getattr(
-                            patcher.model, "model_loaded_weight_memory", 0))
-                    except Exception:
-                        pass
-            high = max(_RESERVE_HIGHWATER.get(key, 0), residency)
-            _RESERVE_HIGHWATER[key] = high
-            charges.append(reserve.charge(
-                reserve.entitlement(high, floor=_WORKER_FIXED_VRAM_COST),
-                residency, process_local))
-
+        charges = _worker_charges()
         proposed = reserve.total_reserve(
-            _RESERVE_BASE, charges, device_total=_device_total_bytes())
+            _RESERVE_BASE, list(charges.values()), device_total=_device_total_bytes())
         value = reserve.next_reserve(
             _RESERVE_PUBLISHED, proposed, shrink_allowed)
         if value != _RESERVE_PUBLISHED:
             mm.EXTRA_RESERVED_VRAM = value
             _RESERVE_PUBLISHED = value
+            _forward_reserve_to_aimdo(value)
             if _DBG_MODELS:
                 _log(f"[comfy-env] reserve published {value / 1e9:.2f}GB "
                      f"(base {_RESERVE_BASE / 1e9:.2f}GB, "
@@ -608,6 +725,14 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
         _host_reserved = int(mm.extra_reserved_memory())
     except Exception:
         _host_reserved = 0
+    # The published reserve already holds the requester's own growth; this
+    # load IS that growth. Asking the host to keep it free on top of the
+    # weights evicts host models for the same bytes twice.
+    try:
+        _own_charge = _worker_charges().get(requester_key, 0) if requester_key else 0
+    except Exception:
+        _own_charge = 0
+    _host_reserved = reserve.reserve_for_requester(_host_reserved, _own_charge)
     need = reserve.ask_target(
         weights=total_requested,
         slack=state_sync.WEIGHT_SLACK,
@@ -1088,6 +1213,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # worker creation.
     _report_memory_manager(worker, env_dir)
     _check_host_contract()
+    _start_idle_sweep()
     return worker, gen
 
 
