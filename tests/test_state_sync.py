@@ -711,3 +711,74 @@ class TestPlanIdleRelease:
         from comfy_env.state_sync import plan_idle_release
         workers = {k: self._w() for k in ("c", "a", "b")}
         assert plan_idle_release(workers, 120.0) == ["a", "b", "c"]
+
+
+class TestPlanPressureRelease:
+    """The admission time ask: the host has evicted everything it owns and is
+    still short, so the parent asks the processes it owns. Its refusals are
+    the interesting part."""
+
+    @staticmethod
+    def _w(held=6 * 1024 ** 3, **kw):
+        base = {"alive": True, "advertises": True, "in_flight": False,
+                "held": held}
+        base.update(kw)
+        return base
+
+    def test_asks_the_largest_holder_first(self):
+        """Catches: dictionary order, which makes the number of round trips
+        depend on insertion order rather than on who has the memory."""
+        from comfy_env.state_sync import plan_pressure_release
+        GB = 1024 ** 3
+        workers = {"small": self._w(2 * GB), "big": self._w(8 * GB)}
+        plan = plan_pressure_release(workers, 3 * GB)
+        assert plan == [("big", 3 * GB)]
+
+    def test_asks_each_only_for_what_is_still_missing(self):
+        """Catches: asking every candidate for the whole shortfall, which
+        evicts several workers to cover one load."""
+        from comfy_env.state_sync import plan_pressure_release
+        GB = 1024 ** 3
+        workers = {"a": self._w(4 * GB), "b": self._w(4 * GB)}
+        assert plan_pressure_release(workers, 6 * GB) == [("a", 4 * GB), ("b", 2 * GB)]
+
+    def test_never_asks_the_requester(self):
+        """Catches: taking back the pages of the worker that is asking to
+        load, which undoes the admission it just requested."""
+        from comfy_env.state_sync import plan_pressure_release
+        GB = 1024 ** 3
+        workers = {"req": self._w(8 * GB)}
+        assert plan_pressure_release(workers, 4 * GB, requester="req") == []
+
+    def test_never_asks_a_worker_mid_call(self):
+        """Catches: dropping pages a running kernel is reading. A busy
+        worker's memory is in use and cannot be taken at any price."""
+        from comfy_env.state_sync import plan_pressure_release
+        workers = {"a": self._w(in_flight=True)}
+        assert plan_pressure_release(workers, 4 * 1024 ** 3) == []
+
+    def test_never_asks_a_worker_holding_nothing(self):
+        from comfy_env.state_sync import plan_pressure_release
+        workers = {"a": self._w(held=0)}
+        assert plan_pressure_release(workers, 4 * 1024 ** 3) == []
+
+    def test_a_worker_without_the_command_is_skipped(self):
+        """Catches: sending partial_release to an older worker, which answers
+        with an error frame that reads as a failed admission."""
+        from comfy_env.state_sync import plan_pressure_release
+        workers = {"a": self._w(advertises=False)}
+        assert plan_pressure_release(workers, 4 * 1024 ** 3) == []
+
+    def test_no_shortfall_asks_nobody(self):
+        """Catches: a sweep on every load. The ask only exists for the moment
+        the host has run out of its own memory to give."""
+        from comfy_env.state_sync import plan_pressure_release
+        assert plan_pressure_release({"a": self._w()}, 0) == []
+        assert plan_pressure_release({"a": self._w()}, -5) == []
+
+    def test_asks_no_more_than_a_worker_holds(self):
+        """Catches: asking for the whole shortfall from a small holder, whose
+        manager then evicts everything it has and still cannot cover it."""
+        from comfy_env.state_sync import plan_pressure_release
+        GB = 1024 ** 3
+        assert plan_pressure_release({"a": self._w(1 * GB)}, 9 * GB) == [("a", 1 * GB)]

@@ -506,6 +506,61 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
     return True
 
 
+def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
+    """Ask idle siblings to give back ``shortfall`` bytes, now.
+
+    The host has just evicted everything it owns and is still short. Nothing
+    outside a process can free that process's VRAM, so the parent asks the
+    processes it owns: idle workers shrink through their own manager and
+    keep their models loaded, refaulting from pinned RAM on their next call.
+    Measured (research/memory-floor/p6_partial_release): 0.05 to 0.20 s to
+    free 2 to 6 GiB, visible to the driver at once, 0.09 to 0.30 s to
+    refault.
+
+    This is the admission time half of what replaces host driven reclaim;
+    the idle timer and the prompt boundary are the unhurried halves. Returns
+    bytes actually given back, measured from the receipts.
+    """
+    if shortfall <= 0:
+        return 0
+    with _POOL_LOCK:
+        entries = dict(_WORKER_POOL)
+    states = {}
+    for key, (worker, _gen) in entries.items():
+        states[key] = {
+            "alive": worker.is_alive(),
+            "advertises": getattr(worker, "supports_partial_release", False),
+            "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
+            "held": _RESERVE_HIGHWATER.get(key, 0),
+        }
+    plan = state_sync.plan_pressure_release(states, shortfall,
+                                            requester=str(requester_key)
+                                            if requester_key else None)
+    freed_total = 0
+    for key, ask in plan:
+        worker, _gen = entries[key]
+        try:
+            reply = worker.send_command_no_spawn("partial_release", size=int(ask),
+                                                 lock_timeout=2.0)
+        except Exception as exc:
+            _log(f"[comfy-env] admission ask to {Path(key).name} failed: {exc}")
+            continue
+        if reply == "busy":
+            continue
+        receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
+        freed = int((receipt or {}).get("freed_bytes", 0))
+        freed_total += freed
+        # The high-water is now a forecast the worker has disproved: it let
+        # this much go on request, so the reserve may follow it down.
+        _RESERVE_HIGHWATER[key] = max(0, _RESERVE_HIGHWATER.get(key, 0) - freed)
+        _log(f"[comfy-env] admission ask: {Path(key).name} gave back "
+             f"{freed / 1e9:.2f}GB of {ask / 1e9:.2f}GB asked")
+    if freed_total:
+        # Receipts in hand, so the reserve may shrink to match.
+        _publish_reserve(shrink_allowed=True)
+    return freed_total
+
+
 def _publish_reserve(shrink_allowed: bool = False) -> int:
     """Tell ComfyUI the card is smaller by what workers will take.
 
@@ -772,6 +827,18 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     if _DBG_MODELS:
         _log(f"[comfy-env] VRAM after eviction: "
              f"blind={mm.get_free_memory(device) / 1e9:.2f}GB")
+
+    # The host has now given up everything it owns. If the card is still
+    # short, the rest is held by processes ComfyUI cannot reach and the
+    # parent can: ask idle siblings before the requester loads into a card
+    # that has no room, which is the OOM this whole floor exists to avoid.
+    post_free = _true_device_free(device)
+    if post_free is None:
+        _pb = mm.get_free_memory(device)
+        post_free = (max(0, _pb - _worker_held_bytes())
+                     if _blind_free_is_process_local() else _pb)
+    if need > post_free:
+        _ask_idle_workers(need - int(post_free), requester_key)
 
     # vram_state/extra_reserved pass through as ComfyUI computed them; the
     # negotiation below is the only mechanism that adjusts them.

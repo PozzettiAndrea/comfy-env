@@ -264,3 +264,74 @@ class TestPinPressureSeam:
         assert "release_pins" not in ast.unparse(call_parent), (
             "release_pins dispatched from the interleave; it would free "
             "pins under an active forward")
+
+
+GIB = 1024 ** 3
+
+
+class TestPartialReleaseSeam:
+    """The admission time shrink. Unlike full_release it keeps the model
+    loaded, so the pages come back from pinned RAM rather than from disk;
+    that is what makes asking cheaper than evicting."""
+
+    def test_it_asks_for_free_plus_the_shortfall(self):
+        """Catches: passing the shortfall straight to free_memory. ComfyUI's
+        loop evicts until `memory_required - get_free_memory` is met, so a
+        target below the current free number evicts nothing at all."""
+        import types
+        from comfy_env import memory_manager as mm_mod
+        asks = []
+        mm = types.SimpleNamespace(
+            get_torch_device=lambda: "cuda",
+            get_free_memory=lambda dev: 1 * GIB,
+            free_memory=lambda amount, dev: asks.append(amount))
+        mm_mod.partial_release(4 * GIB, _modules={"comfy.model_management": mm})
+        assert asks == [5 * GIB]
+
+    def test_the_receipt_is_measured_not_assumed(self):
+        """Catches: reporting the asked size as freed. The parent lowers a
+        worker's high-water by this number, so an optimistic receipt hands
+        the host space that never came back."""
+        import types
+        from comfy_env import memory_manager as mm_mod
+        free = [1 * GIB]
+        mm = types.SimpleNamespace(
+            get_torch_device=lambda: "cuda",
+            get_free_memory=lambda dev: free[0],
+            free_memory=lambda amount, dev: free.__setitem__(0, 3 * GIB))
+        receipt = mm_mod.partial_release(9 * GIB,
+                                         _modules={"comfy.model_management": mm})
+        assert receipt["freed_bytes"] == 2 * GIB
+
+    def test_a_raising_manager_returns_a_receipt_not_an_exception(self):
+        """Catches: letting a worker side failure surface as a failed budget
+        reply, which the requester reads as a refused admission."""
+        import types
+        from comfy_env import memory_manager as mm_mod
+
+        def boom(*a, **k):
+            raise RuntimeError("no cuda")
+        mm = types.SimpleNamespace(get_torch_device=boom,
+                                   get_free_memory=boom, free_memory=boom)
+        receipt = mm_mod.partial_release(1 * GIB,
+                                         _modules={"comfy.model_management": mm})
+        assert receipt["errors"] and "freed_bytes" not in receipt
+
+    def test_dispatch_is_main_loop_only(self):
+        """Catches: handling partial_release in the _call_parent interleave,
+        which would drop pages while a forward is running in this worker."""
+        tree = ast.parse(WORKER.read_text(encoding="utf-8"))
+        call_parent = next(n for n in ast.walk(tree)
+                           if isinstance(n, ast.FunctionDef)
+                           and n.name == "_call_parent")
+        assert "partial_release" not in ast.unparse(call_parent)
+        src = WORKER.read_text(encoding="utf-8")
+        assert 'request.get("method") == "partial_release"' in src
+
+    def test_ready_frame_advertises_the_capability(self):
+        """Catches: shipping the handler without the flag, so the parent
+        never asks, or the flag without the handler, so it asks a worker
+        that answers with an error."""
+        src = WORKER.read_text(encoding="utf-8")
+        ready = src[src.index("_ready_frame = {"):src.index("transport.send(_ready_frame)")]
+        assert '"partial_release": True' in ready

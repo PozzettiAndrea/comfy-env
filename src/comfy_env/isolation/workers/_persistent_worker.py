@@ -1954,7 +1954,8 @@ def main():
     # parent broadcasts /free only to advertisers (an unknown method gets no
     # reply and the sender would eat the 60 s recv timeout).
     _ready_frame = {"status": "ready", "memory_manager": _mem_info,
-                    "full_release": True, "release_pins": True}
+                    "full_release": True, "release_pins": True,
+                    "partial_release": True}
     try:
         if _memmgr is not None:
             _ps = _memmgr.pin_state()
@@ -2090,6 +2091,24 @@ def main():
             except Exception as _fre:
                 _fr["receipt"] = {"steps": [], "errors": [str(_fre)]}
             transport.send(_attach_new_models(_fr))
+            continue
+
+        # Admission time shrink: the host is short and this worker is idle,
+        # so give back N bytes of VRAM through the worker's OWN manager and
+        # keep the model loaded (it refaults from pinned RAM). Main loop
+        # only, like full_release: a mid-forward release would drop pages a
+        # running kernel is reading.
+        if request.get("method") == "partial_release":
+            _sr = {"status": "ok", "call_id": request.get("call_id")}
+            try:
+                if _memmgr is not None:
+                    _sr["receipt"] = _memmgr.partial_release(
+                        int(request.get("size", 0)), log=wlog)
+                else:
+                    _sr["receipt"] = {"errors": ["no memory_manager"]}
+            except Exception as _sre:
+                _sr["receipt"] = {"errors": [str(_sre)]}
+            transport.send(_attach_new_models(_sr))
             continue
 
         # Host RAM-pressure pin reclaim: release N pinned bytes through the

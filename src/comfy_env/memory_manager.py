@@ -871,6 +871,69 @@ def install_pin_eviction_counters(log=None) -> None:
     mm.free_model_pins = _counted_free_model_pins
 
 
+def partial_release(size, log=None, _modules=None) -> Dict[str, Any]:
+    """Shrink this worker's VRAM by ``size`` bytes, for the host's admission.
+
+    The one lever that works on both paths from inside the process that owns
+    the memory: ``mm.free_memory`` runs the worker's OWN manager, which on
+    the paged path asks the pager to drop pages and on the legacy path
+    partially unloads. Measured (research/memory-floor/p6_partial_release):
+    2, 4 and 6 GiB freed in 0.05 to 0.20 s, visible to another process's
+    driver reading as soon as the call returns, refaulting in 0.09 to 0.30 s.
+
+    The models stay REGISTERED either way, so nothing is reloaded from disk,
+    but what the release costs depends on the path, and the receipt says
+    which. Paged models drop pages and refault transparently on their next
+    access (measured 0.09 to 0.30 s). Legacy models are partially unloaded,
+    which copies weights back to host RAM and requires ComfyUI's own
+    load_models_gpu before the next forward, exactly as it would for an
+    in-process model the host evicted. A pack that forwards a model without
+    going through load_models_gpu is already outside ComfyUI's contract and
+    would break the same way unisolated.
+
+    Never raises; returns a measured receipt so the parent's reserve can
+    move on evidence rather than expectation.
+    """
+    _log = log or (lambda *_: None)
+    modules = sys.modules if _modules is None else _modules
+    receipt: Dict[str, Any] = {"errors": []}
+    mm = modules.get("comfy.model_management")
+    torch = modules.get("torch")
+    if mm is None:
+        receipt["errors"].append("no comfy.model_management")
+        return receipt
+    try:
+        device = mm.get_torch_device()
+        free_before = int(mm.get_free_memory(device))
+        receipt["free_before"] = free_before
+        # Ask for what is already free PLUS the shortfall: ComfyUI's own
+        # loop evicts until `memory_required - get_free_memory` is met, so a
+        # target below the current free number evicts nothing.
+        mm.free_memory(free_before + max(0, int(size)), device)
+        if torch is not None:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        free_after = int(mm.get_free_memory(device))
+        receipt["free_after"] = free_after
+        receipt["freed_bytes"] = max(0, free_after - free_before)
+        # Which path paid: a paged model refaults, a legacy one needs the
+        # next load_models_gpu. The parent logs it so a user who sees a
+        # reload knows why.
+        try:
+            receipt["legacy_models"] = sum(
+                1 for lm in getattr(mm, "current_loaded_models", [])
+                if not lm.model.is_dynamic())
+        except Exception:
+            pass
+    except Exception as exc:
+        receipt["errors"].append(f"free_memory: {exc}")
+    _log(f"[worker] partial release: asked {int(size) / 1e9:.2f}GB, freed "
+         f"{receipt.get('freed_bytes', 0) / 1e9:.2f}GB")
+    return receipt
+
+
 def release_pins(size, log=None, _modules=None) -> Dict[str, Any]:
     """Release ``size`` bytes of this worker's pinned host RAM, for the
     host's RAM-pressure sweep. Never raises.

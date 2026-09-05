@@ -593,6 +593,46 @@ RELEASE_DEBOUNCE_SECONDS = 0.5
 IDLE_RELEASE_SECONDS = 60.0
 
 
+def plan_pressure_release(workers, shortfall, requester=None):
+    """Which idle workers to ask for VRAM, and for how much. Pure.
+
+    Called when the host has already evicted its own models and the card is
+    still short. ``workers`` maps key to {"alive", "advertises", "in_flight",
+    "held"}. Largest holder first, so one round trip covers the shortfall
+    where possible, and each worker is asked only for what is still missing
+    after the ones before it, never for its whole residency.
+
+    Refusals that matter as much as the selections: the requester is never
+    asked (it is about to load, and taking its pages back would undo the
+    admission it is asking for), a worker mid call is never asked (its pages
+    are in use by a running kernel), and a worker holding nothing is never
+    asked (a round trip for no memory).
+    """
+    remaining = max(0, int(shortfall or 0))
+    if not remaining:
+        return []
+    candidates = []
+    for key, state in (workers or {}).items():
+        if requester is not None and key == requester:
+            continue
+        if not state.get("alive") or not state.get("advertises"):
+            continue
+        if state.get("in_flight"):
+            continue
+        held = max(0, int(state.get("held") or 0))
+        if not held:
+            continue
+        candidates.append((held, key))
+    out = []
+    for held, key in sorted(candidates, key=lambda c: (-c[0], c[1])):
+        if remaining <= 0:
+            break
+        ask = min(held, remaining)
+        out.append((key, ask))
+        remaining -= ask
+    return out
+
+
 def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
                       current_prompt=None):
     """Which idle workers should be asked to release. Pure.

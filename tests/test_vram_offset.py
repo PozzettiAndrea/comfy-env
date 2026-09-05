@@ -295,3 +295,77 @@ def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
     # entitlement: context floor plus the 2 GB high water.
     expected_charge = pool._WORKER_FIXED_VRAM_COST + 2 * GB
     assert stranger - own == expected_charge
+
+
+class _AskWorker:
+    def __init__(self, freed, in_flight=0, advertises=True):
+        self.supports_partial_release = advertises
+        self._calls_in_flight = in_flight
+        self._freed = freed
+        self.sent = []
+
+    def is_alive(self):
+        return True
+
+    def send_command_no_spawn(self, method, **kw):
+        self.sent.append((method, kw.get("size")))
+        return {"receipt": {"freed_bytes": self._freed}}
+
+
+def _ask_fixture(pool, monkeypatch, workers, free_after_evict):
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {k: (w, 1) for k, w in workers.items()})
+    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {k: 8 * GB for k in workers})
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: free_after_evict)
+    monkeypatch.setattr(pool, "_publish_reserve", lambda **kw: 0)
+    pool._WORKER_PATCHERS.clear()
+
+
+def test_admission_asks_idle_siblings_when_the_host_is_still_short(pool_mod, monkeypatch):
+    """Catches: giving up after the host has evicted its own models. Nothing
+    outside a process can free that process's VRAM, so the parent asks the
+    processes it owns before the requester loads into a card with no room."""
+    pool, mm, calls = pool_mod
+    idle = _AskWorker(freed=4 * GB)
+    _ask_fixture(pool, monkeypatch, {"idle": idle}, free_after_evict=2 * GB)
+
+    pool._handle_vram_budget({"total_size": 6 * GB}, worker_key="req")
+
+    assert idle.sent and idle.sent[0][0] == "partial_release"
+    assert idle.sent[0][1] > 0
+
+
+def test_admission_asks_nobody_when_the_card_already_has_room(pool_mod, monkeypatch):
+    """Catches: an ask on every load. Round trips and page traffic for a
+    shortfall that does not exist."""
+    pool, mm, calls = pool_mod
+    idle = _AskWorker(freed=4 * GB)
+    _ask_fixture(pool, monkeypatch, {"idle": idle}, free_after_evict=50 * GB)
+
+    pool._handle_vram_budget({"total_size": 6 * GB}, worker_key="req")
+
+    assert idle.sent == []
+
+
+def test_admission_never_asks_the_requester(pool_mod, monkeypatch):
+    """Catches: the requester shrinking itself to make room for its own
+    load, which is a round trip that cancels the admission."""
+    pool, mm, calls = pool_mod
+    req = _AskWorker(freed=4 * GB)
+    _ask_fixture(pool, monkeypatch, {"req": req}, free_after_evict=1 * GB)
+
+    pool._handle_vram_budget({"total_size": 6 * GB}, worker_key="req")
+
+    assert req.sent == []
+
+
+def test_a_freed_receipt_lowers_that_workers_high_water(pool_mod, monkeypatch):
+    """Catches: a high-water that survives a proven release, which keeps the
+    reserve holding space the worker has demonstrably given back."""
+    pool, mm, calls = pool_mod
+    idle = _AskWorker(freed=3 * GB)
+    _ask_fixture(pool, monkeypatch, {"idle": idle}, free_after_evict=1 * GB)
+
+    pool._ask_idle_workers(4 * GB, requester_key="req")
+
+    assert pool._RESERVE_HIGHWATER["idle"] == 5 * GB

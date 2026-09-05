@@ -686,6 +686,7 @@ class SubprocessWorker(Worker):
         # unknown method NO reply and die at the 60 s recv timeout.
         self.supports_full_release = bool(msg.get("full_release"))
         self.supports_release_pins = bool(msg.get("release_pins"))
+        self.supports_partial_release = bool(msg.get("partial_release"))
         # Mirror divergence check: recompute the read-back hash over the SAME
         # applied names with OUR args and compare. Log-only and fail-open,
         # always: a worker refusing to start would convert a 2x footprint

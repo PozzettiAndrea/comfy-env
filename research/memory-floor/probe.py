@@ -70,8 +70,15 @@ def vram_truth():
     return out
 
 
-def load(gib=2.0, layer_n=8192):
-    """Load a model through ComfyUI's own path, so aimdo really pages it."""
+def load(gib=2.0, layer_n=8192, ops=False):
+    """Load a model through ComfyUI's own path, so aimdo really pages it.
+
+    ``ops=True`` builds comfy.ops layers, which carry comfy_cast_weights and
+    are therefore routed through a VBAR by ModelPatcherDynamic. Plain
+    nn.Linear (the default, and what P2 used) takes the weight.to(device)
+    branch instead and never pages: that difference is what made P2 read the
+    pager's headroom as inert.
+    """
     import torch
     import torch.nn as nn
     import comfy.model_management as mm
@@ -79,9 +86,19 @@ def load(gib=2.0, layer_n=8192):
 
     per_layer = layer_n * layer_n * 2
     layers = max(1, int(gib * 1024 ** 3 / per_layer))
-    model = nn.Sequential(*[
-        nn.Linear(layer_n, layer_n, bias=False) for _ in range(layers)
-    ]).half()
+    if ops:
+        import comfy.memory_management as cmm
+        import comfy.ops
+        saved = cmm.aimdo_enabled
+        cmm.aimdo_enabled = False
+        try:
+            mods = [comfy.ops.disable_weight_init.Linear(layer_n, layer_n, bias=False)
+                    for _ in range(layers)]
+        finally:
+            cmm.aimdo_enabled = saved
+    else:
+        mods = [nn.Linear(layer_n, layer_n, bias=False) for _ in range(layers)]
+    model = nn.Sequential(*mods).half()
     patcher = mp.CoreModelPatcher(
         model, load_device=mm.get_torch_device(),
         offload_device=torch.device("cpu"))
@@ -104,6 +121,15 @@ def forward(steps=1, layer_n=8192):
             for p in _PATCHERS:
                 x = p.model(x)
     torch.cuda.synchronize()
+    return vram_truth()
+
+
+def reload():
+    """What every real node call does before using a model: go back through
+    ComfyUI's own admission. After a partial release a paged model refaults
+    here and a legacy one is copied back to the device."""
+    import comfy.model_management as mm
+    mm.load_models_gpu(list(_PATCHERS))
     return vram_truth()
 
 
