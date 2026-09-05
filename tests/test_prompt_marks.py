@@ -321,14 +321,13 @@ def _patched_comfy_attributes(path, only=None):
 class TestNoHostPatchingRule:
     """The architectural rule: comfy-env does not patch its host.
 
-    Two wraps remain by deliberate exception, each behind a kill switch and
-    each calling the original first. Everything else must be a read. This
-    guard exists so that set shrinks and never grows by accident.
+    No wraps, no class patches, no function replacement. The one write is a
+    VALUE published into a knob ComfyUI itself exposes for exactly this
+    purpose. Everything else must be a read. This guard exists so the set
+    never grows by accident.
     """
 
     ALLOWED = {
-        "mm.unload_all_models",
-        "mm.should_free_pins_for_ram_pressure",
         # the reserve is a VALUE comfy-env publishes into ComfyUI's own
         # knob, the same one --reserve-vram writes; it replaces no behaviour
         "mm.EXTRA_RESERVED_VRAM",
@@ -337,8 +336,8 @@ class TestNoHostPatchingRule:
     def test_the_pool_patches_nothing_outside_the_allowed_set(self):
         found = set(_patched_comfy_attributes(POOL))
         assert found <= self.ALLOWED, (
-            "new host patching in pool.py: {}. comfy-env reads its host; "
-            "the two remaining wraps are a deliberate, switched exception."
+            "new host patching in pool.py: {}. comfy-env reads its host and "
+            "publishes one value; it wraps nothing."
             .format(sorted(found - self.ALLOWED)))
 
     def test_the_guard_would_catch_a_new_patch(self):

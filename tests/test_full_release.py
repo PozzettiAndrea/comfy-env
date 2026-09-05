@@ -184,25 +184,6 @@ class TestFreeSeamGuards:
         assert "_ensure_started" not in src
         assert "is_alive" in src
 
-    def test_wrap_calls_the_original_before_broadcasting(self):
-        """The sweep must detach worker models (dropping their pins through
-        the real unpatch path) BEFORE the ladder runs, or rung 4 flushes a
-        cache the sweep is about to refill."""
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_wrapped_unload_all_models")
-        src = ast.unparse(fn)
-        assert src.index("_original(") < src.index("broadcast_release")
-
-    def test_wrap_is_behind_its_kill_switch(self):
-        """comfy-env's first host-side function wrap earns a revert path that
-        needs no package rollback."""
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_install_free_broadcast")
-        assert "FREE_BROADCAST_ENV_VAR" in ast.unparse(fn)
 
     def test_release_dispatch_is_main_loop_only(self):
         """A release executed from _call_parent's interleave would run gc and
@@ -238,21 +219,11 @@ class TestFreeSeamGuards:
 
 
 class TestPinPressureSeam:
-    """The RAM-pressure reclaim wiring (gap 6): the one honest trigger is
-    should_free_pins_for_ram_pressure (single upstream caller, fires only
-    under genuine pressure); the broadcast must never block the execution
-    loop and never respawn the dead."""
+    """The RAM-pressure pin release lever. comfy-env does not patch the host,
+    so nothing upstream triggers it; it is a lever comfy-env's own code may
+    pull, and when pulled it must never block the execution loop and never
+    respawn the dead."""
 
-    def test_wrap_calls_original_first_and_returns_it_verbatim(self):
-        """The wrap is observability plus a side effect, never a behavior
-        change: the host's own free_pins must still run on the True path."""
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_wrapped_should_free_pins")
-        src = ast.unparse(fn)
-        assert src.index("_original(") < src.index("broadcast_pin_release")
-        assert "return result" in src
 
     def test_pressure_broadcast_never_joins(self):
         """broadcast_release may join (a human pressed /free and waits);
@@ -268,12 +239,6 @@ class TestPinPressureSeam:
             "stalls under sustained pressure")
         assert "send_command_no_spawn" in src
 
-    def test_pressure_installer_holds_the_install_lock(self):
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef)
-                  and n.name == "_install_pin_pressure")
-        assert "with _INSTALL_LOCK" in ast.unparse(fn)
 
     def test_release_pins_never_touches_the_ladder_exclusions(self):
         """Same OUT list as full_release: keepers, overflow store, and it

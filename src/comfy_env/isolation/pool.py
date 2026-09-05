@@ -817,113 +817,24 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
         _log(f"[comfy-env] Registered proxy route: {method} {path} -> {module_name}.{handler_func}")
 
 
-# --- /free broadcast: the host's free button crosses the process boundary ---
+# --- Release levers: full_release and pin release, sent to workers -----
+# Nothing in the host calls these on its own: comfy-env does not patch the
+# host, so the Free button and the host's RAM-pressure sweep do not reach
+# workers unless something inside comfy-env (idle release, the optional
+# observer) decides to call them.
 
-#: Kill switch for comfy-env's first host-side function wrap. Off restores
-#: byte-identical behavior; one release with a revert path that needs no
-#: package rollback.
-FREE_BROADCAST_ENV_VAR = "COMFY_ENV_FREE_BROADCAST"
 
-_FREE_WRAP_INSTALLED = False
 _LAST_RELEASE_BROADCAST = [0.0]
 
-#: Serializes both one-shot host patches. A plain-bool check-then-set let two
-#: concurrent first-worker creations both read False and the loser capture
-#: the winner's WRAPPER as "_original", nesting permanently. Nothing else
-#: ever takes this lock, so holding it across the comfy import inside an
-#: install cannot deadlock.
+#: Serializes the once-per-process host contract check. Nothing else ever
+#: takes this lock.
 _INSTALL_LOCK = threading.Lock()
 
 
-def _install_free_broadcast() -> None:
-    """Wrap comfy.model_management.unload_all_models, once.
-
-    Its exactly three upstream callers (main.py's /free flag path and
-    execution.py's OOM and DISABLE_SMART_MEMORY fallbacks) all mean "release
-    everything", which is the only honest trigger comfy-env can observe: the
-    proxy-detach hook is blind to call_module packs and to a second /free
-    (upstream pops unloaded ledger entries), and comfy-env's own admission
-    eviction calls free_memory, never this, so no self-eviction guard is
-    needed. Wrap calls the original FIRST (the sweep detaches worker models
-    and drops their pin registrations through the real unpatch path), then
-    broadcasts. Install failure logs once and degrades, never raises."""
-    global _FREE_WRAP_INSTALLED
-    with _INSTALL_LOCK:
-        if _FREE_WRAP_INSTALLED:
-            return
-        _FREE_WRAP_INSTALLED = True
-        if os.environ.get(FREE_BROADCAST_ENV_VAR, "1").strip().lower() in (
-                "0", "false", "off"):
-            return
-        try:
-            import comfy.model_management as mm
-            _original = mm.unload_all_models
-
-            def _wrapped_unload_all_models(*args, **kwargs):
-                result = _original(*args, **kwargs)
-                try:
-                    broadcast_release()
-                except Exception as exc:
-                    _log(f"[comfy-env] release broadcast failed: {exc}")
-                return result
-
-            _wrapped_unload_all_models._comfy_env_wrap = True
-            mm.unload_all_models = _wrapped_unload_all_models
-        except Exception as exc:
-            _log(f"[comfy-env] free-broadcast wrap not installed: {exc}")
 
 
-# --- Prompt epoch source: the host's one observer of prompt boundaries ----
-
-
-
-# --- Host RAM-pressure pin reclaim (coverage gap: execution.py's periodic
-# --- free_pins sweep cannot see worker pinned RAM) -------------------------
-
-PIN_PRESSURE_ENV_VAR = "COMFY_ENV_PIN_PRESSURE"
-
-_PIN_PRESSURE_INSTALLED = False
 _LAST_PIN_PRESSURE_SWEEP = [0.0]
 
-
-def _install_pin_pressure() -> None:
-    """Wrap comfy.model_management.should_free_pins_for_ram_pressure, once.
-
-    Its ONLY upstream caller is the execution loop's post-node RAM path
-    (execution.py, via the ram_release_callback), it runs once per completed
-    node only under the RAM_PRESSURE cache, and a True return means the host
-    is in genuine RAM pressure with the shortfall in hand -- the one honest
-    trigger. Wrapping free_pins instead would fire on every pin attempt
-    (ensure_pin_budget calls it constantly). The wrap calls the original
-    first and returns its result verbatim; the broadcast is a side effect.
-    Reads only the ungated pin census: this reclaim needs nothing from the
-    deleted pin-split allocation machinery."""
-    global _PIN_PRESSURE_INSTALLED
-    with _INSTALL_LOCK:
-        if _PIN_PRESSURE_INSTALLED:
-            return
-        _PIN_PRESSURE_INSTALLED = True
-        if os.environ.get(PIN_PRESSURE_ENV_VAR, "1").strip().lower() in (
-                "0", "false", "off"):
-            return
-        try:
-            import comfy.model_management as mm
-            _original = mm.should_free_pins_for_ram_pressure
-
-            def _wrapped_should_free_pins(ram_shortfall, *args, **kwargs):
-                result = _original(ram_shortfall, *args, **kwargs)
-                if result:
-                    try:
-                        broadcast_pin_release(
-                            int(ram_shortfall) + 512 * 1024 * 1024)
-                    except Exception as exc:
-                        _log(f"[comfy-env] pin pressure broadcast failed: {exc}")
-                return result
-
-            _wrapped_should_free_pins._comfy_env_wrap = True
-            mm.should_free_pins_for_ram_pressure = _wrapped_should_free_pins
-        except Exception as exc:
-            _log(f"[comfy-env] pin-pressure wrap not installed: {exc}")
 
 
 def broadcast_pin_release(target_bytes: int) -> None:
@@ -1110,25 +1021,6 @@ def _check_host_contract() -> None:
         )
 
 
-def _install_host_patches() -> None:
-    """The one host-integration install point. comfy-env wraps exactly two
-    upstream functions, each install-once under _INSTALL_LOCK, each behind
-    its own kill switch (blast radii differ), each calling the original
-    first and degrading on failure:
-
-    * unload_all_models wrap  -> /free broadcast   (COMFY_ENV_FREE_BROADCAST)
-    * should_free_pins_for_ram_pressure -> reclaim (COMFY_ENV_PIN_PRESSURE)
-
-    A third wrap used to live here, class-patching the prompt tracker to
-    learn the prompt epoch. It is gone: the epoch is now READ from ComfyUI's
-    own progress registry, which carries the real prompt id and needs no
-    hook (see subprocess._current_prompt_gen).
-
-    Called at first worker creation: without workers there is nothing for
-    either of them to reach."""
-    _install_free_broadcast()
-    _install_pin_pressure()
-
 
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           env_vars: Optional[dict] = None,
@@ -1196,7 +1088,6 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # worker creation.
     _report_memory_manager(worker, env_dir)
     _check_host_contract()
-    _install_host_patches()
     return worker, gen
 
 
