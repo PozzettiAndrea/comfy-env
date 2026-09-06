@@ -51,7 +51,7 @@ def main():
         held = holder.call_module("probe", "vram_truth")
         resident = max(int(held.get("aimdo_total", 0)),
                        int(held.get("torch_reserved", 0)))
-        pool._RESERVE_HIGHWATER["holder"] = resident
+        pool._WORKER_HELD["holder"] = resident
         free_before = H.smi_free_bytes() or 0
         r.note("holder resident {}, device free {}".format(
             H.gib(resident), H.gib(free_before)))
@@ -88,8 +88,8 @@ def main():
         r.check("the card really has more room",
                 free_after - free_before > shortfall * 0.7)
         r.check("the receipt is not a lie", freed > shortfall * 0.7)
-        r.check("the high water followed the receipt down",
-                pool._RESERVE_HIGHWATER["holder"] < resident)
+        r.check("our copy of what it holds followed the receipt down",
+                pool._WORKER_HELD["holder"] < resident)
 
         # And the model is still loaded: this is what makes an ask cheaper
         # than an eviction, so the next call refaults instead of reloading.
@@ -117,7 +117,7 @@ def main():
             except Exception:
                 pass
         pool._WORKER_POOL.clear()
-        pool._RESERVE_HIGHWATER.clear()
+        pool._WORKER_HELD.clear()
     return r
 
 

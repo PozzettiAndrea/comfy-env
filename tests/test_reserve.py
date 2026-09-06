@@ -3,7 +3,7 @@
 Pure unit tests, no torch and no comfy. Every test names the wrong
 implementation it exists to catch, and the priority ones are the mistakes
 that produce a plausible-looking but silently wrong number: the platform
-split, entitlement versus current residency, and the shrink rule.
+split, what the host can already see, and the shrink rule.
 """
 
 import ast
@@ -15,53 +15,42 @@ GIB = 1024 ** 3
 SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_env"
 
 
-class TestEntitlement:
-    def test_books_the_context_floor_even_with_nothing_resident(self):
-        """Catches: booking zero for an idle worker. A live worker holds its
-        CUDA context whether or not it holds a model, measured at 276 to
-        300 MiB, and a host that takes that space OOMs the worker's next
-        call."""
-        assert R.entitlement(0) == R.CONTEXT_FLOOR_BYTES
-
-    def test_uses_high_water_not_current_residency(self):
-        """Catches: tracking current residency, which hands the host the
-        worker's space between calls and takes it back by OOM on the next
-        one."""
-        assert R.entitlement(4 * GIB) == R.CONTEXT_FLOOR_BYTES + 4 * GIB
-
-    def test_negative_and_none_are_floored_not_subtracted(self):
-        """Catches: a bad reading reducing the entitlement below the floor."""
-        assert R.entitlement(-5) == R.CONTEXT_FLOOR_BYTES
-        assert R.entitlement(None) == R.CONTEXT_FLOOR_BYTES
-
-
 class TestCharge:
-    def test_device_wide_charges_only_the_unheld_headroom(self):
-        """THE double-book. On Linux cudaMemGetInfo already reports worker
-        VRAM, so charging residency again removed 8.9 GiB of usable card in
-        measurement. Only what the worker will take BEYOND what it holds is
-        new information to the host."""
-        entitled = R.entitlement(6 * GIB)
-        assert R.charge(entitled, 6 * GIB, process_local_free=False) == \
-            R.CONTEXT_FLOOR_BYTES
+    """The rule is one sentence: declare only what the host cannot see. That
+    makes every charge a measurement, never a prediction."""
 
-    def test_windows_charges_the_whole_entitlement(self):
-        """Catches: applying the Linux rule everywhere. On WDDM the host's
-        reading is per process, so the worker is invisible and nothing would
-        be reserved at all."""
-        entitled = R.entitlement(6 * GIB)
-        assert R.charge(entitled, 6 * GIB, process_local_free=True) == entitled
+    def test_a_device_wide_host_is_told_nothing(self):
+        """Catches the old high-water design, and any return of it. On Linux
+        cudaMemGetInfo already excludes every byte a worker holds, models and
+        CUDA context alike, so anything we add here is booked twice and the
+        host runs on a card smaller than the one it has."""
+        assert R.charge(6 * GIB, process_local_free=False) == 0
+        assert R.charge(0, process_local_free=False) == 0
 
-    def test_an_idle_worker_still_charges_on_both_platforms(self):
-        """Catches: charging nothing once a worker has released. The context
-        is still held and the worker will need its high-water again."""
-        entitled = R.entitlement(6 * GIB)
-        assert R.charge(entitled, 0, False) == entitled
-        assert R.charge(entitled, 0, True) == entitled
+    def test_windows_is_told_exactly_what_the_worker_holds_now(self):
+        """Catches: applying the device-wide rule on WDDM, where the host's
+        reading is its own budget and shows nothing of a sibling, so a
+        charge of zero means the host believes it owns the whole card."""
+        assert R.charge(6 * GIB, process_local_free=True) == \
+            R.CONTEXT_FLOOR_BYTES + 6 * GIB
 
-    def test_residency_above_entitlement_never_goes_negative(self):
-        """Catches: a negative charge quietly reducing another worker's."""
-        assert R.charge(R.entitlement(1 * GIB), 99 * GIB, False) == 0
+    def test_windows_books_the_context_of_a_worker_holding_no_model(self):
+        """Catches: charging nothing for a live worker with nothing loaded.
+        Its CUDA context is on the card either way, and on WDDM the host
+        cannot see that either."""
+        assert R.charge(0, process_local_free=True) == R.CONTEXT_FLOOR_BYTES
+
+    def test_junk_residency_never_produces_a_negative_charge(self):
+        assert R.charge(-5, process_local_free=True) == R.CONTEXT_FLOOR_BYTES
+        assert R.charge(None, process_local_free=True) == R.CONTEXT_FLOOR_BYTES
+
+    def test_there_is_no_forecast_term_left(self):
+        """Catches a reintroduced high water mark by its signature: the
+        charge must depend only on what is true now, so calling twice with
+        the same residency after a spike must not remember the spike."""
+        first = R.charge(8 * GIB, process_local_free=True)
+        R.charge(20 * GIB, process_local_free=True)
+        assert R.charge(8 * GIB, process_local_free=True) == first
 
 
 class TestTotalReserve:

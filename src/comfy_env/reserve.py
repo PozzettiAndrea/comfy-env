@@ -38,31 +38,34 @@ CONTEXT_FLOOR_BYTES = 300 * 1024 * 1024
 AIMDO_DEFAULT_HEADROOM = 256 * 1024 * 1024
 
 
-def entitlement(highwater, floor=CONTEXT_FLOOR_BYTES):
-    """What one worker is entitled to hold: its context plus its high-water
-    residency.
-
-    High-water rather than current, because the reserve exists to stop the
-    host taking memory a worker is ABOUT to need again. A worker that has
-    held 6 GiB once will hold it again on its next call, and a reserve that
-    tracked current residency would hand that space to the host between
-    calls and take it back by OOM.
-    """
-    return int(floor) + max(0, int(highwater or 0))
-
-
-def charge(entitled, residency, process_local_free):
+def charge(residency, process_local_free, floor=CONTEXT_FLOOR_BYTES):
     """What to add to the reserve for one worker.
 
-    ``process_local_free`` says whether the host's free-VRAM reading is
-    per process (Windows WDDM) or device wide (everything else). Device
-    wide means the host already sees ``residency``, so charging it again
-    double books; only the headroom beyond it is new information.
+    Only what the host physically CANNOT SEE. That is the whole rule, and it
+    makes the answer a measurement rather than a prediction.
+
+    On a device wide platform (Linux, macOS) ``cudaMemGetInfo`` reports free
+    memory for the whole card, so every byte a worker holds is already
+    missing from the host's own reading: its models AND its CUDA context.
+    There is nothing left to declare, so the charge is zero and the host
+    simply sees the truth.
+
+    On Windows WDDM the reading is the calling process's own budget and
+    shows nothing of any sibling, so the charge is what the worker holds
+    right now plus its context, measured, not forecast.
+
+    There used to be a high water term here, reserving what a worker had
+    peaked at on the theory that it would want that much again. It was a
+    forecast from one observation, wrong in both directions: a pack that
+    spiked once had that space held against it until it went idle, and a
+    pack about to need far more got nothing. What replaces it is not a
+    better forecast, it is the model proxy: the host can take memory back
+    from a worker when it actually needs it, so it does not have to be
+    stopped from taking it in advance.
     """
-    entitled = max(0, int(entitled))
-    if process_local_free:
-        return entitled
-    return max(0, entitled - max(0, int(residency or 0)))
+    if not process_local_free:
+        return 0
+    return int(floor) + max(0, int(residency or 0))
 
 
 def total_reserve(base, charges, device_total=None):

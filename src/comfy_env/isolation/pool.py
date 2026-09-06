@@ -302,10 +302,10 @@ def _true_device_free(device) -> "int | None":
 #: --reserve-vram instruction: comfy-env ADDS to it and must never lose it.
 _RESERVE_BASE = None
 _RESERVE_PUBLISHED = 0
-#: Per-worker high-water residency. High-water rather than current, because
-#: the reserve exists to stop the host taking space a worker is about to need
-#: again; see reserve.entitlement.
-_RESERVE_HIGHWATER: Dict[str, int] = {}
+#: What each worker currently holds on the card, as IT measured it. Current,
+#: not a high water mark: the reserve declares only what the host cannot see,
+#: and reclaim from a worker is what covers the rest.
+_WORKER_HELD: Dict[str, int] = {}
 
 
 #: When each worker last finished a call, for the idle release policy.
@@ -410,7 +410,7 @@ def _release_idle_workers() -> None:
                 "advertises": getattr(worker, "supports_full_release", False),
                 "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
                 "idle_since": _LAST_ACTIVITY.get(key),
-                "holding": _RESERVE_HIGHWATER.get(key, 0) > 0,
+                "holding": _WORKER_HELD.get(key, 0) > 0,
                 "last_prompt": _LAST_PROMPT.get(key),
             }
         due = state_sync.plan_idle_release(
@@ -427,7 +427,7 @@ def _release_idle_workers() -> None:
             if reply == "busy":
                 continue
             receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
-            _RESERVE_HIGHWATER[key] = 0
+            _WORKER_HELD[key] = 0
             _LAST_ACTIVITY[key] = time.monotonic()
             _LAST_PROMPT.pop(key, None)
             _log(f"[comfy-env] idle release: {Path(key).name} gave back "
@@ -465,11 +465,9 @@ def _worker_charges() -> Dict[str, int]:
                         patcher.model, "model_loaded_weight_memory", 0))
                 except Exception:
                     pass
-        high = max(_RESERVE_HIGHWATER.get(key, 0), residency)
-        _RESERVE_HIGHWATER[key] = high
-        charges[key] = reserve.charge(
-            reserve.entitlement(high, floor=_WORKER_FIXED_VRAM_COST),
-            residency, process_local)
+        _WORKER_HELD[key] = residency
+        charges[key] = reserve.charge(residency, process_local,
+                                      floor=_WORKER_FIXED_VRAM_COST)
     return charges
 
 
@@ -619,7 +617,7 @@ def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
             "alive": worker.is_alive(),
             "advertises": getattr(worker, "supports_partial_release", False),
             "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
-            "held": _RESERVE_HIGHWATER.get(key, 0),
+            "held": _WORKER_HELD.get(key, 0),
         }
     plan = state_sync.plan_pressure_release(states, shortfall,
                                             requester=str(requester_key)
@@ -638,9 +636,9 @@ def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
         receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
         freed = int((receipt or {}).get("freed_bytes", 0))
         freed_total += freed
-        # The high-water is now a forecast the worker has disproved: it let
-        # this much go on request, so the reserve may follow it down.
-        _RESERVE_HIGHWATER[key] = max(0, _RESERVE_HIGHWATER.get(key, 0) - freed)
+        # The worker measured this much gone, so our copy of what it holds
+        # follows. The next census overwrites it either way.
+        _WORKER_HELD[key] = max(0, _WORKER_HELD.get(key, 0) - freed)
         _log(f"[comfy-env] admission ask: {Path(key).name} gave back "
              f"{freed / 1e9:.2f}GB of {ask / 1e9:.2f}GB asked")
     if freed_total:
@@ -694,12 +692,12 @@ def _publish_reserve(shrink_allowed: bool = False) -> int:
 
 
 def _forget_reserve(env_dir) -> None:
-    """Drop a dead worker's high-water so its space returns to the host.
+    """Drop a dead worker's residency so its space returns to the host.
 
-    Called on real worker removal only. A restart keeps nothing: the new
-    worker starts at the context floor and earns its high-water again.
+    Called on real worker removal only, because a dead worker's memory is
+    gone with it and nothing should still be declared for it.
     """
-    _RESERVE_HIGHWATER.pop(str(env_dir), None)
+    _WORKER_HELD.pop(str(env_dir), None)
 
 
 def _worker_held_bytes() -> int:

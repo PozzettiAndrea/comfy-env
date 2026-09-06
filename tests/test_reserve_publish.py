@@ -30,7 +30,7 @@ def pool_mod(monkeypatch):
     from comfy_env.isolation import pool
     monkeypatch.setattr(pool, "_RESERVE_BASE", None)
     monkeypatch.setattr(pool, "_RESERVE_PUBLISHED", 0)
-    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {})
+    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     monkeypatch.setattr(pool, "_WORKER_POOL", {})
     monkeypatch.setattr(pool, "_device_total_bytes", lambda: 24 * GB)
     monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: False)
@@ -78,22 +78,17 @@ class TestPublish:
             pool._publish_reserve()
         assert mm.EXTRA_RESERVED_VRAM == first
 
-    def test_an_idle_worker_still_reserves_its_context(self, pool_mod):
-        """Catches: charging nothing for a worker holding no model. Its CUDA
-        context is real and the host taking that space OOMs its next call."""
-        pool, _ = pool_mod
-        _add_worker(pool, "a", loaded=0)
-        assert pool._publish_reserve() > 400 * 1024 ** 2
-
-    def test_a_dead_worker_is_not_charged(self, pool_mod):
-        """Catches: reserving for a process that no longer exists, which
-        shrinks the card permanently after any crash."""
-        pool, _ = pool_mod
-        _add_worker(pool, "a", loaded=4 * GB, alive=False)
-        pool._publish_reserve()
-        _add_worker(pool, "b", loaded=0)
-        with_live_only = pool._publish_reserve(shrink_allowed=True)
-        assert with_live_only < 4 * GB
+    def test_a_device_wide_host_is_told_nothing_at_all(self, pool_mod):
+        """The whole rule, at the publish level: on Linux cudaMemGetInfo
+        already excludes a worker's models AND its CUDA context, so there is
+        nothing to declare and the published number is the operator's own
+        --reserve-vram, untouched. Catches any charge creeping back in,
+        including the old high water forecast and the context floor, both of
+        which the host can already see."""
+        pool, mm = pool_mod
+        _add_worker(pool, "a", loaded=6 * GB)
+        assert pool._publish_reserve() == 400 * 1024 ** 2
+        assert mm.EXTRA_RESERVED_VRAM == 400 * 1024 ** 2
 
     def test_residency_is_not_double_booked_on_device_wide_platforms(self, pool_mod):
         """Catches the 8.9 GiB bug: on Linux the host already sees resident
@@ -104,7 +99,7 @@ class TestPublish:
         published = pool._publish_reserve()
         assert published < 400 * 1024 ** 2 + 6 * GB
 
-    def test_windows_charges_the_whole_entitlement(self, pool_mod, monkeypatch):
+    def test_windows_charges_what_the_worker_holds_now(self, pool_mod, monkeypatch):
         """Catches: applying the device-wide rule on WDDM, where the host
         cannot see the worker at all and would reserve nothing for it."""
         pool, _ = pool_mod
@@ -114,47 +109,34 @@ class TestPublish:
 
 
 class TestShrinkRule:
-    def test_protection_is_constant_as_residency_moves(self, pool_mod):
-        """The property that matters, which is NOT "the number never falls".
-
-        On a device-wide platform the host already sees resident worker VRAM,
-        so the charge is the headroom beyond it. As a worker's residency
-        drops, the host starts seeing that space as free, and the charge must
-        RISE by the same amount to keep the worker's entitlement protected.
-        Catches: a charge that ignores residency (the double book) or one
-        that falls with it (handing the host space the worker still needs).
-        """
+    def test_a_device_wide_charge_does_not_move_with_residency(self, pool_mod):
+        """The old design made the charge RISE as a worker's residency fell,
+        to keep protecting space it might want back. That was the forecast,
+        and it is gone: the host sees residency directly, and takes memory
+        back through the model proxies when it needs it. Catches the forecast
+        returning in the form of a residency-sensitive charge."""
         pool, _ = pool_mod
         _add_worker(pool, "a", loaded=6 * GB)
         busy = pool._publish_reserve()
         pool._WORKER_PATCHERS["a"] = {"m": _Patcher(0)}
         idle = pool._publish_reserve()
-        # busy: host sees 6 GB held, we add the context floor.
-        # idle: host sees nothing held, we add the whole entitlement.
-        assert idle - busy == 6 * GB
+        assert idle == busy
 
     def test_a_lower_proposal_is_refused_without_a_receipt(self, pool_mod):
         """The shrink rule itself: a proposal below what is published needs
         evidence the memory is actually back, because a reserve that drops
         early is space the host loads straight into."""
         pool, _ = pool_mod
-        _add_worker(pool, "a", loaded=0)
+        # Only the process-local branch publishes a charge at all now, so
+        # that is where a shrink can be observed.
+        pool._blind_free_is_process_local = lambda: True
+        _add_worker(pool, "a", loaded=2 * GB)
         pool._publish_reserve()
         published = pool._RESERVE_PUBLISHED
         pool._WORKER_POOL.clear()
         pool._WORKER_PATCHERS.clear()
         assert pool._publish_reserve(shrink_allowed=False) == published
         assert pool._publish_reserve(shrink_allowed=True) < published
-
-    def test_high_water_survives_a_drop_to_zero(self, pool_mod):
-        """Catches: tracking current residency, which hands the host the
-        worker's space between calls."""
-        pool, _ = pool_mod
-        _add_worker(pool, "a", loaded=6 * GB)
-        pool._publish_reserve()
-        pool._WORKER_PATCHERS["a"] = {"m": _Patcher(0)}
-        pool._publish_reserve()
-        assert pool._RESERVE_HIGHWATER["a"] >= 6 * GB
 
     def test_removal_is_what_returns_the_space(self, pool_mod):
         """The one legitimate shrink: the process is gone, so the memory is
@@ -167,7 +149,7 @@ class TestShrinkRule:
         pool._WORKER_PATCHERS.pop("a", None)
         pool._forget_reserve("a")
         assert pool._publish_reserve(shrink_allowed=True) == 400 * 1024 ** 2
-        assert "a" not in pool._RESERVE_HIGHWATER
+        assert "a" not in pool._WORKER_HELD
 
 
 def test_publish_never_raises_without_comfy(monkeypatch):
@@ -247,7 +229,6 @@ class TestPagerForward:
         monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
         pool._publish_reserve()
         assert control.calls == []
-        assert mm.EXTRA_RESERVED_VRAM > 400 * 1024 ** 2
 
     def test_falls_back_to_the_raw_export_before_aimdo_107(self, pool_mod, aimdo_stub, monkeypatch):
         """Catches: requiring the Python wrapper (comfy-aimdo #107). Every
@@ -272,6 +253,7 @@ class TestPagerForward:
         def boom(b):
             raise RuntimeError("comfy-aimdo is not initialized")
         control.set_simple_vram_headroom = boom
+        monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: True)
         monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
         published = pool._publish_reserve()
         assert published > 400 * 1024 ** 2

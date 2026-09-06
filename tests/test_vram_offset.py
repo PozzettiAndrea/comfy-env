@@ -272,7 +272,7 @@ def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
     pool, mm, calls = pool_mod
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
-    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {})
+    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     pool._WORKER_PATCHERS.clear()
 
     class _W:
@@ -292,7 +292,8 @@ def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
     own = calls["free_memory"][0]
 
     # Fixture is process local (WDDM branch), so the charge is the whole
-    # entitlement: context floor plus the 2 GB high water.
+    # Fixture is process local (the WDDM branch), so the charge is the
+    # context floor plus what the worker holds right now.
     expected_charge = pool._WORKER_FIXED_VRAM_COST + 2 * GB
     assert stranger - own == expected_charge
 
@@ -315,7 +316,8 @@ class _AskWorker:
 def _ask_fixture(pool, monkeypatch, workers, free_after_evict):
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
     monkeypatch.setattr(pool, "_WORKER_POOL", {k: (w, 1) for k, w in workers.items()})
-    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {k: 8 * GB for k in workers})
+    monkeypatch.setattr(pool, "_WORKER_HELD", {k: 8 * GB for k in workers})
+    monkeypatch.setattr(pool, "_worker_charges", lambda: {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: free_after_evict)
     monkeypatch.setattr(pool, "_publish_reserve", lambda **kw: 0)
     pool._WORKER_PATCHERS.clear()
@@ -368,7 +370,7 @@ def test_a_freed_receipt_lowers_that_workers_high_water(pool_mod, monkeypatch):
 
     pool._ask_idle_workers(4 * GB, requester_key="req")
 
-    assert pool._RESERVE_HIGHWATER["idle"] == 5 * GB
+    assert pool._WORKER_HELD["idle"] == 5 * GB
 
 
 def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
@@ -380,7 +382,7 @@ def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
     pool, mm, calls = pool_mod
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
-    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {})
+    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     pool._WORKER_PATCHERS.clear()
 
     class _W:
