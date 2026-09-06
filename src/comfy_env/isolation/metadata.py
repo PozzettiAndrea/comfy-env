@@ -1385,7 +1385,12 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
         if _DBG_VRAM:
             _log_vram(f"After {node_name}")
         return result
-    except (RuntimeError, ConnectionError) as te:
+    # TimeoutError is an OSError, not a RuntimeError, so it was declining this
+    # clause and skipping _remove_worker entirely: the pool entry, the temp
+    # dir, the socket and the worker's _WORKER_HELD reserve all survived a
+    # worker that had just been killed, and the reserve never shrank because
+    # node boundary republishes refuse to lower without a receipt.
+    except (RuntimeError, ConnectionError, TimeoutError) as te:
         # Always on: a worker teardown is the single most consequential
         # event in this file and used to be silent. Name the env and the
         # exception class so a user's log shows WHICH worker died and why.

@@ -967,3 +967,40 @@ class TestRegistrationDrainOrdering:
             "above the drain or the registrations it skips are lost forever")
         assert body.index("get_torch_device") < drain, (
             "the device lookup must happen before the drain, not after")
+
+
+class TestContractGateStaysArmed:
+    """ADR-0008 says fail loudly on correctness. Loudly ONCE is not loudly."""
+
+    def test_the_verdict_is_cached_not_the_fact_of_checking(self, monkeypatch):
+        """Catches the shipped gate: `_CONTRACT_CHECKED = True` was set BEFORE
+        the check ran, so a FATAL gap raised on the first node execution and
+        was silently skipped on every one after. The user presses Queue again,
+        it "works", and every VRAM decision for the rest of the session is
+        computed against a host that cannot support the floor.
+        """
+        import pytest as _pytest
+        from comfy_env import contract
+        from comfy_env.isolation import pool
+
+        monkeypatch.setattr(pool, "_CONTRACT_VERDICT", None)
+        monkeypatch.setattr(pool, "_log", lambda m: None)
+        monkeypatch.setattr(contract, "check",
+                            lambda **k: (False, ["EXTRA_RESERVED_VRAM gone"], []))
+        for attempt in range(3):
+            with _pytest.raises(RuntimeError, match="cannot manage memory"):
+                pool._check_host_contract()
+
+    def test_a_pass_is_not_rechecked(self, monkeypatch):
+        """The caching still has to work: this runs at every worker creation."""
+        from comfy_env import contract
+        from comfy_env.isolation import pool
+
+        calls = []
+        monkeypatch.setattr(pool, "_CONTRACT_VERDICT", None)
+        monkeypatch.setattr(pool, "_log", lambda m: None)
+        monkeypatch.setattr(contract, "check",
+                            lambda **k: (calls.append(1), (True, [], []))[1])
+        for _ in range(3):
+            pool._check_host_contract()
+        assert len(calls) == 1

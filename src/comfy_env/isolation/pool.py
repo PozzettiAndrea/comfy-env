@@ -1356,7 +1356,10 @@ def broadcast_pin_release(target_bytes: int) -> None:
         threading.Thread(target=_ask_one, args=(key, size), daemon=True).start()
 
 
-_CONTRACT_CHECKED = False
+#: The cached host contract verdict as (ok, failures, notes), or None
+#: before the first check. The VERDICT is cached, not the fact of checking,
+#: so a failure keeps failing.
+_CONTRACT_VERDICT = None
 
 
 def _check_host_contract() -> None:
@@ -1369,24 +1372,33 @@ def _check_host_contract() -> None:
 
     Never patches, wraps or otherwise touches ComfyUI: this only reads.
     """
-    global _CONTRACT_CHECKED
+    # Cache the VERDICT, never a bare "already checked". Setting a flag before
+    # running the check meant a FATAL gap raised on the first node execution
+    # and was silently skipped on every one after it: the user pressed Queue
+    # again, it "worked", and every VRAM decision for the rest of the session
+    # was computed against a host that cannot support the floor. A correctness
+    # gate that disarms after firing once is worse than no gate, because the
+    # single traceback reads like a transient.
+    global _CONTRACT_VERDICT
     with _INSTALL_LOCK:
-        if _CONTRACT_CHECKED:
-            return
-        _CONTRACT_CHECKED = True
-    try:
-        from .. import contract
-        ok, failures, notes = contract.check(
-            side=contract.HOST, tiers=(contract.FLOOR,))
-    except Exception as exc:
-        _log(f"[comfy-env] contract check skipped: {exc}")
-        return
-    for note in notes:
-        _log(f"[comfy-env] host contract: {note}")
-    if not ok:
+        verdict = _CONTRACT_VERDICT
+        if verdict is None:
+            try:
+                from .. import contract
+                ok, failures, notes = contract.check(
+                    side=contract.HOST, tiers=(contract.FLOOR,))
+                verdict = (ok, tuple(failures), tuple(notes))
+            except Exception as exc:
+                # Availability, not correctness: no contract module, no verdict.
+                _log(f"[comfy-env] contract check skipped: {exc}")
+                verdict = (True, (), ())
+            _CONTRACT_VERDICT = verdict
+            for note in verdict[2]:
+                _log(f"[comfy-env] host contract: {note}")
+    if not verdict[0]:
         raise RuntimeError(
             "comfy-env cannot manage memory against this ComfyUI: "
-            + "; ".join(failures)
+            + "; ".join(verdict[1])
         )
 
 
