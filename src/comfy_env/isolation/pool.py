@@ -1755,6 +1755,23 @@ def _register_new_patchers(env_dir, worker, generation):
     # straight into. Shrinking waits for _forget_reserve on a real removal.
     _publish_reserve(shrink_allowed=False)
 
+    # Everything that can fail happens BEFORE the drain. Draining first and
+    # then returning early loses those registrations for good: the weights are
+    # resident on the card, they have no patcher, they are not in
+    # current_loaded_models, they are invisible to _worker_charges and
+    # _worker_held_bytes, and nothing can ever evict them. Silently, because
+    # the early return had no log either.
+    try:
+        import comfy.model_management
+
+        from .model_patcher import SubprocessModelPatcher
+        load_device = comfy.model_management.get_torch_device()
+        offload_device = comfy.model_management.unet_offload_device()
+    except Exception as exc:
+        _log(f"[comfy-env] cannot register worker models, leaving them queued "
+             f"for the next node boundary: {exc}")
+        return
+
     # Drain: _send_request ACCUMULATES registrations (so no path drops them and
     # no interleaved command wipes them); this is the single consumer.
     new_models = list(getattr(worker, '_last_new_models', []))
@@ -1763,15 +1780,6 @@ def _register_new_patchers(env_dir, worker, generation):
     except Exception:
         pass
     if not new_models:
-        return
-
-    from .model_patcher import SubprocessModelPatcher
-
-    try:
-        import comfy.model_management
-        load_device = comfy.model_management.get_torch_device()
-        offload_device = comfy.model_management.unet_offload_device()
-    except Exception:
         return
 
     key = str(env_dir)

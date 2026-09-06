@@ -942,3 +942,28 @@ class TestTrueDeviceFreeLadder:
                 raise RuntimeError("no index for you")
 
         pool._true_device_free(Hostile())  # must not raise
+
+
+class TestRegistrationDrainOrdering:
+    """The drain of _last_new_models is destructive and has exactly one
+    consumer, so anything that can fail must fail before it."""
+
+    def test_nothing_that_can_return_sits_after_the_drain(self):
+        """Catches the shipped ordering: drain, then look up the torch device,
+        then `return` on any exception. Those registrations are gone for good.
+        The weights stay resident on the card with no patcher, absent from
+        current_loaded_models, invisible to _worker_charges and
+        _worker_held_bytes, unevictable by either side, and with no log line,
+        because the early return had none either.
+        """
+        src = (Path(__file__).parent.parent / "src" / "comfy_env" / "isolation"
+               / "pool.py").read_text(encoding="utf-8")
+        body = src.split("def _register_new_patchers(", 1)[1].split("\ndef ", 1)[0]
+        drain = body.index("_last_new_models = []")
+        after = body[drain:]
+        # The only legal early return after the drain is the empty check.
+        assert after.count("return") <= 1, (
+            "something after the destructive drain can return early; move it "
+            "above the drain or the registrations it skips are lost forever")
+        assert body.index("get_torch_device") < drain, (
+            "the device lookup must happen before the drain, not after")
