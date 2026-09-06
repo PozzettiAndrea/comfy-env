@@ -257,6 +257,64 @@ def _blind_free_is_process_local() -> bool:
     return state_sync.blind_free_is_process_local(sys.platform)
 
 
+#: The NVML library handle and its init state, kept for the life of the
+#: process. nvmlInit is not free, and the rung it feeds runs on the admission
+#: path, so initialising per call was a measurable part of what this used to
+#: cost. None means not tried yet; False means tried and unavailable.
+_NVML_LIB = None
+
+
+def _nvml():
+    """libnvidia-ml by ctypes, initialised once. False when unavailable.
+
+    comfy-aimdo does exactly this and gets a device wide reading on every
+    platform without a Python dependency, because NVML ships with the driver
+    that is already required for any of this to run. pynvml is itself only a
+    ctypes wrapper over the same library, so depending on it would buy nothing
+    but a package that nothing else in the stack installs.
+    """
+    global _NVML_LIB
+    if _NVML_LIB is not None:
+        return _NVML_LIB
+    import ctypes
+    import ctypes.util
+    names = (["nvml.dll"] if os.name == "nt" else
+             ["libnvidia-ml.so.1", "libnvidia-ml.so"])
+    for name in names:
+        try:
+            lib = (ctypes.WinDLL(name) if os.name == "nt"
+                   else ctypes.CDLL(name))
+        except OSError:
+            continue
+        try:
+            if lib.nvmlInit_v2() != 0:
+                continue
+        except Exception:
+            continue
+        _NVML_LIB = lib
+        return lib
+    _NVML_LIB = False
+    return False
+
+
+def _device_pci_bus_id(device):
+    """The PCI bus id CUDA knows this device by, as NVML spells it.
+
+    NOT the device index. Under CUDA_VISIBLE_DEVICES the CUDA index and the
+    NVML index are different devices, so asking NVML or nvidia-smi for index 0
+    can return a different card's free memory than the one torch is using.
+    Both rungs below used the index before this was noticed.
+    """
+    try:
+        import torch
+        idx = device.index if getattr(device, "index", None) is not None else 0
+        p = torch.cuda.get_device_properties(idx)
+        return "%08X:%02X:%02X.0" % (p.pci_domain_id, p.pci_bus_id,
+                                     p.pci_device_id)
+    except Exception:
+        return None
+
+
 def _true_device_free(device) -> "int | None":
     """Device-wide free VRAM, across processes. None if unobtainable.
 
@@ -266,7 +324,8 @@ def _true_device_free(device) -> "int | None":
     13,443 MB while the parent's mem_get_info fell 75 MB. Every admission
     decision made from that number is fiction on the majority platform.
 
-    Ladder: pynvml -> nvidia-smi -> None (caller falls back to its own ledger).
+    Ladder: NVML by ctypes -> pynvml -> nvidia-smi -> None (caller falls
+    back to its own ledger).
 
     In practice the first rung is usually absent: pynvml is not a dependency
     of comfy-env, ComfyUI or comfy-aimdo, so the common case is the subprocess.
@@ -281,12 +340,35 @@ def _true_device_free(device) -> "int | None":
     mem_get_info moved zero. The pager sees the card; ComfyUI does not; nothing
     forwards the pager's view to ComfyUI.
     """
+    import ctypes
+
+    bus_id = _device_pci_bus_id(device)
+    lib = _nvml()
+    if lib is not False and bus_id:
+        try:
+            class _Mem(ctypes.Structure):
+                _fields_ = [("total", ctypes.c_ulonglong),
+                            ("free", ctypes.c_ulonglong),
+                            ("used", ctypes.c_ulonglong)]
+
+            h = ctypes.c_void_p()
+            rc = lib.nvmlDeviceGetHandleByPciBusId_v2(
+                bus_id.encode("ascii"), ctypes.byref(h))
+            if rc == 0:
+                m = _Mem()
+                if lib.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) == 0:
+                    return int(m.free)
+        except Exception:
+            pass
+
     try:
         import pynvml
         pynvml.nvmlInit()
         try:
-            idx = device.index if getattr(device, "index", None) is not None else 0
-            h = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            h = (pynvml.nvmlDeviceGetHandleByPciBusId(bus_id.encode("ascii"))
+                 if bus_id else pynvml.nvmlDeviceGetHandleByIndex(
+                     device.index if getattr(device, "index", None) is not None
+                     else 0))
             return int(pynvml.nvmlDeviceGetMemoryInfo(h).free)
         finally:
             try:
@@ -297,9 +379,11 @@ def _true_device_free(device) -> "int | None":
         pass
     try:
         import subprocess as _sp
-        idx = device.index if getattr(device, "index", None) is not None else 0
+        target = bus_id or str(device.index
+                               if getattr(device, "index", None) is not None
+                               else 0)
         out = _sp.run(
-            ["nvidia-smi", f"--id={idx}", "--query-gpu=memory.free",
+            ["nvidia-smi", f"--id={target}", "--query-gpu=memory.free",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=3)
         if out.returncode == 0 and out.stdout.strip():

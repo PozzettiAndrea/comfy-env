@@ -881,3 +881,64 @@ class TestLedgerEntryIsNeverCurrentlyUsed:
         assert "lm.currently_used = False" in body, (
             "the entry must be inserted with currently_used False; anything "
             "else reopens loaded_models(only_currently_used=True) to the fake")
+
+
+class TestTrueDeviceFreeLadder:
+    """Device wide free VRAM. The ladder is on the admission path, so what it
+    costs and which card it asks about both matter."""
+
+    def test_nvml_is_loaded_once_not_per_call(self):
+        """Catches the shipped implementation: pynvml.nvmlInit() and
+        nvmlShutdown() around every single read. Initialising NVML per call is
+        most of what made this rung expensive, and it runs on every admission
+        decision that needs a true device figure."""
+        src = (Path(__file__).parent.parent / "src" / "comfy_env" / "isolation"
+               / "pool.py").read_text(encoding="utf-8")
+        body = src.split("def _nvml(", 1)[1].split("\ndef ", 1)[0]
+        assert "global _NVML_LIB" in body and "_NVML_LIB is not None" in body, (
+            "_nvml must cache the handle for the life of the process")
+        assert "nvmlShutdown" not in body, (
+            "shutting NVML down means the next call pays nvmlInit again")
+
+    def test_every_rung_addresses_the_card_not_the_index(self):
+        """Catches asking NVML or nvidia-smi for device INDEX 0.
+
+        Under CUDA_VISIBLE_DEVICES the CUDA index and the NVML index are
+        different physical cards, so an index-addressed rung silently reports
+        a card torch is not using. Both rungs did this before.
+        """
+        src = (Path(__file__).parent.parent / "src" / "comfy_env" / "isolation"
+               / "pool.py").read_text(encoding="utf-8")
+        body = src.split("def _true_device_free(", 1)[1].split("\ndef ", 1)[0]
+        assert "nvmlDeviceGetHandleByPciBusId_v2" in body
+        assert "nvmlDeviceGetHandleByIndex(" not in body.split(
+            "import pynvml", 1)[0], "the ctypes rung must not use an index"
+        assert "--id={target}" in body, (
+            "the nvidia-smi rung must address the resolved bus id")
+
+    def test_it_degrades_to_none_rather_than_raising(self, monkeypatch):
+        """Catches letting a missing driver library escape into the admission
+        path: _handle_vram_budget calls this and must get None, not an
+        exception, on a box with no NVML and no nvidia-smi at all."""
+        import subprocess
+        from comfy_env.isolation import pool
+
+        def _no_smi(*a, **k):
+            raise FileNotFoundError("nvidia-smi")
+
+        monkeypatch.setattr(pool, "_NVML_LIB", False)
+        monkeypatch.setattr(pool, "_device_pci_bus_id", lambda d: None)
+        monkeypatch.setattr(subprocess, "run", _no_smi)
+        assert pool._true_device_free(object()) is None
+
+    def test_it_never_raises_even_with_a_hostile_device(self, monkeypatch):
+        """The real contract. This runs inside the worker's budget callback;
+        an exception here fails the load rather than degrading it."""
+        from comfy_env.isolation import pool
+
+        class Hostile:
+            @property
+            def index(self):
+                raise RuntimeError("no index for you")
+
+        pool._true_device_free(Hostile())  # must not raise
