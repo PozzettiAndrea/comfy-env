@@ -432,135 +432,33 @@ class TestApplyReserveBootstrap:
         assert apply_reserve_bootstrap("1024") is False
 
 
-class TestAimdoProtocolLevel:
-    """Compatibility is a property of the protocol, not the version string."""
-
-    def test_level_rises_with_the_kwargs_the_wheel_accepts(self):
-        """Catches: a hardcoded version-to-level table, which is stale within
-        the month at three comfy-aimdo releases per month."""
-        from comfy_env.memory_manager import aimdo_protocol_level
-        assert aimdo_protocol_level((), False) == 1
-        assert aimdo_protocol_level(("simple_vram_headroom",), False) == 2
-        assert aimdo_protocol_level((), True) == 2
-        assert aimdo_protocol_level(
-            ("simple_vram_headroom", "nvml_pressure"), True) == 3
-
-    def test_implementation_kwarg_alone_is_not_a_level(self):
-        """Catches: counting any parameter as a capability. `implementation`
-        exists at every level and says nothing about the device protocol."""
-        from comfy_env.memory_manager import aimdo_protocol_level
-        assert aimdo_protocol_level(("implementation",), False) == 1
-
-
-class TestAimdoSkewVerdict:
-    def test_same_level_different_patch_versions_is_allowed(self):
-        """THE bug this replaces. Exact-version equality stranded two of
-        nineteen live worker envs on the legacy ledger because their host had
-        moved 0.4.13 to 0.4.15, wheels whose Python shims are byte identical
-        apart from _version.py."""
-        from comfy_env.memory_manager import aimdo_skew_verdict
-        ok, why = aimdo_skew_verdict(3, 3, "0.4.13", "0.4.15")
-        assert ok and why is None
-
-    def test_level_difference_is_refused_and_names_both_sides(self):
-        """Catches: allowing a cross-level pair, where one side silently pages
-        under a policy the other does not apply."""
-        from comfy_env.memory_manager import aimdo_skew_verdict
-        ok, why = aimdo_skew_verdict(2, 3, "0.4.10", "0.4.15")
-        assert not ok
-        assert "0.4.10" in why and "0.4.15" in why and "2" in why and "3" in why
-
-    def test_unknown_parent_level_degrades_to_allowing(self):
-        """Catches: treating a missing parent level as level 0 and refusing
-        every worker whose parent predates this signal."""
-        from comfy_env.memory_manager import aimdo_skew_verdict
-        assert aimdo_skew_verdict(3, None)[0] is True
-
-    def test_zero_is_a_level_not_a_missing_value(self):
-        """Catches: `if not parent_level`, which would treat a genuine 0 the
-        same as absent."""
-        from comfy_env.memory_manager import aimdo_skew_verdict
-        assert aimdo_skew_verdict(3, 0)[0] is False
-
-
-class TestAimdoSkewSeam:
-    def test_the_guard_never_compares_version_strings(self):
-        """Catches: the exact-equality guard returning. The verdict must come
-        from the protocol level; the version strings are diagnostics only."""
-        import ast
-        src = Path("src/comfy_env/memory_manager.py").read_text(encoding="utf-8")
-        fn = next(n for n in ast.walk(ast.parse(src))
-                  if isinstance(n, ast.FunctionDef) and n.name == "maybe_enable_aimdo")
-        for node in ast.walk(fn):
-            if isinstance(node, ast.Compare):
-                text = ast.unparse(node)
-                assert not ("installed" in text and "wanted" in text), (
-                    "maybe_enable_aimdo compares version strings again: " + text)
-        assert "aimdo_skew_verdict" in ast.unparse(fn)
-
-    def test_parent_exports_the_level_beside_the_version(self):
-        """Catches: exporting only the version, which leaves every worker with
-        an unknown parent level and the guard permanently inert."""
-        import ast
-        src = Path("src/comfy_env/isolation/workers/subprocess.py").read_text(
-            encoding="utf-8")
-        assert "LEVEL_ENV_VAR" in src
-        tree = ast.parse(src)
-        assigns = [ast.unparse(n) for n in ast.walk(tree)
-                   if isinstance(n, ast.Assign)]
-        assert any("LEVEL_ENV_VAR" in a and "aimdo_installed_level" in a
-                   for a in assigns), "parent never computes its own level"
-
-    def test_host_derived_level_yields_to_an_operator_override(self):
-        """Catches: an unconditional `env[LEVEL_ENV_VAR] = ...`, which the
-        surrounding block's own comment forbids ("an operator who pinned a
-        value there outranks the host-derived one") and which also makes the
-        guard untestable, since a harness cannot inject a parent level."""
-        import ast
-        src = Path("src/comfy_env/isolation/workers/subprocess.py").read_text(
-            encoding="utf-8")
-        tree = ast.parse(src)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            target = ast.unparse(node.targets[0])
-            if "LEVEL_ENV_VAR" not in target and "VERSION_ENV_VAR" not in target:
-                continue
-            guarded = any(
-                isinstance(a, ast.If) and "not in env" in ast.unparse(a.test)
-                for a in ast.walk(tree)
-                if isinstance(a, ast.If) and node in ast.walk(a)
-            )
-            assert guarded, "unguarded host-derived write: " + target
-
-
 class TestAimdoDeviceArgs:
-    def test_level_two_and_above_gets_tuples(self):
+    def test_a_modern_wheel_gets_tuples(self):
         from comfy_env.memory_manager import aimdo_device_args
-        args, dropped = aimdo_device_args([0, 1], 512, 3)
+        args, dropped = aimdo_device_args([0, 1], 512, True)
         assert args == [(0, 512), (1, 512)] and dropped is None
 
-    def test_level_one_gets_bare_ints_and_says_what_it_lost(self):
+    def test_a_pre_0_4_10_wheel_gets_bare_ints_and_says_what_it_lost(self):
         """Catches the shipped bug: comfy-env passed (index, headroom) tuples
         unconditionally, and comfy-aimdo before 0.4.10 does int(device_id) on
         each, so the call raised TypeError and the worker fell to the legacy
         ledger. ComfyUI's own main.py has this fallback; comfy-env did not."""
         from comfy_env.memory_manager import aimdo_device_args
-        args, dropped = aimdo_device_args([0], 512, 1)
+        args, dropped = aimdo_device_args([0], 512, False)
         assert args == [0]
         assert dropped and "headroom" in dropped
 
-    def test_level_one_with_no_headroom_loses_nothing(self):
+    def test_a_pre_0_4_10_wheel_with_no_headroom_loses_nothing(self):
         """Catches: reporting a dropped policy that was never requested, which
         would make an ordinary old-wheel worker look misconfigured."""
         from comfy_env.memory_manager import aimdo_device_args
-        assert aimdo_device_args([0], 0, 1) == ([0], None)
+        assert aimdo_device_args([0], 0, False) == ([0], None)
 
     def test_generator_is_not_returned(self):
         """Catches: handing init_devices a generator, which cannot be
         inspected, logged, or retried after a TypeError."""
         from comfy_env.memory_manager import aimdo_device_args
-        args, _ = aimdo_device_args([0, 1], 0, 3)
+        args, _ = aimdo_device_args([0, 1], 0, True)
         assert isinstance(args, list) and len(args) == 2
 
 
@@ -585,3 +483,70 @@ class TestAimdoPolicyDrops:
                 assert "_log(" in body, (
                     "a TypeError rung around control.init drops a policy "
                     "without saying so")
+
+
+class TestTupleDeviceDetection:
+    """The one thing about an installed comfy-aimdo that changes an argument
+    comfy-env builds. A wrong answer here hands bare ints to a wheel that
+    wants pairs, or the reverse, and either way the worker lands on the
+    legacy ledger with the per device headroom lost."""
+
+    def test_an_unreadable_shape_assumes_the_modern_form(self):
+        """Catches: falling back to the old form. Unreadable is not evidence
+        of absence, and the pair form has been the only one since 0.4.10, so
+        guessing old drops the headroom silently for the process's life."""
+        from comfy_env.memory_manager import aimdo_takes_tuple_devices
+        control = type("C", (), {"init_devices": len})   # builtin: no source
+        assert aimdo_takes_tuple_devices(control) is True
+
+    def test_a_genuine_old_wheel_is_still_detected(self):
+        """Catches: the fallback becoming a rubber stamp. A pre 0.4.10 wheel
+        takes bare ints and must be read as such, or init_devices raises
+        TypeError inside a comprehension."""
+        from comfy_env.memory_manager import aimdo_takes_tuple_devices
+
+        def init_devices(device_ids):
+            return True
+        control = type("C", (), {"init_devices": staticmethod(init_devices)})
+        assert aimdo_takes_tuple_devices(control) is False
+
+    def test_the_annotation_is_read_before_the_source(self):
+        """Catches: reading source text as the only evidence. An annotated
+        signature is the durable answer and needs no source at all."""
+        from typing import List, Tuple
+        from comfy_env.memory_manager import aimdo_takes_tuple_devices
+
+        def init_devices(device_ids: List[Tuple[int, int]]):
+            return True
+        control = type("C", (), {"init_devices": staticmethod(init_devices)})
+        assert aimdo_takes_tuple_devices(control) is True
+
+
+class TestNoLevelRefusal:
+    """The ladder that used to live here refused to page across a protocol
+    difference. It went because refusing drops the worker to the legacy
+    ledger, which on a card shared with the host is worse than the mismatch
+    it was avoiding, and because the parent's level shaped no argument."""
+
+    def test_a_version_difference_never_refuses_aimdo(self):
+        """Catches: any re-introduction of a skew refusal. A worker on a
+        neighbouring patch version must still page."""
+        import ast
+        import inspect
+        from comfy_env import memory_manager
+        src = inspect.getsource(memory_manager.maybe_enable_aimdo)
+        tree = ast.parse(src.lstrip())
+        raises = [n for n in ast.walk(tree) if isinstance(n, ast.Raise)]
+        for node in raises:
+            text = ast.unparse(node)
+            assert "skew" not in text.lower(), text
+
+    def test_the_parent_no_longer_exports_a_level(self):
+        """Catches: the export coming back. Nothing reads it, and a stale one
+        would refuse a worker for a difference that does not matter."""
+        import pathlib
+        src = pathlib.Path(
+            "src/comfy_env/isolation/workers/subprocess.py"
+        ).read_text(encoding="utf-8")
+        assert "COMFY_ENV_AIMDO_LEVEL" not in src
+        assert "aimdo_installed_level" not in src

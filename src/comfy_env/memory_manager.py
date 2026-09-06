@@ -61,9 +61,6 @@ DISABLE_VALUES = ("0", "false", "no", "off")
 #: made on the protocol level below, never on this string.
 VERSION_ENV_VAR = "COMFY_ENV_AIMDO_VERSION"
 
-#: The parent's aimdo PROTOCOL LEVEL (see ``aimdo_protocol_level``). This, not
-#: the version string, is what the worker compares against.
-LEVEL_ENV_VAR = "COMFY_ENV_AIMDO_LEVEL"
 
 #: Per device VRAM headroom in bytes, as the parent resolved it from
 #: ``--vram-headroom``. A worker paging with no headroom against a host that
@@ -247,107 +244,55 @@ def _cuda_devices() -> list:
         return []
 
 
-#: comfy-aimdo protocol levels. Compatibility is a property of the PROTOCOL,
-#: not of the version string: comfy-aimdo ships about three releases a month
-#: (18 in six months, measured) while the protocol moved twice in twelve.
-#: Exact-version equality therefore drops workers to the legacy ledger on
-#: every host patch bump, silently and permanently -- observed live on two of
-#: nineteen worker envs whose Python shims were byte identical to the host's
-#: apart from ``_version.py``.
+#: Whether ``init_devices`` takes (index, headroom) pairs. That is the ONE
+#: thing about an installed comfy-aimdo that changes an argument comfy-env
+#: builds: a tuple handed to a pre 0.4.10 wheel raises TypeError inside a
+#: comprehension, which is how a worker silently landed on the legacy ledger.
 #:
-#: 1: ``init()`` takes neither policy kwarg; ``init_devices`` takes bare ints.
-#: 2: ``simple_vram_headroom`` accepted; ``init_devices`` takes (index, bytes)
-#:    tuples. Arrived in 0.4.10.
-#: 3: ``nvml_pressure`` accepted as well. Arrived in 0.4.11.
-AIMDO_LEVEL_MIN = 1
-AIMDO_LEVEL_TUPLE_DEVICES = 2
-AIMDO_LEVEL_NVML = 3
+#: There used to be a three level ladder here, with the parent exporting its
+#: level and the worker refusing to page across a difference. It went because
+#: it only ever REFUSED: the parent's level shaped no argument (every call is
+#: built from the worker's own wheel), and a refusal drops that worker to the
+#: ledger, which on a shared card is worse than the mismatch it avoided. Its
+#: only live evidence, 0.4.14 against a host on 0.4.13, was within a level and
+#: allowed anyway. What survives is the part that shapes a real call.
+AIMDO_TUPLE_DEVICES_SINCE = "0.4.10"
 
 
-def aimdo_protocol_level(init_params, devices_accept_tuples) -> int:
-    """Capability level of an installed comfy-aimdo, from what it accepts.
+def aimdo_device_args(devices, headroom, takes_tuples):
+    """Argument shape for ``control.init_devices`` on this wheel.
 
-    Pure: ``init_params`` is the parameter-name collection of
-    ``control.init`` and ``devices_accept_tuples`` says whether
-    ``control.init_devices`` understands (index, headroom) pairs. Both are
-    read from the installed wheel by the caller, never from a version string,
-    because a version-to-level table would be stale within the month.
-    """
-    params = set(init_params or ())
-    level = AIMDO_LEVEL_MIN
-    if "simple_vram_headroom" in params or devices_accept_tuples:
-        level = AIMDO_LEVEL_TUPLE_DEVICES
-    if "nvml_pressure" in params:
-        level = AIMDO_LEVEL_NVML
-    return level
-
-
-def aimdo_skew_verdict(worker_level, parent_level, worker_version=None,
-                       parent_version=None):
-    """Whether a worker may enable aimdo against this parent.
-
-    Returns ``(ok, reason)``; ``reason`` is None when ok. The rule is: lag
-    WITHIN a protocol level is fine, a difference ACROSS one is not. Same
-    level means both sides accept the same policy kwargs and the same device
-    argument shape, so they page under the same policy whatever their patch
-    versions. A level difference means one side would silently run a
-    different policy, which is the failure this guard exists to prevent.
-
-    An unknown parent level (an older parent that exported no level) is not
-    a verdict: it degrades to allowing, exactly as before this guard existed.
-    """
-    if parent_level is None:
-        return True, None
-    if worker_level == parent_level:
-        return True, None
-    return False, (
-        "aimdo protocol skew: worker level {} ({}), parent level {} ({})"
-        .format(worker_level, worker_version or "unknown",
-                parent_level, parent_version or "unknown")
-    )
-
-
-def aimdo_device_args(devices, headroom, level):
-    """Argument shape for ``control.init_devices`` at this protocol level.
-
-    Level 2 introduced (index, headroom) pairs; before that the call took
-    bare ints and a tuple raises TypeError inside a comprehension, which is
-    how a worker on comfy-aimdo older than 0.4.10 silently landed on the
-    legacy ledger. ComfyUI's own main.py carries the equivalent fallback for
-    its own call; comfy-env did not.
+    (index, headroom) pairs arrived in 0.4.10; before that the call took bare
+    ints and a tuple raises TypeError inside a comprehension, which is how a
+    worker on an older comfy-aimdo silently landed on the legacy ledger.
+    ComfyUI's own main.py carries the equivalent fallback for its own call;
+    comfy-env did not.
 
     Returns ``(args, dropped)`` where ``dropped`` names the policy this wheel
     cannot carry, so the caller can say so rather than losing it in silence.
     """
     ids = [int(d) for d in devices]
-    if level >= AIMDO_LEVEL_TUPLE_DEVICES:
+    if takes_tuples:
         return [(i, int(headroom)) for i in ids], None
     return ids, ("per-device headroom" if headroom else None)
 
 
-def aimdo_installed_level(control, log=None) -> int:
-    """Protocol level of the comfy_aimdo bound to ``control``. Never raises.
+def aimdo_takes_tuple_devices(control, log=None) -> bool:
+    """Whether this comfy_aimdo's ``init_devices`` takes (index, headroom)
+    pairs. Never raises.
 
     Reads ``init``'s signature and, because ``init_devices`` keeps one
-    parameter at every level, its source for the tuple branch. Falls back to
-    the lowest level when neither can be read, which refuses rather than
-    over-claiming.
+    Asks the signature's annotations first and the source only as a fallback,
+    and treats an unreadable shape as the modern form rather than the old one:
+    guessing old would hand bare ints to a wheel that wants pairs and drop the
+    per device headroom, silently, for the life of the process.
     """
     import inspect
 
-    params = ()
-    try:
-        params = tuple(inspect.signature(control.init).parameters)
-    except Exception as exc:  # pragma: no cover - defensive
-        if log is not None:
-            log("[worker] aimdo init signature unreadable: {}".format(exc))
-    # Whether init_devices understands (index, headroom) pairs, asked of the
-    # SIGNATURE and only then of the source. Reading source text for the word
-    # "tuple" was the brittlest line here: a refactor that keeps the
-    # behaviour but drops the word, or any wheel shipped without source,
-    # silently demoted the worker to level 1 and a default headroom. Source
-    # is now the last resort and an unreadable one is not evidence of
-    # absence, so the level falls back to what the kwargs already prove.
+    # Asked of the SIGNATURE first and only then of the source. Reading source
+    # text for the word "tuple" was the brittlest line here: a refactor that
+    # keeps the behaviour but drops the word, or any wheel shipped without
+    # source, silently demoted the worker to bare ints and a default headroom.
     tuples = None
     try:
         sig = inspect.signature(control.init_devices)
@@ -362,9 +307,13 @@ def aimdo_installed_level(control, log=None) -> int:
             tuples = "tuple" in src
         except Exception as exc:  # pragma: no cover - defensive
             if log is not None:
-                log("[worker] aimdo init_devices shape unreadable, level from "
-                    "init kwargs alone: {}".format(exc))
-    return aimdo_protocol_level(params, bool(tuples))
+                log("[worker] aimdo init_devices shape unreadable, assuming "
+                    "the modern form: {}".format(exc))
+            # Unreadable is not evidence of absence. The modern form has been
+            # the only one since 0.4.10; guessing the old one here would hand
+            # bare ints to a wheel that wants pairs and lose the headroom.
+            tuples = True
+    return bool(tuples)
 
 
 def maybe_enable_aimdo(log=None) -> bool:
@@ -419,19 +368,13 @@ def maybe_enable_aimdo(log=None) -> bool:
 
         installed = aimdo_version()
         wanted = os.environ.get(VERSION_ENV_VAR, "")
-        _my_level = aimdo_installed_level(control, log=_log)
-        _parent_level = None
-        _raw_level = os.environ.get(LEVEL_ENV_VAR, "")
-        if _raw_level:
-            try:
-                _parent_level = int(_raw_level)
-            except ValueError:
-                _parent_level = None
-        _ok, _why = aimdo_skew_verdict(
-            _my_level, _parent_level, installed, wanted
-        )
-        if not _ok:
-            raise RuntimeError(_why)
+        _takes_tuples = aimdo_takes_tuple_devices(control, log=_log)
+        if installed and wanted and installed != wanted:
+            # Reported, never refused. A worker that declines to page lands on
+            # the legacy ledger, which on a card shared with the host is worse
+            # than paging on a neighbouring patch version.
+            _log("[worker] comfy-aimdo {} against host {}; paging anyway"
+                 .format(installed, wanted))
 
         try:
             simple = os.environ.get(SIMPLE_HEADROOM_ENV_VAR)
@@ -464,7 +407,7 @@ def maybe_enable_aimdo(log=None) -> bool:
             headroom = int(os.environ.get(HEADROOM_ENV_VAR, "0"))
         except ValueError:
             headroom = 0
-        _dev_args, _dropped = aimdo_device_args(devices, headroom, _my_level)
+        _dev_args, _dropped = aimdo_device_args(devices, headroom, _takes_tuples)
         if not control.init_devices(_dev_args):
             raise RuntimeError("comfy_aimdo.control.init_devices returned False")
         if _dropped:
