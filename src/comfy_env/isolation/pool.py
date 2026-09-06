@@ -687,14 +687,15 @@ def _warn_if_headroom_was_changed(control, about_to_write: int) -> None:
     lands there are two writers on one value, last write wins, and the loser
     is silent. This is the cheapest possible detector for that.
 
-    It is a DIAGNOSTIC, not a precondition. The getter is comfy-aimdo #107,
-    which merged after the newest published wheel was built, so as of today
-    this check is inert on EVERY wheel that exists, Windows included (verified
-    against 0.5.2 win_amd64: no wrapper, no getter, not even an exported
-    symbol). Its absence must therefore cost nothing: no getter means no check,
-    and the forward proceeds exactly as before. Do not let the wrapper's
-    presence become a health signal, or a working Windows install reads as
-    broken.
+    It is a DIAGNOSTIC, not a precondition. #107's accessors merged after the
+    newest published wheel was built, so on Windows this is inert on every
+    wheel that exists (verified against 0.5.2 win_amd64: no wrapper, no getter,
+    not even an exported symbol). On Linux it works TODAY, including on 0.4.13
+    which is what is actually installed, because the ELF exports the global as
+    a data symbol and ctypes can read it directly. Its absence must cost
+    nothing either way: no getter means no check, and the forward proceeds
+    exactly as before. Do not let the wrapper's presence become a health
+    signal, or a working Windows install reads as broken.
 
     Nothing to detect yet, either: a full grep of ComfyUI at 15eb748 finds
     three writes of simple_vram_headroom, all inside the import time
@@ -704,10 +705,23 @@ def _warn_if_headroom_was_changed(control, about_to_write: int) -> None:
     global _AIMDO_FOREIGN_WRITER_LOGGED
     if _AIMDO_HEADROOM_WRITTEN is None or _AIMDO_FOREIGN_WRITER_LOGGED:
         return
+    lib = getattr(control, "lib", None)
     getter = getattr(control, "get_simple_vram_headroom", None)
-    if getter is None:
-        lib = getattr(control, "lib", None)
-        getter = getattr(lib, "get_simple_vram_headroom", None) if lib is not None else None
+    if getter is None and lib is not None:
+        getter = getattr(lib, "get_simple_vram_headroom", None)
+    if getter is None and lib is not None:
+        # Third rung, and the only one that works on anything shipped today.
+        # The ELF exports simple_vram_headroom as a DATA symbol, so ctypes can
+        # read the global directly with no accessor at all. Verified against
+        # 0.4.13, the version actually installed here. The Windows DLL does not
+        # export it, so this rung is Linux only, which is the opposite of the
+        # usual asymmetry.
+        try:
+            import ctypes
+            cell = ctypes.c_int64.in_dll(lib, "simple_vram_headroom")
+            getter = lambda: cell.value  # noqa: E731 - a read, not a policy
+        except Exception:
+            getter = None
     if getter is None:
         return
     try:
