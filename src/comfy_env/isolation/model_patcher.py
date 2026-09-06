@@ -105,6 +105,21 @@ WORKER_GONE = _Outcome("WORKER_GONE")   # process died; its VRAM died with it
 SEND_FAILED = _Outcome("SEND_FAILED")   # worker alive; weights still resident
 
 
+#: A private identity for the clone checks. ComfyUI compares
+#: ``.clone_base_uuid`` against a target's uuid in ``unload_model_and_clones``
+#: (model_management.py:2085) and in multigpu.py:163, and a match means "this
+#: is a copy of the thing being unloaded, free it too".
+#:
+#: None is NOT safe here even though it works today. It works only because
+#: ModelPatcher.__init__ always assigns uuid.uuid4() (model_patcher.py:385),
+#: so no real target ever carries None. The day anything reaches those call
+#: sites with a None uuid, every worker stand-in on the device matches, drops
+#: out of keep_loaded, and is freed by someone else's eviction, silently.
+#: An object() can never equal a uuid, so the match is impossible rather than
+#: merely unlikely.
+_NOT_A_CLONE = object()
+
+
 class SubprocessModelPatcher:
     """Standalone duck-type for a worker-resident model.
 
@@ -146,7 +161,7 @@ class SubprocessModelPatcher:
         # ComfyUI's LoadedModel._set_model reads .parent; clone chains do not
         # exist for subprocess models, so it is always None.
         self.parent = None
-        self.clone_base_uuid = None
+        self.clone_base_uuid = _NOT_A_CLONE
         self.size = model_size
         self.model = SubprocessModel(model_size, offload_device)
         self._residency_peak = model_size  # registration is a full-size receipt
@@ -324,7 +339,22 @@ class SubprocessModelPatcher:
         return freed
 
     def detach(self, unpatch_all=True):
-        """Full unload. Idempotent, and never raises -- runs inside free_memory."""
+        """Unload. Idempotent, and never raises -- runs inside free_memory.
+
+        ``unpatch_all=False`` is upstream's CHEAP call, not a weaker version
+        of the expensive one. ``ModelPatcher.detach`` (model_patcher.py) ejects
+        the model, moves its patches to the offload device, and skips
+        ``unpatch_model`` entirely, so the weights do not move. Its one caller
+        on a list entry is the clone dedup pop in ``load_models_gpu``
+        (model_management.py:962), which runs on every load.
+
+        Ignoring the flag turned that into a full worker offload and, with the
+        reload that follows, made upstream's cheapest bookkeeping call the most
+        expensive thing comfy-env does. There are no worker side patches to
+        move, so the honest mirror of upstream is to do nothing at all.
+        """
+        if not unpatch_all:
+            return self.model
         if self.model.model_loaded_weight_memory <= 0 and \
                 self.model.device == self.offload_device:
             return self.model  # already off the GPU; skip the round trip

@@ -188,3 +188,41 @@ def test_inner_model_is_weakref_able(patcher_mod):
     p = _make(patcher_mod, FakeWorker())
     assert weakref.ref(p.model)() is p.model
     assert weakref.ref(p)() is p       # LoadedModel._set_model weakrefs the patcher
+
+
+def test_clone_base_uuid_can_never_equal_a_real_uuid(patcher_mod):
+    """Catches the shipped `self.clone_base_uuid = None`.
+
+    `unload_model_and_clones` keeps an entry only while
+    `model.clone_base_uuid != loaded_model.model.clone_base_uuid`
+    (model_management.py:2085). None worked solely because
+    `ModelPatcher.__init__` always assigns `uuid.uuid4()`, so no real target
+    ever carried None. The first caller that passes one frees every worker
+    model on that device, silently, on somebody else's eviction.
+    """
+    import uuid
+    p = _make(patcher_mod, FakeWorker())
+    assert p.clone_base_uuid is not None, (
+        "None is exactly the value that collides with a None target")
+    assert p.clone_base_uuid != uuid.uuid4()
+    assert p.clone_base_uuid != uuid.uuid4()
+
+
+def test_detach_false_moves_no_weights_and_sends_nothing(patcher_mod):
+    """Catches ignoring `unpatch_all`, which is what shipped.
+
+    Upstream's `detach(unpatch_all=False)` ejects the model and moves its
+    patches, then deliberately SKIPS `unpatch_model`, so the weights stay on
+    the card. Its one caller on a list entry is the clone dedup pop in
+    `load_models_gpu` (model_management.py:962), which runs on every load.
+    Sending `model_to_device` there costs a full worker offload plus the
+    reload that follows.
+    """
+    w = FakeWorker(reply={"seq": 1})
+    p = _make(patcher_mod, w)
+    out = p.detach(unpatch_all=False)
+    assert out is p.model
+    assert w.sent == [], (
+        f"detach(unpatch_all=False) sent {w.sent}; upstream moves no weights "
+        f"on this path")
+    assert p.model.model_loaded_weight_memory > 0, "weights must stay resident"
