@@ -634,7 +634,7 @@ def plan_pressure_release(workers, shortfall, requester=None):
 
 
 def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
-                      current_prompt=None):
+                      current_prompt=None, under_pressure=False):
     """Which idle workers should be asked to release. Pure.
 
     ``workers`` maps key to {"alive", "advertises", "in_flight", "idle_since",
@@ -643,12 +643,17 @@ def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
     asking a worker that holds nothing is a round trip for no memory, and it
     would reset a high-water that is still the right forecast.
 
-    Two clocks say when. The idle timer: quiet for ``min_idle``. The prompt:
-    if ``current_prompt`` is known and differs from the prompt the worker
-    last served, the prompt that needed its memory is over, so it is asked
-    at once rather than a minute later while the host runs on a smaller
-    card. A worker with no recorded prompt, or an unknown current prompt,
-    falls back to the timer.
+    Two clocks say when, and one of them needs a reason. The idle timer:
+    quiet for ``min_idle``, which is the unconditional one. The prompt: a
+    worker whose last prompt is over is released EARLY, before the timer,
+    but only when ``under_pressure`` says someone actually needs the card.
+
+    Without that condition this cools a warm worker between two queued
+    prompts, which is the opposite of what a model cache is for: a queue of
+    ten prompts through one pack would reload its model ten times. Native
+    ComfyUI keeps models across prompts and evicts on demand, and a worker
+    should behave the same way. The prompt boundary is the moment it is
+    CHEAPEST to take memory back, not a reason to take it back.
     """
     out = []
     for key, state in sorted((workers or {}).items()):
@@ -659,7 +664,8 @@ def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
         if not state.get("holding"):
             continue
         last_prompt = state.get("last_prompt")
-        prompt_over = (current_prompt is not None and last_prompt is not None
+        prompt_over = (under_pressure and current_prompt is not None
+                       and last_prompt is not None
                        and last_prompt != current_prompt)
         since = state.get("idle_since")
         timer_due = since is not None and (now - since) >= min_idle

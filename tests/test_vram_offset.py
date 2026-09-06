@@ -369,3 +369,33 @@ def test_a_freed_receipt_lowers_that_workers_high_water(pool_mod, monkeypatch):
     pool._ask_idle_workers(4 * GB, requester_key="req")
 
     assert pool._RESERVE_HIGHWATER["idle"] == 5 * GB
+
+
+def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
+    """The worker assigns this number to its OWN EXTRA_RESERVED_VRAM, where
+    it shrinks the weight budget of the very load it is about to do. Catches
+    handing over the raw published total, which made BOTH ends under load:
+    the host freed for a reserve that already counted the requester, and the
+    requester then reserved against itself."""
+    pool, mm, calls = pool_mod
+    monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
+    monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
+    monkeypatch.setattr(pool, "_RESERVE_HIGHWATER", {})
+    pool._WORKER_PATCHERS.clear()
+
+    class _W:
+        _last_vram_report = {"held": 2 * GB}
+        _calls_in_flight = 0
+
+        def is_alive(self):
+            return True
+    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": (_W(), 1)})
+    mm.EXTRA_RESERVED_VRAM = 8 * GB
+    mm.extra_reserved_memory = lambda: mm.EXTRA_RESERVED_VRAM
+
+    own = pool._handle_vram_budget({"total_size": 1 * GB}, worker_key="req")
+    stranger = pool._handle_vram_budget({"total_size": 1 * GB}, worker_key="other")
+
+    charge = pool._WORKER_FIXED_VRAM_COST + 2 * GB
+    assert stranger["extra_reserved_vram"] == 8 * GB
+    assert own["extra_reserved_vram"] == 8 * GB - charge

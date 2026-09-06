@@ -367,6 +367,27 @@ def _start_idle_sweep() -> None:
                      daemon=True).start()
 
 
+def _card_is_tight() -> bool:
+    """Whether the card is short enough that a warm worker should let go.
+
+    The prompt boundary is the cheapest moment to take memory back, not a
+    reason to take it back: cooling a worker between two queued prompts
+    reloads its model on the next one, which is what a model cache exists to
+    avoid. So the early release needs a reason, and this is it. Compared
+    against what the reserve already says the workers will want, so the test
+    is "the card cannot cover what is booked", not an arbitrary fraction.
+    """
+    try:
+        import comfy.model_management as mm
+        device = mm.get_torch_device()
+        free = _true_device_free(device)
+        if free is None:
+            free = mm.get_free_memory(device)
+        return int(free) < int(_RESERVE_PUBLISHED)
+    except Exception:
+        return False
+
+
 def _release_idle_workers() -> None:
     """Ask workers that have been idle a while to give their VRAM back.
 
@@ -392,8 +413,9 @@ def _release_idle_workers() -> None:
                 "holding": _RESERVE_HIGHWATER.get(key, 0) > 0,
                 "last_prompt": _LAST_PROMPT.get(key),
             }
-        due = state_sync.plan_idle_release(states, time.monotonic(),
-                                           current_prompt=_current_prompt())
+        due = state_sync.plan_idle_release(
+            states, time.monotonic(), current_prompt=_current_prompt(),
+            under_pressure=_card_is_tight())
         for key in due:
             worker, _gen = entries[key]
             try:
@@ -909,7 +931,14 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     # vram_state/extra_reserved pass through as ComfyUI computed them; the
     # negotiation below is the only mechanism that adjusts them.
     vram_state_name = mm.vram_state.name
-    extra_reserved = mm.EXTRA_RESERVED_VRAM
+    # Discounted the same way the ask above is. The published reserve holds
+    # every worker's growth including this one's, and the worker assigns this
+    # number to its OWN EXTRA_RESERVED_VRAM, where it shrinks the weight
+    # budget of the very load it is about to do. Handing over the raw total
+    # made both ends under load: the host freed for a reserve that already
+    # counted the requester, and the requester then reserved against itself.
+    extra_reserved = reserve.reserve_for_requester(
+        int(mm.EXTRA_RESERVED_VRAM), _own_charge)
 
     # Re-measure after eviction: the worker corrects its own blind view from
     # this (its get_free_memory - device_free = what everyone else holds).
