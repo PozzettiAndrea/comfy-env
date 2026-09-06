@@ -267,6 +267,19 @@ def _true_device_free(device) -> "int | None":
     decision made from that number is fiction on the majority platform.
 
     Ladder: pynvml -> nvidia-smi -> None (caller falls back to its own ledger).
+
+    In practice the first rung is usually absent: pynvml is not a dependency
+    of comfy-env, ComfyUI or comfy-aimdo, so the common case is the subprocess.
+    Measured on the Windows box, 2026-09-06: median 30.9 ms per call, min 30.1,
+    max 34.8 over 15 runs. That is the cost of every admission decision that
+    needs a true device figure on a process local platform.
+
+    Worth knowing while reading this: comfy-aimdo does NOT go through pynvml.
+    It loads nvml.dll itself with LoadLibraryExW, so its own pressure reading
+    is device wide on Windows even on a box with no pynvml installed, and
+    measured 8311 MiB of movement for a sibling's 8 GiB where this process's
+    mem_get_info moved zero. The pager sees the card; ComfyUI does not; nothing
+    forwards the pager's view to ComfyUI.
     """
     try:
         import pynvml
