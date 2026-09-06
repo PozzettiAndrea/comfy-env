@@ -55,6 +55,8 @@ from ._ipc_parent import (
     _has_af_unix,
     _create_server_socket,
     # Tensor lifecycle
+    _cuda_ipc_cache_tensors,
+    _cuda_ipc_metadata_cache,
     _pool_ipc_cache_tensors,
     _pool_ipc_available,
     _probe_cuda_ipc,
@@ -295,9 +297,21 @@ class SubprocessWorker(Worker):
                 pass
             self._server_socket = None
         self._worker_pool = None
-        # Clear stale pool IPC caches -- pointer export data from dead worker's
-        # pool is invalid and would corrupt CUDA state if reused with new pool
+        # Clear stale IPC caches -- pointer export data from a dead worker is
+        # invalid and would corrupt CUDA state if reused with a new process.
+        #
+        # BOTH families, not just the pool one. _serialize_cuda_ipc consults
+        # _cuda_ipc_metadata_cache FIRST and returns the hit verbatim, and
+        # _cleanup_ipc_cache only evicts zero-sized storages, which a mapping
+        # of a dead exporter is not. On the multi-hop path this file documents
+        # (worker A to parent to worker B) that hands a dead process's handle
+        # to a live one: best case an invalid device context from an unrelated
+        # node, worst case the driver has reissued the memory and the map
+        # succeeds. The view branch is the dangerous one, because it re-emits a
+        # stale handle under a new shape where nothing downstream can catch it.
         _pool_ipc_cache_tensors.clear()
+        _cuda_ipc_metadata_cache.clear()
+        _cuda_ipc_cache_tensors.clear()
 
     def _worker_exit_diagnostic(self) -> str:
         """Collect diagnostic info when the worker process dies unexpectedly."""

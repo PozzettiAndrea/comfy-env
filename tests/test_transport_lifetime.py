@@ -123,3 +123,34 @@ def test_consumed_ack_frees_keepers_immediately(worker):
     assert pong.get("status") == "pong"
     assert pong.get("keepers") == {"tensors": 0, "shm": 0}, (
         f"keeper entries not freed on consumed-ack: {pong.get('keepers')}")
+
+
+def test_kill_clears_every_ipc_cache_not_just_the_pool_one():
+    """Catches the shipped asymmetry: `_kill_worker` cleared
+    `_pool_ipc_cache_tensors` with a comment saying stale export data "would
+    corrupt CUDA state if reused with new pool", and left the two CUDA IPC
+    caches beside it untouched.
+
+    `_serialize_cuda_ipc` consults `_cuda_ipc_metadata_cache` FIRST and returns
+    the hit verbatim, and `_cleanup_ipc_cache` only evicts zero-sized storages,
+    which a mapping of a dead exporter is not. So on the multi-hop path
+    (worker A to parent to worker B) a dead process's handle gets handed to a
+    live one. Behaviour test, not a source grep: fill the caches, kill, assert
+    all three are empty.
+    """
+    from comfy_env.isolation.workers import _ipc_parent
+    from comfy_env.isolation.workers.subprocess import SubprocessWorker
+
+    w = SubprocessWorker(python=sys.executable, name="cache-test")
+    for cache in (_ipc_parent._pool_ipc_cache_tensors,
+                  _ipc_parent._cuda_ipc_metadata_cache,
+                  _ipc_parent._cuda_ipc_cache_tensors):
+        cache[12345] = "stale handle from a dead worker"
+
+    w._kill_worker()
+
+    for name in ("_pool_ipc_cache_tensors", "_cuda_ipc_metadata_cache",
+                 "_cuda_ipc_cache_tensors"):
+        assert not getattr(_ipc_parent, name), (
+            f"{name} survived _kill_worker; its entries are export data from a "
+            f"process that no longer exists")

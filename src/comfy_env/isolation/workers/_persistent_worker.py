@@ -6,6 +6,7 @@ import socket
 import traceback
 import faulthandler
 import collections
+import weakref
 import time
 import importlib
 from types import SimpleNamespace
@@ -1189,6 +1190,49 @@ def main():
             pass
     _model_registry_meta = {}     # model_id -> {"size": int, "kind": str}
     _model_id_by_obj = {}         # id(module) -> model_id  (dedup)
+
+    def _live_model(mid):
+        """The module behind a model_id, or None if it has been collected.
+
+        _model_registry holds WEAK references. It used to hold strong ones and
+        nothing anywhere removed an entry, so once a module touched CUDA in a
+        worker comfy-env owned its lifetime for the life of the process: the
+        pack's own del, the worker's unload_all_models and full_release's
+        gc.collect() were all defeated by a reference nobody could see. A pack
+        that builds a model per call grew host RSS forever while full_release
+        reported clean receipts and nothing in any log named it.
+        """
+        ref = _model_registry.get(mid)
+        if ref is None:
+            return None
+        return ref() if isinstance(ref, weakref.ref) else ref
+
+    def _forget_model(mid, obj_id):
+        """Drop every trace of a collected module.
+
+        The obj_id entry is the one that MUST go. CPython reuses id() as soon
+        as the memory is freed, so a stale entry makes the dedup check in
+        _register_cuda_module skip a genuinely new model, leaving it GPU
+        resident with no ledger entry and permanently un-evictable.
+        """
+        _model_registry.pop(mid, None)
+        _model_registry_meta.pop(mid, None)
+        if _model_id_by_obj.get(obj_id) == mid:
+            _model_id_by_obj.pop(obj_id, None)
+
+    def _hold_weakly(mid, module):
+        """Weak reference plus finalizer, falling back to strong if it must.
+
+        Some objects are not weakref-able. Those keep the old behaviour rather
+        than failing the registration, because a model we cannot track is
+        worse than one we cannot free.
+        """
+        try:
+            _model_registry[mid] = weakref.ref(module)
+            weakref.finalize(module, _forget_model, mid, id(module))
+        except TypeError:
+            _model_registry[mid] = module
+            wlog(f"[worker] '{mid}' is not weakref-able; held strongly")
     _model_counter = [0]          # mutable counter in list for closure access
     # Serialises the registry writes below. _hooked_to/_hooked_cuda replace
     # torch.nn.Module.to/.cuda GLOBALLY, so they fire on whatever thread a
@@ -1210,7 +1254,7 @@ def main():
 
     def _register_model(model_id, model, kind="other"):
         """Register a model explicitly (optional -- auto-hook handles most cases)."""
-        _model_registry[model_id] = model
+        _hold_weakly(model_id, model)
         _model_id_by_obj[id(model)] = model_id
         size = _compute_model_size(model)
         _model_registry_meta[model_id] = {"size": size, "kind": kind}
@@ -1242,7 +1286,7 @@ def main():
             _model_counter[0] += 1
             model_id = f"{module.__class__.__name__}_{_model_counter[0]}"
             size = _compute_model_size(module)
-            _model_registry[model_id] = module
+            _hold_weakly(model_id, module)
             _model_registry_meta[model_id] = {"size": size, "kind": "other"}
             _model_id_by_obj[obj_id] = model_id
             _new_models_this_call.append({"id": model_id, "size": size, "kind": "other"})
@@ -1315,7 +1359,7 @@ def main():
         _mid = request.get("model_id")
         _req_call_id = request.get("call_id", _current_call_id)
         _partial_unload = request.get("method") == "model_partial_unload"
-        _model = _model_registry.get(_mid)
+        _model = _live_model(_mid)
         if _model is None:
             transport.send({"status": "error", "call_id": _req_call_id,
                             "error": f"Model '{_mid}' not registered"})
@@ -1380,7 +1424,7 @@ def main():
         _mid = request.get("model_id")
         _target = request.get("device", "cpu")
         _req_call_id = request.get("call_id", _current_call_id)
-        _model = _model_registry.get(_mid)
+        _model = _live_model(_mid)
         if _model is None:
             transport.send({"status": "error", "call_id": _req_call_id,
                             "error": f"Model '{_mid}' not registered"})
@@ -1854,7 +1898,10 @@ def main():
         Never raises: the census is advisory and a failed read keeps the
         parent's last receipt (missing means unknown, not zero)."""
         out = []
-        for _mid, _model in list(_model_registry.items()):
+        for _mid in list(_model_registry.keys()):
+            _model = _live_model(_mid)
+            if _model is None:
+                continue  # collected; its finalizer already pruned it
             try:
                 _lm = _find_loaded_model(_model)
                 if _lm is not None:
@@ -1957,7 +2004,7 @@ def main():
         # when they land on CUDA, but the subprocess may have moved them back
         # to CPU before the call finished (or the raise interrupted a move).
         for _nme in _new_models_this_call:
-            _nm_model = _model_registry.get(_nme["id"])
+            _nm_model = _live_model(_nme["id"])
             if _nm_model is not None:
                 try:
                     _nm_p = next(_nm_model.parameters(), None)
