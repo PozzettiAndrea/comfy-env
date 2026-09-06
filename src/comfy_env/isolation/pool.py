@@ -517,11 +517,29 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
     this repo's own P2 write-up still records the opposite conclusion from
     an experiment that used plain nn.Linear and therefore never paged.
 
-    Bound lazily, and permanently: the Python wrapper is #107, every wheel
-    since 0.4.10 carries the raw export, and the installed base is 0.4.13.
-    comfy-env never controls both ends (worker envs are pixi pinned per pack,
-    the host's aimdo is whatever ComfyUI installed), so there is no version
-    at which this probe can be deleted.
+    Bound lazily, and permanently. Read the fallback below as the LIVE path,
+    not a legacy one: measured on Windows against the published 0.5.2 wheel,
+    the module level wrapper does not exist, the getter does not exist, and
+    `simple_vram_headroom` is not even an exported symbol, so
+    `lib.set_simple_vram_headroom` is the only working write path that ships
+    today. #107 adds the wrapper but merged after 0.5.2 was uploaded. comfy-env
+    also never controls both ends (worker envs are pixi pinned per pack, the
+    host's aimdo is whatever ComfyUI installed), so there is no version at
+    which this probe can be deleted.
+
+    Measured on Windows, 2026-09-06, first execution of this path anywhere:
+    setting the headroom and driving one VBAR fault took residency from
+    14,784 MiB to 6,112 MiB in 52.3 ms, and the resulting ceiling is
+    `capacity - headroom` to within one 32 MiB page. It works.
+
+    Two asymmetries the arithmetic above does not know about. Raising evicts at
+    the next fault; LOWERING returns nothing until something calls prioritize()
+    and then faults, so a shrink does not hand VRAM back when it is published.
+    And there is a dead zone: on that card roughly 1,596 MiB of a 16,380 MiB
+    device is never reachable anyway, so any forwarded value below it does
+    nothing at all. One idle worker forwards seed plus its context floor, 556
+    MiB, which is inside that zone. The forward only bites once workers hold
+    real weights.
 
     Gated on the host actually running the pager; on the legacy path the
     published reserve already does the job.
@@ -585,9 +603,19 @@ def _warn_if_headroom_was_changed(control, about_to_write: int) -> None:
     lands there are two writers on one value, last write wins, and the loser
     is silent. This is the cheapest possible detector for that.
 
-    It is a DIAGNOSTIC, not a precondition. The getter is comfy-aimdo #107
-    and the installed base is 0.4.13, so its absence must cost nothing: no
-    getter means no check, and the forward proceeds exactly as before.
+    It is a DIAGNOSTIC, not a precondition. The getter is comfy-aimdo #107,
+    which merged after the newest published wheel was built, so as of today
+    this check is inert on EVERY wheel that exists, Windows included (verified
+    against 0.5.2 win_amd64: no wrapper, no getter, not even an exported
+    symbol). Its absence must therefore cost nothing: no getter means no check,
+    and the forward proceeds exactly as before. Do not let the wrapper's
+    presence become a health signal, or a working Windows install reads as
+    broken.
+
+    Nothing to detect yet, either: a full grep of ComfyUI at 15eb748 finds
+    three writes of simple_vram_headroom, all inside the import time
+    control.init call, and none after startup. comfy-env is currently the sole
+    writer. This exists for the day that changes.
     """
     global _AIMDO_FOREIGN_WRITER_LOGGED
     if _AIMDO_HEADROOM_WRITTEN is None or _AIMDO_FOREIGN_WRITER_LOGGED:
