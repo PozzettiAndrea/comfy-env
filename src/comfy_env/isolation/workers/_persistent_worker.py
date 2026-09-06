@@ -1800,6 +1800,25 @@ def main():
         except Exception as _e:
             wlog(f"[worker] memory manager probe failed: {_e}")
 
+    # The contract, evaluated where its worker-side entries actually live.
+    # Every comfy_aimdo entry is WORKER side and PAGED tier, and the only
+    # caller was the host at FLOOR, so none of them was ever evaluated by
+    # anything: the sweep marks them absent by design and the module was
+    # staged into every worker where nothing imported it. Reported rather
+    # than enforced: a missing symbol here means this worker pages worse,
+    # and the reply to that is to say so, not to refuse to start.
+    try:
+        import contract as _contract  # staged beside this program
+        _tiers = (_contract.FLOOR,)
+        if _mem_info.get("manager") == "aimdo":
+            _tiers = (_contract.FLOOR, _contract.PAGED)
+        _ok, _fail, _notes = _contract.check(side=_contract.WORKER, tiers=_tiers)
+        if _fail or _notes:
+            _mem_info["contract"] = {"ok": bool(_ok), "failures": list(_fail),
+                                     "notes": list(_notes)}
+    except Exception as _ce:
+        wlog(f"[worker] contract check skipped: {_ce}")
+
     # Pin budget bootstrap. The counter installs unconditionally (telemetry);
     # The per-worker pin CEILING is gone with the pin-split allocation half:
     # comfy's own ensure_pin_budget already stops pinning from the global

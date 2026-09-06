@@ -1403,6 +1403,12 @@ def _report_memory_manager(worker, env_dir) -> None:
         # costs real memory, and it is invisible without this line. Measured
         # about 92 MB of private RAM for a second cuBLASLt. Reported per
         # worker because it depends on that env's own wheels.
+        # What the worker's own contract check found. Its entries are all
+        # WORKER side and PAGED tier, so the host's FLOOR check cannot see
+        # them; the worker evaluates and the parent reports.
+        _wc = worker_info.get("contract") or {}
+        for _line in list(_wc.get("failures") or []) + list(_wc.get("notes") or []):
+            _log(f"[comfy-env] {name} contract: {_line}")
         for lib, paths in (worker_info.get("duplicate_cuda_majors") or {}).items():
             _log(
                 f"[comfy-env] NOTE: {name} maps two majors of lib{lib}: "

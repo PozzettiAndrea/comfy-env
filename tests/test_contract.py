@@ -147,3 +147,54 @@ def test_each_tier_has_entries(tier):
     """Catches: a tier that exists in the level switch but requires nothing,
     so its availability is never actually checked."""
     assert any(e["tier"] == tier for e in C.CONTRACT)
+
+
+class TestWorkerSideIsActuallyEvaluated:
+    """Every comfy_aimdo entry is WORKER side and PAGED tier. The only caller
+    was the host at FLOOR, so none of them was evaluated by anything: the
+    static sweep marks them absent by design and the module is staged into
+    every worker where nothing imported it. These pin the wiring that makes
+    the entries mean something."""
+
+    def test_the_worker_program_runs_the_check(self):
+        """Catches: entries that exist to be read by humans. A contract that
+        nothing evaluates is a comment with a data structure around it."""
+        import pathlib
+        src = pathlib.Path(
+            "src/comfy_env/isolation/workers/_persistent_worker.py"
+        ).read_text(encoding="utf-8")
+        assert "import contract as _contract" in src
+        assert "side=_contract.WORKER" in src
+
+    def test_the_paged_tier_is_only_asked_for_when_paging(self):
+        """Catches: reporting missing aimdo symbols on a ledger worker, where
+        their absence is correct and expected."""
+        import pathlib
+        src = pathlib.Path(
+            "src/comfy_env/isolation/workers/_persistent_worker.py"
+        ).read_text(encoding="utf-8")
+        i = src.index("side=_contract.WORKER")
+        window = src[i - 600:i]
+        assert '_mem_info.get("manager") == "aimdo"' in window
+        assert "_contract.PAGED" in window
+
+    def test_the_worker_entries_are_reachable_at_all(self):
+        """Catches the state this fixes: required_keys(WORKER, PAGED) coming
+        back empty, or the aimdo entries being on a side nothing checks."""
+        from comfy_env import contract
+        keys = contract.required_keys(contract.WORKER,
+                                      (contract.FLOOR, contract.PAGED))
+        assert any(k.startswith("comfy_aimdo.") for k in keys)
+
+    def test_a_missing_aimdo_symbol_is_reported_not_fatal_to_startup(self):
+        """Catches: a worker refusing to start over a DEGRADE entry. A missing
+        symbol means this worker pages worse; the answer is to say so."""
+        from comfy_env import contract
+        present = {k: True for k in contract.required_keys(
+            contract.WORKER, (contract.FLOOR, contract.PAGED))}
+        present["comfy_aimdo.model_vbar.vbars_reset_watermark_limits"] = False
+        ok, failures, notes = contract.evaluate(
+            present, side=contract.WORKER,
+            tiers=(contract.FLOOR, contract.PAGED))
+        assert ok is True
+        assert any("vbars_reset_watermark_limits" in n for n in notes)

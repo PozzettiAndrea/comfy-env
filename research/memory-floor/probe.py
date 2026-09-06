@@ -153,3 +153,18 @@ def release_all():
         "before": before,
         "after": vram_truth(),
     }
+
+
+def contract_probe():
+    """Prove the staged contract module is importable and evaluates the
+    worker side entries in this process, with a deliberate miss."""
+    import contract as c
+    keys = c.required_keys(c.WORKER, (c.FLOOR, c.PAGED))
+    ok, failures, notes = c.check(side=c.WORKER, tiers=(c.FLOOR, c.PAGED))
+    present = {k: True for k in keys}
+    present["comfy_aimdo.model_vbar.vbars_reset_watermark_limits"] = False
+    ok2, _f2, notes2 = c.evaluate(present, side=c.WORKER,
+                                  tiers=(c.FLOOR, c.PAGED))
+    return {"worker_keys": len(keys), "live_ok": ok,
+            "live_failures": failures, "live_notes": notes,
+            "simulated_miss_ok": ok2, "simulated_miss_notes": notes2}
