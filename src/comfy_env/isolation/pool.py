@@ -318,6 +318,7 @@ _LAST_PROMPT: Dict[str, Any] = {}
 #: read once: the reserve is forwarded into the pager as seed plus what
 #: comfy-env added, and the seed must not drift with our own writes.
 _AIMDO_SEED = None
+_AIMDO_SETTER_MISSING_LOGGED = False
 
 #: The idle sweep used to run only at worker call boundaries, so a prompt
 #: made of host nodes after a worker prompt never released anything: the
@@ -494,6 +495,15 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
         lib = getattr(_control, "lib", None)
         setter = getattr(lib, "set_simple_vram_headroom", None) if lib is not None else None
     if setter is None:
+        # Silent here would be wrong: the reserve keeps being published and
+        # keeps being inert on this path, which looks like the floor working.
+        global _AIMDO_SETTER_MISSING_LOGGED
+        if not _AIMDO_SETTER_MISSING_LOGGED:
+            _AIMDO_SETTER_MISSING_LOGGED = True
+            _log("[comfy-env] NOTE: this comfy-aimdo exports no "
+                 "set_simple_vram_headroom, so the published reserve cannot "
+                 "reach the pager; it stays preventive on the legacy path "
+                 "and reactive on the paged one.")
         return False
     headroom = reserve.aimdo_headroom(_aimdo_headroom_seed(), published, _RESERVE_BASE)
     try:

@@ -341,14 +341,30 @@ def aimdo_installed_level(control, log=None) -> int:
     except Exception as exc:  # pragma: no cover - defensive
         if log is not None:
             log("[worker] aimdo init signature unreadable: {}".format(exc))
-    tuples = False
+    # Whether init_devices understands (index, headroom) pairs, asked of the
+    # SIGNATURE and only then of the source. Reading source text for the word
+    # "tuple" was the brittlest line here: a refactor that keeps the
+    # behaviour but drops the word, or any wheel shipped without source,
+    # silently demoted the worker to level 1 and a default headroom. Source
+    # is now the last resort and an unreadable one is not evidence of
+    # absence, so the level falls back to what the kwargs already prove.
+    tuples = None
     try:
-        src = inspect.getsource(control.init_devices)
-        tuples = "tuple" in src
-    except Exception as exc:  # pragma: no cover - defensive
-        if log is not None:
-            log("[worker] aimdo init_devices source unreadable: {}".format(exc))
-    return aimdo_protocol_level(params, tuples)
+        sig = inspect.signature(control.init_devices)
+        ann = " ".join(str(p_.annotation) for p_ in sig.parameters.values())
+        if "tuple" in ann.lower() or "Tuple" in ann:
+            tuples = True
+    except Exception:
+        pass
+    if tuples is None:
+        try:
+            src = inspect.getsource(control.init_devices)
+            tuples = "tuple" in src
+        except Exception as exc:  # pragma: no cover - defensive
+            if log is not None:
+                log("[worker] aimdo init_devices shape unreadable, level from "
+                    "init kwargs alone: {}".format(exc))
+    return aimdo_protocol_level(params, bool(tuples))
 
 
 def maybe_enable_aimdo(log=None) -> bool:

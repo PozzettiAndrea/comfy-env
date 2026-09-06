@@ -840,3 +840,54 @@ class TestDuplicateCudaMajors:
         """Catches: assuming Linux. This runs at every worker start."""
         from comfy_env.memory_manager import duplicate_cuda_majors
         assert duplicate_cuda_majors("/nonexistent/maps") == {}
+
+
+class TestAimdoLevelDetection:
+    """Level detection decides whether a worker pages under the host's
+    policy or a default one, so how it FAILS matters as much as how it
+    reads."""
+
+    def test_an_unreadable_shape_does_not_demote_a_level_2_wheel(self):
+        """Catches the brittlest line this file had: reading source text for
+        the word 'tuple'. A C extension, a stripped wheel or a refactor that
+        keeps the behaviour without the word demoted the worker to level 1
+        and a default headroom, silently and permanently."""
+        from comfy_env.memory_manager import aimdo_installed_level, AIMDO_LEVEL_NVML
+
+        def init(simple_vram_headroom=None, nvml_pressure=False):
+            pass
+        # A builtin has no source and no annotations: the worst case.
+        control = type("C", (), {"init": staticmethod(init),
+                                 "init_devices": len})
+        assert aimdo_installed_level(control) == AIMDO_LEVEL_NVML
+
+    def test_the_signature_is_consulted_before_the_source(self):
+        """Catches: keeping source as the only evidence. An annotated
+        signature is the durable answer and needs no source at all."""
+        from comfy_env.memory_manager import (aimdo_installed_level,
+                                              AIMDO_LEVEL_TUPLE_DEVICES)
+        from typing import List, Tuple
+
+        def init():
+            pass
+
+        def init_devices(device_ids: "List[Tuple[int, int]]"):
+            pass
+        control = type("C", (), {"init": staticmethod(init),
+                                 "init_devices": staticmethod(init_devices)})
+        assert aimdo_installed_level(control) >= AIMDO_LEVEL_TUPLE_DEVICES
+
+    def test_a_genuine_level_1_wheel_still_reads_as_level_1(self):
+        """Catches: the fallback becoming a rubber stamp. An old wheel takes
+        bare ints and must be detected, or init_devices raises inside a
+        comprehension and the worker lands on the ledger anyway."""
+        from comfy_env.memory_manager import aimdo_installed_level, AIMDO_LEVEL_MIN
+
+        def init():
+            pass
+
+        def init_devices(device_ids):
+            return True
+        control = type("C", (), {"init": staticmethod(init),
+                                 "init_devices": staticmethod(init_devices)})
+        assert aimdo_installed_level(control) == AIMDO_LEVEL_MIN

@@ -107,6 +107,12 @@ CONTRACT = (
      "why": "per device headroom, which is fixed here and cannot be changed "
             "later; absent, the worker pages without mirroring host reserve",
      "since": "comfy-aimdo 0.4.10 for the (index, bytes) form"},
+    {"module": "comfy_aimdo.model_vbar", "attr": "vbars_reset_watermark_limits",
+     "kind": "callable", "severity": DEGRADE, "tier": PAGED, "side": WORKER,
+     "why": "the node boundary release. Absent, a paged worker keeps "
+            "allocating cast buffers with nothing freeing them, which leaks "
+            "quietly rather than failing",
+     "since": None},
     {"module": "comfy_aimdo.control", "attr": "get_total_vram_usage",
      "kind": "callable", "severity": FATAL, "tier": PAGED, "side": WORKER,
      "why": "the only honest measure of what a paged worker holds: torch "
