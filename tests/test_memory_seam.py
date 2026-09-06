@@ -840,3 +840,44 @@ class TestDuplicateCudaMajors:
         """Catches: assuming Linux. This runs at every worker start."""
         from comfy_env.memory_manager import duplicate_cuda_majors
         assert duplicate_cuda_majors("/nonexistent/maps") == {}
+
+
+class TestLedgerEntryIsNeverCurrentlyUsed:
+    """`currently_used` is the leak valve. It must stay shut.
+
+    Upstream reads the flag in exactly one place,
+    `loaded_models(only_currently_used=True)`, and every caller of that
+    function hands the result straight back to `load_models_gpu`.
+    """
+
+    def test_no_call_site_can_ask_for_currently_used(self):
+        """Catches the shipped implementation:
+        `_insert_loaded_model(p, currently_used=(p.model.device == load_device))`,
+        which is True for exactly the resident models, that is the normal case.
+
+        The cost was not theoretical. It put the stand-in inside
+        `models_to_load`, where `load_models_gpu` calls `model_load` on it and
+        re-faults weights the worker had let go, and where
+        `model_management.py:970-971` adds the model's FULL size to
+        `total_pins_required` (because we answer `is_dynamic()` False), which
+        `ensure_pin_budget` spends evicting pinned HOST ram for weights that
+        live in another process and can never be pinned here.
+
+        Asserted against the source rather than behaviour because the flag is
+        write-only from comfy-env's side: no runtime assertion can observe a
+        wrong value until an upstream node reads it.
+        """
+        src = (Path(__file__).parent.parent / "src" / "comfy_env" / "isolation"
+               / "pool.py").read_text(encoding="utf-8")
+        # Precise: the docstring legitimately names upstream's
+        # loaded_models(only_currently_used=True), so match the assignment.
+        assert "lm.currently_used = True" not in src
+        assert "_insert_loaded_model(p, " not in src, (
+            "a call site is passing currently_used again")
+        assert "def _insert_loaded_model(p):" in src, (
+            "_insert_loaded_model grew a currently_used parameter again. There "
+            "is no case where True is correct; keep it unrepresentable.")
+        body = src.split("def _insert_loaded_model(p):", 1)[1].split("\ndef ", 1)[0]
+        assert "lm.currently_used = False" in body, (
+            "the entry must be inserted with currently_used False; anything "
+            "else reopens loaded_models(only_currently_used=True) to the fake")

@@ -572,8 +572,8 @@ def _install_pressure_hook() -> None:
     An earlier design added one (a MemoryObserver that held nothing and
     listened for the 1e30 Free-memory sentinel). It was deleted: the button
     already reaches workers through the stand-in's own detach, and a bare
-    entry of ours in upstream's list was the surface both of comfy-env's
-    loud breaks came through.
+    entry of ours in upstream's list, answering anything asked of it, is the
+    shape every defect ever found in this area came through.
 
     Imported here rather than at module scope because model_patcher imports
     comfy.model_management, and pool must stay importable without ComfyUI.
@@ -1395,19 +1395,37 @@ def _shutdown_all_workers():
 atexit.register(_shutdown_all_workers)
 
 
-def _insert_loaded_model(p, currently_used):
+def _insert_loaded_model(p):
     """Insert one proxy into ComfyUI's ledger as a LoadedModel.
 
     Shared by first registration and by the post-eviction repair, so the two
     cannot drift. Inserting directly rather than via load_models_gpu is
     deliberate: that would try to load every model at once and OOM.
+
+    ``currently_used`` is False here and has no parameter, because there is
+    no case where True is right. Upstream reads the flag in exactly one
+    place, ``loaded_models(only_currently_used=True)``, and all six of that
+    function's callers (controlnet and five extras nodes) hand what they get
+    straight back to ``load_models_gpu``. A stand-in arriving there costs
+    twice. ``load_models_gpu`` calls ``model_load`` on it, re-faulting
+    weights the worker had already let go. And because we answer
+    ``is_dynamic()`` False, ``model_management.py:970-971`` adds the model's
+    FULL size to ``total_pins_required``, which ``ensure_pin_budget`` then
+    spends evicting pinned HOST ram to make room for weights that live in
+    another process and are never pinned here. With the pager running that
+    ask is entirely phantom: host models are dynamic and book nothing, so
+    they are the only models ``free_pins`` can reach and the only ones that
+    pay.
+
+    Nothing on the eviction path reads the flag (``free_memory`` only writes
+    it), so False costs nothing.
     """
     import weakref
 
     import comfy.model_management
 
     lm = comfy.model_management.LoadedModel(p)
-    lm.currently_used = currently_used
+    lm.currently_used = False
     # Set real_model and model_finalizer (needed by model_unload)
     lm.real_model = weakref.ref(p.model)
     lm.model_finalizer = weakref.finalize(
@@ -1531,9 +1549,7 @@ def _register_new_patchers(env_dir, worker, generation):
         if any(lm.model is p
                for lm in comfy.model_management.current_loaded_models):
             continue  # still listed; nothing was lost
-        # Not currently_used: free_memory cleared that before popping, and
-        # recomputing it from the device would resurrect eviction priority.
-        _insert_loaded_model(p, currently_used=False)
+        _insert_loaded_model(p)
         _log(f"[comfy-env] restored ledger entry for '{p._model_id}': "
              f"eviction could not reach a busy worker and upstream dropped it")
 
@@ -1605,4 +1621,4 @@ def _register_new_patchers(env_dir, worker, generation):
         # would try to load all models simultaneously and OOM).
         for model_id in created:
             p = patchers[model_id]
-            _insert_loaded_model(p, currently_used=(p.model.device == load_device))
+            _insert_loaded_model(p)
