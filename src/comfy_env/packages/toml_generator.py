@@ -14,7 +14,7 @@ import copy
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ..config import ComfyEnvConfig
 from ..detection import get_pixi_platform
@@ -148,6 +148,7 @@ def _replace_host_derived(
     name: str,
     label: str = "[pypi-dependencies]",
     log: Callable[[str], None] = print,
+    derived: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Remove a pack's host-derived declarations in place; return the substitutes.
 
@@ -163,12 +164,34 @@ def _replace_host_derived(
     is normalised. An exact pin that disagrees with the host is a deliberate
     statement the seam cannot honour. Same split as `_validate_node_config`,
     which raises for torch while `_strip_torch_family` strips elsewhere.
+
+    ``derived`` names the packages comfy-env is allowed to overrule at all.
+    A declaration is dropped even when the host offers no substitute, because
+    the rule is that these versions are not a pack's to choose: the worker
+    pages the same card as the host under the same policy, so a pack pinning
+    one is a mismatch waiting to happen, and leaving it stand when the host's
+    pin is unreadable applied the rule exactly where nobody would notice it
+    was not applied. With no substitute the solver picks, which is what a
+    pack that never declared it already gets.
+
+    ``derived`` is EMPTY when the operator turned replication off, and then
+    this strips nothing at all: opting out has to mean opting out, or the
+    switch would still take a pack's declaration away and give nothing back.
     """
     canon_hosts = {_canonical(k): (k, v) for k, v in host_pins.items()}
+    canon_derived = {_canonical(k) for k in (derived or ())}
     out: Dict[str, Any] = {}
     for key in list(node_pypi.keys()):
-        match = canon_hosts.get(_canonical(key))
+        canon = _canonical(key)
+        match = canon_hosts.get(canon)
         if match is None:
+            if canon in canon_derived:
+                node_pypi.pop(key)
+                log(
+                    f"[pixi] {label} {name}: dropping `{key}` (no host pin to "
+                    f"replicate, and this is not a pack's version to choose); "
+                    f"the solver picks"
+                )
             continue
         pkg, wanted = match
         declared = node_pypi.pop(key)
@@ -331,6 +354,9 @@ def _build_node_feature(
     # PyPI deps: torch family pin (replicated workspace-wide) + node's own
     pypi = _torch_family_pypi(torch_pin, torch_index, log)
     host_pins = _host_derived_pypi(comfyui_dir, host_derived, log)
+    # Empty when the operator turned replication off, so the strip below is a
+    # no-op then: opting out must leave a pack's own declarations standing.
+    _derived_names = _HOST_DERIVED_PKGS if host_derived else ()
     node_pypi = copy.deepcopy(cfg.pixi_passthrough.get("pypi-dependencies", {}))
     if node_pypi:
         _strip_torch_family(node_pypi, name, "[pypi-dependencies]", log)
@@ -338,7 +364,8 @@ def _build_node_feature(
         # package. Adding it to a pack that never asked would put a native CUDA
         # wheel into CPU-only envs and change every env's identity, which is a
         # far larger blast radius than the drift this exists to fix.
-        pypi.update(_replace_host_derived(node_pypi, host_pins, name, log))
+        pypi.update(_replace_host_derived(node_pypi, host_pins, name,
+                                          log=log, derived=_derived_names))
         pypi.update(node_pypi)
     # Inject even when the pack never asked. These are not the pack's
     # dependencies to declare: the HOST's ComfyUI imports them unguarded, so a
@@ -383,6 +410,7 @@ def _build_node_feature(
                     pypi.update(_replace_host_derived(
                         cur_target[tbl], host_pins, name,
                         f"[target.{current}.{tbl}]", log,
+                        derived=_derived_names,
                     ))
                 if not cur_target[tbl]:
                     del cur_target[tbl]

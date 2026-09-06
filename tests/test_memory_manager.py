@@ -231,14 +231,21 @@ class TestHostDerivedSubstitution:
         pypi = self._build(cfg, self._host(tmp_path))
         assert pypi["comfy-aimdo"] == "==0.4.13"
 
-    def test_the_pack_spec_stands_when_the_host_has_no_pin(self, tmp_path):
-        """Never remove without a replacement. This is the load-bearing invariant."""
+    def test_a_pack_pin_does_not_stand_when_the_host_has_no_pin(self, tmp_path):
+        """These versions are not a pack's to choose, and the rule has to hold
+        when the host's pin is unreadable too, which is where nobody would
+        notice it was not being applied. Catches the earlier invariant, "never
+        remove without a replacement", which was right for a pack's own
+        dependencies and wrong for the two comfy-env replicates: a worker
+        pages the same card as the host and must page under the same policy.
+        With no substitute the solver picks, which is what a pack that never
+        declared it already gets."""
         cfg = self._cfg(tmp_path, "*")
         root = tmp_path / "ComfyUI"
         root.mkdir(exist_ok=True)
         (root / "requirements.txt").write_text("torch\n", encoding="utf-8")
         pypi = self._build(cfg, root)
-        assert pypi["comfy-aimdo"] == "*"
+        assert "comfy-aimdo" not in pypi
 
     def test_a_conflicting_explicit_pin_is_an_error(self, tmp_path):
         """A wildcard is boilerplate. An explicit disagreement is a statement."""
@@ -280,6 +287,9 @@ class TestHostDerivedSubstitution:
             self._build(load_config(tmp_path / "comfy-env.toml"), self._host(tmp_path))
 
     def test_disabled_leaves_everything_alone(self, tmp_path):
+        """Opting out of replication has to mean opting out. Catches a strip
+        that runs regardless of the switch, which would take the pack's
+        declaration away and give nothing back."""
         cfg = self._cfg(tmp_path, "*")
         pypi = self._build(cfg, self._host(tmp_path), host_derived=False)
         assert pypi["comfy-aimdo"] == "*"

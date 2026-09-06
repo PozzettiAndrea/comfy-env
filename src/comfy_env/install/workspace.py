@@ -289,10 +289,12 @@ def _bootstrap_torch_pin(bootstrap_torch: Optional[str]) -> Optional[str]:
 def _fast_key(
     cf: Path,
     discovered: List[Tuple[str, "Path", "Path", "ComfyEnvConfig"]],
+    comfyui_dir: Optional[Path] = None,
 ) -> str:
     """Local-only change detector (level 1). See block comment above."""
     from ..detection.cuda import has_nvidia_gpu
     from ..environment.cache import _abi_tag
+    from ..packages.toml_generator import _HOST_DERIVED_PKGS, read_host_pin
 
     h = hashlib.sha256()
     # Manifest-format generation. Bump when the SHAPE of what install writes
@@ -311,6 +313,20 @@ def _fast_key(
     ) + sorted(
         {cfg.python or "host" for _n, _p, _c, cfg in discovered}
     )
+    # The host's pins for packages comfy-env replicates rather than authors.
+    # Without these the gate reads "nothing changed locally" and skips, so a
+    # ComfyUI update that moves the comfy-aimdo pin never reaches an existing
+    # env: it keeps the old wheel for the life of the install and the only
+    # sign is a version-skew NOTE at runtime. The rule is "replicate the
+    # host's pin"; this is what makes it true after the first install.
+    h.update(b"host-pins:")
+    for pkg in _HOST_DERIVED_PKGS:
+        h.update(pkg.encode())
+        h.update(b"=")
+        h.update((read_host_pin(comfyui_dir, pkg) or "-").encode())
+        h.update(b";")
+    h.update(b"\n")
+
     h.update(b"combo-inputs:")
     h.update(",".join(combo_inputs).encode())
     h.update(b"\ntoml:")
@@ -658,7 +674,7 @@ def install_workspace(
     legacy_v1: Dict[str, bool] = {}
     derive: List[str] = []
     for env_name, _plugin, cf, _cfg in discovered:
-        fast_keys[env_name] = _fast_key(cf, discovered)
+        fast_keys[env_name] = _fast_key(cf, discovered, comfyui_dir)
         env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
         identity, fastkey, legacy = _read_hash_file(
             env_manifest_dir / _INSTALL_HASH_FILE)
