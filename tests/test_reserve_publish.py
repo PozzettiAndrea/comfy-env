@@ -304,53 +304,53 @@ class TestIdleSweepTimer:
         assert "_release_idle_workers" in called
 
 
-class TestObserverInstall:
-    """Wiring the listener. Off by default; on, it must not be able to stall
-    the host."""
+class TestPressureHook:
+    """The stand-in's eviction path is the pressure signal. There is no
+    second entry in ComfyUI's list any more, and there must not be one."""
 
-    @pytest.fixture()
-    def obs_env(self, pool_mod, monkeypatch):
+    def test_nothing_of_ours_is_planted_in_the_ledger(self, pool_mod):
+        """Catches the design that was deleted: a listener appended to
+        current_loaded_models to hear the Free button. The button already
+        reaches workers through the stand-in's own detach, and a bare entry
+        of ours in upstream's list is the surface both loud breaks came
+        through. Installing the hook must touch nothing but our own module."""
         pool, mm = pool_mod
         mm.current_loaded_models = []
-        monkeypatch.setattr(pool, "_OBSERVER", None)
-        return pool, mm
-
-    def test_off_by_default(self, obs_env, monkeypatch):
-        """Catches: planting an object in ComfyUI's list without being asked.
-        The floor needs nothing from it, and it is the one piece with a
-        breakage history."""
-        pool, mm = obs_env
-        monkeypatch.delenv("COMFY_ENV_MEMORY_OBSERVER", raising=False)
-        assert pool._install_observer() is False
+        pool._install_pressure_hook()
         assert mm.current_loaded_models == []
 
-    def test_on_it_joins_the_ledger_once(self, obs_env, monkeypatch):
-        """Catches: one entry per worker. The signals are per process."""
-        pool, mm = obs_env
-        monkeypatch.setenv("COMFY_ENV_MEMORY_OBSERVER", "1")
-        assert pool._install_observer() is True
-        assert pool._install_observer() is True
-        assert len(mm.current_loaded_models) == 1
+    def test_the_hook_lands_on_the_object_comfyui_already_calls(self, pool_mod):
+        """Catches wiring it to anything other than the stand-in: the whole
+        point is that no new object is introduced."""
+        pool, _mm = pool_mod
+        pool._install_pressure_hook()
+        from comfy_env.isolation import model_patcher
+        assert model_patcher._ON_PRESSURE is pool._on_host_pressure
 
-    def test_the_callbacks_never_block_the_host(self, obs_env, monkeypatch):
-        """Catches THE way this breaks a user's ComfyUI: the callbacks run on
-        the host's thread, inside free_memory, inside a node. A synchronous
-        IPC round trip to a busy worker there stalls every host load."""
+    def test_it_never_blocks_the_host(self, pool_mod, monkeypatch):
+        """Catches THE way this breaks a user's ComfyUI: it runs on the
+        host's thread, inside free_memory, inside a node. A synchronous IPC
+        round trip to a busy worker there stalls every host load."""
         import ast
         import inspect
-        pool, mm = obs_env
-        src = inspect.getsource(pool._install_observer)
-        tree = ast.parse(src.lstrip())
-        for name in ("_on_free_all", "_on_pressure"):
-            fn = next(n for n in ast.walk(tree)
-                      if isinstance(n, ast.FunctionDef) and n.name == name)
-            body = ast.unparse(fn)
-            assert "Thread" in body and "daemon=True" in body, name
-            assert "join" not in body, name
+        pool, _mm = pool_mod
+        body = ast.unparse(ast.parse(
+            inspect.getsource(pool._on_host_pressure).lstrip()))
+        assert "Thread" in body and "daemon=True" in body
+        assert "join" not in body
 
-    def test_a_broken_ledger_never_breaks_startup(self, obs_env, monkeypatch):
-        """Catches: letting an optional listener take worker creation down."""
-        pool, mm = obs_env
-        monkeypatch.setenv("COMFY_ENV_MEMORY_OBSERVER", "1")
-        del mm.current_loaded_models
-        assert pool._install_observer() is False
+    def test_one_eviction_pass_is_one_ask(self, pool_mod, monkeypatch):
+        """Catches asking once per stand-in: ComfyUI's loop walks every
+        candidate in a single pass and each ask is the same news, so an
+        undebounced hook fans one shortage into N sweeps of every worker."""
+        pool, _mm = pool_mod
+        asks = []
+        monkeypatch.setattr(pool, "_ask_idle_workers",
+                            lambda n, *a, **k: asks.append(n))
+        monkeypatch.setattr(pool, "_LAST_PRESSURE_ASK", [0.0])
+        for _ in range(5):
+            pool._on_host_pressure(1 << 30)
+        for t in list(__import__("threading").enumerate()):
+            if t.name == "comfy-env-pressure":
+                t.join(timeout=5.0)
+        assert len(asks) == 1, asks

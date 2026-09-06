@@ -22,7 +22,6 @@ from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
 from .. import reserve, state_sync
-from . import observer
 from ..debug import WORKER as _DBG_WORKER, MODELS as _DBG_MODELS, log as _log
 
 
@@ -391,10 +390,11 @@ def _card_is_tight() -> bool:
 def _release_idle_workers() -> None:
     """Ask workers that have been idle a while to give their VRAM back.
 
-    This is the whole replacement for host-driven reclaim. comfy-env no
-    longer registers a proxy that ComfyUI can evict, so nothing can take a
-    worker's memory from outside; instead the worker lets go on its own and
-    the reserve follows it down.
+    Host-driven reclaim through the stand-in only reaches REGISTERED
+    models. This reaches what it cannot: a worker that holds a context and
+    an allocator cache but has no model ComfyUI ever listed, and a worker
+    whose models are listed but which nothing has asked. The worker lets go
+    on its own and the reserve follows it down.
 
     A successful release is the measured receipt that permits the reserve to
     SHRINK: the worker has told us what it freed, so the space is provably
@@ -537,59 +537,50 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
     return True
 
 
-#: The optional listener in ComfyUI's loaded-model list, if an operator
-#: turned it on. One per process, planted at first worker creation.
-_OBSERVER = None
+#: Debounce for the pressure hook. ComfyUI's eviction loop can ask several
+#: stand-ins in one pass, and each ask is the same news.
+_LAST_PRESSURE_ASK = [0.0]
+
+#: Two asks inside this window are one pressure event, not two.
+PRESSURE_DEBOUNCE_SECONDS = 2.0
 
 
-def _install_observer() -> bool:
-    """Plant the read-only listener, once, if COMFY_ENV_MEMORY_OBSERVER is on.
+def _on_host_pressure(shortfall: int) -> None:
+    """ComfyUI asked a worker model to shrink, so the host is short.
 
-    comfy-env patches nothing, so two signals it would like are simply not
-    delivered: the Free-memory button and the host's OOM handler both reach
-    ComfyUI's own eviction loop and never leave the process. An entry in the
-    list is asked, and that is the only way to hear them without replacing a
-    function.
+    This runs on ComfyUI's thread, inside free_memory, inside a node. It
+    posts and returns: waiting on a worker here would stall every host load.
 
-    Off by default because it is still a coupling: an object of ours inside
-    their bookkeeping, which is the surface both of comfy-env's loud breaks
-    came through. This one reports holding nothing, so no upstream decision
-    depends on its answers; see isolation/observer.py for why that is the
-    difference that matters.
-
-    Both callbacks POST and return. They run on ComfyUI's thread inside
-    free_memory inside a node, so waiting on a worker here would stall every
-    host load.
+    The signal is worth having because the eviction loop only ever asks for
+    what a REGISTERED model can give. A worker also holds a CUDA context and
+    an allocator cache that no stand-in represents, and idle siblings that
+    were never asked at all. Those are what _ask_idle_workers reaches.
     """
-    global _OBSERVER
-    if _OBSERVER is not None:
-        return True
-    if not observer.enabled(os.environ):
-        return False
-    try:
-        import comfy.model_management as mm
-    except ImportError:
-        return False
-    try:
-        def _on_free_all():
-            threading.Thread(target=broadcast_release,
-                             name="comfy-env-free-all", daemon=True).start()
+    now = time.monotonic()
+    if now - _LAST_PRESSURE_ASK[0] < PRESSURE_DEBOUNCE_SECONDS:
+        return
+    _LAST_PRESSURE_ASK[0] = now
+    threading.Thread(target=_ask_idle_workers, args=(int(shortfall),),
+                     name="comfy-env-pressure", daemon=True).start()
 
-        def _on_pressure(nbytes):
-            threading.Thread(target=_ask_idle_workers, args=(int(nbytes),),
-                             name="comfy-env-pressure", daemon=True).start()
 
-        obs = observer.MemoryObserver(device=mm.get_torch_device(),
-                                      on_free_all=_on_free_all,
-                                      on_pressure=_on_pressure)
-        mm.current_loaded_models.append(obs)
-        _OBSERVER = obs
-        _log("[comfy-env] memory observer on: the Free button and OOM now "
-             "reach workers (COMFY_ENV_MEMORY_OBSERVER)")
-        return True
-    except Exception as exc:
-        _log(f"[comfy-env] memory observer not installed: {exc}")
-        return False
+def _install_pressure_hook() -> None:
+    """Wire the stand-in's eviction path to the idle-worker ask, once.
+
+    The stand-in is already in ComfyUI's list and is already called under
+    pressure with the exact shortfall; no second object is needed to hear it.
+    An earlier design added one (a MemoryObserver that held nothing and
+    listened for the 1e30 Free-memory sentinel). It was deleted: the button
+    already reaches workers through the stand-in's own detach, and a bare
+    entry of ours in upstream's list was the surface both of comfy-env's
+    loud breaks came through.
+
+    Imported here rather than at module scope because model_patcher imports
+    comfy.model_management, and pool must stay importable without ComfyUI.
+    This is not a cycle: model_patcher imports nothing from pool.
+    """
+    from . import model_patcher
+    model_patcher._ON_PRESSURE = _on_host_pressure
 
 
 def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
@@ -1103,13 +1094,10 @@ def _register_proxy_routes(routes, env_dir, package_root, sys_path, env_vars,
 
 
 # --- Release levers: full_release and pin release, sent to workers -----
-# Nothing in the host calls these on its own: comfy-env does not patch the
-# host, so the Free button and the host's RAM-pressure sweep do not reach
-# workers unless something inside comfy-env (idle release, the optional
-# observer) decides to call them.
+# comfy-env does not patch the host, so nothing upstream pulls these. They
+# are pulled by comfy-env's own code: the idle sweep, the prompt boundary,
+# the admission ask, and the pressure hook on the stand-in's eviction path.
 
-
-_LAST_RELEASE_BROADCAST = [0.0]
 
 #: Serializes the once-per-process host contract check. Nothing else ever
 #: takes this lock.
@@ -1165,60 +1153,6 @@ def broadcast_pin_release(target_bytes: int) -> None:
 
     for key, size in asks.items():
         threading.Thread(target=_ask_one, args=(key, size), daemon=True).start()
-
-
-def broadcast_release() -> None:
-    """Send full_release to every idle advertising worker, in parallel.
-
-    Busy workers get a parent-owned deferral flag drained at their next node
-    boundary (a mid-compute worker is not reading its socket, and its memory
-    is in use anyway). Dead workers are skipped, never respawned. Every send
-    binds its reply: the receipt's measured numbers are logged per worker,
-    and the reply's piggybacked census and pin scalar are INGESTED here (a
-    released worker may go quiet; waiting for a next call that never comes
-    would advertise stale pins forever)."""
-    now = time.monotonic()
-    with _POOL_LOCK:
-        entries = dict(_WORKER_POOL)
-    plan = state_sync.plan_release_broadcast(
-        {key: {"alive": worker.is_alive(),
-               "advertises": getattr(worker, "supports_full_release", False)}
-         for key, (worker, _g) in entries.items()},
-        now, _LAST_RELEASE_BROADCAST[0])
-    if plan["send"]:
-        _LAST_RELEASE_BROADCAST[0] = now
-    for key in plan["skip_dead"]:
-        _log(f"[comfy-env] /free: worker {Path(key).name} is dead, skipped")
-
-    def _release_one(key):
-        worker, gen = entries[key]
-        try:
-            r = worker.send_command_no_spawn("full_release", lock_timeout=2.0)
-            if r == "busy":
-                worker._release_deferred = True
-                _log(f"[comfy-env] /free: worker {Path(key).name} busy, "
-                     f"release deferred to its next node boundary")
-                return
-            if r == "dead":
-                return
-            receipt = (r or {}).get("receipt") or {}
-            _ingest_worker_frames(key, worker, gen)
-            _log(f"[comfy-env] /free worker {Path(key).name}: reserved "
-                 f"{receipt.get('reserved_before', 0) / 1e9:.2f}GB -> "
-                 f"{receipt.get('reserved_after', 0) / 1e9:.2f}GB, pinned "
-                 f"{receipt.get('pinned_before', 0) / 1e9:.2f}GB -> "
-                 f"{receipt.get('pinned_after', 0) / 1e9:.2f}GB"
-                 + (f", errors={receipt.get('errors')}"
-                    if receipt.get("errors") else ""))
-        except Exception as exc:
-            _log(f"[comfy-env] /free: release of {Path(key).name} failed: {exc}")
-
-    threads = [threading.Thread(target=_release_one, args=(k,), daemon=True)
-               for k in plan["send"]]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=90.0)
 
 
 _CONTRACT_CHECKED = False
@@ -1323,7 +1257,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     _report_memory_manager(worker, env_dir)
     _check_host_contract()
     _start_idle_sweep()
-    _install_observer()
+    _install_pressure_hook()
     return worker, gen
 
 

@@ -41,6 +41,21 @@ from ..debug import VRAM as _DBG_VRAM
 
 log = logging.getLogger("comfy_env.model_patcher")
 
+#: Set by pool._install_pressure_hook. Called with the shortfall in bytes
+#: when ComfyUI asks a worker model to shrink, which is the only in-process
+#: notice that the host is short of VRAM.
+#:
+#: It is wired HERE, on the object ComfyUI already calls, rather than on a
+#: second entry planted in current_loaded_models purely to listen. The
+#: listener existed and was deleted: it duplicated a signal this method
+#: already receives, and it put an object of ours in upstream's list with a
+#: permissive __getattr__, which is the shape both of comfy-env's loud
+#: breaks came through.
+#:
+#: The callee must POST and RETURN. This fires on ComfyUI's thread, inside
+#: free_memory, inside a node.
+_ON_PRESSURE = None
+
 
 def _log_vram(label: str) -> None:
     """Log compact VRAM state around model load/unload."""
@@ -277,6 +292,15 @@ class SubprocessModelPatcher:
         if resident_before <= 0:
             return 0
         want = int(memory_to_free) if memory_to_free else resident_before
+        # Being asked at all is the news: the host is short by `want` and has
+        # already evicted what it owns. Tell comfy-env before doing our own
+        # part, so idle siblings shrink in parallel with this round trip.
+        # Never let a hook failure break someone else's eviction loop.
+        if _ON_PRESSURE is not None and memory_to_free:
+            try:
+                _ON_PRESSURE(want)
+            except Exception as exc:
+                log.debug("pressure hook failed: %s", exc)
         _log_vram(f"Before partial offload '{self._model_id}' (-{want // (1024 * 1024)} MB)")
         r = self._send("model_partial_unload", quiet_on_loss=True, bytes_to_free=want)
         if r is WORKER_GONE:

@@ -567,20 +567,6 @@ def forward_cast_need(largest_tensor: Optional[int],
     return max(0, int(num_streams)) * max(0, int(largest_tensor))
 
 
-# ---------------------------------------------------------------------------
-# /free broadcast planning
-# ---------------------------------------------------------------------------
-
-#: Minimum seconds between release broadcasts. Suppresses SAME-BURST
-#: duplicates only (a nested double-wrap, an OOM retry storm): deliberately
-#: short, because the wrap site cannot distinguish a human /free from OOM
-#: recovery (both call unload_all_models), so a long window would swallow a
-#: genuine press arriving right after an OOM broadcast, leaving those
-#: workers with only the shallow detach and not the deep ladder. Accepted
-#: residual: a human press within this window still gets the shallow pass.
-RELEASE_DEBOUNCE_SECONDS = 0.5
-
-
 #: How long a worker may sit idle before it is asked to give its VRAM back.
 #: This is what replaces host-driven reclaim: the host cannot reach into a
 #: worker, so the worker lets go on its own and the reserve follows.
@@ -672,35 +658,6 @@ def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
         if not prompt_over and not timer_due:
             continue
         out.append(key)
-    return out
-
-
-def plan_release_broadcast(workers: Dict[str, Dict[str, Any]], now: float,
-                           last_broadcast: float,
-                           debounce: float = RELEASE_DEBOUNCE_SECONDS
-                           ) -> Dict[str, List[str]]:
-    """Which workers get the full_release command.
-
-    ``workers`` maps key to ``{"alive": bool, "advertises": bool}``. Every
-    input key lands in exactly one output list (set equality, so a filtered
-    worker cannot hide): ``send`` (alive advertisers), ``skip_dead`` (their
-    memory died with them; the send path must NEVER resurrect one to free
-    it), ``skip_unsupported`` (no ready-frame advertisement; an unknown
-    method gets no reply and the sender eats the recv timeout). Inside the
-    debounce window everything moves to ``skip_debounced``.
-    """
-    out: Dict[str, List[str]] = {"send": [], "skip_dead": [],
-                                 "skip_unsupported": [], "skip_debounced": []}
-    if now - last_broadcast < debounce:
-        out["skip_debounced"] = sorted(workers)
-        return out
-    for key, w in workers.items():
-        if not w.get("alive"):
-            out["skip_dead"].append(key)
-        elif not w.get("advertises"):
-            out["skip_unsupported"].append(key)
-        else:
-            out["send"].append(key)
     return out
 
 

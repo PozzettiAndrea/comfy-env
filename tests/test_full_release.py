@@ -1,15 +1,14 @@
 """Tests for the /free deep release (host wrap, broadcast, worker ladder).
 
-The pure units are memory_manager.full_release (injected modules) and
-state_sync.plan_release_broadcast; the ast guards pin the wiring bare CI
-cannot execute. Every test names the wrong implementation it catches.
+The pure unit is memory_manager.full_release (injected modules); the ast
+guards pin the wiring bare CI cannot execute. Every test names the wrong
+implementation it catches.
 """
 
 import ast
 from pathlib import Path
 
 from comfy_env.memory_manager import full_release
-from comfy_env.state_sync import plan_release_broadcast
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_env"
 POOL = SRC / "isolation" / "pool.py"
@@ -133,45 +132,6 @@ class TestFullReleaseLadder:
             "never kill the worker's request loop")
 
 
-class TestPlanReleaseBroadcast:
-    def test_every_key_lands_in_exactly_one_list(self):
-        """Set equality, not lengths: a filtered-out worker cannot hide."""
-        plan = plan_release_broadcast(
-            {"a": {"alive": True, "advertises": True},
-             "b": {"alive": False, "advertises": True},
-             "c": {"alive": True, "advertises": False}},
-            now=100.0, last_broadcast=0.0)
-        assert plan["send"] == ["a"]
-        assert plan["skip_dead"] == ["b"]
-        assert plan["skip_unsupported"] == ["c"]
-        everything = sum(plan.values(), [])
-        assert sorted(everything) == ["a", "b", "c"]
-
-    def test_dead_worker_never_lands_in_send(self):
-        """The send path must never resurrect a worker to free its memory
-        (send_command runs _ensure_started; the no-spawn path exists for
-        exactly this)."""
-        plan = plan_release_broadcast({"d": {"alive": False, "advertises": True}},
-                                      now=100.0, last_broadcast=0.0)
-        assert plan["send"] == [] and plan["skip_dead"] == ["d"]
-
-    def test_debounce_suppresses_same_burst_duplicates_only(self):
-        """The window is deliberately SHORT (0.5 s): the wrap site cannot
-        tell a human /free from OOM recovery, so a long window would swallow
-        a genuine press right after an OOM broadcast. Inside the window a
-        nested duplicate is skipped; just outside it a fresh press sends."""
-        plan = plan_release_broadcast({"a": {"alive": True, "advertises": True}},
-                                      now=100.0, last_broadcast=99.7)
-        assert plan["send"] == [] and plan["skip_debounced"] == ["a"]
-        plan = plan_release_broadcast({"a": {"alive": True, "advertises": True}},
-                                      now=100.0, last_broadcast=99.0)
-        assert plan["send"] == ["a"]
-
-    def test_empty_pool_is_a_noop(self):
-        plan = plan_release_broadcast({}, now=1.0, last_broadcast=0.0)
-        assert all(v == [] for v in plan.values())
-
-
 class TestFreeSeamGuards:
     def test_no_spawn_send_path_contains_no_ensure_started(self):
         """send_command runs _ensure_started, so a broadcast through it would
@@ -199,19 +159,6 @@ class TestFreeSeamGuards:
         src = WORKER.read_text(encoding="utf-8")
         assert 'request.get("method") == "full_release"' in src
 
-    def test_broadcast_binds_and_ingests_every_reply(self):
-        """Fire-and-forget masks failure, and harvested-but-not-ingested
-        replies sit unconsumed until a next call that a released worker may
-        never make."""
-        tree = ast.parse(POOL.read_text(encoding="utf-8"))
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "_release_one")
-        src = ast.unparse(fn)
-        assert "send_command_no_spawn" in src
-        assert "_ingest_worker_frames" in src, (
-            "the broadcast no longer ingests the reply's census and pin "
-            "scalar; a quiet released worker advertises stale pins forever")
-
     def test_ready_frame_advertises_the_capability(self):
         src = WORKER.read_text(encoding="utf-8")
         ready = src[src.index("_ready_frame = {"):src.index("transport.send(_ready_frame)")]
@@ -226,9 +173,8 @@ class TestPinPressureSeam:
 
 
     def test_pressure_broadcast_never_joins(self):
-        """broadcast_release may join (a human pressed /free and waits);
-        the pressure sweep fires from the execution loop BETWEEN NODES and a
-        join would stall every prompt under sustained pressure."""
+        """The pressure sweep fires from the execution loop BETWEEN NODES;
+        a join would stall every prompt under sustained pressure."""
         tree = ast.parse(POOL.read_text(encoding="utf-8"))
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
