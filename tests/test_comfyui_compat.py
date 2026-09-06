@@ -23,10 +23,11 @@ Contact surface (keep this list in sync with reality):
 Needs a ComfyUI checkout: set COMFYUI_DIR. Skipped otherwise.
 """
 
-import inspect
 from pathlib import Path
+import ast
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -50,13 +51,46 @@ def test_folder_paths_base_path():
     assert isinstance(folder_paths.base_path, str)
 
 
+def _params_of(path, cls, func):
+    """Parameter names of a method, read from source.
+
+    Source level on purpose. Importing comfy.model_patcher drags in torch,
+    tqdm and comfy_aimdo, and this lane runs on a CPU only hosted runner
+    where at least one of those is always missing. Three consecutive weekly
+    canary runs failed on exactly that and nobody read them, which makes a
+    red canary worth nothing. What is being checked here is a SIGNATURE, and
+    a signature is in the text.
+    """
+    tree = ast.parse(Path(path).read_text(encoding="utf-8", errors="replace"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == cls:
+            for sub in node.body:
+                if isinstance(sub, ast.FunctionDef) and sub.name == func:
+                    a = sub.args
+                    return [p.arg for p in a.posonlyargs + a.args + a.kwonlyargs]
+    return None
+
+
 def test_model_patcher_surface():
-    from comfy.model_patcher import ModelPatcher
-    assert callable(getattr(ModelPatcher, "unpatch_model", None))
-    # SubprocessModelPatcher passes (model, load_device, offload_device)
-    params = list(inspect.signature(ModelPatcher.__init__).parameters)
-    for expected in ("model", "load_device", "offload_device"):
-        assert expected in params
+    """The three methods the stand-in mirrors, and their argument names.
+
+    Deliberately NOT ModelPatcher.__init__: comfy-env stopped subclassing in
+    0.4.22, and test_model_patcher_surface.py now asserts that it must never
+    start again, so pinning the constructor here pinned a coupling the rest
+    of the suite forbids.
+    """
+    mp = Path(COMFYUI_DIR) / "comfy" / "model_patcher.py"
+    for name, expected in (
+        ("partially_load", ("device_to", "extra_memory")),
+        ("partially_unload", ("device_to", "memory_to_free")),
+        ("detach", ("unpatch_all",)),
+    ):
+        params = _params_of(mp, "ModelPatcher", name)
+        assert params is not None, f"ModelPatcher.{name} is gone"
+        for arg in expected:
+            assert arg in params, (
+                f"ModelPatcher.{name} no longer takes {arg!r}; the stand-in "
+                f"mirrors this signature in isolation/model_patcher.py")
 
 
 def test_folder_paths_input_directory():
@@ -74,13 +108,22 @@ def test_execution_validate_exemption_contract():
 
 
 def test_model_management_surface():
-    import comfy.model_management as mm
+    """Same reasoning as above: read it, do not import it."""
+    src = (Path(COMFYUI_DIR) / "comfy" / "model_management.py").read_text(
+        encoding="utf-8", errors="replace")
+    tree = ast.parse(src)
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    classes = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
     for name in ("get_free_memory", "get_total_memory", "get_torch_device",
-                 "cleanup_models"):
-        assert callable(getattr(mm, name, None)), f"comfy.model_management.{name} gone"
-    assert hasattr(mm, "LoadedModel")
-    assert isinstance(mm.current_loaded_models, list)
-    # setup.py's pool patch replicates these signatures; a new required
-    # parameter upstream would break the patched versions.
-    assert list(inspect.signature(mm.get_free_memory).parameters)[:2] == ["dev", "torch_free_too"]
-    assert list(inspect.signature(mm.get_total_memory).parameters)[:2] == ["dev", "torch_total_too"]
+                 "cleanup_models", "free_memory", "load_models_gpu",
+                 "unload_all_models"):
+        assert name in funcs, f"comfy.model_management.{name} gone"
+    assert "LoadedModel" in classes
+    assert "current_loaded_models" in src
+    # comfy-env reproduces these two signatures when it reads free memory; a
+    # new leading parameter upstream would silently shift the arguments.
+    for name, expected in (("get_free_memory", ["dev", "torch_free_too"]),
+                           ("get_total_memory", ["dev", "torch_total_too"])):
+        a = funcs[name].args
+        got = [p.arg for p in a.posonlyargs + a.args][:2]
+        assert got == expected, f"{name}{tuple(got)} moved its first two args"

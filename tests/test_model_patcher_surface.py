@@ -11,7 +11,9 @@ it. When ComfyUI starts touching something new, CI fails here with the name --
 which is the tripwire that stands in for an upstream interface contract we do
 not have.
 
-Skips cleanly when ComfyUI is not importable/locatable.
+The canary is marked `comfyui` and FAILS rather than skips when no
+checkout is found, because a skip is indistinguishable from a pass in CI.
+The other tests in this file need no ComfyUI and run in the main lane.
 """
 
 import re
@@ -27,7 +29,7 @@ def _comfyui_model_management() -> "Path | None":
         return Path(mm.__file__)
     except Exception:
         pass
-    for env in ("COMFYUI_BASE", "COMFYUI_PATH"):
+    for env in ("COMFYUI_DIR", "COMFYUI_BASE", "COMFYUI_PATH"):
         import os
         base = os.environ.get(env)
         if base and (Path(base) / "comfy" / "model_management.py").is_file():
@@ -66,6 +68,7 @@ def test_declared_surface_is_implemented():
         f"COMFY_SURFACE declares names the proxy does not implement: {missing}")
 
 
+@pytest.mark.comfyui
 def test_canary_comfyui_touches_nothing_new():
     """CI tripwire: ComfyUI must not read a patcher member we do not provide.
 
@@ -74,8 +77,16 @@ def test_canary_comfyui_touches_nothing_new():
     inheriting ModelPatcher to make it pass.
     """
     mm_path = _comfyui_model_management()
-    if mm_path is None:
-        pytest.skip("ComfyUI not available")
+    # NOT a skip. This test carries the `comfyui` marker, so the only way it
+    # runs at all is that somebody selected it with `-m comfyui`; the main
+    # lane deselects it. Skipping when asked for is how this canary spent its
+    # whole life green without ever executing: unmarked in a lane with no
+    # ComfyUI, deselected in the lane that had one.
+    assert mm_path is not None, (
+        "the compat canary was selected but no ComfyUI was found. Set "
+        "COMFYUI_DIR (or COMFYUI_BASE / COMFYUI_PATH) to a checkout. A skip "
+        "here would mean the one test that watches the upstream boundary "
+        "reports success without looking at anything.")
     src = mm_path.read_text(encoding="utf-8", errors="replace")
 
     touched = set(re.findall(r"\.model\.([a-zA-Z_][a-zA-Z0-9_]*)", src))
