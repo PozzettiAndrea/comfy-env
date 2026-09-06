@@ -18,7 +18,7 @@ import harness as H  # noqa: E402
 H.bootstrap()
 GIB = H.GIB
 
-import comfy.model_management as mm  # noqa: E402
+import comfy.model_management as mm  # noqa: E402,F401  (bootstraps the host manager)
 from comfy_env.isolation import pool  # noqa: E402
 
 
