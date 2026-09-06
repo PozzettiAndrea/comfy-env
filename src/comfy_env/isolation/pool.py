@@ -1226,57 +1226,6 @@ def broadcast_release() -> None:
 _CONTRACT_CHECKED = False
 
 
-_MEMORY_LEVEL = None
-
-
-def _memory_level_facts() -> dict:
-    """What this host can actually support, probed by name. Never raises."""
-    facts = {"aimdo_available": False, "marks_available": False,
-             "pressure_available": False}
-    try:
-        import comfy.model_management as mm
-        facts["pressure_available"] = hasattr(
-            mm, "should_free_pins_for_ram_pressure")
-        facts["marks_available"] = hasattr(mm, "free_model_pins")
-    except Exception:
-        pass
-    try:
-        import comfy.model_patcher as cmp
-        facts["marks_available"] = facts["marks_available"] and hasattr(
-            cmp, "PromptModelTracker")
-    except Exception:
-        facts["marks_available"] = False
-    try:
-        from ..memory_manager import aimdo_version
-        facts["aimdo_available"] = bool(aimdo_version())
-    except Exception:
-        pass
-    return facts
-
-
-def _resolve_memory_level() -> str:
-    """Settle COMFY_ENV_MEMORY_MANAGEMENT once, and say so if it dropped.
-
-    An unrequested demotion is loud and a requested one is silent. That
-    polarity is the point: four worker environments on the development
-    machine ran a different memory manager than their host and nothing
-    reported it, while a deliberate choice of a lower level is a decision
-    and warning about it would train the operator to ignore the channel.
-    """
-    global _MEMORY_LEVEL
-    if _MEMORY_LEVEL is not None:
-        return _MEMORY_LEVEL
-    from .. import memlevel
-    requested = os.environ.get(memlevel.ENV_VAR)
-    level, note = memlevel.resolve(requested, _memory_level_facts())
-    _MEMORY_LEVEL = level
-    if note:
-        _log(f"[comfy-env] memory management: {note}")
-    elif _DBG_MODELS:
-        _log(f"[comfy-env] memory management: {level}")
-    return level
-
-
 def _check_host_contract() -> None:
     """Verify the host satisfies what comfy-env requires of it, once.
 

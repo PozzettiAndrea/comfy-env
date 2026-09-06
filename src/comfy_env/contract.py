@@ -29,8 +29,11 @@ the oldest interpreter a worker environment can use.
 FATAL = "fatal"
 DEGRADE = "degrade"
 
-#: Which tier needs the entry. The floor is always on; the rest map to
-#: COMFY_ENV_MEMORY_MANAGEMENT levels.
+#: Which tier needs the entry. FLOOR is always required. PAGED is required
+#: only of a worker that resolved to comfy-aimdo, and SHARED only where the
+#: pin sharing surface is in play; the worker picks its own tiers from what
+#: it actually resolved to (_persistent_worker.py), which is the one place
+#: that knows.
 FLOOR = "floor"
 PAGED = "paged"
 SHARED = "shared"
