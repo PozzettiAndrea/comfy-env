@@ -493,15 +493,30 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
 
     ComfyUI's EXTRA_RESERVED_VRAM never reaches comfy-aimdo: the pager is
     seeded once at startup (main.py) and decides residency at fault time
-    from its own headroom. Measured on the paged path (research/memory-floor
-    P2 and its 2026-09-05 replication): the published reserve is inert, the
-    pager's own setter is live at the next fault. So the second of the two
-    writes comfy-env makes is this one, a value into the knob the library
-    exports for it, the same knob ComfyUI seeds from --reserve-vram.
+    from its own headroom. So the second of the two writes comfy-env makes
+    is this one, into the knob the library exports for it, the same knob
+    ComfyUI seeds from --reserve-vram.
 
-    Bound lazily: the Python wrapper is comfy-aimdo #107; every wheel since
-    0.4.10 carries the raw export. Gated on the host actually running the
-    pager; on the legacy path the published reserve already does the job.
+    That the setter is live at the next fault is now comfy-aimdo's contract
+    rather than our observation: #107 documents it and ships a test asserting
+    "a simple_vram_headroom set after init_devices() steers the next VBAR
+    fault". Before that it was a bare C export with no Python wrapper, and
+    this repo's own P2 write-up still records the opposite conclusion from
+    an experiment that used plain nn.Linear and therefore never paged.
+
+    Bound lazily, and permanently: the Python wrapper is #107, every wheel
+    since 0.4.10 carries the raw export, and the installed base is 0.4.13.
+    comfy-env never controls both ends (worker envs are pixi pinned per pack,
+    the host's aimdo is whatever ComfyUI installed), so there is no version
+    at which this probe can be deleted.
+
+    Gated on the host actually running the pager; on the legacy path the
+    published reserve already does the job.
+
+    Note what this is worth per platform: reserve.charge() returns 0 wherever
+    the driver's free figure is device wide, so on Linux published == base,
+    the added term is 0, and the forwarded value equals the seed the pager
+    already had. The write only moves a number on a process local platform.
     """
     try:
         import comfy.memory_management as _cmm
@@ -526,15 +541,62 @@ def _forward_reserve_to_aimdo(published: int) -> bool:
                  "and reactive on the paged one.")
         return False
     headroom = reserve.aimdo_headroom(_aimdo_headroom_seed(), published, _RESERVE_BASE)
+    _warn_if_headroom_was_changed(_control, headroom)
     try:
         setter(int(headroom))
     except Exception as exc:
         _log(f"[comfy-env] pager headroom forward failed: {exc}")
         return False
+    global _AIMDO_HEADROOM_WRITTEN
+    _AIMDO_HEADROOM_WRITTEN = int(headroom)
     if _DBG_MODELS:
         _log(f"[comfy-env] pager headroom {headroom / 1e9:.2f}GB "
              f"(seed {_aimdo_headroom_seed() / 1e9:.2f}GB + reserve added)")
     return True
+
+
+#: What we last wrote into the pager's headroom, so the next forward can
+#: tell whether anything else has written it since. None until the first
+#: successful forward.
+_AIMDO_HEADROOM_WRITTEN = None
+_AIMDO_FOREIGN_WRITER_LOGGED = False
+
+
+def _warn_if_headroom_was_changed(control, about_to_write: int) -> None:
+    """Say so if something other than comfy-env moved the pager's headroom.
+
+    simple_vram_headroom is one process wide global with no owner. ComfyUI
+    seeds it once at startup and, today, never again; the open issue about
+    --reserve-vram being ignored after startup is exactly that gap, and the
+    obvious fix upstream is to start writing it per load. On the day that
+    lands there are two writers on one value, last write wins, and the loser
+    is silent. This is the cheapest possible detector for that.
+
+    It is a DIAGNOSTIC, not a precondition. The getter is comfy-aimdo #107
+    and the installed base is 0.4.13, so its absence must cost nothing: no
+    getter means no check, and the forward proceeds exactly as before.
+    """
+    global _AIMDO_FOREIGN_WRITER_LOGGED
+    if _AIMDO_HEADROOM_WRITTEN is None or _AIMDO_FOREIGN_WRITER_LOGGED:
+        return
+    getter = getattr(control, "get_simple_vram_headroom", None)
+    if getter is None:
+        lib = getattr(control, "lib", None)
+        getter = getattr(lib, "get_simple_vram_headroom", None) if lib is not None else None
+    if getter is None:
+        return
+    try:
+        current = int(getter())
+    except Exception:
+        return
+    if current == int(_AIMDO_HEADROOM_WRITTEN):
+        return
+    _AIMDO_FOREIGN_WRITER_LOGGED = True
+    _log(f"[comfy-env] NOTE: the pager headroom is {current / 1e9:.2f}GB, not "
+         f"the {int(_AIMDO_HEADROOM_WRITTEN) / 1e9:.2f}GB comfy-env last wrote. "
+         f"Something else writes simple_vram_headroom, so these two writers "
+         f"now race and the loser is whichever wrote first. About to write "
+         f"{int(about_to_write) / 1e9:.2f}GB.")
 
 
 #: Debounce for the pressure hook. ComfyUI's eviction loop can ask several

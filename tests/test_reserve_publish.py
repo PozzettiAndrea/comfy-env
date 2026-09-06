@@ -354,3 +354,66 @@ class TestPressureHook:
             if t.name == "comfy-env-pressure":
                 t.join(timeout=5.0)
         assert len(asks) == 1, asks
+
+
+class TestForeignHeadroomWriter:
+    """The pager's headroom is one process wide global with no owner.
+
+    ComfyUI seeds it once and, today, never again. The obvious upstream fix
+    for that is to start writing it per load, at which point there are two
+    writers and the loser is silent. These pin the detector.
+    """
+
+    def _control(self, current, with_getter=True):
+        import types
+        c = types.SimpleNamespace()
+        if with_getter:
+            c.get_simple_vram_headroom = lambda: current
+        return c
+
+    def test_a_value_we_did_not_write_is_reported(self, pool_mod, monkeypatch):
+        """Catches shipping the setter with no read back at all, which is what
+        shipped until comfy-aimdo #107 gave us a getter: two writers on one
+        global, last write wins, and nothing says which one lost."""
+        pool, _mm = pool_mod
+        said = []
+        monkeypatch.setattr(pool, "_log", lambda m: said.append(m))
+        monkeypatch.setattr(pool, "_AIMDO_HEADROOM_WRITTEN", 4 << 30)
+        monkeypatch.setattr(pool, "_AIMDO_FOREIGN_WRITER_LOGGED", False)
+        pool._warn_if_headroom_was_changed(self._control(9 << 30), 5 << 30)
+        assert any("Something else writes" in m for m in said), said
+
+    def test_our_own_value_is_silent(self, pool_mod, monkeypatch):
+        """Catches a detector that fires on every forward: we write this knob
+        on every publish, so reading back our own number is the normal case."""
+        pool, _mm = pool_mod
+        said = []
+        monkeypatch.setattr(pool, "_log", lambda m: said.append(m))
+        monkeypatch.setattr(pool, "_AIMDO_HEADROOM_WRITTEN", 4 << 30)
+        monkeypatch.setattr(pool, "_AIMDO_FOREIGN_WRITER_LOGGED", False)
+        pool._warn_if_headroom_was_changed(self._control(4 << 30), 4 << 30)
+        assert said == []
+
+    def test_no_getter_costs_nothing(self, pool_mod, monkeypatch):
+        """Catches making the read back a precondition. The getter is #107 and
+        the installed base is 0.4.13, so its absence must not block or warn."""
+        pool, _mm = pool_mod
+        said = []
+        monkeypatch.setattr(pool, "_log", lambda m: said.append(m))
+        monkeypatch.setattr(pool, "_AIMDO_HEADROOM_WRITTEN", 4 << 30)
+        monkeypatch.setattr(pool, "_AIMDO_FOREIGN_WRITER_LOGGED", False)
+        pool._warn_if_headroom_was_changed(
+            self._control(9 << 30, with_getter=False), 5 << 30)
+        assert said == []
+
+    def test_it_says_so_once_not_every_publish(self, pool_mod, monkeypatch):
+        """Catches a warning inside the publish path with no latch: publishing
+        runs at every node boundary, so this would be one line per node."""
+        pool, _mm = pool_mod
+        said = []
+        monkeypatch.setattr(pool, "_log", lambda m: said.append(m))
+        monkeypatch.setattr(pool, "_AIMDO_HEADROOM_WRITTEN", 4 << 30)
+        monkeypatch.setattr(pool, "_AIMDO_FOREIGN_WRITER_LOGGED", False)
+        for _ in range(5):
+            pool._warn_if_headroom_was_changed(self._control(9 << 30), 5 << 30)
+        assert len(said) == 1, said

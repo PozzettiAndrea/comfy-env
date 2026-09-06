@@ -9,10 +9,16 @@ Measured constraints this encodes, all from research/memory-floor/p2:
 * Publishing works on the LEGACY path only. With a 20.13 GiB reserve a 6 GiB
   model went from fully resident to 1.38 GiB. Under aimdo the same reserve
   changed nothing, because ModelPatcherDynamic ignores lowvram_model_memory
-  and pages at fault time, and aimdo's own headroom is fixed once its
-  devices are initialised. So the paged path relies on the reactive route
-  (asking the host to free) and publishes only for the non-paged loads a
-  host still does.
+  and pages at fault time. The paged path therefore relies on the reactive
+  route (asking the host to free) plus a second write, straight into the
+  pager's own headroom.
+
+  This paragraph used to end "and aimdo's own headroom is fixed once its
+  devices are initialised". That was wrong, and it was wrong because p2
+  exercised plain nn.Linear modules, which never page, so the setter had
+  nothing to steer. comfy-aimdo #107 settles it the other way and makes it
+  a contract: the setter is documented as taking effect at the next VBAR
+  fault, with an upstream test asserting exactly that.
 * On a device-wide platform the host ALREADY sees resident worker VRAM,
   because cudaMemGetInfo reports the whole card. Publishing residency again
   double books it, which cost 8.9 GiB of idle card in measurement. So the
