@@ -1500,11 +1500,13 @@ def _ingest_worker_frames(env_dir, worker, generation):
     """Drain and apply everything a worker's frames piggybacked: the residency
     census, the pin scalar, and the measured VRAM overhead.
 
-    One helper, two callers: the node boundary (_register_new_patchers) and
-    the full_release broadcast's reply path -- harvest happens in
-    _send_request for both, but harvested is not applied, and a released
-    worker may go quiet, so the broadcast must apply its receipt itself
-    rather than waiting for a next call that may never come.
+    One caller: the node boundary (_register_new_patchers). Harvest happens
+    in _send_request, but harvested is not applied, so somebody has to apply
+    it. There used to be a second caller, the full_release broadcast's reply
+    path, which had to apply its own receipt because a released worker may go
+    quiet; that broadcast was deleted with the memory observer. The idle
+    sweep does NOT call this, so a worker released on the timer keeps a stale
+    high ledger until its next node boundary.
     """
     global _OVERHEAD_SEQ
     report = getattr(worker, "_last_vram_report", None)
@@ -1582,18 +1584,6 @@ def _register_new_patchers(env_dir, worker, generation):
         except Exception as _ppe:
             _log(f"[comfy-env] deferred pin release failed: {_ppe}")
 
-    if getattr(worker, "_release_deferred", False):
-        worker._release_deferred = False
-        try:
-            r = worker.send_command_no_spawn("full_release", lock_timeout=2.0)
-            if r == "busy":
-                worker._release_deferred = True  # try again next boundary
-            elif isinstance(r, dict):
-                _ingest_worker_frames(env_dir, worker, generation)
-                _log(f"[comfy-env] /free: deferred release of "
-                     f"{Path(str(env_dir)).name} completed")
-        except Exception as _fre:
-            _log(f"[comfy-env] /free: deferred release failed: {_fre}")
 
     # Repair entries free_memory removed on a FAILED eviction. Upstream's
     # model_unload returns True even when detach() could not reach the worker
