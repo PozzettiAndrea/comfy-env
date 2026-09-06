@@ -550,3 +550,45 @@ class TestNoLevelRefusal:
         ).read_text(encoding="utf-8")
         assert "COMFY_ENV_AIMDO_LEVEL" not in src
         assert "aimdo_installed_level" not in src
+
+
+class TestKitchenVersionReport:
+    """comfy-kitchen gets a version line and nothing else, and the reason is
+    not modesty: it fails loudly by itself. ComfyUI calls
+    int8_attention_is_available() at module scope, so drift is an
+    AttributeError at worker start with a file, a line and a name. aimdo
+    fails silently instead, which is what its machinery is for."""
+
+    def test_describe_carries_the_kitchen_version(self):
+        """Catches: reporting aimdo and leaving the other replicated pin
+        invisible, so a reader of a crash cannot tell which two versions were
+        in play."""
+        from comfy_env.memory_manager import describe
+        assert "kitchen_version" in describe()
+
+    def test_the_summary_line_names_it_when_present(self, monkeypatch):
+        from comfy_env import memory_manager as mm
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION_READ", True)
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION", "0.2.31")
+        assert "kitchen 0.2.31" in mm.summary_line()
+
+    def test_an_absent_kitchen_adds_nothing_to_the_line(self, monkeypatch):
+        """Catches: printing 'kitchen none' on every CPU worker, where its
+        absence is correct and expected."""
+        from comfy_env import memory_manager as mm
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION_READ", True)
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION", None)
+        assert "kitchen" not in mm.summary_line()
+
+    def test_the_lookup_is_cached_like_aimdos(self, monkeypatch):
+        """Catches: an importlib.metadata walk on a path describe() runs per
+        request."""
+        from comfy_env import memory_manager as mm
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION_READ", False)
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION", None)
+        calls = []
+        first = mm.kitchen_version()
+        monkeypatch.setattr(mm, "_KITCHEN_VERSION", "sentinel")
+        assert mm.kitchen_version() == "sentinel"
+        assert calls == []
+        assert first is None or isinstance(first, str)

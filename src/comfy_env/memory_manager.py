@@ -85,6 +85,8 @@ _ENABLE_ERROR: Optional[str] = None
 
 _AIMDO_VERSION: Optional[str] = None
 _AIMDO_VERSION_READ = False
+_KITCHEN_VERSION: Optional[str] = None
+_KITCHEN_VERSION_READ = False
 
 
 def aimdo_version() -> Optional[str]:
@@ -108,6 +110,37 @@ def aimdo_version() -> Optional[str]:
     except Exception:
         _AIMDO_VERSION = None
     return _AIMDO_VERSION
+
+
+def kitchen_version() -> Optional[str]:
+    """Installed ``comfy-kitchen`` version, or None when it is not present.
+
+    Reported, and nothing more. comfy-env never calls comfy-kitchen: it
+    replicates the host's pin into every worker because the HOST's ComfyUI
+    imports it unguarded from four modules on the ``comfy.model_patcher``
+    chain, so a worker without it cannot import comfy at all.
+
+    That is also why it needs none of the machinery aimdo has. A drift here
+    fails LOUDLY and immediately: ComfyUI calls
+    ``comfy_kitchen.int8_attention_is_available()`` at module scope
+    (``comfy/ldm/modules/attention.py``), so a missing or renamed symbol is
+    an AttributeError with a file, a line and a name at worker start. aimdo
+    fails silently instead, with a worker resolving to a different manager
+    and reporting plausible numbers, which is what all that machinery is
+    for. Symmetry between the two would be a mistake; a version in the log
+    is not.
+    """
+    global _KITCHEN_VERSION, _KITCHEN_VERSION_READ
+    if _KITCHEN_VERSION_READ:
+        return _KITCHEN_VERSION
+    _KITCHEN_VERSION_READ = True
+    try:
+        from importlib.metadata import version
+
+        _KITCHEN_VERSION = version("comfy-kitchen")
+    except Exception:
+        _KITCHEN_VERSION = None
+    return _KITCHEN_VERSION
 
 
 #: CUDA libraries that must not appear twice at different major versions in
@@ -165,6 +198,7 @@ def describe() -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "manager": LEDGER,
         "aimdo_version": aimdo_version(),
+        "kitchen_version": kitchen_version(),
         "aimdo_importable": False,
         "reason": "comfy.memory_management not imported",
     }
@@ -207,9 +241,11 @@ def summary_line(prefix: str = "") -> str:
     """One line an operator can grep for, describing this process."""
     info = describe()
     version = info.get("aimdo_version") or "none"
+    kitchen = info.get("kitchen_version")
+    tail = f", kitchen {kitchen}" if kitchen else ""
     if info["manager"] == AIMDO:
-        return f"{prefix}memory manager: aimdo {version}"
-    return f"{prefix}memory manager: legacy ledger ({info['reason']})"
+        return f"{prefix}memory manager: aimdo {version}{tail}"
+    return f"{prefix}memory manager: legacy ledger ({info['reason']}){tail}"
 
 
 def _cuda_devices() -> list:

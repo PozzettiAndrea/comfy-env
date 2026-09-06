@@ -1416,6 +1416,19 @@ def _report_memory_manager(worker, env_dir) -> None:
                 f"loader cache; it costs private RAM per worker and runs two "
                 f"majors against one torch build."
             )
+        # comfy-kitchen gets a version line and nothing else. It fails loudly
+        # by itself: ComfyUI calls int8_attention_is_available() at module
+        # scope, so drift is an AttributeError at worker start with a file, a
+        # line and a name. What a reader needs is which two versions were in
+        # play when that happened.
+        w_kitchen = worker_info.get("kitchen_version")
+        h_kitchen = host_info.get("kitchen_version")
+        if w_kitchen and h_kitchen and w_kitchen != h_kitchen:
+            _log(
+                f"[comfy-env] NOTE: {name} has comfy-kitchen {w_kitchen}, host "
+                f"has {h_kitchen}. They share one ComfyUI tree, so a symbol the "
+                f"host's version expects may be absent in the worker's."
+            )
         worker_ver = worker_info.get("aimdo_version")
         host_ver = host_info.get("aimdo_version")
         if worker_ver and host_ver and worker_ver != host_ver:
