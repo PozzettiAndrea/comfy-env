@@ -401,13 +401,37 @@ def update_pin_reports(reports: Dict[str, Dict[str, int]], key: str,
 # Worker VRAM overhead booking (coverage item: cast buffers vs the flat cost)
 # ---------------------------------------------------------------------------
 
-#: Per-worker fixed VRAM cost OUTSIDE the caching allocator: CUDA context plus
-#: cuBLAS/cuDNN handles. torch.cuda.memory_reserved structurally cannot see
-#: these, so the floor and the measured excess partition cleanly (floor =
-#: outside the allocator, excess = inside it beyond registered residency) and
-#: they ADD; max() would under-book by min(floor, excess). Measured 276 to
-#: 300 MiB on Linux/RTX 3090 (2026-09); the old 250 MiB figure was a Windows
-#: RTX 4060 Ti measurement.
+#: Per-worker fixed VRAM cost mostly OUTSIDE the caching allocator: the CUDA
+#: context plus cuBLAS and cuDNN handles. It ADDS to the measured excess rather
+#: than capping it, because the dominant term really is invisible: after
+#: torch.cuda.init() nvidia-smi shows the context while memory_reserved() still
+#: reads exactly 0.
+#:
+#: "Partition cleanly" was too strong, and is measurably wrong. Modern torch
+#: allocates the cuBLAS workspace THROUGH the caching allocator, so 20 MiB of
+#: what this constant is meant to cover is already inside memory_reserved
+#: (32 MiB under cudaMallocAsync). Floor and excess overlap by that much, and
+#: adding them double books it.
+#:
+#: Measured on Windows, RTX 4060 Ti, driver 581.57, 2026-09-06, three runs per
+#: configuration with ZERO MiB of variance within a configuration:
+#:
+#:   torch 2.14+cu126, default allocator   173 MiB device wide, 153 invisible
+#:   torch 2.14+cu126, cudaMallocAsync     197 MiB device wide, 165 invisible
+#:   torch 2.5.1+cu124, default allocator  175 MiB device wide, 155 invisible
+#:
+#: import torch alone costs 0. cuda.init() costs 119 MiB, exactly the bare
+#: nvcuda context. cuDNN costs nothing measurable on top of cuBLAS; it loads
+#: lazily. Nine torch minor versions moved the floor by 2 MiB, while the
+#: allocator backend moved it by 24, so the backend matters ten times more than
+#: the version and this constant ignores both.
+#:
+#: 300 is therefore high on this card: against the number it claims to be, the
+#: invisible part, it over books by 135 MiB per worker, 1.8x. Kept anyway, as a
+#: deliberate safety margin, and because the dominant term is the CUDA context,
+#: which is a card and driver property rather than a torch one, so a 3090 figure
+#: is not transferable and 300 covers both. What is NOT defensible is the old
+#: claim of a clean partition, which is why it is gone.
 WORKER_VRAM_FLOOR = 300 * 1024 * 1024
 
 #: Multiplicative headroom on the WEIGHT bytes of an incoming load. Mirrors
