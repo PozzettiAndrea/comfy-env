@@ -413,24 +413,45 @@ def update_pin_reports(reports: Dict[str, Dict[str, int]], key: str,
 #: (32 MiB under cudaMallocAsync). Floor and excess overlap by that much, and
 #: adding them double books it.
 #:
-#: Measured on Windows, RTX 4060 Ti, driver 581.57, 2026-09-06, three runs per
-#: configuration with ZERO MiB of variance within a configuration:
+#: Measured on both platforms, 2026-09-06, three runs per configuration with
+#: ZERO MiB of variance in every column:
 #:
-#:   torch 2.14+cu126, default allocator   173 MiB device wide, 153 invisible
-#:   torch 2.14+cu126, cudaMallocAsync     197 MiB device wide, 165 invisible
-#:   torch 2.5.1+cu124, default allocator  175 MiB device wide, 155 invisible
+#:                              Win 4060 Ti / 581.57   Linux 3090 / 580.126.20
+#:   bare CUDA context                    119 MiB              264 MiB
+#:   default allocator, invisible         153                  324
+#:   cudaMallocAsync, invisible           165                  344
 #:
-#: import torch alone costs 0. cuda.init() costs 119 MiB, exactly the bare
-#: nvcuda context. cuDNN costs nothing measurable on top of cuBLAS; it loads
-#: lazily. Nine torch minor versions moved the floor by 2 MiB, while the
-#: allocator backend moved it by 24, so the backend matters ten times more than
-#: the version and this constant ignores both.
+#: import torch alone costs 0 on both. cuDNN costs 2 MiB on top of cuBLAS on
+#: both; it loads lazily. Nine torch minor versions moved it 2 MiB while the
+#: allocator backend moved it 24, so the backend matters ten times more than
+#: the version and this constant ignores both. ComfyUI defaults to
+#: cudaMallocAsync, so the async row is the operative one.
 #:
-#: 300 is therefore high on this card: against the number it claims to be, the
-#: invisible part, it over books by 135 MiB per worker, 1.8x. Kept anyway, as a
-#: deliberate safety margin, and because the dominant term is the CUDA context,
-#: which is a card and driver property rather than a torch one, so a 3090 figure
-#: is not transferable and 300 covers both. What is NOT defensible is the old
+#: THE CONSTANT IS WRONG IN OPPOSITE DIRECTIONS ON THE TWO PLATFORMS, because
+#: the dominant term is the CUDA context and that is a card and driver
+#: property: 264 MiB on the 3090 against 119 on the 4060 Ti, 2.2x.
+#:
+#:   Windows, where charge() applies it:   over books by 135 MiB per worker
+#:   Linux, where the admission ask
+#:   applies it (pool.py, need +=):        UNDER books by 44 MiB per worker
+#:
+#: The Linux side is the one that bites, because that is where this runs and
+#: because under booking is the direction that ends in an OOM rather than a
+#: wasted reservation. Three idle workers cost 786 MiB of a 24 GiB card before
+#: a model byte, and this books 900 for them while their real invisible cost is
+#: 1032.
+#:
+#: On where "276 to 300" came from, since it is worth not repeating: both
+#: numbers appear exactly in the PER PROCESS nvidia-smi used_memory column,
+#: which reads 8 MiB low against the device wide delta here (256 vs 264, 336 vs
+#: 344). The original measurement almost certainly read that column, and
+#: stopped before varying the allocator backend.
+#:
+#: Left at 300 for now on the operator's call. The right fix is not a bigger
+#: constant, it is to stop guessing: a worker can measure its own context cost
+#: at startup as a device wide delta and report it, the way it already reports
+#: its allocator excess, which would make this a first load fallback rather
+#: than an answer. What is NOT defensible is the old
 #: claim of a clean partition, which is why it is gone.
 WORKER_VRAM_FLOOR = 300 * 1024 * 1024
 
