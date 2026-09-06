@@ -795,3 +795,48 @@ class TestLedgerFallbackSeam:
         assert len(held_calls) >= 2, "guard: both fallback sites must still exist"
         ungated = [n.lineno for n in held_calls if id(n) not in gated]
         assert not ungated, f"ungated ledger subtraction at pool.py:{ungated}"
+
+
+class TestDuplicateCudaMajors:
+    """Two majors of one CUDA library in a worker cost real memory and run
+    against one torch build. Nobody chooses it: a library that dlopens a
+    versioned soname finds a system CUDA through the loader cache, which no
+    RUNPATH edit prevents. The least comfy-env can do is say so."""
+
+    def _maps(self, tmp_path, *paths):
+        p = tmp_path / "maps"
+        p.write_text("".join(
+            "7f0000000000-7f0000001000 r-xp 00000000 00:00 1  %s\n" % x
+            for x in paths))
+        return str(p)
+
+    def test_two_majors_of_one_library_are_reported(self, tmp_path):
+        """Catches: not looking at all, which is where this started: the cost
+        was measured only because someone went looking by hand."""
+        from comfy_env.memory_manager import duplicate_cuda_majors
+        out = duplicate_cuda_majors(self._maps(
+            tmp_path,
+            "/env/site-packages/nvidia/cublas/lib/libcublasLt.so.12",
+            "/usr/local/cuda-13.0/targets/x86_64-linux/lib/libcublasLt.so.13.1.0.3"))
+        assert list(out) == ["cublasLt"]
+        assert len(out["cublasLt"]) == 2
+
+    def test_one_major_mapped_twice_is_not_a_finding(self, tmp_path):
+        """Catches: reporting on the segment count. A library is mapped many
+        times over (text, data, relro); that is normal and says nothing."""
+        from comfy_env.memory_manager import duplicate_cuda_majors
+        assert duplicate_cuda_majors(self._maps(
+            tmp_path,
+            "/env/lib/libcublasLt.so.12",
+            "/env/lib/libcublasLt.so.12",
+            "/env/lib/libcublasLt.so.12.4.5")) == {}
+
+    def test_unrelated_libraries_are_ignored(self, tmp_path):
+        from comfy_env.memory_manager import duplicate_cuda_majors
+        assert duplicate_cuda_majors(self._maps(
+            tmp_path, "/lib/libc.so.6", "/lib/libstdc++.so.6")) == {}
+
+    def test_a_missing_maps_file_is_silence_not_a_crash(self):
+        """Catches: assuming Linux. This runs at every worker start."""
+        from comfy_env.memory_manager import duplicate_cuda_majors
+        assert duplicate_cuda_majors("/nonexistent/maps") == {}

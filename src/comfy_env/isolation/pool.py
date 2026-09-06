@@ -1389,6 +1389,17 @@ def _report_memory_manager(worker, env_dir) -> None:
         # Version skew is reportable even when both sides resolve to the same
         # manager, and it happens: an unpinned `comfy-aimdo = "*"` in a pack's
         # comfy-env.toml resolves at solve time and drifts off the host's pin.
+        # Two majors of one CUDA library in a worker: nobody chose it, it
+        # costs real memory, and it is invisible without this line. Measured
+        # about 92 MB of private RAM for a second cuBLASLt. Reported per
+        # worker because it depends on that env's own wheels.
+        for lib, paths in (worker_info.get("duplicate_cuda_majors") or {}).items():
+            _log(
+                f"[comfy-env] NOTE: {name} maps two majors of lib{lib}: "
+                f"{', '.join(paths)}. One is a system CUDA found through the "
+                f"loader cache; it costs private RAM per worker and runs two "
+                f"majors against one torch build."
+            )
         worker_ver = worker_info.get("aimdo_version")
         host_ver = host_info.get("aimdo_version")
         if worker_ver and host_ver and worker_ver != host_ver:

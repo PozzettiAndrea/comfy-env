@@ -113,6 +113,51 @@ def aimdo_version() -> Optional[str]:
     return _AIMDO_VERSION
 
 
+#: CUDA libraries that must not appear twice at different major versions in
+#: one process. Each carries multi-megabyte writable state and its own
+#: handles, and mixing majors against one torch build is unsupported.
+_ONE_MAJOR_LIBS = ("cublasLt", "cublas", "cudnn", "cudart")
+
+
+def duplicate_cuda_majors(maps_path="/proc/self/maps"):
+    """CUDA libraries mapped at two different major versions in this process.
+
+    Returns {"cublasLt": ["/path/libcublasLt.so.12", "/path/...so.13.1.0.3"]}
+    or {} on anything that is not Linux, or when nothing is doubled up.
+
+    Why this is worth a line in the log: measured on a worker importing
+    comfy_kitchen 0.2.31, a second cuBLASLt at a different major costs about
+    92 MB of private RAM (81 MB of it that library's own writable tables),
+    and the two majors are then live against one torch build. It happens
+    without anyone choosing it, because a library that dlopens a versioned
+    soname finds a system CUDA through the loader cache, which no RUNPATH
+    edit or LD_LIBRARY_PATH can prevent (verified: stripping the RUNPATH
+    changes nothing while /etc/ld.so.conf.d lists the system CUDA).
+
+    Diagnosis only. Nothing here changes what loads; the point is that a
+    silent cost becomes a readable one.
+    """
+    import re
+    found: Dict[str, Dict[str, str]] = {}
+    try:
+        with open(maps_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                path = line.rstrip("\n").rsplit(" ", 1)[-1]
+                if not path.startswith("/"):
+                    continue
+                name = path.rsplit("/", 1)[-1]
+                for lib in _ONE_MAJOR_LIBS:
+                    if not name.startswith("lib" + lib + ".so"):
+                        continue
+                    m = re.search(r"\.so\.(\d+)", name)
+                    if m:
+                        found.setdefault(lib, {})[m.group(1)] = path
+    except Exception:
+        return {}
+    return {lib: sorted(byver.values())
+            for lib, byver in found.items() if len(byver) > 1}
+
+
 def describe() -> Dict[str, Any]:
     """Report the manager this process resolved to.
 
@@ -135,6 +180,9 @@ def describe() -> Dict[str, Any]:
 
     enabled = bool(getattr(mm, "aimdo_enabled", False))
     info["manager"] = AIMDO if enabled else LEDGER
+    dupes = duplicate_cuda_majors()
+    if dupes:
+        info["duplicate_cuda_majors"] = dupes
 
     try:
         import comfy_aimdo.control as control  # noqa: F401
