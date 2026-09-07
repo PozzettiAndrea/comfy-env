@@ -8,9 +8,13 @@ auto-probe staying behind its opt-in gate.
 """
 
 import ast
+import enum
 import json
+import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+
+import pytest
 
 from comfy_env.mirrored_args import (
     ATTENTION_KEY,
@@ -26,6 +30,45 @@ from comfy_env.mirrored_args import (
 SRC = Path(__file__).resolve().parents[1] / "src" / "comfy_env"
 WORKER = SRC / "isolation" / "workers" / "_persistent_worker.py"
 SUBPROCESS = SRC / "isolation" / "workers" / "subprocess.py"
+
+
+class _StubPerformanceFeature(enum.Enum):
+    """Stands in for comfy.cli_args.PerformanceFeature.
+
+    A real Enum, not a mock: hydration does `PerformanceFeature(v)`, and only
+    an Enum reproduces both halves of that -- a known value constructing, an
+    unknown one raising ValueError.
+    """
+    Fp16Accumulation = "fp16_accumulation"
+
+
+@pytest.fixture()
+def comfy_cli_args(monkeypatch):
+    """Install (or remove) a fake `comfy.cli_args` for the duration of a test.
+
+    Hydration of `fast` reaches for comfy, so whether it succeeds used to
+    depend on whether a ComfyUI happened to be importable in the session --
+    ambient, not asserted. `absent()` and `present()` make each branch a
+    choice the test states.
+    """
+    class _Control:
+        def absent(self):
+            # None in sys.modules makes `from comfy.cli_args import X` raise
+            # ImportError deterministically, without needing comfy to be gone
+            # from the machine.
+            monkeypatch.setitem(sys.modules, "comfy", None)
+            monkeypatch.setitem(sys.modules, "comfy.cli_args", None)
+
+        def present(self):
+            pkg = ModuleType("comfy")
+            pkg.__path__ = []
+            mod = ModuleType("comfy.cli_args")
+            mod.PerformanceFeature = _StubPerformanceFeature
+            pkg.cli_args = mod
+            monkeypatch.setitem(sys.modules, "comfy", pkg)
+            monkeypatch.setitem(sys.modules, "comfy.cli_args", mod)
+
+    return _Control()
 
 
 def _fake_args(**kw):
@@ -111,12 +154,42 @@ class TestApply:
         assert any(s["name"] == "disable_smart_memory"
                    and s["reason"] == "unknown_here" for s in out["skipped"])
 
-    def test_fast_that_cannot_hydrate_skips_the_whole_flag(self):
-        """Half a PerformanceFeature set would be an invented value; the
-        whole flag skips instead. (Bare CI has no comfy, so hydration always
-        fails here, which is exactly the failure path under test.)"""
+    def test_fast_hydrates_when_comfy_is_importable(self, comfy_cli_args):
+        """The success branch, which nothing asserted before.
+
+        Catches an apply that skips `fast` unconditionally: the old test for
+        this flag only ever ran with comfy absent -- "bare CI has no comfy",
+        said its own docstring -- so a mirror that never applied `fast` at
+        all passed, and inside a real ComfyUI worker (where comfy IS
+        importable) the host's fp16 accumulation would silently not mirror.
+        """
+        comfy_cli_args.present()
         target = _fake_args()
         out = apply_host_args(target, {"fast": ["fp16_accumulation"]})
+        assert target.fast == {_StubPerformanceFeature.Fp16Accumulation}
+        assert "fast" in out["applied"]
+        assert not out["skipped"]
+
+    def test_fast_skips_the_whole_flag_when_comfy_is_absent(self, comfy_cli_args):
+        """Half a PerformanceFeature set would be an invented value; the
+        whole flag skips instead. Absence is now stated, not inherited from
+        whatever else the session imported."""
+        comfy_cli_args.absent()
+        target = _fake_args()
+        out = apply_host_args(target, {"fast": ["fp16_accumulation"]})
+        assert target.fast == set()
+        assert any(s["name"] == "fast"
+                   and s["reason"].startswith("unhydratable")
+                   for s in out["skipped"])
+
+    def test_fast_skips_the_whole_flag_on_an_unknown_member(self, comfy_cli_args):
+        """Version skew the other way: comfy is here but does not know this
+        member. Half a set is still an invented value, so the whole flag
+        skips -- the same outcome as absence, reached differently."""
+        comfy_cli_args.present()
+        target = _fake_args()
+        out = apply_host_args(
+            target, {"fast": ["fp16_accumulation", "a_feature_from_the_future"]})
         assert target.fast == set()
         assert any(s["name"] == "fast"
                    and s["reason"].startswith("unhydratable")

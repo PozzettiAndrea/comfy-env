@@ -23,7 +23,6 @@ Contact surface (keep this list in sync with reality):
 Needs a ComfyUI checkout: set COMFYUI_DIR. Skipped otherwise.
 """
 
-from pathlib import Path
 import ast
 import os
 import sys
@@ -35,10 +34,50 @@ pytestmark = pytest.mark.comfyui
 
 COMFYUI_DIR = os.environ.get("COMFYUI_DIR")
 
-if COMFYUI_DIR:
-    sys.path.insert(0, COMFYUI_DIR)
-else:
+if not COMFYUI_DIR:
     pytest.skip("COMFYUI_DIR not set", allow_module_level=True)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _comfyui_importable():
+    """Put COMFYUI_DIR on sys.path for this module only, and take it back off.
+
+    Catches the wrong implementation this replaced: a module-level
+    ``sys.path.insert(0, COMFYUI_DIR)`` with no teardown. It made ComfyUI
+    importable for the WHOLE pytest session, and the two tests below that
+    really import leave `comfy` and `folder_paths` in ``sys.modules``. Every
+    later test then ran against a process that could import folder_paths --
+    which is exactly how comfy_env decides it is running inside a ComfyUI
+    server (``environment/cache.py:find_comfyui_source_dir``, first branch).
+    Four tests in test_worker_comfyui_base.py, which assert on a walk that
+    must find NOTHING, got this checkout's root instead. Restoring sys.path
+    alone is not enough: an already-imported module stays importable from
+    sys.modules, so the residue has to go too.
+    """
+    sys.path.insert(0, COMFYUI_DIR)
+    before = set(sys.modules)
+    try:
+        yield
+    finally:
+        try:
+            sys.path.remove(COMFYUI_DIR)
+        except ValueError:
+            pass
+        # Purge by FILE LOCATION, not by name prefix: `comfy` and `comfy_env`
+        # share a prefix and only one of them is upstream's.
+        root = Path(COMFYUI_DIR).resolve()
+        for name in sorted(set(sys.modules) - before):
+            mod = sys.modules.get(name)
+            f = getattr(mod, "__file__", None)
+            if not f:
+                continue
+            try:
+                if Path(f).resolve().is_relative_to(root):
+                    del sys.modules[name]
+            except (OSError, ValueError):
+                pass
+        assert "folder_paths" not in sys.modules, (
+            "this module left ComfyUI importable for the rest of the session")
 
 
 def test_cli_args_base_directory():
