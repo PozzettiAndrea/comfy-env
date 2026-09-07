@@ -34,7 +34,7 @@ class RuntimeEnv:
     gpu_compute: Optional[str]     # "8.9"
     gpu_vram_mb: Optional[int]
     workspace_dir: Optional[str]   # machine-wide env root
-    abi_tag: Optional[str]         # e.g. "py313-torch2.10-cu128"
+    abi_tag: Optional[str]         # e.g. "py313-torch2-10-cu128"
     comfy_env_version: Optional[str]
 
     @classmethod
