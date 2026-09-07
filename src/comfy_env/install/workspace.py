@@ -20,6 +20,7 @@ unchanged envs, and the post-install libomp dedupe.
 
 from __future__ import annotations
 
+import re
 import hashlib
 import os
 import sys
@@ -353,8 +354,23 @@ def _env_identity(manifest: Dict[str, Any], wheel_urls: List[str]) -> str:
     return "v3:" + h.hexdigest()
 
 
+#: Any versioned identity line, so a prefix bump in _env_identity cannot
+#: silently disable the skip gate. It did: _env_identity emitted "v3:" while
+#: this reader matched the literal "v2:", so `identity` read back None forever
+#: and all three skip branches failed their `is not None` test. Every install()
+#: re-derived and re-materialized every env, which is the multi-gigabyte pixi
+#: operation the entire two-level seal exists to avoid.
+_IDENTITY_LINE = re.compile(r"^v\d+:")
+
+
 def _read_hash_file(hp: Path) -> Tuple[Optional[str], Optional[str], bool]:
-    """Returns (identity, fastkey, is_legacy_v1)."""
+    """Returns (identity, fastkey, is_legacy_v1).
+
+    A stored identity from an OLDER prefix is returned, not discarded: the
+    caller compares it against the freshly computed one, so a prefix bump
+    re-derives exactly once and then settles. Discarding it re-derives every
+    time, which is the bug this replaced.
+    """
     try:
         lines = [ln.strip() for ln in
                  hp.read_text(encoding="utf-8").splitlines() if ln.strip()]
@@ -362,7 +378,7 @@ def _read_hash_file(hp: Path) -> Tuple[Optional[str], Optional[str], bool]:
         return None, None, False
     if not lines:
         return None, None, False
-    identity = next((ln for ln in lines if ln.startswith("v2:")), None)
+    identity = next((ln for ln in lines if _IDENTITY_LINE.match(ln)), None)
     fastkey = next((ln[len("fastkey:"):] for ln in lines
                     if ln.startswith("fastkey:")), None)
     if identity is None and fastkey is None:

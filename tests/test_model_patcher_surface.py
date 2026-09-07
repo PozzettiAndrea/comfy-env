@@ -41,6 +41,64 @@ def _comfyui_model_management() -> "Path | None":
     return None
 
 
+def _touched_members(src):
+    """Every attribute upstream reads off a `LoadedModel.model`.
+
+    Two shapes, because upstream uses both and a literal `.model.<x>` regex
+    can only see one. Measured against 15eb748: `.model.load_device` appears
+    ZERO times while `load_device` is read 11 times, reached through
+    `model = loaded_model.model` first. `parent`, `model_patches_models` and
+    `get_nested_additional_models` are the same shape. The tripwire guarding
+    18 members was structurally blind to 4 of them, including the one upstream
+    reads most.
+
+    AST, not regex, and scope aware on purpose. Following the alias by regex
+    over the whole file reports `named_modules`, read inside
+    `archive_model_dtypes(model)` where `model` is an nn.Module parameter with
+    nothing to do with the ledger. A guard that cries wolf gets an allowlist,
+    and an allowlist nobody re-reads is how this went blind.
+
+    What this still does NOT cover, stated so nobody assumes otherwise: three
+    surface members (`parent`, `model_patches_models`,
+    `get_nested_additional_models`) are read off the INCOMING model rather than
+    off a list entry, so no amount of ledger-shaped matching finds them. The
+    stand-in must still answer them, because a node handing the ledger back
+    through load_models_gpu makes it the incoming model. Covering that needs a
+    different sweep, over the callers of loaded_models(), not this one.
+    """
+    import ast
+
+    touched = set()
+    tree = ast.parse(src)
+
+    for node in ast.walk(tree):
+        # Shape 1: <anything>.model.<name>
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "model"):
+            touched.add(node.attr)
+
+    # Shape 2: `x = <anything>.model`, then x.<name>, within that function only.
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        aliases = set()
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "model"):
+                aliases.add(node.targets[0].id)
+        if not aliases:
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in aliases):
+                touched.add(node.attr)
+    return touched
+
+
 def _proxy_surface():
     """COMFY_SURFACE without importing comfy (the module imports comfy at top)."""
     src = (Path(__file__).parent.parent / "src" / "comfy_env" / "isolation"
@@ -89,7 +147,7 @@ def test_canary_comfyui_touches_nothing_new():
         "reports success without looking at anything.")
     src = mm_path.read_text(encoding="utf-8", errors="replace")
 
-    touched = set(re.findall(r"\.model\.([a-zA-Z_][a-zA-Z0-9_]*)", src))
+    touched = _touched_members(src)
 
     # Names that are NOT patcher members:
     #   model            -> the inner nn.Module stand-in (SubprocessModel)
@@ -99,7 +157,8 @@ def test_canary_comfyui_touches_nothing_new():
     # Guarded by `is_dynamic()`; our False excludes these paths entirely.
     # test_dynamic_exclusion_is_still_justified guards that assumption, and it
     # runs whether or not ComfyUI is installed.
-    dynamic_only = {"loaded_ram_size", "pinned_memory_size", "partially_unload_ram"}
+    dynamic_only = {"loaded_ram_size", "pinned_memory_size",
+                    "partially_unload_ram", "unregister_inactive_pins"}
 
     expected = touched - not_patcher_members - dynamic_only
     missing = sorted(expected - _proxy_surface())

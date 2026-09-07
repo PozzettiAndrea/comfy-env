@@ -333,12 +333,69 @@ class TestNoHostPatchingRule:
         "mm.EXTRA_RESERVED_VRAM",
     }
 
-    def test_the_pool_patches_nothing_outside_the_allowed_set(self):
-        found = set(_patched_comfy_attributes(POOL))
-        assert found <= self.ALLOWED, (
-            "new host patching in pool.py: {}. comfy-env reads its host and "
-            "publishes one value; it wraps nothing."
-            .format(sorted(found - self.ALLOWED)))
+    #: Every module that can execute in the ComfyUI process. The guard read
+    #: pool.py alone while ADR-0038 promised "an AST test fails the build if
+    #: ANYTHING assigns to a comfy module apart from EXTRA_RESERVED_VRAM" and
+    #: memory-api-inventory.md promised the same. A rule enforced over one file
+    #: of five is a rule a refactor walks straight out of: moving a wrap from
+    #: pool.py to metadata.py turned a build failure into a green run.
+    HOST_MODULES = (POOL, PROXY,
+                    SRC / "isolation" / "wrap.py",
+                    SRC / "isolation" / "metadata.py")
+
+    #: memory_manager.py is SHARED: staged into workers and importable in the
+    #: host. Its three comfy writes are worker-only today, so it cannot go in
+    #: HOST_MODULES without three allowances that would weaken the rule for the
+    #: four modules that ARE host-only. It gets a confinement check instead.
+    MEMMGR = SRC / "memory_manager.py"
+    WORKER_ONLY_WRITERS = {"maybe_enable_aimdo", "install_pin_eviction_counters"}
+
+    def test_no_host_module_patches_outside_the_allowed_set(self):
+        offenders = {}
+        for mod in self.HOST_MODULES:
+            found = set(_patched_comfy_attributes(mod)) - self.ALLOWED
+            if found:
+                offenders[mod.name] = sorted(found)
+        assert not offenders, (
+            "new host patching: {}. comfy-env reads its host and publishes one "
+            "value; it wraps nothing. If this fired for a WORKER-only path, "
+            "the module does not belong in HOST_MODULES."
+            .format(offenders))
+
+    def test_shared_memory_manager_writes_stay_in_worker_only_functions(self):
+        """memory_manager.py may write to comfy, but only from functions the
+        host never calls. Verified: maybe_enable_aimdo and
+        install_pin_eviction_counters have exactly one caller each, both in
+        _persistent_worker.py. A write added to a function the host DOES call
+        (describe, pin_state, full_release) is a host patch wearing a shared
+        module as a disguise, and the four-module guard above cannot see it.
+        """
+        import ast
+        tree = ast.parse(self.MEMMGR.read_text(encoding="utf-8"))
+        stray = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            if fn.name in self.WORKER_ONLY_WRITERS:
+                continue
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for t in node.targets:
+                    if (isinstance(t, ast.Attribute)
+                            and isinstance(t.value, ast.Name)
+                            and t.value.id in ("mm", "model_patcher", "_cmm")):
+                        write = f"{t.value.id}.{t.attr}"
+                        # EXTRA_RESERVED_VRAM is the sanctioned value write in
+                        # every process; the same allowance as the guard above.
+                        if write in self.ALLOWED:
+                            continue
+                        stray.append(f"{fn.name}: {write}")
+        assert not stray, (
+            "memory_manager.py writes to a comfy module from a function that "
+            "is not worker-only: {}. Either it is worker-only and belongs in "
+            "WORKER_ONLY_WRITERS with its caller checked, or it is a host "
+            "patch.".format(sorted(stray)))
 
     def test_the_guard_would_catch_a_new_patch(self):
         """Counterexample, so the guard cannot go vacuous when a refactor

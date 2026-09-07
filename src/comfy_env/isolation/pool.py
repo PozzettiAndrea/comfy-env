@@ -552,7 +552,9 @@ def _worker_charges() -> Dict[str, int]:
             continue
         residency = 0
         report = getattr(worker, "_last_vram_report", None) or {}
-        measured = report.get("held")
+        # The live frame if one is pending, else the last one ingest saw. Never
+        # only the live frame: ingest consumes it and runs first.
+        measured = report.get("held", getattr(worker, "_last_held_bytes", None))
         if measured is not None:
             residency = max(0, int(measured))
         else:
@@ -1664,6 +1666,21 @@ def _ingest_worker_frames(env_dir, worker, generation):
     if not report:
         return
     worker._last_vram_report = None
+    # Keep the measured per worker total alive past the consume. _worker_charges
+    # reads it AFTER this function on the node boundary path (_ingest here, then
+    # _publish_reserve), so reading the consumed frame handed it None every time
+    # and it silently fell back to the patcher ledger. Its own docstring calls
+    # that fallback wrong in exactly the configuration the reserve exists for,
+    # and the visible cost is that a worker holding a context and an allocator
+    # cache with NO registered model reports 0 held, never trips the `holding`
+    # gate in plan_idle_release, and is never idle released. Which is the case
+    # _release_idle_workers was added for.
+    _held = report.get("held")
+    if _held is not None:
+        try:
+            worker._last_held_bytes = max(0, int(_held))
+        except (TypeError, ValueError):
+            pass
 
     _mode = os.environ.get(state_sync.RESIDENCY_ENV_VAR, "boundary").lower()
     if _mode not in ("off", "command", "0", "false"):

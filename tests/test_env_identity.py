@@ -52,10 +52,22 @@ def test_identity_is_order_independent():
 def test_hash_file_roundtrip_and_v1_detection(tmp_path):
     hp = tmp_path / "install.hash"
 
-    # v2 round-trip
-    _write_hash_file(hp, "v2:abc", "deadbeef", log=lambda m: None)
+    # Round-trip the REAL identity, not a literal. Feeding a hardcoded "v2:abc"
+    # is how the v3 prefix bump shipped with the skip gate dead for every user:
+    # _env_identity emitted "v3:" while _read_hash_file matched "v2:", and this
+    # test passed throughout because it never asked _env_identity for anything.
+    real = _env_identity({"deps": {"torch": "2.8.0"}}, ["https://x/y.whl"])
+    assert real.startswith("v"), real
+    _write_hash_file(hp, real, "deadbeef", log=lambda m: None)
     identity, fastkey, legacy = _read_hash_file(hp)
-    assert (identity, fastkey, legacy) == ("v2:abc", "deadbeef", False)
+    assert (identity, fastkey, legacy) == (real, "deadbeef", False), (
+        "the identity written by _env_identity must read back verbatim; if it "
+        "does not, every install() re-derives every env")
+
+    # An OLDER prefix must still read back, so the caller can compare it and
+    # re-derive exactly once rather than on every run.
+    _write_hash_file(hp, "v2:abc", "deadbeef", log=lambda m: None)
+    assert _read_hash_file(hp) == ("v2:abc", "deadbeef", False)
 
     # legacy single-line v1 format is detected for grandfathering
     hp.write_text("0123456789abcdef\n", encoding="utf-8")
