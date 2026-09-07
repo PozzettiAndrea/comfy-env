@@ -109,19 +109,6 @@ def install_from_registry(
     return node_path
 
 
-def install_requirements(node_dir: Path, log: Callable[[str], None] = print) -> None:
-    """Install a peer pack's requirements.txt into the host env, as written."""
-    req_file = node_dir / "requirements.txt"
-    if not req_file.exists(): return
-    log(f"  Installing requirements for {node_dir.name}...")
-
-    target = str(req_file)
-    cmd = ["uv", "pip", "install", "-r", target, "--python", sys.executable] if shutil.which("uv") else [sys.executable, "-m", "pip", "install", "-r", target]
-    result = subprocess.run(cmd, cwd=node_dir, capture_output=True, text=True)
-    if result.returncode != 0:
-        log(f"  Warning: requirements failed: {result.stderr.strip()[:200]}")
-
-
 def run_install_script(node_dir: Path, log: Callable[[str], None] = print) -> None:
     install_script = node_dir / "install.py"
     if install_script.exists():
@@ -163,7 +150,6 @@ def install_node_packs(
                 log(f"  Warning: {name} has no github or registry source, skipping")
                 continue
 
-            install_requirements(node_path, log)
             run_install_script(node_path, log)
 
             nested_config = discover_config(node_path)
