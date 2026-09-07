@@ -22,8 +22,10 @@ from ..config import (
 from .plugin import (
     _install_node_packs,
     _reinstall_main_requirements,
-    check_sibling_comfy_env_pins,
 )
+# Deletion unit, its own module on purpose. Goes when ADR-0022's shim split
+# lands; see the header of sibling_pins.py.
+from .sibling_pins import check_sibling_comfy_env_pins
 from .workspace import install_workspace
 
 __all__ = [

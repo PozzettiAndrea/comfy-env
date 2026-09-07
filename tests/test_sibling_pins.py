@@ -1,7 +1,7 @@
 """Contract: stale comfy-env pins in sibling packs are surfaced, not silent."""
 
 import comfy_env
-from comfy_env.install.plugin import check_sibling_comfy_env_pins
+from comfy_env.install.sibling_pins import check_sibling_comfy_env_pins
 
 
 def _pack(custom_nodes, name, requirements=None):
