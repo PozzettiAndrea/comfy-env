@@ -27,6 +27,13 @@ except PackageNotFoundError:
 # failure into a signpost.
 # =============================================================================
 
+# Removed-setting tombstones. Imported for the side effect: the module raises
+# on an env var whose meaning inverted under it (COMFY_ENV_ISOLATE=0 and
+# friends). It has to be reached from the facade, because the facade is the
+# only thing every entry point has in common -- the two modules that used to
+# import it are both off the ComfyUI runtime path, so until this line the
+# guards could not fire where they mattered.
+from . import settings  # noqa: F401
 from .install import install
 from .environment.setup import setup_env
 from .environment.cache import copy_files

@@ -12,7 +12,7 @@ def subprocess_env(**extra):
       reason unrelated to the test.
     * ``Path.home()`` reads ``USERPROFILE`` on Windows, not ``HOME``. Setting
       only ``HOME`` leaves the child reading the developer's REAL
-      ``~/.comfy-env/settings.env``, which is what these tests exist to exclude.
+      ``~/.comfy-env/debug.env``, which is what these tests exist to exclude.
     """
     import os
     import sys as _sys

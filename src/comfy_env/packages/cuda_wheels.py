@@ -27,25 +27,22 @@ CUDA_WHEELS_INDEX_DEFAULT = "https://comfy-forge.github.io/cuda-wheels/"
 def cuda_wheels_index() -> str:
     """The cuda-wheels index base URL, with a trailing slash.
 
-    Override with ``COMFY_ENV_CUDA_WHEELS_INDEX`` (env var, or a line in
-    ``~/.comfy-env/settings.env`` -- that file is loaded into ``os.environ``
-    with ``setdefault``, so one lookup covers both tiers). The point is
-    mirrors: an air-gapped or bandwidth-limited site can serve the same
-    directory listing from its own host without patching comfy-env.
+    Override with the ``COMFY_ENV_CUDA_WHEELS_INDEX`` environment variable.
+    The point is mirrors: an air-gapped or bandwidth-limited site can serve
+    the same directory listing from its own host without patching comfy-env.
 
     Resolved per call rather than frozen at import so a test or a caller can
     change it without reloading the module.
 
-    !! This URL is a TRUST boundary. Wheels from it are installed with
-    ``uv pip install --no-deps`` against direct links and are NOT hash-checked
-    here, so whatever it serves executes at import time inside the isolated
-    env. Point it only at an index you control or trust as much as the
-    default (ADR-0026).
+    !! This URL is a TRUST boundary. What it serves is inlined into the
+    generated pixi manifest as a direct-URL pypi-dependency and installed by
+    pixi into the isolated env, where it executes at import time. It is
+    hash-verified only where the index attaches a ``#sha256=`` fragment to
+    the link (``toml_generator._resolve_cuda_wheels`` preserves the fragment;
+    it does not invent one). Point it only at an index you control or trust
+    as much as the default (ADR-0026).
     """
     import os
-    # Importing settings has the side effect of loading ~/.comfy-env/settings.env
-    # into os.environ; without it a file-only override would be invisible here.
-    from .. import settings  # noqa: F401
     raw = (os.environ.get("COMFY_ENV_CUDA_WHEELS_INDEX") or "").strip()
     if not raw:
         return CUDA_WHEELS_INDEX_DEFAULT

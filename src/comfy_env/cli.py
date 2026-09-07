@@ -30,7 +30,7 @@ def main(args: Optional[List[str]] = None) -> int:
     p.add_argument("--json", action="store_true", help="JSON output")
 
     # settings
-    sub.add_parser("settings", help="Configure comfy-env settings")
+    sub.add_parser("settings", help="Configure comfy-env debug logging")
 
     # gc (cleanup kept as a deprecated alias)
     for _name in ("gc", "cleanup"):
@@ -161,32 +161,35 @@ def _read_env_file(path):
 
 
 def cmd_settings(args) -> int:
-    """Configure comfy-env settings (tabbed TUI)."""
-    return _open_settings_tui(initial_tab=0)
+    """Configure comfy-env debug logging."""
+    return _open_settings_tui()
 
 
 def _open_settings_tui(initial_tab=0) -> int:
+    """The settings screen. One tab today: debug categories.
+
+    There was a second, "General", persisting to ``~/.comfy-env/settings.env``.
+    It was removed with that file: nothing on the ComfyUI runtime path imported
+    ``comfy_env.settings``, so the toggles it wrote never reached a worker, and
+    a switch that reports itself as on while changing nothing is worse than no
+    switch. Debug persists because ``comfy_env.debug`` IS imported there. Its
+    one setting, ``COMFY_ENV_POOL_IPC``, is now an environment variable only.
+    """
     from .debug import CATEGORIES as DEBUG_CATEGORIES, SETTINGS_FILE as DEBUG_FILE
-    from .settings import (GENERAL_SETTINGS, GENERAL_DEFAULTS,
-                           SETTINGS_FILE as GENERAL_FILE)
 
     # Read current state
     debug_enabled = _read_env_file(DEBUG_FILE)
-    general_enabled = _read_env_file(GENERAL_FILE)
 
     # Also check live env vars
     for var, _ in DEBUG_CATEGORIES:
         if os.environ.get(var, "").lower() in ("1", "true", "yes"):
             debug_enabled.add(var)
-    for var, _ in GENERAL_SETTINGS:
-        val = os.environ.get(var, "")
-        if val.lower() in ("1", "true", "yes"):
-            general_enabled.add(var)
-        elif val == "" and GENERAL_DEFAULTS.get(var, False):
-            general_enabled.add(var)  # default on
+    # Tuple's last field: does item 0 act as a master switch for the rest?
+    # Carried per tab rather than tested as `active_tab == 1`, which silently
+    # became a claim about the DEBUG tab's position the moment a tab was
+    # removed.
     tabs = [
-        ("General", GENERAL_SETTINGS, general_enabled, GENERAL_FILE),
-        ("Debug", DEBUG_CATEGORIES, debug_enabled, DEBUG_FILE),
+        ("Debug", DEBUG_CATEGORIES, debug_enabled, DEBUG_FILE, True),
     ]
 
     try:
@@ -202,6 +205,7 @@ def _settings_tui(curses, tabs, initial_tab):
     tab_items = [t[1] for t in tabs]  # list of [(var, label), ...]
     tab_selected = [[var in t[2] for var, _ in t[1]] for t in tabs]
     tab_files = [t[3] for t in tabs]
+    tab_master = [t[4] for t in tabs]
 
     active_tab = initial_tab
     cursor = 0
@@ -254,7 +258,7 @@ def _settings_tui(curses, tabs, initial_tab):
                     break
                 check = "x" if sel[i] else " "
                 # Debug tab: master switch indicator
-                if active_tab == 1 and i > 0 and sel[0] and not sel[i]:
+                if tab_master[active_tab] and i > 0 and sel[0] and not sel[i]:
                     check = "*"
                 attr = curses.A_REVERSE if cursor == i else 0
                 line = f"  [{check}] {label:<48s} {var}"
@@ -276,13 +280,13 @@ def _settings_tui(curses, tabs, initial_tab):
                 stdscr.addstr(help_y, 2,
                               "Tab/\u2190\u2192 switch tab  \u2191\u2193 navigate  Space toggle/edit  q quit",
                               curses.A_DIM)
-                if active_tab == 1 and help_y + 1 < h:
+                if tab_master[active_tab] and help_y + 1 < h:
                     stdscr.addstr(help_y + 1, 2, "* = enabled via master switch",
                                   curses.A_DIM)
 
             # Status message
             if status_msg:
-                sy = help_y + 2 if active_tab == 1 else help_y + 1
+                sy = help_y + 2 if tab_master[active_tab] else help_y + 1
                 if sy < h:
                     color = curses.color_pair(1) if curses.has_colors() else curses.A_BOLD
                     stdscr.addstr(sy, 2, status_msg, color)
@@ -330,12 +334,12 @@ def _settings_text(tabs):
         nonlocal offset
         offset = 0
         offsets.clear()
-        for ti, (name, items, _, _) in enumerate(tabs):
+        for ti, (name, items, _, _, master) in enumerate(tabs):
             print(f"\n  --- {name} ---")
             offsets.append(offset)
             for i, (var, label) in enumerate(items):
                 check = "x" if tab_selected[ti][i] else " "
-                if ti == 1 and i > 0 and tab_selected[ti][0] and not tab_selected[ti][i]:
+                if master and i > 0 and tab_selected[ti][0] and not tab_selected[ti][i]:
                     check = "*"
                 print(f"  {offset + i}. [{check}] {label:<48s} {var}")
             offset += len(items)

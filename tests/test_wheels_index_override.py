@@ -24,7 +24,7 @@ def test_missing_trailing_slash_is_repaired(monkeypatch):
 
 @pytest.mark.parametrize("blank", ["", "   "])
 def test_blank_falls_back_to_the_default(monkeypatch, blank):
-    """An empty value in settings.env must not produce a relative URL."""
+    """An empty value must not produce a relative URL."""
     monkeypatch.setenv("COMFY_ENV_CUDA_WHEELS_INDEX", blank)
     assert cw.cuda_wheels_index() == cw.CUDA_WHEELS_INDEX_DEFAULT
 

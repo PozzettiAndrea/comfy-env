@@ -1,32 +1,36 @@
-"""General settings for comfy-env.
+"""Settings for comfy-env: environment variables, and nothing else.
 
-Precedence (most specific wins):
-  1. Environment variables (COMFY_ENV_*)
-  2. Persistent ~/.comfy-env/settings.env (loaded at import with
-     os.environ.setdefault -- it fills UNSET env vars, so it can never
-     override an explicitly-set one)
-  3. Defaults
+Precedence has one tier. A setting is an environment variable (``COMFY_ENV_*``)
+or it is a default; there is no settings file.
 
-All settings are machine-global: the per-pack [settings] section was
-removed in 0.4.25 (its one wired key served an experiment that a global
-env var covers; its other key was parsed but never consulted).
+There used to be a second tier -- ``~/.comfy-env/settings.env``, written by the
+General tab of ``comfy-env settings`` and loaded here at import with
+``os.environ.setdefault``. It never worked. Nothing on the ComfyUI runtime path
+imported this module, so a key the TUI wrote reached ``os.environ`` only in the
+two processes that DID import it (the CLI itself, and the installer's
+cuda-wheels lookup). Toggling Pool IPC in the TUI therefore changed nothing
+about how workers ran, which is the one thing it looked like it was for.
 
-Workers can't import this module (different venv), so they parse env vars directly.
+The file, the loader and the General tab were removed together rather than
+wired up. The consumers of these settings are workers, which cannot import
+comfy_env at all (different venv) and parse ``os.environ`` directly, so an env
+var is the only tier that can reach every reader; a file tier can only ever
+serve the subset of readers that happen to import this module.
+``~/.comfy-env/debug.env`` is unaffected and still works, because
+``comfy_env.debug`` IS imported on the runtime path -- that difference, not
+the file format, is why one tier was real and the other was decoration.
+
+What survives here is the removed-variable tombstones, and the facade imports
+this module so they actually run. They did not, before: with the only two
+importers off the runtime path, a machine still exporting
+``COMFY_ENV_ISOLATE=0`` got no error from ComfyUI at all.
 """
 
 import os
-from pathlib import Path
 
-SETTINGS_FILE = Path.home() / ".comfy-env" / "settings.env"
-
-# Removed settings (0.4.25). Checked BEFORE the persistent file loads: after
-# the loader's setdefault, a Dockerfile/CI export and a TUI-written file line
-# are indistinguishable, and only the former is user intent. The TUI wrote
-# EVERY settings key to settings.env on save, so file keys are residue for
-# every user who ever opened `comfy-env settings` -- they are skipped quietly
-# and disappear on the next save. A falsy env var is a semantic inversion
-# (the machine was told to run un-isolated and no longer will) and fails
-# loudly; a truthy one matches the only behavior that exists now and warns.
+# Removed settings (0.4.25). A falsy env var is a semantic inversion (the
+# machine was told to run un-isolated and no longer will) and fails loudly; a
+# truthy one matches the only behavior that exists now and is ignored.
 _REMOVED_DISABLE_VARS = ("COMFY_ENV_ISOLATE", "COMFY_ENV_INSTALL_ISOLATED")
 
 # Removed in 0.4.25. Opposite polarity to the two above: this one did nothing
@@ -73,32 +77,3 @@ def _check_removed_env_vars():
 
 
 _check_removed_env_vars()
-
-# Load persistent settings (simple KEY=VALUE file) -- env vars always override
-if SETTINGS_FILE.exists():
-    try:
-        for line in SETTINGS_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                k = k.strip()
-                if k in _REMOVED_ENV_VARS:
-                    continue  # TUI residue; next save drops it
-
-                os.environ.setdefault(k, v.strip())
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
-
-
-# General settings
-GENERAL_SETTINGS = [
-    ("COMFY_ENV_POOL_IPC", "Pool IPC (zero-copy GPU tensor transfer)"),
-]
-
-GENERAL_DEFAULTS = {
-    "COMFY_ENV_POOL_IPC": False,
-}
-
-

@@ -4,8 +4,12 @@ The [settings] section itself was removed in 0.4.25 (pre-1.0, ADR-0017), so
 ANY [settings] table in a root config now hits the closed-schema error --
 which subsumes the earlier per-key tombstones. Env-var side: only a FALSY
 isolate/install_isolated fails loudly (semantic inversion -- the machine was
-told to run un-isolated and no longer will); truthy values and settings.env
-residue (the old TUI wrote every key on save) are ignored silently.
+told to run un-isolated and no longer will); truthy values are ignored
+silently.
+
+The ~/.comfy-env/settings.env tier is gone too, and one test below holds it
+gone: the tombstones now reach the runtime through `import comfy_env`, which
+is the reason they can fire at all.
 
 These tests are scheduled for deletion together with the tombstones.
 """
@@ -63,25 +67,45 @@ def test_truthy_env_var_is_silently_ignored(var):
     assert "removed" not in r.stderr
 
 
-def test_settings_env_file_keys_are_skipped_not_errored(tmp_path):
-    """TUI residue: a falsy key in settings.env must NOT brick the boot --
-    it is silently skipped before it can reach os.environ."""
+def test_settings_env_file_is_not_read(tmp_path):
+    """The file tier is gone, not quietly still wired.
+
+    Catches a reintroduced loader: settings.env used to be read into os.environ
+    with setdefault, which looked like a settings system and was one only for
+    the two processes that imported comfy_env.settings -- never a worker. If a
+    key in this file reaches os.environ, the dead tier is back.
+    """
     home = tmp_path / "home"
     (home / ".comfy-env").mkdir(parents=True)
     (home / ".comfy-env" / "settings.env").write_text(
-        "COMFY_ENV_ISOLATE=0\nCOMFY_ENV_POOL_IPC=0\n", encoding="utf-8"
+        "COMFY_ENV_POOL_IPC=1\n", encoding="utf-8"
     )
     code = (
-        "import os, comfy_env.settings as s; "
-        "print('ISOLATE-IN-ENV' if 'COMFY_ENV_ISOLATE' in os.environ else 'SKIPPED'); "
-        "print('OTHERS-LOADED' if os.environ.get('COMFY_ENV_POOL_IPC') == '0' else 'OTHERS-MISSING')"
+        "import os, comfy_env.settings; "
+        "print('FILE-READ' if 'COMFY_ENV_POOL_IPC' in os.environ else 'FILE-IGNORED')"
     )
     env = subprocess_env(HOME=str(home), USERPROFILE=str(home))
     r = subprocess.run([sys.executable, "-c", code], env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
-    assert "SKIPPED" in r.stdout          # removed key never enters os.environ
-    assert "OTHERS-LOADED" in r.stdout    # surviving keys still load
+    assert "FILE-IGNORED" in r.stdout, r.stdout
+
+
+def test_importing_the_facade_arms_the_tombstones():
+    """The tombstones are only worth having where ComfyUI reaches them.
+
+    Catches the state this replaced: comfy_env.settings was imported by the CLI
+    and the installer's wheel lookup and by nothing on the runtime path, so a
+    machine exporting COMFY_ENV_ISOLATE=0 got no error from ComfyUI at all.
+    Asserting on `import comfy_env` (not on comfy_env.settings) is the point.
+    """
+    r = subprocess.run(
+        [sys.executable, "-c", "import comfy_env"],
+        env=subprocess_env(COMFY_ENV_ISOLATE="0"),
+        capture_output=True, text=True,
+    )
+    assert r.returncode != 0, r.stdout
+    assert "removed in 0.4.25" in r.stderr
 
 
 # --- COMFY_ENV_AUTO_INSTALL (removed 0.4.25) --------------------------------
