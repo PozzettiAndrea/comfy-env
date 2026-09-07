@@ -901,10 +901,11 @@ def install_workspace(
             # Compare DIRECTORY names, not logical env names: directories carry
             # the ABI tag (`<name>-py313-torch2-10-cu128`), so matching the bare
             # name here would report every live env as orphaned.
-            from ..environment.cache import _env_dir_name
-            current_names = {
-                _env_dir_name(env_name) for env_name, _, _, _ in discovered
-            }
+            from ..environment.cache import _env_dir_name, legacy_dir_names
+            current_names = set()
+            for env_name, _, _, _ in discovered:
+                current_names.add(_env_dir_name(env_name))
+                current_names.update(legacy_dir_names(env_name))
             for d in sorted(new_envs_root.iterdir()):
                 if not d.is_dir() or d.name in current_names:
                     continue

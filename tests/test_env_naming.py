@@ -42,5 +42,52 @@ def test_sanitization_produces_pixi_safe_names(tmp_path):
 
 
 def test_env_dir_name_is_abi_qualified(monkeypatch):
-    monkeypatch.setattr(cache, "_ABI_TAG", "py313-torch2-10-cu128")
-    assert cache._env_dir_name("sam3-nodes") == "sam3-nodes-py313-torch2-10-cu128"
+    monkeypatch.setattr(cache, "_ABI_TAG", "py313-torch2.10-cu128")
+    assert cache._env_dir_name("sam3-nodes") == "sam3-nodes_py313-torch2.10-cu128"
+
+
+def test_the_seam_cannot_occur_in_either_half(monkeypatch):
+    """ADR-0039. Catches a seam that is also a legal name character.
+
+    The old separator was `-`, which `get_env_name` ALSO uses to join a pack
+    to its config subdirectory and `_abi_tag` uses to join its own fields. So
+    `foo-nodes-py313-...` could not be split, by eye or by code, and
+    `ComfyUI-Foo-Bar` (root config) collided with `ComfyUI-Foo` (config in
+    `bar/`). `_` is safe precisely because the sanitizer collapses it out of
+    every name component.
+    """
+    monkeypatch.setattr(cache, "_ABI_TAG", "py313-torch2.10-cu128")
+    dir_name = cache._env_dir_name("foo-bar")
+    assert dir_name.count(cache._DIR_SEP) == 1, dir_name
+    logical, tag = dir_name.split(cache._DIR_SEP)
+    assert logical == "foo-bar" and tag == "py313-torch2.10-cu128"
+
+
+def test_abi_tag_keeps_version_dots(monkeypatch):
+    """Catches re-running the tag through `_sanitize_pixi_name`.
+
+    That is what rendered torch 2.10 as `torch2-10`, which reads as a
+    component boundary rather than a version and is indistinguishable from
+    torch 2 build 10. The tag is a directory name only; the pixi environment
+    is always called `default`, so the [a-z0-9-] rule never applied to it.
+    """
+    tag = cache._abi_tag()          # the live interpreter, no mocking
+    assert "_" not in tag, f"the seam must not occur inside the tag: {tag}"
+    if "torch" in tag and "notorch" not in tag:
+        assert "." in tag, f"version dots were collapsed: {tag}"
+
+
+def test_legacy_names_recover_the_pre_adr_spelling(monkeypatch):
+    """Adoption, not orphaning. Catches shipping the rename without the alias.
+
+    Without this, every env built before ADR-0039 becomes unreferenced, so
+    `comfy-env gc --delete` offers to delete envs that are in active use, and
+    `install()` re-materializes what is already on disk. That is exactly what
+    the previous rename did: four pre-tag directories, 26 GB, still on the
+    maintainer's machine.
+    """
+    monkeypatch.setattr(cache, "_ABI_TAG", "py313-torch2.10-cu128")
+    legacy = cache.legacy_dir_names("sam3-nodes")
+    assert "sam3-nodes-py313-torch2.10-cu128" in legacy   # seam was a dash
+    assert "sam3-nodes-py313-torch2-10-cu128" in legacy   # and dots were dashed
+    assert cache._env_dir_name("sam3-nodes") not in legacy

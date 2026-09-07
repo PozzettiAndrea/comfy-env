@@ -419,7 +419,7 @@ def cmd_gc(args) -> int:
     import shutil
 
     from .environment.cache import (
-        get_workspace_dir, _env_dir_name,
+        get_workspace_dir, _env_dir_name, legacy_dir_names,
     )
     from .install.workspace import _discover_node_configs
 
@@ -433,7 +433,11 @@ def cmd_gc(args) -> int:
     if comfyui_dir and (comfyui_dir / "custom_nodes").is_dir():
         try:
             for env_name, _plugin, _cf, _cfg in _discover_node_configs(comfyui_dir):
+                # Every spelling, not just the current one: an env adopted
+                # under its pre-ADR-0039 name is LIVE, and a referenced set
+                # built from the new name alone would offer to delete it.
                 referenced.add(_env_dir_name(env_name))
+                referenced.update(legacy_dir_names(env_name))
         except Exception as e:
             print(f"WARNING: node discovery failed ({e}); treating ALL envs as "
                   f"unreferenced would be unsafe -- aborting.", file=sys.stderr)
@@ -471,10 +475,43 @@ def cmd_gc(args) -> int:
               "installs share this machine, run gc from each of them first.")
         return 0
 
+    # NEVER ignore_errors here. A partial delete leaves `.pixi/envs/default`
+    # and a still-VALID `env.stamp.json` standing, and wrap.py binds on
+    # `env_dir.exists()` gated only by the stamp -- so the next launch binds a
+    # worker into a gutted site-packages, which is the DLL-load chaos that
+    # wrap.py's own comment says the stamp exists to prevent. Swallowing the
+    # error also let this print "Reclaimed" for space it had not reclaimed.
+    reclaimed_mb = 0
+    failures = []
+
+    def _on_error(func, path, exc):
+        failures.append((path, exc))
+
     for d, size_mb in victims:
         print(f"Deleting {d} ({size_mb} MB)...")
-        shutil.rmtree(d, ignore_errors=True)
-    print(f"Reclaimed ~{total_mb} MB.")
+        before = len(failures)
+        try:
+            shutil.rmtree(d, onexc=_on_error)
+        except TypeError:  # onexc is 3.12+; onerror is the 3.10/3.11 spelling
+            shutil.rmtree(d, onerror=lambda f, p, e: failures.append((p, e)))
+        if len(failures) == before and not d.exists():
+            reclaimed_mb += size_mb
+        else:
+            print(f"  FAILED: {d} is still on disk, wholly or partly.",
+                  file=sys.stderr)
+
+    print(f"Reclaimed ~{reclaimed_mb} MB.")
+    if failures:
+        print(
+            f"\n{len(failures)} path(s) could not be removed. A partly deleted "
+            f"env still has a valid stamp, so comfy-env would bind a worker "
+            f"into it: delete the listed directories by hand, or re-run "
+            f"`comfy-env install` to rebuild them. First few:",
+            file=sys.stderr,
+        )
+        for path, exc in failures[:5]:
+            print(f"  {path}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

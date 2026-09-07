@@ -93,7 +93,7 @@ _ABI_TAG = None
 
 
 def _abi_tag():
-    """ABI identity of the bootstrap interpreter, e.g. ``py313-torch2-10-cu128``.
+    """ABI identity of the bootstrap interpreter, e.g. ``py313-torch2.10-cu128``.
 
     The workspace root is shared machine-wide and envs were keyed on the node
     name ALONE, but a materialized env is not interchangeable across stacks:
@@ -144,8 +144,26 @@ def _abi_tag():
         # there is no ABI to pin beyond the interpreter.
         parts.append("notorch")
 
-    _ABI_TAG = _sanitize_pixi_name("-".join(parts))
+    # Join WITHOUT the pixi sanitizer. This string is only ever a directory
+    # name (the pixi environment is always called "default"), so the
+    # [a-z0-9-] rule does not apply, and running it through the sanitizer is
+    # what used to collapse `torch2.10` to `torch2-10` -- a dot rendered as
+    # the same character that separates the tag's own fields and joins the
+    # pack to its subdirectory. Components are individually safe by
+    # construction: they come from version numbers and a fixed backend
+    # vocabulary, never from a folder name on disk.
+    _ABI_TAG = "-".join(parts)
     return _ABI_TAG
+
+
+#: Separator between the logical env name and the ABI tag. Deliberately NOT
+#: `-`: the env name already joins the pack folder to its config subdirectory
+#: with a dash (`get_env_name`), and the tag joins its own fields with one, so
+#: a single `-` meant four different things in `foo-nodes-py313-torch2-8-cu128`
+#: and the string could not be read back by eye or by code. `_` cannot occur
+#: in either half, because `_sanitize_pixi_name` collapses it out of every
+#: name component (ADR-0039).
+_DIR_SEP = "_"
 
 
 def _env_dir_name(env_name: str) -> str:
@@ -154,7 +172,29 @@ def _env_dir_name(env_name: str) -> str:
     ``env_name`` stays the logical identity (manifests, logs, config lookup);
     only the directory carries the ABI tag.
     """
-    return f"{env_name}-{_abi_tag()}"
+    return f"{env_name}{_DIR_SEP}{_abi_tag()}"
+
+
+def legacy_dir_names(env_name: str) -> list:
+    """Directory spellings this env used before ADR-0039, newest first.
+
+    Adoption, not migration: an env built by an older comfy-env is byte
+    identical to one built now, because nothing inside it records its own
+    path (`pixi.lock` and the generated manifest carry no absolute paths, and
+    payloads are hardlinks into the shared rattler cache). So the old
+    directory is used where it stands rather than renamed -- renaming a
+    directory whose DLLs a running worker holds open fails on Windows, and
+    there is nothing to gain by winning that race.
+
+    Every consumer of `_env_dir_name` must consult this too, or `comfy-env gc`
+    will see a live env under its old spelling, find it absent from the
+    referenced set, and offer to delete it.
+    """
+    tag = _abi_tag()
+    return [
+        f"{env_name}-{tag}",                              # `_` seam -> `-`
+        f"{env_name}-{_sanitize_pixi_name(tag)}",          # and dotted -> dashed
+    ]
 
 
 def _short_global_root():
@@ -268,6 +308,14 @@ def get_env_manifest_dir(env_name: str, comfyui_dir=None) -> Path:
     """
     envs_root = get_workspace_dir(comfyui_dir) / "envs"
     target = envs_root / _env_dir_name(env_name)
+    if not target.is_dir():
+        # Adopt an env this machine built under an older spelling. Same ABI
+        # tag, so the same env; using it where it stands costs nothing and
+        # avoids re-materializing what is already on disk.
+        for legacy in legacy_dir_names(env_name):
+            candidate = envs_root / legacy
+            if candidate.is_dir():
+                return candidate
     _warn_if_orphaned(envs_root, env_name, target)
     return target
 
