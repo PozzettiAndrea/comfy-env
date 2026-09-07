@@ -19,10 +19,7 @@ from ..config import (
     CONFIG_FILE_NAME,
     ROOT_CONFIG_FILE_NAME,
 )
-from .plugin import (
-    _install_node_packs,
-    _reinstall_main_requirements,
-)
+from .plugin import _install_node_packs
 # Deletion unit, its own module on purpose. Goes when ADR-0022's shim split
 # lands; see the header of sibling_pins.py.
 from .sibling_pins import check_sibling_comfy_env_pins
@@ -67,7 +64,6 @@ def install(
 
     if cfg.node_packs:
         _install_node_packs(cfg.node_packs, node_dir, log, dry_run)
-        _reinstall_main_requirements(node_dir, log, dry_run)
 
     # Surface stale comfy-env pins in sibling packs (warn-only): whichever
     # pack reinstalls its requirements last wins in the shared env, so an old
