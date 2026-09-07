@@ -35,6 +35,17 @@ deliberately NOT in STAGED_WORKER_MODULES.
 #: Per-worker VRAM that exists outside any allocator: the CUDA context plus
 #: cuBLAS/cuDNN handles. Measured 276 to 300 MiB on Linux/RTX 3090. Booked
 #: for every live worker, busy or idle, because it is there either way.
+#: MUST equal state_sync.WORKER_VRAM_FLOOR. Two literals for one physical
+#: quantity, because neither module may import the other: both are staged flat
+#: beside the worker and imported by bare basename, so a package relative
+#: import would break every worker at startup.
+#:
+#: Production always passes state_sync's value explicitly (pool passes
+#: floor=_WORKER_FIXED_VRAM_COST), and the tests here exercise this one as a
+#: default, so a change to either alone leaves the whole suite green.
+#: test_reserve.py asserts they are equal; that assertion is the only thing
+#: tying them together. The provenance for the number itself lives on
+#: state_sync.WORKER_VRAM_FLOOR, which carries the measurements.
 CONTEXT_FLOOR_BYTES = 300 * 1024 * 1024
 
 #: comfy-aimdo's compile time simple headroom (VRAM_HEADROOM in its plat.h):

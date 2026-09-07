@@ -175,3 +175,24 @@ class TestReserveForRequester:
         from comfy_env.reserve import reserve_for_requester
         assert reserve_for_requester(6 * GIB, 0) == 6 * GIB
         assert reserve_for_requester(6 * GIB, None) == 6 * GIB
+
+
+def test_the_two_context_floor_literals_have_not_diverged():
+    """Catches a change to one 300 MiB literal and not the other.
+
+    reserve.CONTEXT_FLOOR_BYTES and state_sync.WORKER_VRAM_FLOOR are the same
+    physical quantity, a worker's CUDA context plus its cuBLAS and cuDNN
+    handles, written twice because neither module may import the other: both
+    are staged flat beside the worker and imported by bare basename.
+
+    Nothing else ties them. Production always passes state_sync's value
+    (pool.py, floor=_WORKER_FIXED_VRAM_COST) while every test in this file
+    exercises reserve's as a default, so editing either one alone leaves the
+    suite green and the two silently disagree about how much a worker costs.
+    """
+    from comfy_env import reserve, state_sync
+    assert reserve.CONTEXT_FLOOR_BYTES == state_sync.WORKER_VRAM_FLOOR, (
+        "the context floor is defined twice and the two have diverged: "
+        f"reserve.CONTEXT_FLOOR_BYTES={reserve.CONTEXT_FLOOR_BYTES}, "
+        f"state_sync.WORKER_VRAM_FLOOR={state_sync.WORKER_VRAM_FLOOR}. "
+        "state_sync's carries the measurements; update both.")
