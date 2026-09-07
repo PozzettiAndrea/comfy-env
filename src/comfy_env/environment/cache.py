@@ -93,7 +93,11 @@ _ABI_TAG = None
 
 
 def _abi_tag():
-    """ABI identity of the bootstrap interpreter, e.g. ``py313-torch2.10-cu128``.
+    """ABI identity of the bootstrap interpreter, e.g. ``py313-torch2-10-cu128``.
+
+    Note the dashes in the torch version: the parts are joined and then run
+    through ``_sanitize_pixi_name``, which collapses the dot. A tag spelled
+    ``torch2.10`` never reaches disk, so do not grep for one.
 
     The workspace root is shared machine-wide and envs were keyed on the node
     name ALONE, but a materialized env is not interchangeable across stacks:
