@@ -663,8 +663,15 @@ def full_release(log=None, _modules=None) -> Dict[str, Any]:
     register now, unconditionally, so the host CAN reach these models. Rung 0
     stays because this ladder is also reached by the idle sweep and by
     partial_release, neither of which goes through the host's ledger, and
-    because a worker must be able to let go on its own. Measured: without rung 0 a 6 GiB paged model survived
-    the whole ladder untouched (research/memory-floor/p8_free_button).
+    because a worker must be able to let go on its own.
+
+    Measured: without rung 0 a 6 GiB paged model survived the whole ladder
+    untouched. The experiment that produced that number was p8_free_button,
+    and it was deleted on 2026-09-06 along with the MemoryObserver, because
+    its whole premise was "does the Free button reach a worker WHEN THE
+    OBSERVER IS ON" and there is no observer any more. The measurement stands;
+    the harness that produced it does not, so re-deriving it needs a new
+    experiment rather than that file.
 
     The rest touches only rebuildable cache and garbage, never state:
 
