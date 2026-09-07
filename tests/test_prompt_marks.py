@@ -336,7 +336,7 @@ class TestNoHostPatchingRule:
     #: Every module that can execute in the ComfyUI process. The guard read
     #: pool.py alone while ADR-0038 promised "an AST test fails the build if
     #: ANYTHING assigns to a comfy module apart from EXTRA_RESERVED_VRAM" and
-    #: memory-api-inventory.md promised the same. A rule enforced over one file
+    #: comfyui-memory-api-inventory.md promised the same. A rule enforced over one
     #: of five is a rule a refactor walks straight out of: moving a wrap from
     #: pool.py to metadata.py turned a build failure into a green run.
     HOST_MODULES = (POOL, PROXY,
