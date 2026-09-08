@@ -94,3 +94,32 @@ def test_wrap_log_is_transparent_when_disabled(tmp_path, monkeypatch):
     d = _env(tmp_path, conda=1, meta=1)
     p = InstallProgress(d, "pack", 1, 1, log=print)
     assert p.wrap_log(print) is print
+
+
+def test_target_is_recovered_when_the_lock_arrives_late(tmp_path, monkeypatch):
+    """Catches reading pixi.lock once, at construction.
+
+    A brand new env has no `pixi.lock` until pixi writes one part way through
+    the install, so a single read at start gave every fresh env a denominator
+    of zero and a spinner for the whole run, then a final line reading
+    "329 package(s) on disk" with no total. Observed exactly that on a real
+    install whose lock turned out to hold 329 entries matching 329 files.
+    """
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    p = InstallProgress(tmp_path, "pack", 1, 1, log=None, interval=0.01)
+    assert p.total == 0, "no lock yet, so no denominator yet"
+
+    # pixi writes the lock and starts linking
+    _env(tmp_path, conda=4, meta=4)
+    p.total = p.total or lock_package_count(tmp_path)
+    assert p.total == 4
+
+
+def test_final_line_reports_elapsed_time(tmp_path, monkeypatch):
+    """The summary must say how long it took, not just what landed."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    d = _env(tmp_path, conda=2, meta=2)
+    lines = []
+    with InstallProgress(d, "pack", 1, 1, log=lines.append):
+        pass
+    assert lines and "2/2" in lines[0] and lines[0].rstrip().endswith("s")

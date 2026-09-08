@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 #: A conda entry in pixi.lock looks like `  - conda: https://...`.
@@ -97,7 +98,12 @@ class InstallProgress:
         self.prefix = f"[{index}/{count}] {env_name}"
         self.log = log
         self.interval = interval
+        # May legitimately be 0 here. A brand new env has no pixi.lock until
+        # pixi writes one part way through the install, so reading it once at
+        # construction gave every fresh env a denominator of zero and a
+        # spinner for the whole run. The poller re-reads until it appears.
         self.total = lock_package_count(self.manifest_dir)
+        self._started = time.monotonic()
         self._stop = threading.Event()
         self._thread = None
         self._last = 0
@@ -107,11 +113,19 @@ class InstallProgress:
         except (AttributeError, ValueError):
             self._enabled = False
 
+    @property
+    def _elapsed(self) -> str:
+        s = time.monotonic() - self._started
+        if s < 60:
+            return f"{s:4.1f}s"
+        return f"{int(s // 60)}m{int(s % 60):02d}s"
+
     def _render(self, done: int) -> None:
         if self.total:
-            line = f"  {self.prefix}  {_bar(done, self.total)} {done}/{self.total}"
+            line = (f"  {self.prefix}  {_bar(done, self.total)} "
+                    f"{done}/{self.total}  {self._elapsed}")
         else:
-            line = f"  {self.prefix}  installing... {done} package(s)"
+            line = f"  {self.prefix}  installing... {done} package(s)  {self._elapsed}"
         # Pad to overwrite a previously longer line; \r keeps it on one row.
         sys.stdout.write("\r" + line.ljust(self._width) + "\r" + line)
         sys.stdout.flush()
@@ -127,12 +141,16 @@ class InstallProgress:
     def _poll(self) -> None:
         while not self._stop.wait(self.interval):
             try:
+                if not self.total:      # the lock arrives mid install
+                    self.total = lock_package_count(self.manifest_dir)
                 done = installed_package_count(self.manifest_dir)
             except Exception:
                 return          # progress must never take down an install
-            if done != self._last:
-                self._last = done
-                self._render(done)
+            # Repaint on a clock, not only on a change: the elapsed time is
+            # part of the line, and a stalled install is exactly when a
+            # reader most needs to see the seconds still moving.
+            self._last = done
+            self._render(done)
 
     def wrap_log(self, log):
         """A log callback that does not get scribbled over by the bar.
@@ -169,8 +187,7 @@ class InstallProgress:
             sys.stdout.flush()
         if self.log is not None:
             done = installed_package_count(self.manifest_dir)
-            if self.total:
-                self.log(f"  {self.prefix}: {done}/{self.total} package(s) on disk")
-            else:
-                self.log(f"  {self.prefix}: {done} package(s) on disk")
+            total = self.total or lock_package_count(self.manifest_dir)
+            frac = f"{done}/{total}" if total else str(done)
+            self.log(f"  {self.prefix}: {frac} package(s) in {self._elapsed.strip()}")
         return False
