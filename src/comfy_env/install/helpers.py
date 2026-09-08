@@ -91,6 +91,11 @@ def _run_streaming(cmd, log: Callable, cwd=None, env=None):
     proc = subprocess.Popen(
         cmd, cwd=cwd, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # stdin was INHERITED, so a child that decides to prompt (an auth
+        # challenge, a confirmation) blocks forever against a console nobody
+        # is watching, inside an install that looks hung. DEVNULL turns a
+        # prompt into an immediate EOF, which the child handles as "no".
+        stdin=subprocess.DEVNULL,
     )
 
     def _read_stderr():
