@@ -141,7 +141,54 @@ def cmd_info(args) -> int:
         print(f"  GPU:      {env.gpu_name}")
         if env.gpu_compute: print(f"  Compute:  {env.gpu_compute}")
     print()
+    _print_envs(env)
     return 0
+
+
+def _print_envs(env) -> None:
+    """List the materialized envs and what each was built for.
+
+    This is the one read-only command a user can be asked to run. Without it
+    the only artifact carrying an env's identity is a startup log line, so
+    every diagnosis began with "paste your whole console output".
+
+    Each env's stack is read from its own `env.stamp.json` rather than parsed
+    out of the directory name: an env can be adopted under an older spelling
+    (ADR-0039), and the stamp is authoritative either way.
+    """
+    import json as _json
+
+    from .environment.cache import get_workspace_dir, _abi_tag
+
+    try:
+        envs_root = get_workspace_dir(None) / "envs"
+        dirs = sorted(d for d in envs_root.iterdir() if d.is_dir())
+    except OSError:
+        return
+
+    print(f"Environments ({envs_root})\n" + "=" * 40)
+    if not dirs:
+        print("  none materialized yet -- run `comfy-env install --dir <pack>`")
+        print()
+        return
+
+    live = _abi_tag()
+    for d in dirs:
+        try:
+            stamp = _json.loads((d / "env.stamp.json").read_text(encoding="utf-8"))
+            abi = stamp.get("abi_tag") or "?"
+            src = stamp.get("source")
+        except (OSError, ValueError, AttributeError):
+            abi, src = None, None
+        if abi is None:
+            note = "unstamped (predates stamping; cannot be verified)"
+        elif abi == live:
+            note = f"{abi}  <- this stack"
+        else:
+            note = abi
+        print(f"  {d.name}")
+        print(f"      {note}" + (f"   from {src}" if src else ""))
+    print()
 
 
 def _read_env_file(path):

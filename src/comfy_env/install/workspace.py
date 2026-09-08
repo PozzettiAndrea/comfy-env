@@ -993,10 +993,12 @@ def install_workspace(
             else:
                 prov = "install_workspace"
                 stamp_pin = torch_pin
+            from ..environment.cache import env_source_id
             write_env_stamp(
                 get_env_manifest_dir(env_name, comfyui_dir),
                 torch_pin=stamp_pin,
                 provenance=prov,
+                source=env_source_id(_plugin, cf),
                 accel_imports=_resolve_accel_imports(env_name, _cfg.cuda_packages),
                 comfyui_version=_cv,
                 host_derived=_hd,

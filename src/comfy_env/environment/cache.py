@@ -337,6 +337,20 @@ def resolve_pixi_manifest(env_root: Path) -> tuple[Path, str]:
     return (manifest, "default")
 
 
+def env_label(env_dir) -> str:
+    """The env DIRECTORY name, given the materialized root inside it.
+
+    `get_workspace_env_dir` returns `<ws>/envs/<dir>/.pixi/envs/default`, so
+    `Path(env_dir).name` is the string "default" for every env on the machine.
+    Two log lines used that as the env's identity and so named nothing.
+    """
+    env_dir = Path(env_dir)
+    parts = env_dir.parts
+    if len(parts) >= 4 and parts[-3:] == (".pixi", "envs", "default"):
+        return parts[-4]
+    return env_dir.name
+
+
 def get_workspace_env_dir(comfyui_dir, env_name):
     """Path to one environment's materialized site-packages root.
 
@@ -346,6 +360,34 @@ def get_workspace_env_dir(comfyui_dir, env_name):
     actually load -- see _abi_tag(). No legacy fallback.
     """
     return get_env_manifest_dir(env_name, comfyui_dir) / ".pixi" / "envs" / "default"
+
+
+def env_source_id(plugin_dir, config_path) -> str:
+    """Which pack, and which config inside it, an env was derived FROM.
+
+    `get_env_name` is lossy on purpose: it strips the `ComfyUI-` prefix,
+    lowercases, collapses everything outside [a-z0-9-] to a dash, and joins
+    the pack to its config subdirectory with that same dash. So distinct
+    sources collapse onto one name -- `ComfyUI-Foo-Bar` with a root config and
+    `ComfyUI-Foo` with a config in `bar/` both derive `foo-bar`.
+
+    Inside one ComfyUI install that clash is a hard error at discovery
+    (`install/workspace.py`). Across two installs sharing the machine-wide
+    workspace there is no such check, and the result is silent: each install
+    re-derives the same directory, the identity seal mismatches every run,
+    both rebuild forever, and nothing says why. Recording the source is what
+    makes that collision loud (ADR-0039).
+
+    Deliberately NOT part of the directory name. A separator makes a name
+    readable; it cannot stop two sources deriving one name, and lengthening
+    the name to encode the source would trade a silent bug for a worse one.
+    """
+    plugin_dir = Path(plugin_dir)
+    try:
+        rel = Path(config_path).resolve().relative_to(plugin_dir.resolve())
+    except (ValueError, OSError):
+        rel = Path(config_path).name
+    return f"{plugin_dir.name}/{Path(rel).as_posix()}"
 
 
 _STAMP_FILE = "env.stamp.json"
@@ -374,7 +416,7 @@ def read_comfyui_version(comfyui_dir):
 
 def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown",
                     accel_imports=None, comfyui_version=None,
-                    host_derived=None, log=None):
+                    host_derived=None, source=None, log=None):
     """Record what an env was built from and against, next to its manifest.
 
     Written only after a successful install. `validate_env_stamp` checks it at
@@ -407,6 +449,7 @@ def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown",
     stamp = {
         "comfy_env_version": ce_version,
         "abi_tag": _abi_tag(),
+        "source": source,
         "torch_pin": torch_pin,
         "provenance": provenance,
         "pixi_lock_sha256": lock_sha,
@@ -430,7 +473,7 @@ def write_env_stamp(env_manifest_dir, torch_pin=None, provenance="unknown",
             log(f"[comfy-env] WARNING: could not write env stamp: {e}")
 
 
-def validate_env_stamp(env_manifest_dir):
+def validate_env_stamp(env_manifest_dir, expected_source=None):
     """Check a materialized env's stamp against the current stack.
 
     Returns (ok, reason). Unstamped envs pass with a note -- they predate
@@ -460,6 +503,18 @@ def validate_env_stamp(env_manifest_dir):
             f"built for abi={got}, current stack is abi={want} "
             f"(provenance={stamp.get('provenance')}, "
             f"torch_pin={stamp.get('torch_pin')})"
+        )
+    # Derivation collision. Two different packs can reduce to one env name
+    # (`env_source_id` explains how), and the ABI check above cannot see it
+    # because both are built for the same stack. Absent on stamps written
+    # before ADR-0039, which pass like unstamped envs do.
+    src = stamp.get("source")
+    if src and expected_source and src != expected_source:
+        return False, (
+            f"built from {src}, but this bind is for {expected_source}. Two "
+            f"packs derive the same env name and would share one directory, "
+            f"rebuilding over each other forever. Rename one pack folder, or "
+            f"move its config to a differently named subdirectory"
         )
     return True, f"abi={got} verified"
 

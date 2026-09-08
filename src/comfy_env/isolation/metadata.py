@@ -16,6 +16,8 @@ import uuid
 
 from .. import state_sync
 from pathlib import Path
+
+from ..environment.cache import env_label
 from typing import Any, Dict, List, Optional
 
 from ..config import DEFAULT_HEALTH_CHECK_TIMEOUT
@@ -774,7 +776,10 @@ def fetch_metadata(
         # hard-coded the env name as "default", silently scanning under the
         # wrong env's site-packages. `--frozen` avoids re-resolving the
         # lockfile per scan.
-        is_pixi = ".pixi" in str(python)
+        # COMPONENT, not substring: `".pixi" in str(python)` also matched a
+        # host interpreter living under ~/.pixi from `pixi global`, and is
+        # the same reading-semantics-out-of-a-path mistake as the libomp bug.
+        is_pixi = ".pixi" in Path(python).parts
         if is_pixi:
             from ..environment.cache import resolve_pixi_manifest
             from ..pixi import PIXI
@@ -1394,7 +1399,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
         # Always on: a worker teardown is the single most consequential
         # event in this file and used to be silent. Name the env and the
         # exception class so a user's log shows WHICH worker died and why.
-        _log(f"[comfy-env] worker teardown env={Path(env_dir).name} "
+        _log(f"[comfy-env] worker teardown env={env_label(env_dir)} "
              f"node={node_name} cause={type(te).__name__}: {str(te)[:200]}")
         _remove_worker(env_dir)
         raise
@@ -1416,7 +1421,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
             host_free = int(_mm.get_free_memory(_mm.get_torch_device()))
         except Exception:
             pass
-        _log(f"[comfy-env] worker {we.error_kind} env={Path(env_dir).name} "
+        _log(f"[comfy-env] worker {we.error_kind} env={env_label(env_dir)} "
              f"node={node_name} call_id={getattr(worker, '_call_counter', '?')} "
              f"worker_allocated={stats.get('allocated')} "
              f"worker_reserved={stats.get('reserved')} "

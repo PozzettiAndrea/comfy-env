@@ -89,8 +89,12 @@ def _find_env_dir(node_dir: Path, config_path: Optional[Path] = None) -> Optiona
         # handshake downstream, so a foreign-stack env fails as DLL-load
         # chaos (ERROR_PROC_NOT_FOUND on shm.dll) or worse, not as a clean
         # error. The stamp written at install time is checked here instead.
-        from ..environment.cache import validate_env_stamp
-        ok, reason = validate_env_stamp(env_dir.parent.parent.parent)
+        from ..environment.cache import validate_env_stamp, env_source_id
+        ok, reason = validate_env_stamp(
+            env_dir.parent.parent.parent,
+            expected_source=env_source_id(plugin_dir, config_path)
+            if config_path else None,
+        )
         if not ok:
             _log(
                 f"[comfy-env] REFUSING env `{env_name}` at {env_dir}: {reason}. "

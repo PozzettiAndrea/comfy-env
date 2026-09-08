@@ -523,7 +523,8 @@ class SubprocessWorker(Worker):
         # OMP guard or delay-loaded DLLs failed at `import torch` with
         # WinError 127 / OMP Error #15. `--as-is` avoids re-resolving the
         # lockfile per worker (the original perf concern).
-        is_pixi = '.pixi' in str(self.python)
+        # COMPONENT, not substring: see the note in metadata.py.
+        is_pixi = '.pixi' in Path(self.python).parts
         if _DBG_WORKER:
             print(f"[SubprocessWorker] is_pixi={is_pixi}, python={self.python}", flush=True)
         if is_pixi:
