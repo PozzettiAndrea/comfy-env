@@ -785,6 +785,16 @@ def install_workspace(
                 log=log,
             )
             cuda_urls_by_env[env_name] = urls
+            # SILENT. This build exists only to hash the plan and compare it
+            # to last time's (seal 2, see seals.md); `write_env_pixi_toml`
+            # builds the same manifest again to write it, and both used to
+            # narrate, so every "replicating host pin" and every overruled
+            # pin printed twice per env. Narrating here is also wrong for a
+            # second reason: this pass runs for EVERY env including the ones
+            # about to be skipped, so an env that is not changing would
+            # explain a manifest nobody is going to write. The write pass
+            # runs only for genuinely stale envs, which is exactly when the
+            # reader wants to know what went into the file.
             manifest = build_env_toml(
                 env_name, cfg,
                 torch_index=torch_index,
@@ -792,7 +802,7 @@ def install_workspace(
                 torch_pin=torch_pin,
                 chosen_torch_index=chosen_torch_index,
                 chosen_torch_pin=chosen_torch_pin_for_override,
-                log=log,
+                log=lambda _msg: None,
                 cuda_wheel_urls=urls,
                 comfyui_dir=comfyui_dir,
             )

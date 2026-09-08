@@ -159,3 +159,43 @@ class TestStampRecordsWhatItWasBuiltAgainst:
             '__version__ = "0.34.1"\n', encoding="utf-8")
         assert describe_env_stamp_drift(
             tmp_path, tmp_path, {"comfy-aimdo": "0.4.15"}) is None
+
+
+def test_the_identity_derivation_does_not_narrate():
+    """Seal 2 builds the manifest to HASH it; the writer builds it again to
+    write it. Catches handing both passes the real log.
+
+    When both narrated, every `[pixi] replicating host pin ...` and every
+    `... replaced by the host's ...` line printed twice per env on every
+    install. It is also wrong in a second way that is easy to miss: this pass
+    runs for EVERY discovered env, including the ones about to be skipped, so
+    an env that is not changing would explain a manifest nobody writes.
+
+    Structural rather than behavioural: exercising it end to end needs a
+    materialized ComfyUI tree, and the defect is entirely in which callback
+    is passed at one call site. Same approach as the AST guards in
+    test_prompt_marks.py.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "src" / "comfy_env" / "install" / "workspace.py").read_text()
+    tree = ast.parse(src)
+
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "build_env_toml"]
+    assert calls, "build_env_toml is no longer called directly in workspace.py"
+
+    for call in calls:
+        log_kw = next((k for k in call.keywords if k.arg == "log"), None)
+        assert log_kw is not None, "build_env_toml called without an explicit log"
+        # The silent form is a lambda; the narrating form is `log=log`.
+        assert not (isinstance(log_kw.value, ast.Name)
+                    and log_kw.value.id == "log"), (
+            f"build_env_toml at line {call.lineno} narrates. The identity "
+            f"derivation must be silent: the writer says the same things, "
+            f"once, and only for envs it actually rebuilds."
+        )
