@@ -7,6 +7,7 @@ were wrong in the first draft.
 """
 
 import sys
+import time
 
 from comfy_env.install.progress import (
     InstallProgress, installed_package_count, lock_package_count,
@@ -73,18 +74,36 @@ def test_counts_survive_a_missing_env(tmp_path):
     assert lock_package_count(tmp_path / "nope") == 0
 
 
-def test_no_bar_when_stdout_is_not_a_tty(tmp_path, monkeypatch, capsys):
-    """CI, a piped install and ComfyUI's captured startup must all be clean.
+def test_no_ansi_when_stdout_is_not_a_tty(tmp_path, monkeypatch, capsys):
+    """Off a tty there must be no redraw, but there MUST still be progress.
 
-    An install must not behave differently because someone is watching it.
+    Catches gating the whole feature on isatty, which is what shipped first
+    and made it invisible: ComfyUI's stdout is routinely not a terminal, so a
+    sixty second install printed one line at the very end and looked hung.
+    Progress off a tty goes to the log as discrete lines instead.
     """
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
     d = _env(tmp_path, conda=3, meta=3)
     lines = []
-    with InstallProgress(d, "pack", 1, 1, log=lines.append):
-        pass
-    assert capsys.readouterr().out == ""
-    assert lines and "3/3" in lines[0]
+    with InstallProgress(d, "pack", 1, 1, log=lines.append, interval=0.01,
+                         line_interval=0.0):
+        time.sleep(0.1)
+    out = capsys.readouterr().out
+    assert "\r" not in out and "█" not in out, "no bar redraw off a tty"
+    assert any("3/3" in ln for ln in lines)
+    assert any("elapsed" in ln for ln in lines), "no live progress line emitted"
+
+
+def test_progress_lines_are_rate_limited(tmp_path, monkeypatch):
+    """A cached install finishing in a second must not add a line per tick."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    d = _env(tmp_path, conda=3, meta=3)
+    lines = []
+    with InstallProgress(d, "pack", 1, 1, log=lines.append, interval=0.01,
+                         line_interval=60.0):
+        time.sleep(0.1)
+    # Only the final summary; the 60s gate suppresses every interim line.
+    assert len(lines) == 1 and "in " in lines[0]
 
 
 def test_wrap_log_is_transparent_when_disabled(tmp_path, monkeypatch):

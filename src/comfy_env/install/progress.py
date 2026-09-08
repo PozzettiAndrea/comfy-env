@@ -86,24 +86,37 @@ class InstallProgress:
     discrete line. `install.log` is read after the fact by someone debugging
     a failure, and a thousand redraws of a bar is worse than useless there.
 
-    A no-op when stdout is not a tty, which covers CI, a piped install, and
-    ComfyUI's own captured startup. The install must not behave differently
-    because someone is watching it.
+    Off a tty there is still progress, just not a redrawing one: a discrete
+    line every `line_interval` seconds while the count moves. Gating the whole
+    feature on `isatty` meant nobody ever saw it, because ComfyUI's stdout is
+    routinely not a terminal (a service, an IDE, anything that captures
+    output), and a sixty second install then printed one line at the end.
+    Discrete lines are also what `install.log` wants, since that is where a
+    reader goes to find out where a slow install spent its time.
     """
 
     def __init__(self, manifest_dir, env_name: str, index: int, count: int,
-                 log=None, interval: float = 0.25):
+                 log=None, interval: float = 0.25,
+                 line_interval: float = 10.0):
         self.manifest_dir = Path(manifest_dir)
         self.env_name = env_name
         self.prefix = f"[{index}/{count}] {env_name}"
         self.log = log
         self.interval = interval
+        self.line_interval = line_interval
+        # Seeded to the start time, NOT 0.0. At 0.0 the first gate check is
+        # `monotonic() - 0 < interval`, which is false forever, so the first
+        # line always fired however short the install was and a one second
+        # cached env logged "0 package(s)" for nothing.
+        self._last_line_at = 0.0
+        self._last_line_count = -1
         # May legitimately be 0 here. A brand new env has no pixi.lock until
         # pixi writes one part way through the install, so reading it once at
         # construction gave every fresh env a denominator of zero and a
         # spinner for the whole run. The poller re-reads until it appears.
         self.total = lock_package_count(self.manifest_dir)
         self._started = time.monotonic()
+        self._last_line_at = self._started
         self._stop = threading.Event()
         self._thread = None
         self._last = 0
@@ -146,11 +159,31 @@ class InstallProgress:
                 done = installed_package_count(self.manifest_dir)
             except Exception:
                 return          # progress must never take down an install
-            # Repaint on a clock, not only on a change: the elapsed time is
-            # part of the line, and a stalled install is exactly when a
-            # reader most needs to see the seconds still moving.
             self._last = done
-            self._render(done)
+            if self._enabled:
+                # Repaint on a clock, not only on a change: the elapsed time
+                # is part of the line, and a stalled install is exactly when
+                # a reader most needs to see the seconds still moving.
+                self._render(done)
+            else:
+                self._maybe_line(done)
+
+    def _maybe_line(self, done: int) -> None:
+        """One discrete line, at most every `line_interval`, off a tty.
+
+        Rate limited AND change gated together: a fast cached install adds
+        nothing beyond its summary, and a stalled one does not repeat an
+        identical line forever.
+        """
+        if self.log is None or done == self._last_line_count:
+            return
+        now = time.monotonic()
+        if now - self._last_line_at < self.line_interval:
+            return
+        self._last_line_at = now
+        self._last_line_count = done
+        frac = f"{done}/{self.total}" if self.total else f"{done}"
+        self.log(f"  {self.prefix}: {frac} package(s), {self._elapsed.strip()} elapsed")
 
     def wrap_log(self, log):
         """A log callback that does not get scribbled over by the bar.
@@ -172,8 +205,12 @@ class InstallProgress:
         return _log
 
     def __enter__(self):
+        # The poller runs either way. On a tty it repaints a bar; off one it
+        # emits a line every line_interval. Starting it only when isatty was
+        # the bug that made this feature invisible in normal ComfyUI use.
         if self._enabled:
             self._render(installed_package_count(self.manifest_dir))
+        if self._enabled or self.log is not None:
             self._thread = threading.Thread(target=self._poll, daemon=True)
             self._thread.start()
         return self
