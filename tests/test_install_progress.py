@@ -142,3 +142,27 @@ def test_final_line_reports_elapsed_time(tmp_path, monkeypatch):
     with InstallProgress(d, "pack", 1, 1, log=lines.append):
         pass
     assert lines and "2/2" in lines[0] and lines[0].rstrip().endswith("s")
+
+
+def test_heartbeat_continues_when_the_count_is_frozen(tmp_path, monkeypatch):
+    """The flat spot is the whole point. Catches ANDing the rate limit with a
+    change gate, which is what shipped first.
+
+    Measured on a cold install: conda linking finishes in about two seconds
+    and pypi then runs for another fifty, during which `conda-meta` stops
+    growing entirely. With a change gate the heartbeat stopped there, so the
+    console showed one line and then nothing for fifty seconds, which is
+    indistinguishable from the hang this class exists to disprove. uv also
+    links its whole tree in a final burst, so no counter of any kind fills
+    that window: only the clock can.
+    """
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False, raising=False)
+    d = _env(tmp_path, conda=26, meta=26)       # already "complete", never moves
+    lines = []
+    with InstallProgress(d, "pack", 1, 1, log=lines.append, interval=0.01,
+                         line_interval=0.03):
+        time.sleep(0.25)
+    interim = [ln for ln in lines if "elapsed" in ln]
+    assert len(interim) >= 3, (
+        f"heartbeat stopped while the count was frozen: {lines}")
+    assert all("26/26" in ln for ln in interim)

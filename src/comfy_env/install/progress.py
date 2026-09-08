@@ -29,6 +29,13 @@ from pathlib import Path
 
 #: A conda entry in pixi.lock looks like `  - conda: https://...`.
 #:
+#: THE LEADING `\s+` IS LOAD BEARING. pixi.lock lists every package TWICE: once
+#: at indent 0 in the top level `packages:` catalogue, and once indented under
+#: `environments.<name>.packages.<platform>`. Measured on a real lock: 329
+#: indented entries against 658 total. Drop the indent requirement and the
+#: denominator silently doubles, so the bar reports half progress forever and
+#: never errors.
+#:
 #: CONDA ONLY, and the restriction is load bearing. Counting pypi entries too
 #: and pairing them with `site-packages/*.dist-info` double counts, because a
 #: conda package that is a Python library ships a dist-info AS WELL AS its
@@ -169,13 +176,20 @@ class InstallProgress:
                 self._maybe_line(done)
 
     def _maybe_line(self, done: int) -> None:
-        """One discrete line, at most every `line_interval`, off a tty.
+        """One discrete line every `line_interval`, off a tty.
 
-        Rate limited AND change gated together: a fast cached install adds
-        nothing beyond its summary, and a stalled one does not repeat an
-        identical line forever.
+        Rate limited ONLY. An earlier version also required the count to have
+        moved, which reproduced the exact complaint this class exists to
+        answer: measured on a cold install, conda linking finishes in about
+        two seconds and pypi then takes another fifty, during which `done`
+        never changes. The heartbeat therefore stopped, and the console showed
+        one line and then nothing for fifty seconds, which is indistinguishable
+        from a hang.
+
+        The clock is the point. `_render` on a tty already repaints on a timer
+        for exactly this reason; off a tty it must too.
         """
-        if self.log is None or done == self._last_line_count:
+        if self.log is None:
             return
         now = time.monotonic()
         if now - self._last_line_at < self.line_interval:
