@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import types
-from pathlib import Path
 
 import pytest
 
@@ -61,22 +60,34 @@ def test_comfy_env_root_expands_tilde(monkeypatch, tmp_path):
     expand it; Path('~/envs') creates a literal '~' directory under cwd."""
     import comfy_env.environment.cache as cache
 
+    # Point HOME at tmp_path FIRST. `_short_global_root` mkdirs what it
+    # resolves, so without this the test creates `~/ce-test-root` in the
+    # developer's real home directory and never removes it.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("COMFY_ENV_ROOT", "~/ce-test-root")
     monkeypatch.setattr(cache, "_ANNOUNCED_WS", True, raising=False)
     root = cache._short_global_root()
 
     assert "~" not in str(root), f"tilde left unexpanded: {root}"
     assert root.is_absolute()
-    assert str(root).startswith(str(Path.home()))
+    assert str(root).startswith(str(tmp_path))
 
 
-def test_comfy_env_root_is_absolute(monkeypatch):
+def test_comfy_env_root_is_absolute(monkeypatch, tmp_path):
     """A relative value would resolve differently per working directory."""
     import comfy_env.environment.cache as cache
 
+    # chdir into tmp_path first: `_short_global_root` resolves a relative
+    # value against the CWD and then MKDIRS it, so run from the repo root
+    # this test left an empty `relative-envs/` directory in the working tree.
+    # Git never reported it, because git does not track empty directories.
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("COMFY_ENV_ROOT", "relative-envs")
     monkeypatch.setattr(cache, "_ANNOUNCED_WS", True, raising=False)
-    assert cache._short_global_root().is_absolute()
+    root = cache._short_global_root()
+    assert root.is_absolute()
+    assert str(root).startswith(str(tmp_path))
 
 
 # --------------------------------------------------------------------------
