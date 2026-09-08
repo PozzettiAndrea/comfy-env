@@ -898,26 +898,34 @@ def install_workspace(
                 f"{', '.join(install_failures)}"
             )
 
-        # Report envs on disk that no node declares -- DO NOT prune. A user may
-        # have multiple ComfyUI installs sharing this workspace, or a node's
-        # `comfy-env.toml` may be transiently missing (mid-clone, partial checkout).
+        # Count envs on disk that no node declares. ONE line, and no `rm -rf`
+        # suggestion, because "not declared by this install" is not the same
+        # as "unused": the workspace is machine-wide, so an env belonging to
+        # ANOTHER ComfyUI install on this box lands in this set and is live.
+        # This used to print a line per env with a delete command attached,
+        # which on a normal machine is twenty lines of advice to delete
+        # something that might be in use, on every single install. `comfy-env
+        # gc` is the command that reasons about this properly (it refuses to
+        # delete when it cannot find a ComfyUI, and says to run it from each
+        # install), and `comfy-env info` lists what is there.
         new_envs_root = workspace_dir / "envs"
         if new_envs_root.is_dir():
             # Compare DIRECTORY names, not logical env names: directories carry
-            # the ABI tag (`<name>-py313-torch2-10-cu128`), so matching the bare
-            # name here would report every live env as orphaned.
+            # the ABI tag (`<name>_py313-torch2.10-cu128`), so matching the bare
+            # name here would count every live env as undeclared.
             from ..environment.cache import _env_dir_name, legacy_dir_names
             current_names = set()
             for env_name, _, _, _ in discovered:
                 current_names.add(_env_dir_name(env_name))
                 current_names.update(legacy_dir_names(env_name))
-            for d in sorted(new_envs_root.iterdir()):
-                if not d.is_dir() or d.name in current_names:
-                    continue
+            undeclared = [d for d in sorted(new_envs_root.iterdir())
+                          if d.is_dir() and d.name not in current_names]
+            if undeclared:
                 log(
-                    f"[comfy-env] Note: env `{d.name}` is on disk but no node "
-                    f"declares it in this run. Leaving as-is. "
-                    f"Remove via `rm -rf {d}` if intended."
+                    f"[comfy-env] {len(undeclared)} env(s) in the workspace are "
+                    f"not declared by this install (they may belong to another "
+                    f"ComfyUI on this machine). `comfy-env info` lists them; "
+                    f"`comfy-env gc` reviews them for deletion."
                 )
 
         # Dedupe libomp.dylib copies in each env's site-packages (macOS only).
