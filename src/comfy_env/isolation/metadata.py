@@ -1301,8 +1301,17 @@ def _splice_dynamic_options(sections: Dict[str, Any], marks) -> Dict[str, Any]:
     return result
 
 
+#: HiddenHolder attributes comfy-env forwards, lowercase of their sentinel
+#: (`Hidden.prompt = "PROMPT"`, _io.py:1592-1606). `dynprompt` is absent on
+#: purpose: it is a live DynamicPrompt, not JSON, and nothing ComfyUI ships
+#: consumes it.
+_V3_HIDDEN_ATTRS = ("prompt", "extra_pnginfo", "unique_id",
+                    "auth_token_comfy_org", "api_key_comfy_org",
+                    "comfy_usage_source")
+
+
 def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
-                    self_state, kwargs, node_name,
+                    self_state, kwargs, node_name, hidden=None,
                     seed=False, state_id=None, state_dict=None):
     """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
 
@@ -1351,6 +1360,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                 method_name=method_name,
                 self_state=self_state,
                 kwargs=kwargs,
+                hidden=hidden,
                 seed=seed,
                 state_id=state_id,
                 timeout=600.0,
@@ -1525,11 +1535,30 @@ def _build_v3_proxy_class(
 
     def _make_v3_proxy(fn, mod, cn, ed, pr, sp, ev, hct, nn):
         def proxy(cls, **kwargs):
+            # V3 hidden inputs never travel as kwargs. ComfyUI puts them in
+            # v3_data["hidden_inputs"], and PREPARE_CLASS_CLONE hangs them on
+            # a per-call class clone (_io.py:2085-2091). This proxy IS a real
+            # io.ComfyNode with FUNCTION="execute", so ComfyUI runs that
+            # machinery on it like any other node -- meaning `cls` arriving
+            # here already carries a populated HiddenHolder. It used to be
+            # discarded on the next line; read it instead.
+            #
+            # getattr-guarded: outside that dispatch `hidden` is the class
+            # default None (_io.py:1977), and dynprompt is skipped because it
+            # is a live object rather than data.
+            _hidden = None
+            _holder = getattr(cls, "hidden", None)
+            if _holder is not None:
+                _hidden = [[_a.upper(), None, _v]
+                           for _a in _V3_HIDDEN_ATTRS
+                           for _v in (getattr(_holder, _a, None),)
+                           if _v is not None] or None
             # self_state is the literal None, never derived from `cls`.
             return _call_in_worker(
                 worker_spec=(ed, pr, sp, ev, hct),
                 module_name=mod, class_name=cn, method_name=fn,
                 self_state=None, kwargs=kwargs, node_name=nn,
+                hidden=_hidden,
             )
         return proxy
 
@@ -1784,16 +1813,30 @@ def build_proxy_class(
             return _cached
     attrs["INPUT_TYPES"] = _input_types
 
-    # Hidden kwargs to strip before sending to worker (V3 execute() won't
-    # accept them).  Keep unique_id since isolated nodes may need it.
-    _hidden_strip = set(input_types.get("hidden", {}).keys()) - {"unique_id"}
+    # Hidden inputs travel in their own frame field, never as kwargs.
+    #
+    # ComfyUI matches hidden inputs on the SENTINEL (`h[x] == "PROMPT"`,
+    # execution.py:212-224) and delivers under the author's own parameter
+    # name. This map records both halves so the worker can put each value
+    # back under the name that node actually declared -- whatever it is.
+    # The predecessor of this map keyed on the literal spelling `unique_id`,
+    # which silently dropped a node declaring `{"node_id": "UNIQUE_ID"}`.
+    #
+    # DYNPROMPT is excluded: it is a live DynamicPrompt, not JSON, and
+    # nothing ComfyUI ships consumes it. A node declaring it sees the same
+    # absent kwarg it sees today.
+    _hidden_map = {k: v for k, v in input_types.get("hidden", {}).items()
+                   if isinstance(v, str) and v != "DYNPROMPT"}
 
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hsk):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hmap):
         def proxy(self, **kwargs):
-            # Strip hidden kwargs that V3 execute() doesn't expect
-            if hsk:
-                kwargs = {k: v for k, v in kwargs.items() if k not in hsk}
+            # Lift hidden inputs out of kwargs into their own channel, keyed
+            # by sentinel and carrying the author's parameter name with them.
+            _hidden = None
+            if hmap:
+                _hidden = [[hmap[k], k, kwargs.pop(k)]
+                           for k in list(kwargs) if k in hmap]
 
             # Nest DynamicCombo inputs: flat dotted keys -> nested dicts.
             # e.g. {"backend": "grid", "backend.smooth_normals": "true", ...}
@@ -1818,6 +1861,7 @@ def build_proxy_class(
                     worker_spec=(ed, pr, sp, ev, hct),
                     module_name=mod, class_name=cn, method_name=fn,
                     self_state=None, kwargs=kwargs, node_name=nn,
+                    hidden=_hidden,
                 )
             # The seed sentinel and state id are parent-only bookkeeping:
             # stripped from every outbound state, set on ingest, never written
@@ -1829,7 +1873,7 @@ def build_proxy_class(
                 worker_spec=(ed, pr, sp, ev, hct),
                 module_name=mod, class_name=cn, method_name=fn,
                 self_state=state_sync.outbound_state(_d),
-                kwargs=kwargs, node_name=nn,
+                kwargs=kwargs, node_name=nn, hidden=_hidden,
                 seed=state_sync.SEED_SENTINEL not in _d,
                 state_id=_sid, state_dict=_d,
             )
@@ -1838,7 +1882,7 @@ def build_proxy_class(
     attrs[func_name] = _make_proxy(
         func_name, module_name, class_name,
         env_dir, package_root, sys_path, env_vars, health_check_timeout,
-        dynamic_combo_parents, node_name, _hidden_strip,
+        dynamic_combo_parents, node_name, _hidden_map,
     )
 
     # Validation exemption (named-arg, parent-side, NEVER forwarded). The V1

@@ -905,6 +905,7 @@ class SubprocessWorker(Worker):
         method_name: str,
         self_state: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
+        hidden: Optional[list] = None,
         seed: bool = False,
         state_id: Optional[str] = None,
         timeout: Optional[float] = None,
@@ -958,6 +959,15 @@ class SubprocessWorker(Worker):
                     "self_state": _serialize_for_ipc(self_state)
                     if self_state is not None else None,
                     "kwargs": kwargs_meta,
+                    # Hidden inputs ride the frame as plain JSON, deliberately
+                    # NOT through _to_shm: every sentinel comfy-env forwards is
+                    # a string or a dict the browser sent, so the walker's
+                    # tensor hunt has nothing to find and would only cost a
+                    # traversal of the whole prompt graph. Keeping them out of
+                    # kwargs also means _describe_value -- which iterates
+                    # kwargs (metadata.py) -- structurally cannot print an
+                    # auth token, with no filter to keep in sync.
+                    "hidden": hidden or None,
                 }
                 if _DBG_WORKER:
                     print(f"[SubprocessWorker] sending request via socket...", file=sys.stderr, flush=True)

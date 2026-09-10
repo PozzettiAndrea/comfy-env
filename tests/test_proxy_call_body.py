@@ -161,3 +161,35 @@ def test_result_is_returned_on_the_happy_path(md, pool_stub, tmp_path, is_v3):
     assert _invoke(_build(md, is_v3, tmp_path)) == ("ok",)
     assert pool_stub["registered"] == [42]
     assert pool_stub["removed"] == []
+
+
+def test_v1_hidden_inputs_are_forwarded_not_dropped(md, pool_stub, tmp_path):
+    """The bug this file's harness was one assertion away from catching.
+
+    A V1 proxy used to drop every hidden kwarg except a parameter spelled
+    exactly `unique_id`, so an isolated SaveImage received prompt=None and
+    wrote a PNG with no workflow chunk -- silently, since upstream guards the
+    write with `if prompt is not None`.
+
+    Note `node_id`: ComfyUI matches hidden inputs on the SENTINEL
+    (execution.py:212-224) and delivers under whatever the author named the
+    parameter. Keying on the spelling was the second half of the defect.
+    """
+    m = _meta(False)
+    m["input_types"] = {"required": {"x": ("INT", {})},
+                        "hidden": {"prompt": "PROMPT", "node_id": "UNIQUE_ID"}}
+    cls = md.build_proxy_class(
+        node_name="MyNode", meta=m, env_dir=tmp_path,
+        package_root=tmp_path, sys_path=[], env_vars={},
+    )
+    cls().run(x=1, prompt={"7": {"class_type": "KSampler"}}, node_id="7")
+
+    sent = pool_stub["worker"].seen[-1]
+    forwarded = {s: v for s, _n, v in (sent.get("hidden") or [])}
+    assert forwarded == {"PROMPT": {"7": {"class_type": "KSampler"}},
+                         "UNIQUE_ID": "7"}, "hidden inputs were dropped"
+
+    # They travel in their own field, never as kwargs -- which is what keeps
+    # an auth token out of _describe_value, structurally rather than by filter.
+    assert "prompt" not in sent["kwargs"]
+    assert "node_id" not in sent["kwargs"]

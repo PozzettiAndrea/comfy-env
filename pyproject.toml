@@ -34,6 +34,11 @@ dev = [
     "ruff",
     "import-linter",
     "psutil",
+    # Reads PNG text chunks back off disk in test_hidden_inputs.py. That
+    # assertion is the acceptance test for hidden inputs: an isolated save
+    # node used to write a perfectly valid image with no workflow in it, and
+    # nothing one layer up could tell.
+    "pillow",
 ]
 
 [project.urls]

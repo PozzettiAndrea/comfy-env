@@ -2384,8 +2384,39 @@ def main():
                 _pre_state = (dict(self_state) if self_state else {}) \
                     if _state_sync_on else None
                 _state_owner = (request.get("state_id") or "?") if _state_sync_on else None
+                # Hidden inputs. Dispatch on the REAL class, never on which
+                # proxy called: a V3 node can end up behind a V1 proxy when the
+                # V3 build or the V3 scan fails (metadata.py), and only the
+                # target itself knows which shape it wants.
+                #
+                #   V3 -- hidden lives on a per-call class clone, and calling
+                #         them as kwargs raises TypeError (execute() does not
+                #         accept prompt=). PREPARE_CLASS_CLONE is upstream's
+                #         own tool for this; the clone dies with the call, so
+                #         a credential cannot outlive it in a long-lived
+                #         worker the way a class attribute would.
+                #   V1 -- plain kwargs, under the parameter name the author
+                #         declared, which the parent shipped alongside each
+                #         value.
+                _hidden = request.get("hidden") or []
+                if _hidden:
+                    _prep = getattr(cls, "PREPARE_CLASS_CLONE", None)
+                    if _prep is not None:
+                        _clone = _prep({"hidden_inputs":
+                                        {_s: _v for _s, _n, _v in _hidden}})
+                        wlog(f"[worker] hidden -> V3 clone: "
+                             f"{[_s for _s, _n, _v in _hidden]}")
+                        method = getattr(_clone, method_name)
+                    else:
+                        for _s, _n, _v in _hidden:
+                            if _n:
+                                inputs[_n] = _v
+                        wlog(f"[worker] hidden -> V1 kwargs: "
+                             f"{[_n for _s, _n, _v in _hidden if _n]}")
+                        method = getattr(instance, method_name)
+                else:
+                    method = getattr(instance, method_name)
                 wlog(f"[worker] Calling {method_name}...")
-                method = getattr(instance, method_name)
                 try:
                     with _infer_mode():
                         result = method(**inputs)
