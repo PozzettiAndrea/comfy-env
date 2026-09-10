@@ -221,70 +221,7 @@ if "comfy_env" not in sys.modules:
         _ce_stub = _types.ModuleType("comfy_env")
         _ce_stub.register_serializer = _ipc_shared.register_serializer
 
-        # input_files twin: packs call `from comfy_env import input_files` in
-        # their nodes modules, which import HERE (no comfy_env installed --
-        # ADR-0006). The worker never needs the provenance tag (nothing scans
-        # options in this process), so a plain live listing suffices. Keep in
-        # step with isolation/provided.py's _list_sources semantics.
-        def _ce_input_files(sources, exts=None, placeholder=None):
-            import os as _os
-            if isinstance(sources, str):
-                sources = [sources]
-            norm = []
-            for _s in sources:
-                if isinstance(_s, str):
-                    norm.append({"dir": _s, "recursive": False,
-                                 "rel_to_input": False})
-                else:
-                    _d = dict(_s)
-                    _d.setdefault("dir", "")
-                    _d.setdefault("recursive", False)
-                    _d.setdefault("rel_to_input", False)
-                    norm.append(_d)
-            _ex = set(str(_e).lower() for _e in (exts or []))
-            names, seen = [], set()
-            try:
-                import folder_paths as _fp
-                base = _fp.get_input_directory()
-            except Exception:
-                base = None
-            if base is not None:
-                for _src in norm:
-                    _sub = _src.get("dir", "") or ""
-                    _root = _os.path.join(base, _sub) if _sub else base
-                    try:
-                        if _src.get("recursive"):
-                            for _r, _dd, _ff in _os.walk(_root):
-                                for _fn in _ff:
-                                    if _ex and _os.path.splitext(_fn)[1].lower() not in _ex:
-                                        continue
-                                    _rel = _os.path.relpath(
-                                        _os.path.join(_r, _fn),
-                                        base if _src.get("rel_to_input") else _root)
-                                    _v = _rel.replace(_os.sep, "/")
-                                    if _v not in seen:
-                                        seen.add(_v)
-                                        names.append(_v)
-                        else:
-                            for _fn in _os.listdir(_root):
-                                if not _os.path.isfile(_os.path.join(_root, _fn)):
-                                    continue
-                                if _ex and _os.path.splitext(_fn)[1].lower() not in _ex:
-                                    continue
-                                _v = (_os.path.join(_sub, _fn).replace(_os.sep, "/")
-                                      if _src.get("rel_to_input") and _sub else _fn)
-                                if _v not in seen:
-                                    seen.add(_v)
-                                    names.append(_v)
-                    except Exception:
-                        continue
-            names.sort()
-            if not names and placeholder is not None:
-                names = [placeholder]
-            return names
-
-        _ce_stub.input_files = _ce_input_files
-        _ce_stub.__all__ = ["register_serializer", "input_files"]
+        _ce_stub.__all__ = ["register_serializer"]
         sys.modules["comfy_env"] = _ce_stub
 from _ipc_shared import (
     _cleanup_shm,
@@ -1348,6 +1285,63 @@ def main():
             pass
         return None
 
+    def _combo_options(value):
+        """Return a JSON-safe option list, or None if this is not a combo.
+
+        Deliberately narrow. An input spec's first element is a list only when
+        it is a combo; everything else -- "IMAGE", ("INT", {...}) -- is left
+        alone. And an option list containing anything but a primitive is
+        refused outright rather than partially converted: the parent splices
+        what comes back, so a half-understood list is worse than none.
+        """
+        if not isinstance(value, (list, tuple)):
+            return None
+        out = []
+        for item in value:
+            if item is None or isinstance(item, (str, int, float, bool)):
+                out.append(item)
+            else:
+                return None
+        return out
+
+    def _handle_refresh_input_types(request):
+        """Re-run a node's REAL INPUT_TYPES and report its combo options.
+
+        Rung one of the options ladder. The parent only asks a worker that is
+        already alive and idle, so this never spawns and never queues behind a
+        running node; by the time it arrives the pack module is imported and
+        the call is a directory walk.
+
+        Only combo option lists cross. The rest of the spec -- tooltips,
+        defaults, the set of inputs itself -- stays as captured at scan time,
+        because a node that changes its SHAPE between calls would invalidate
+        the proxy class the parent already built and handed to ComfyUI.
+
+        Never raises. A pack whose INPUT_TYPES throws gets its error reported
+        once and the parent keeps the cached options: a stale dropdown is
+        strictly better than a node that vanishes from /object_info.
+        """
+        _cid = request.get("call_id")
+        try:
+            _mod = importlib.import_module(request["module"])
+            _cls = getattr(_mod, request["class_name"])
+            _spec = _cls.INPUT_TYPES()
+            _out = {}
+            for _section in ("required", "optional"):
+                _entries = _spec.get(_section) or {}
+                if not isinstance(_entries, dict):
+                    continue
+                for _name, _entry in _entries.items():
+                    if not isinstance(_entry, (list, tuple)) or not _entry:
+                        continue
+                    _opts = _combo_options(_entry[0])
+                    if _opts is not None:
+                        _out.setdefault(_section, {})[_name] = _opts
+            return {"status": "ok", "call_id": _cid, "options": _out}
+        except Exception as _e:
+            wlog(f"[worker] refresh_input_types failed: {_e}")
+            return {"status": "error", "call_id": _cid, "error": str(_e)}
+
     def _handle_model_partial(request):
         """Byte-quantized partial load/unload against the REAL ModelPatcher.
 
@@ -2131,6 +2125,10 @@ def main():
             # One-way ack from the parent: it finished reading (or copied)
             # every frame of that call's response. No reply expected.
             _release_consumed(request.get("call_id"))
+            continue
+
+        if request.get("method") == "refresh_input_types":
+            transport.send(_handle_refresh_input_types(request))
             continue
 
         if request.get("method") == "model_to_device":

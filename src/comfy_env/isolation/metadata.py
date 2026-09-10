@@ -193,118 +193,6 @@ if _comfyui_user_dir:
         pass
 
 
-# --- Provenance instrumentation (the "stenographer") -----------------------
-# Installed BEFORE the pack import so `from folder_paths import
-# get_filename_list` binds the shim, and `from comfy_env import input_files`
-# resolves in an env where comfy_env is deliberately not installed
-# (ADR-0006). A real comfy_env package always wins over the stub.
-_provided_mod = None
-_provided_path = os.environ.get("COMFY_ENV_PROVIDED")
-if _provided_path and os.path.isfile(_provided_path):
-    try:
-        import importlib.util as _ilu
-        _spec = _ilu.spec_from_file_location("_comfy_env_provided", _provided_path)
-        _provided_mod = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_provided_mod)
-    except Exception as _e:
-        print(f"[meta-scan] provided.py load failed: {_e}", file=sys.stderr, flush=True)
-        _provided_mod = None
-
-if _provided_mod is not None and "comfy_env" not in sys.modules:
-    try:
-        import comfy_env as _real_ce  # noqa: F401 -- probe; real package wins
-    except ImportError:
-        import types as _types
-        _ce_stub = _types.ModuleType("comfy_env")
-        _ce_stub.input_files = _provided_mod.input_files
-        _ce_stub.__all__ = ["input_files"]
-        sys.modules["comfy_env"] = _ce_stub
-
-_journal_gfl_results = []      # [(category, [names...])]
-_pack_registrations = {}       # category -> {"paths": [...], "exts": [...]}
-try:
-    import folder_paths as _fp_shim
-    _orig_gfl = _fp_shim.get_filename_list
-    _orig_amfp = _fp_shim.add_model_folder_path
-
-    def _shim_gfl(name):
-        res = _orig_gfl(name)
-        cat = name
-        try:
-            cat = _fp_shim.map_legacy(name)   # "unet" -> "diffusion_models"
-        except Exception:
-            pass
-        _journal_gfl_results.append((cat, list(res)))
-        if _provided_mod is not None:
-            return _provided_mod.ProvidedList(
-                list(res),
-                provider={"kind": "filename_list", "category": cat},
-                offset=0, span=len(res))
-        return res
-
-    def _shim_amfp(name, path, *a, **kw):
-        entry = _pack_registrations.setdefault(name, {"paths": [], "exts": []})
-        entry["paths"].append(str(path))
-        try:
-            _pair = _fp_shim.folder_names_and_paths.get(name)
-        except Exception:
-            _pair = None
-        r = _orig_amfp(name, path, *a, **kw)
-        try:
-            entry["exts"] = sorted(_fp_shim.folder_names_and_paths[name][1])
-        except Exception:
-            pass
-        return r
-
-    _fp_shim.get_filename_list = _shim_gfl
-    _fp_shim.add_model_folder_path = _shim_amfp
-except Exception:
-    pass
-
-def _find_provided(entry):
-    """Return (ProvidedList, container) if a combo entry carries the tag."""
-    if _provided_mod is None or not isinstance(entry, (list, tuple)):
-        return None
-    PL = _provided_mod.ProvidedList
-    if entry and isinstance(entry[0], PL):
-        return entry[0]
-    if len(entry) >= 2 and isinstance(entry[1], dict):
-        opts = entry[1].get("options")
-        if isinstance(opts, PL):
-            return opts
-    return None
-
-def _detect_volatile(input_types):
-    """[(section, name, provider, prefix, suffix)] for tagged combos, plus
-    whole-list equality fallback against journaled get_filename_list results
-    (catches sorted()/list() copies that shed the tag)."""
-    out = []
-    for section in ("required", "optional"):
-        for name, entry in (input_types.get(section) or {}).items():
-            pl = _find_provided(entry)
-            if pl is not None and pl.provider is not None:
-                opts = list(pl)
-                out.append({"section": section, "name": name,
-                            "provider": pl.provider,
-                            "prefix": opts[:pl.offset],
-                            "suffix": opts[pl.offset + pl.span:]})
-                continue
-            # Equality fallback: untagged options exactly equal to one
-            # journaled result (and only one distinct category).
-            opts = None
-            if isinstance(entry, (list, tuple)) and entry:
-                if isinstance(entry[0], list):
-                    opts = entry[0]
-                elif len(entry) >= 2 and isinstance(entry[1], dict)                         and isinstance(entry[1].get("options"), list):
-                    opts = entry[1]["options"]
-            if opts:
-                cats = {c for c, res in _journal_gfl_results if res == list(opts)}
-                if len(cats) == 1:
-                    out.append({"section": section, "name": name,
-                                "provider": {"kind": "filename_list",
-                                             "category": cats.pop()},
-                                "prefix": [], "suffix": []})
-    return out
 # ---------------------------------------------------------------------------
 
 # Redirect stdout to stderr so any prints from imported code (or pixi/torch
@@ -471,15 +359,6 @@ for name, cls in _class_map.items():
             meta["input_types"] = {"required": {}}
             meta["input_types_error"] = str(e)
 
-    # Volatile-combo detection MUST run here, before _to_json flattens
-    # ProvidedList to a plain list and the tag is lost.
-    try:
-        meta["volatile_inputs"] = _detect_volatile(meta.get("input_types") or {})
-    except Exception as _e:
-        meta["volatile_inputs"] = []
-        print(f"[meta-scan] volatile detection failed for {name}: {_e}",
-              file=sys.stderr, flush=True)
-
     # V3 detection + native metadata capture. The real class lives here in the
     # isolation env, so its schema-backed classproperties/GET_NODE_INFO_V1 resolve
     # correctly; we capture the plain-dict results (Schema objects are not serializable).
@@ -540,7 +419,6 @@ if _accel_pkgs:
     _accel_violations = sorted(set(_accel_violations))
 
 payload = {"nodes": nodes, "display": display, "routes": routes,
-           "folder_registrations": _pack_registrations,
            "accel_import_violations": _accel_violations,
            "discovery": _discovery,
            "has_comfy_entrypoint": _has_entrypoint,
@@ -729,7 +607,6 @@ def fetch_metadata(
                 # fresh-scan path meant a broken entrypoint screamed once and
                 # was silent on every startup after.
                 _warn_empty_v3_scan(package_name, payload, node_count)
-                _register_pack_folders(payload.get("folder_registrations"))
                 return payload
             elif _DEBUG:
                 print(f"[comfy-env] Cache stale for {package_name} "
@@ -740,12 +617,6 @@ def fetch_metadata(
 
     # Build proper subprocess environment (DLL paths, library paths, etc.)
     scan_env = build_isolation_env(python, env_vars)
-    # The stenographer's helper: the scan child loads provided.py by path
-    # (comfy_env is not installed in the isolated env -- ADR-0006).
-    scan_env.setdefault(
-        "COMFY_ENV_PROVIDED",
-        str(Path(__file__).parent / "provided.py"))
-
     # Write script and allocate a dedicated payload file. The worker dumps the
     # JSON payload into `output_file` so the protocol is decoupled from
     # stdout/stderr (which pixi, torch DLL loaders, and other noise can
@@ -887,7 +758,6 @@ def fetch_metadata(
             print(f"[comfy-env] Scanned {package_name}: {node_count} nodes ({elapsed:.1f}s)", file=sys.stderr, flush=True)
         _warn_empty_v3_scan(package_name, payload, node_count)
         _warn_dropped_nodes(package_name, payload)
-        _register_pack_folders(payload.get("folder_registrations"))
 
         # --- Write cache (atomic: two ComfyUI processes share this dir) ---
         try:
@@ -939,28 +809,102 @@ _DYNAMIC_DIR_KEY = "comfy_env_dynamic_dir"
 _DYNAMIC_SOURCES_KEY = "comfy_env_sources"
 
 
-def _contained_root(base: str, subdir) -> "Optional[str]":
-    """Resolve base/subdir and REJECT anything escaping base.
+#: How long the options refresh will wait for a worker's lock before giving
+#: up. Short on purpose: this is cosmetic work on the /object_info path, and
+#: the answer if we lose the race is "use the cached list", which is what the
+#: whole feature degrades to anyway. Never worth stalling ComfyUI for.
+_REFRESH_LOCK_TIMEOUT = 0.25
 
-    The subdir comes from a marker dict written by pack code running in the
-    isolation env -- it is untrusted input to the parent. Unfenced, a spec of
-    {"dir": "/etc"} wins os.path.join outright and {"dir": "../.."} walks out,
-    and the resulting listing is served to any browser via /object_info.
-    Rejection is LOUD (stderr names the dir) and returns None; callers treat
-    None as "this source contributes nothing", so the cached options stand.
-    Comparison is case-normalized for Windows.
+
+def _refresh_combo_options(env_dir, module_name, class_name):
+    """Ask a warm, idle worker for a node's real combo options. Or don't.
+
+    This is the whole of comfy-env's live-dropdown support, and it is a
+    ladder with three rungs:
+
+      1. the worker for this env is alive AND idle -- ask it to re-run the
+         node's own INPUT_TYPES, and use what comes back. No guessing: it is
+         the pack's real function, in the env that owns it, so it sees a
+         hand-rolled os.walk exactly as well as a folder_paths lookup.
+      2. alive but mid-call -- `send_command_no_spawn` returns "busy" after
+         a quarter second and we fall through rather than queueing behind a
+         node that may run for minutes.
+      3. never started, or dead -- fall through.
+
+    Rungs 2 and 3 both mean "keep the cached options", which is exactly the
+    behaviour of a node whose dropdown was never dynamic. So the worst case
+    is what every isolated node did before this existed, and the ladder can
+    only ever add.
+
+    The rung that matters is deliberately NOT "spawn a worker". /object_info
+    enumerates the entire node registry on every page load, so spawning there
+    would start every isolated env on the machine to draw a dropdown -- and
+    the spawn happens on the event loop, which would freeze ComfyUI's HTTP
+    server for the length of it. Live options are worth a socket round trip
+    to a process that already exists. They are not worth starting one.
+
+    Never raises. A raise inside INPUT_TYPES makes core omit the node from
+    /object_info entirely, and a vanished node is strictly worse than a
+    stale dropdown.
     """
-    subdir = str(subdir or "")
-    root = os.path.join(base, subdir) if subdir else base
-    base_r = os.path.normcase(os.path.realpath(base))
-    root_r = os.path.normcase(os.path.realpath(root))
-    if root_r == base_r or root_r.startswith(base_r + os.sep):
-        return root
-    print(
-        f"[comfy-env] ERROR: dynamic-combo source dir {subdir!r} escapes the "
-        f"input directory -- rejected. Fix the comfy_env_sources entry.",
-        file=sys.stderr, flush=True)
-    return None
+    try:
+        from .pool import _WORKER_POOL
+        entry = _WORKER_POOL.get(str(env_dir))
+        if entry is None:
+            return None                      # rung 3: nothing to ask
+        worker = entry[0]
+        resp = worker.send_command_no_spawn(
+            "refresh_input_types", lock_timeout=_REFRESH_LOCK_TIMEOUT,
+            module=module_name, class_name=class_name)
+        # "dead" / "busy" are sentinel strings, not responses -- rungs 3 and 2.
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            return None
+        opts = resp.get("options")
+        return opts if isinstance(opts, dict) and opts else None
+    except Exception:
+        return None
+
+
+def _splice_combo_options(sections, fresh):
+    """Overlay fresh option lists onto a cached input-spec snapshot.
+
+    Only the options list is replaced, never the trailing config dict, so
+    tooltips, defaults and `image_upload` survive. An input the worker did
+    not report is left exactly as captured -- the fresh answer is additive,
+    never authoritative about what is absent.
+    """
+    out = {}
+    for section, entries in sections.items():
+        new_entries = dict(entries or {})
+        for name, opts in (fresh.get(section) or {}).items():
+            entry = new_entries.get(name)
+            if not isinstance(entry, (list, tuple)) or not entry:
+                continue
+            if not isinstance(entry[0], (list, tuple)):
+                continue                     # not a combo; leave it alone
+            if not opts:
+                continue                     # empty listing keeps the cache
+            new_entries[name] = [list(opts)] + list(entry[1:])
+        out[section] = new_entries
+    return out
+
+
+def _combo_input_names(input_types):
+    """Every input whose options list could change under us.
+
+    An input spec's first element is a list only for a combo, so this is the
+    exact set the refresh can rewrite -- and therefore the exact set whose
+    membership check has to be relaxed. Numeric inputs are not in it, so
+    min/max clamps keep working; that distinction is the whole reason this
+    is a named list and not a **kwargs validate.
+    """
+    out = []
+    for section in ("required", "optional"):
+        for name, entry in (input_types.get(section) or {}).items():
+            if (isinstance(entry, (list, tuple)) and entry
+                    and isinstance(entry[0], (list, tuple))):
+                out.append(name)
+    return out
 
 
 def _make_named_validate(names):
@@ -984,156 +928,6 @@ def _make_named_validate(names):
     return classmethod(ns["_cev_validate"]), names
 
 
-def _resolve_marked_value(spec, value):
-    """Best-effort absolute path for a dynamic-combo VALUE, parent-side.
-
-    Mirrors _scan_one_source's rel_to_input semantics: try the value against
-    the input root and against each source dir. First existing file wins.
-    Returns None when nothing exists (or folder_paths is unavailable).
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        import folder_paths
-        base = folder_paths.get_input_directory()
-    except Exception:
-        return None
-    candidates = [os.path.join(base, value)]
-    sources = spec.get(_DYNAMIC_SOURCES_KEY) or []
-    if not sources and spec.get(_DYNAMIC_DIR_KEY) is not None:
-        sources = [{"dir": spec.get(_DYNAMIC_DIR_KEY)}]
-    for src in sources:
-        root = _contained_root(base, (src or {}).get("dir", ""))
-        if root:
-            candidates.append(os.path.join(root, value))
-    for c in candidates:
-        rc = os.path.realpath(c)
-        if os.path.normcase(rc).startswith(os.path.normcase(os.path.realpath(base)) + os.sep) \
-                and os.path.isfile(rc):
-            return rc
-    return None
-
-
-def _make_dynamic_fingerprint(marks):
-    """A classmethod fingerprinting marked combo values by file mtime,
-    entirely parent-side.
-
-    This replaces the pack's own IS_CHANGED/fingerprint_inputs, which the
-    proxy cannot carry (forwarding to a worker would cold-spawn every env
-    once per node per prompt, at caching time -- and a linked input arrives
-    stubbed as None during that call, poisoning the signature). It attaches
-    ONLY when the pack's declared fingerprint args are a subset of the marked
-    combo inputs, or the marker opts in explicitly
-    (comfy_env_fingerprint = "mtime"); anything wider stays inert, exactly as
-    today, so nodes like CADabra's raytracer keep their correct caching.
-
-    Never raises: an error inside would become NaN in the caching signature
-    (execution.py catches -> float("NaN")), which never equals itself and
-    forces re-execution every run.
-    """
-    spec_by = {n: sp for (_s, n, sp) in marks
-               if isinstance(n, str) and n.isidentifier()}
-    names = sorted(spec_by)
-    if not names:
-        return None
-    params = ", ".join(f"{n}=None" for n in names)
-    ns: dict = {"_spec_by": spec_by, "_resolve": _resolve_marked_value, "os": os}
-    exec(
-        f"def _cev_fingerprint(cls, {params}):\n"
-        f"    out = []\n"
-        f"    for _n in {names!r}:\n"
-        f"        _v = locals().get(_n)\n"
-        f"        try:\n"
-        f"            _p = _resolve(_spec_by[_n], _v)\n"
-        f"            out.append((_n, _v, os.stat(_p).st_mtime_ns if _p else None))\n"
-        f"        except Exception:\n"
-        f"            out.append((_n, _v, None))\n"
-        f"    return repr(out)\n", ns)
-    return classmethod(ns["_cev_fingerprint"])
-
-
-def _extract_dynamic_spec(entry):
-    """Return the marker dict from a captured INPUT_TYPES combo entry, or None.
-
-    A combo entry is a (io_type_or_options, opts_dict) tuple/list; the marker
-    lives in opts_dict (the first dict element)."""
-    if not isinstance(entry, (list, tuple)):
-        return None
-    for el in entry:
-        if isinstance(el, dict) and (_DYNAMIC_DIR_KEY in el or _DYNAMIC_SOURCES_KEY in el):
-            return el
-    return None
-
-
-def _scan_one_source(base, src, exts):
-    """Scan a single {dir, recursive, rel_to_input} source. Never raises."""
-    subdir = src.get("dir", "") or ""
-    recursive = bool(src.get("recursive", False))
-    rel_to_input = bool(src.get("rel_to_input", False))
-    root = _contained_root(base, subdir)
-    if root is None:
-        return []
-    out = []
-    try:
-        if recursive:
-            for r, _dirs, files in os.walk(root):
-                for fn in files:
-                    if exts and os.path.splitext(fn)[1].lower() not in exts:
-                        continue
-                    full = os.path.join(r, fn)
-                    rel = os.path.relpath(full, base if rel_to_input else root)
-                    out.append(rel.replace(os.sep, "/"))
-        else:
-            for fn in os.listdir(root):
-                if not os.path.isfile(os.path.join(root, fn)):
-                    continue
-                if exts and os.path.splitext(fn)[1].lower() not in exts:
-                    continue
-                if rel_to_input and subdir:
-                    out.append(os.path.join(subdir, fn).replace(os.sep, "/"))
-                else:
-                    out.append(fn)
-    except Exception:
-        pass
-    return out
-
-
-def _scan_dynamic_dir(spec):
-    """Live-scan the input folder(s) named by a marker spec, in the parent.
-
-    Returns a sorted, de-duplicated list of matching filenames, the placeholder
-    when empty, or None if the input directory can't be resolved. Never raises --
-    it runs on the /object_info path which enumerates every node."""
-    try:
-        import folder_paths  # ComfyUI core; available in the main process
-        base = folder_paths.get_input_directory()
-    except Exception:
-        return None
-    exts = [str(e).lower() for e in spec.get("comfy_env_exts", []) or []]
-    placeholder = spec.get("comfy_env_placeholder")
-    sources = spec.get(_DYNAMIC_SOURCES_KEY)
-    if not sources:
-        subdir = spec.get(_DYNAMIC_DIR_KEY)
-        if subdir is None:
-            return None
-        sources = [{"dir": subdir, "recursive": False, "rel_to_input": False}]
-    names, seen = [], set()
-    for src in sources:
-        for n in _scan_one_source(base, src, exts):
-            if n not in seen:
-                seen.add(n)
-                names.append(n)
-    names.sort()
-    if not names:
-        # No placeholder declared -> return None so the splice keeps the
-        # CACHED options. Splicing [] would make every saved workflow using
-        # this node fail combo validation the moment a folder is empty --
-        # a transient state (mid-upload, external drive unmounted) must not
-        # brick workflows.
-        return [placeholder] if placeholder is not None else None
-    return names
-
-
 # --- Provider resolution (parent-side re-listing) ---------------------------
 
 # Per-pack private category registry. NEVER written into ComfyUI's global
@@ -1144,162 +938,13 @@ def _scan_dynamic_dir(spec):
 _PACK_FOLDER_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
-def _register_pack_folders(registrations) -> None:
-    for cat, entry in (registrations or {}).items():
-        slot = _PACK_FOLDER_REGISTRY.setdefault(cat, {"paths": [], "exts": set()})
-        for p_ in entry.get("paths", []):
-            if p_ not in slot["paths"]:
-                slot["paths"].append(p_)
-        slot["exts"].update(entry.get("exts", []))
-
-
 # provider-json -> (names, {dir: mtime_ns}). The mtime map records EVERY
 # directory visited (core's own cached_filename_list_ trick), so a change at
 # any depth invalidates; a re-check is a handful of stats, not a walk.
 _LIVE_CACHE: Dict[str, Any] = {}
 
 
-def _dirs_of_provider(provider) -> "Optional[Dict[str, float]]":
-    try:
-        import folder_paths
-        base = folder_paths.get_input_directory()
-    except Exception:
-        return None
-    dirs: Dict[str, float] = {}
-    for src in provider.get("sources", []):
-        root = _contained_root(base, (src or {}).get("dir", ""))
-        if root is None or not os.path.isdir(root):
-            continue
-        try:
-            dirs[root] = os.stat(root).st_mtime_ns
-            if src.get("recursive"):
-                for r, dd, _ff in os.walk(root):
-                    for d in dd:
-                        full = os.path.join(r, d)
-                        dirs[full] = os.stat(full).st_mtime_ns
-        except OSError:
-            continue
-    return dirs
-
-
-def _resolve_provider(provider) -> "Optional[list]":
-    """Fresh option list for a volatile combo, or None (= keep cached).
-
-    Never raises: a raise inside INPUT_TYPES makes node_info OMIT the node
-    from /object_info entirely -- a vanished node is strictly worse than a
-    stale dropdown."""
-    try:
-        kind = (provider or {}).get("kind")
-        if kind == "input_dir":
-            key = json.dumps(provider, sort_keys=True)
-            cached = _LIVE_CACHE.get(key)
-            if cached is not None:
-                names, dirs = cached
-                try:
-                    # st_mtime_ns (int): a float compare plus coarse filesystem
-                    # granularity made a modification in the same granule as
-                    # the recording invisible. ns ints are exact where the
-                    # filesystem is; where it is coarse, the residual race
-                    # window equals core's own cached_filename_list_.
-                    if all(os.stat(d).st_mtime_ns == m for d, m in dirs.items()):
-                        return list(names)
-                except OSError:
-                    pass
-            spec = {
-                "comfy_env_sources": provider.get("sources"),
-                "comfy_env_exts": provider.get("exts"),
-                "comfy_env_placeholder": provider.get("placeholder"),
-            }
-            fresh = _scan_dynamic_dir(spec)
-            if fresh is not None:
-                dirs = _dirs_of_provider(provider) or {}
-                _LIVE_CACHE[key] = (list(fresh), dirs)
-            return fresh
-        if kind == "filename_list":
-            import folder_paths
-            cat = provider.get("category")
-            if cat in folder_paths.folder_names_and_paths:
-                # Read-only; inherits core's mtime-validated cache and the
-                # request-scoped cache_helper (server.py holds it open
-                # across /object_info).
-                fresh = list(folder_paths.get_filename_list(cat))
-                return fresh or None
-            priv = _PACK_FOLDER_REGISTRY.get(cat)
-            if priv and priv.get("paths"):
-                out = set()
-                for p_ in priv["paths"]:
-                    try:
-                        files, _dirs = folder_paths.recursive_search(
-                            p_, excluded_dir_names=[".git"])
-                        out.update(folder_paths.filter_files_extensions(
-                            files, priv.get("exts") or set()))
-                    except Exception:
-                        continue
-                return sorted(out) or None
-            return None
-        return None
-    except Exception:
-        return None
-
-
 # Proxy class builder
-
-def _collect_dynamic_marks(input_types: Dict[str, Any], volatile_inputs=None):
-    """[(section, input_name, spec)] for combos needing live re-listing.
-
-    Two sources, with strict precedence per input:
-    1. `volatile_inputs` -- the scan child's journal (a detected provider).
-       Spec shape: {"__provider__": {...}, "__prefix__": [...], "__suffix__": [...]}.
-    2. Legacy `comfy_env_*` marker dicts in the widget spec -- the old opt-in.
-    A journal record for an input SILENCES the legacy marker on that input:
-    one resolver, one walk, no race (the dual-emit/single-read rule)."""
-    marks = []
-    journaled = set()
-    for v in (volatile_inputs or []):
-        sec, name = v.get("section"), v.get("name")
-        if not sec or not name:
-            continue
-        journaled.add((sec, name))
-        marks.append((sec, name, {"__provider__": v.get("provider") or {},
-                                  "__prefix__": list(v.get("prefix") or []),
-                                  "__suffix__": list(v.get("suffix") or [])}))
-    for section in ("required", "optional"):
-        for name, entry in (input_types.get(section) or {}).items():
-            if (section, name) in journaled:
-                continue
-            spec = _extract_dynamic_spec(entry)
-            if spec is not None:
-                marks.append((section, name, spec))
-    return marks
-
-
-def _splice_dynamic_options(sections: Dict[str, Any], marks) -> Dict[str, Any]:
-    """Return a copy of a {'required': {...}, 'optional': {...}} dict with each
-    marked combo's option list re-scanned live from disk."""
-    result = {sec: dict(entries) for sec, entries in sections.items()}
-    for sec, name, spec in marks:
-        entries = sections.get(sec) or {}
-        if name not in entries:
-            continue
-        if "__provider__" in spec:
-            fresh = _resolve_provider(spec["__provider__"])
-            if fresh is not None:
-                fresh = spec.get("__prefix__", []) + fresh + spec.get("__suffix__", [])
-        else:
-            fresh = _scan_dynamic_dir(spec)
-        if fresh is None:
-            continue  # couldn't resolve -- keep cached options
-        entry = entries[name]
-        if isinstance(entry[0], (list, tuple)):
-            # V1 bare-list combo: options are entry[0]
-            result[sec][name] = (fresh, *entry[1:])
-        elif len(entry) >= 2 and isinstance(entry[1], dict):
-            # V3 combo: ("COMBO", {"options": [...], ...})
-            new_opts = dict(entry[1])
-            new_opts["options"] = fresh
-            result[sec][name] = (entry[0], new_opts)
-    return result
-
 
 #: HiddenHolder attributes comfy-env forwards, lowercase of their sentinel
 #: (`Hidden.prompt = "PROMPT"`, _io.py:1592-1606). `dynprompt` is absent on
@@ -1483,48 +1128,47 @@ def _build_v3_proxy_class(
                    for k, v in meta.get("input_types", {"required": {}}).items()}
     node_info = meta["node_info_v1"]
 
-    dynamic_marks = _collect_dynamic_marks(input_types, meta.get("volatile_inputs"))
-
     return_types = tuple(meta.get("return_types", ()) or ())
     output_is_list = meta.get("output_is_list")
     if not output_is_list or len(output_is_list) != len(return_types):
         output_is_list = tuple(bool(x) for x in (output_is_list or ())) \
             + (False,) * (len(return_types) - len(output_is_list or ()))
 
-    if dynamic_marks:
-        @classmethod
-        def _input_types(cls, _cached=input_types, _marks=dynamic_marks):
-            result = _splice_dynamic_options(
-                {s: e for s, e in _cached.items() if s in ("required", "optional")}, _marks)
-            for s, e in _cached.items():
-                if s not in ("required", "optional"):
-                    result[s] = e
-            return result
-
-        @classmethod
-        def _get_node_info_v1(cls, _info=node_info, _marks=dynamic_marks):
-            info = dict(_info)
-            inp = info.get("input") or {}
-            sections = {s: e for s, e in inp.items() if s in ("required", "optional")}
-            spliced = _splice_dynamic_options(sections, _marks)
-            new_inp = dict(inp)
-            new_inp.update(spliced)
-            info["input"] = new_inp
-            # RELATIVE_PYTHON_MODULE is stamped on the registered class by the main
-            # process (nodes.py), not the scan env -- re-read it here or the frontend
-            # crashes on python_module=None.
-            info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
-            return info
-    else:
-        @classmethod
-        def _input_types(cls, _cached=input_types):
+    # Live options, unconditionally. Every isolated node asks its own worker
+    # for fresh combo options on every /object_info -- see _refresh_combo_options
+    # for the three rungs and why "spawn one" is not among them. When no worker
+    # answers, both methods return exactly the cached snapshot, which is what
+    # they returned for every node before this existed.
+    @classmethod
+    def _input_types(cls, _cached=input_types, _ed=env_dir,
+                     _mod=module_name, _cn=class_name):
+        fresh = _refresh_combo_options(_ed, _mod, _cn)
+        if not fresh:
             return _cached
+        result = _splice_combo_options(
+            {s: e for s, e in _cached.items() if s in ("required", "optional")}, fresh)
+        for s, e in _cached.items():
+            if s not in ("required", "optional"):
+                result[s] = e
+        return result
 
-        @classmethod
-        def _get_node_info_v1(cls, _info=node_info):
-            info = dict(_info)
-            info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
-            return info
+    @classmethod
+    def _get_node_info_v1(cls, _info=node_info, _ed=env_dir,
+                          _mod=module_name, _cn=class_name):
+        info = dict(_info)
+        fresh = _refresh_combo_options(_ed, _mod, _cn)
+        if fresh:
+            inp = info.get("input") or {}
+            sections = {s: e for s, e in inp.items()
+                        if s in ("required", "optional")}
+            new_inp = dict(inp)
+            new_inp.update(_splice_combo_options(sections, fresh))
+            info["input"] = new_inp
+        # RELATIVE_PYTHON_MODULE is stamped on the registered class by the main
+        # process (nodes.py), not the scan env -- re-read it here or the frontend
+        # crashes on python_module=None.
+        info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
+        return info
 
     @classmethod
     def _define_schema_stub(cls):
@@ -1601,22 +1245,22 @@ def _build_v3_proxy_class(
     # V3 branch note: execution.py resolves the V3 validate via
     # first_real_override(cls, "validate_inputs") -- the LOWERCASE name.
     # Attaching VALIDATE_INPUTS here would be dead code.
-    _marked = [n for (_s, n, _sp) in dynamic_marks]
+    _marked = _combo_input_names(input_types)
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(_exempt)
     if _validate_cm is not None:
         attrs["validate_inputs"] = _validate_cm
 
-    # Staleness: parent-side mtime fingerprint (see _make_dynamic_fingerprint).
-    _fp_args = meta.get("fingerprint_args")
-    _fp_optin = any(sp.get("comfy_env_fingerprint") == "mtime"
-                    for (_s, _n, sp) in dynamic_marks)
-    if dynamic_marks and (_fp_optin or (
-            _fp_args is not None and set(_fp_args) <= set(_marked))):
-        _fp_cm = _make_dynamic_fingerprint(dynamic_marks)
-        if _fp_cm is not None:
-            attrs["fingerprint_inputs"] = _fp_cm
+    # No staleness fingerprint. It hashed a dynamic input's value by
+    # the mtime of the file it resolved to, so overwriting a mesh in
+    # place re-executed instead of serving the cached result. It needed
+    # a per-input directory spec to resolve that path, and nothing knows
+    # one any more: which inputs are file listings is now the worker's
+    # answer at refresh time, not a fact the parent holds at build time.
+    # Attaching an mtime hash to every combo instead would change caching
+    # for nodes that have nothing to do with files. Recorded as a real
+    # loss rather than quietly dropped.
 
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
 
@@ -1787,30 +1431,23 @@ def build_proxy_class(
 
     # Combos needing live re-listing: journaled providers first, legacy
     # markers second (journal wins per input) -- same collector and same
-    # splice as the V3 builder. This replaces a near-copy of the splice that
-    # lived inline here and had to be kept in step by hand.
-    dynamic_dir_inputs = _collect_dynamic_marks(
-        input_types, meta.get("volatile_inputs"))
-
-    if dynamic_dir_inputs:
-        # INPUT_TYPES re-lists live on each call, splicing fresh options into
-        # a copy of the cached snapshot. ComfyUI calls this on every
-        # /object_info, prompt validation, and node execution; the resolver's
-        # mtime cache keeps repeat calls at stat-cost.
-        @classmethod
-        def _input_types(cls, _cached=input_types, _marks=dynamic_dir_inputs):
-            sections = {s: e for s, e in _cached.items()
-                        if s in ("required", "optional")}
-            result = _splice_dynamic_options(sections, _marks)
-            for s, e in _cached.items():
-                if s not in ("required", "optional"):
-                    result[s] = e
-            return result
-    else:
-        # INPUT_TYPES classmethod returning cached metadata
-        @classmethod
-        def _input_types(cls, _cached=input_types):
+    # Live options, same ladder as the V3 proxy. ComfyUI calls INPUT_TYPES on
+    # every /object_info, prompt validation and node execution, so the miss
+    # path has to be cheap: a dict lookup in the worker pool, and on a hit a
+    # socket round trip to a process that is already running.
+    @classmethod
+    def _input_types(cls, _cached=input_types, _ed=env_dir,
+                     _mod=module_name, _cn=class_name):
+        fresh = _refresh_combo_options(_ed, _mod, _cn)
+        if not fresh:
             return _cached
+        sections = {s: e for s, e in _cached.items()
+                    if s in ("required", "optional")}
+        result = _splice_combo_options(sections, fresh)
+        for s, e in _cached.items():
+            if s not in ("required", "optional"):
+                result[s] = e
+        return result
     attrs["INPUT_TYPES"] = _input_types
 
     # Hidden inputs travel in their own frame field, never as kwargs.
@@ -1887,22 +1524,22 @@ def build_proxy_class(
 
     # Validation exemption (named-arg, parent-side, NEVER forwarded). The V1
     # branch of execution.py looks up the UPPERCASE name.
-    _marked = [n for (_s, n, _sp) in dynamic_dir_inputs]
+    _marked = _combo_input_names(input_types)
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(_exempt)
     if _validate_cm is not None:
         attrs["VALIDATE_INPUTS"] = _validate_cm
 
-    # Staleness: parent-side mtime fingerprint, same gate as the V3 builder.
-    _fp_args = meta.get("fingerprint_args")
-    _fp_optin = any(sp.get("comfy_env_fingerprint") == "mtime"
-                    for (_s, _n, sp) in dynamic_dir_inputs)
-    if dynamic_dir_inputs and (_fp_optin or (
-            _fp_args is not None and set(_fp_args) <= set(_marked))):
-        _fp_cm = _make_dynamic_fingerprint(dynamic_dir_inputs)
-        if _fp_cm is not None:
-            attrs["IS_CHANGED"] = _fp_cm
+    # No staleness fingerprint. It hashed a dynamic input's value by
+    # the mtime of the file it resolved to, so overwriting a mesh in
+    # place re-executed instead of serving the cached result. It needed
+    # a per-input directory spec to resolve that path, and nothing knows
+    # one any more: which inputs are file listings is now the worker's
+    # answer at refresh time, not a fact the parent holds at build time.
+    # Attaching an mtime hash to every combo instead would change caching
+    # for nodes that have nothing to do with files. Recorded as a real
+    # loss rather than quietly dropped.
 
     # Create the class
     proxy_cls = type(class_name, (), attrs)
