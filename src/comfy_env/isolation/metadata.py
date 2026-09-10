@@ -26,7 +26,7 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "17"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "18"  # Bump when _METADATA_SCRIPT or cache format changes
 
 
 def _write_cache_atomic(cache_file, cache_key, payload) -> None:
@@ -65,6 +65,58 @@ def _warn_dropped_nodes(package_name: str, payload) -> None:
     for w in (payload.get("sanitize_warnings") or [])[:10]:
         print(f"[comfy-env] {package_name}: scan sanitize: {w}",
               file=sys.stderr, flush=True)
+    _warn_node_conformance(package_name, payload)
+
+
+def _lazy_input_names(input_types) -> list:
+    """Names of inputs declared `lazy` in a scanned INPUT_TYPES payload."""
+    out = []
+    for section in ("required", "optional"):
+        for name, entry in (input_types.get(section) or {}).items():
+            if (isinstance(entry, (list, tuple)) and len(entry) > 1
+                    and isinstance(entry[1], dict) and entry[1].get("lazy")):
+                out.append(name)
+    return out
+
+
+def _warn_node_conformance(package_name: str, payload) -> None:
+    """One loud line per node whose contract isolation cannot carry.
+
+    Every defect named here is SILENT at runtime: the node registers, runs,
+    and produces a wrong or stale answer with no traceback. The startup log
+    next to the pack's own scan line is the only place a user can meet them
+    before the symptom.
+    """
+    for name, meta in (payload.get("nodes") or {}).items():
+        if not isinstance(meta, dict):
+            continue
+
+        err = meta.get("input_types_error")
+        if err:
+            print(f"[comfy-env] WARNING: {package_name}: node {name!r} "
+                  f"INPUT_TYPES() raised during the scan and is registered "
+                  f"with ZERO inputs -- every widget and socket is missing: "
+                  f"{err}", file=sys.stderr, flush=True)
+
+        if meta.get("fingerprint_args") is not None:
+            print(f"[comfy-env] WARNING: {package_name}: node {name!r} defines "
+                  f"IS_CHANGED/fingerprint_inputs, which is NOT forwarded "
+                  f"across isolation. ComfyUI will treat this node as never "
+                  f"changing and serve its cached output until restart. If it "
+                  f"reads a file, a clock or an API, make that an input.",
+                  file=sys.stderr, flush=True)
+
+        # Only a regression when the author wrote one: without an override a
+        # native node gets None too (the inherited default is unreachable).
+        if meta.get("has_check_lazy"):
+            lazy = _lazy_input_names(meta.get("input_types") or {})
+            if lazy:
+                print(f"[comfy-env] WARNING: {package_name}: node {name!r} "
+                      f"defines check_lazy_status, which is NOT forwarded, so "
+                      f"lazy input(s) {', '.join(sorted(lazy))} WILL BE None "
+                      f"and the branch you select is never computed. Take "
+                      f"them eagerly and branch inside the node.",
+                      file=sys.stderr, flush=True)
 
 
 def _describe_value(name: str, v) -> str:
@@ -321,34 +373,56 @@ for name, cls in _class_map.items():
     # IS_CHANGED once per node per prompt, so a worker call there cold-spawns
     # every env before anything executes.
     def _named_args(fn):
+        """(parameter names, declared **kwargs) -- ComfyUI reads BOTH.
+
+        An input escapes the built-in min/max/combo checks if it is NAMED in
+        the argspec OR the function has a catch-all (execution.py:889-893,
+        applied at :1019). Capturing only the names silently narrows a
+        `(cls, **kwargs)` validate -- which asks to exempt everything -- into
+        exempting nothing, and a workflow that submits fine natively is then
+        rejected once the pack is isolated.
+        """
         import inspect as _inspect
         try:
             spec = _inspect.getfullargspec(fn)
         except TypeError:
-            return None
+            return None, False
         args = [a for a in spec.args if a not in ("cls", "self", "s")]
-        return args
+        return args, spec.varkw is not None
     _validate = None
+    _validate_varkw = False
     _fingerprint = None
+    _has_lazy_cb = False
     if _V3Base is not None and isinstance(cls, type) and issubclass(cls, _V3Base):
         try:
             from comfy_api.internal import first_real_override as _fro
             _v = _fro(cls, "validate_inputs")
             if _v is not None:
-                _validate = _named_args(_v)
+                _validate, _validate_varkw = _named_args(_v)
             _f = _fro(cls, "fingerprint_inputs")
             if _f is not None:
-                _fingerprint = _named_args(_f)
+                _fingerprint, _ = _named_args(_f)
+            # An AUTHOR-PROVIDED check_lazy_status is the whole gate. The
+            # inherited default is unreachable: first_real_override breaks at
+            # GET_BASE_CLASS(), which for a V3 node IS ComfyNode, so a native
+            # V3 node declaring `lazy` without an override also runs with
+            # None. Only an explicit one is a regression when we drop it.
+            _has_lazy_cb = _fro(cls, "check_lazy_status") is not None
         except Exception:
             pass
     else:
         _v = getattr(cls, "VALIDATE_INPUTS", None)
         if callable(_v):
-            _validate = _named_args(_v)
+            _validate, _validate_varkw = _named_args(_v)
         _f = getattr(cls, "IS_CHANGED", None)
         if callable(_f):
-            _fingerprint = _named_args(_f)
+            _fingerprint, _ = _named_args(_f)
+        # V1: CheckLazyMixin is opt-in, not a base-class default, so a plain
+        # getattr is the honest test.
+        _has_lazy_cb = callable(getattr(cls, "check_lazy_status", None))
+    meta["has_check_lazy"] = bool(_has_lazy_cb)
     meta["validate_args"] = _validate
+    meta["validate_varkw"] = _validate_varkw
     meta["fingerprint_args"] = _fingerprint
 
     # Call INPUT_TYPES classmethod
@@ -607,6 +681,7 @@ def fetch_metadata(
                 # fresh-scan path meant a broken entrypoint screamed once and
                 # was silent on every startup after.
                 _warn_empty_v3_scan(package_name, payload, node_count)
+                _warn_dropped_nodes(package_name, payload)
                 return payload
             elif _DEBUG:
                 print(f"[comfy-env] Cache stale for {package_name} "
@@ -907,24 +982,37 @@ def _combo_input_names(input_types):
     return out
 
 
-def _make_named_validate(names):
-    """A classmethod `f(cls, a=None, b=None, ...) -> True` with EXACTLY the
-    given parameter names.
+def _make_named_validate(names, varkw: bool = False):
+    """A classmethod `f(cls, a=None, b=None, ..., **kwargs) -> True` carrying
+    EXACTLY the original's exemptions.
 
     The signature is the whole point: execution.py exempts an input from its
     built-in min/max/combo checks iff the input's name appears in the validate
-    function's argspec (execution.py:1019). A **kwargs form would exempt EVERY
-    input on the node -- including numeric clamps users rely on -- so the
-    names must be exact. Names that are not identifiers are skipped (they
-    could not be exempted this way anyhow).
+    function's argspec, OR the function declares a catch-all
+    (execution.py:889-893, applied at :1019).
+
+    So `varkw` is reproduced, never invented. Adding `**kwargs` to a validate
+    the author wrote with explicit names would exempt every input including
+    numeric clamps users rely on -- which is why this is driven by what the
+    scan observed rather than by convenience. Omitting it when the author DID
+    write one is the mirror error and the worse of the two: it attaches
+    nothing at all, ComfyUI re-imposes every check the author deliberately
+    waived, and a workflow that submits fine natively is rejected once the
+    pack is isolated.
+
+    Names that are not identifiers are skipped -- they could not be exempted
+    this way anyhow.
     """
     names = [n for n in names if isinstance(n, str) and n.isidentifier()
              and n not in ("cls", "self", "s")]
-    if not names:
+    if not names and not varkw:
         return None, []
-    params = ", ".join(f"{n}=None" for n in names)
+    sig = ", ".join(p for p in (
+        ", ".join(f"{n}=None" for n in names),
+        "**kwargs" if varkw else "",
+    ) if p)
     ns: dict = {}
-    exec(f"def _cev_validate(cls, {params}):\n    return True\n", ns)
+    exec(f"def _cev_validate(cls, {sig}):\n    return True\n", ns)
     return classmethod(ns["_cev_validate"]), names
 
 
@@ -1248,7 +1336,8 @@ def _build_v3_proxy_class(
     _marked = _combo_input_names(input_types)
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
-    _validate_cm, _ = _make_named_validate(_exempt)
+    _validate_cm, _ = _make_named_validate(
+        _exempt, varkw=bool(meta.get("validate_varkw")))
     if _validate_cm is not None:
         attrs["validate_inputs"] = _validate_cm
 
@@ -1527,7 +1616,8 @@ def build_proxy_class(
     _marked = _combo_input_names(input_types)
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
-    _validate_cm, _ = _make_named_validate(_exempt)
+    _validate_cm, _ = _make_named_validate(
+        _exempt, varkw=bool(meta.get("validate_varkw")))
     if _validate_cm is not None:
         attrs["VALIDATE_INPUTS"] = _validate_cm
 

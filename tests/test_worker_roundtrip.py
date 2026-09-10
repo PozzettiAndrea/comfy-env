@@ -119,3 +119,33 @@ def test_no_keeper_hardcodes_its_retention_window():
         f"keeper(s) hardcode a retention window instead of TENSOR_KEEPER_TTL: "
         f"{offenders}"
     )
+
+
+def test_node_state_survives_with_its_types(worker):
+    """The suite's first real-worker `call_method`, and the reason it exists.
+
+    The shippability gate asked `pickle.dumps` while the wire was `json.dumps`
+    with no `default=`, so a picklable-but-not-JSON attribute was promised as
+    shippable and then killed the call. Values that did cross were retyped in
+    silence: a tuple came back a list, an int key came back a string.
+
+    Two calls, because the defect is only visible on the second: state has to
+    make the round trip out to the parent and back before anything can be
+    wrong about it.
+    """
+    common = dict(module_name="state_node", class_name="StateNode",
+                  method_name="run")
+
+    first = worker.call_method(**common, self_state={}, seed=True, state_id="s1")
+    assert first["calls"] == 1
+
+    # what the parent now holds, handed straight back as the next call's state
+    carried = worker._last_state_out["set"]
+
+    second = worker.call_method(**common, self_state=carried, state_id="s1")
+    assert second["calls"] == 2, "self.x did not survive the boundary"
+    assert second["tup"] == [1, 2, 3] or second["tup"] == (1, 2, 3)
+    assert second["tup_type"] == "tuple", "a tuple came back as a list"
+    assert second["by_int_keys"] == ["int"], "an int key came back as a string"
+    assert second["blob_type"] == "bytes", "bytes did not survive the wire"
+    assert second["tags_type"] == "set", "a set did not survive the wire"

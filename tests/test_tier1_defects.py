@@ -169,10 +169,23 @@ def test_cancel_raises_so_the_worker_hears_about_it(monkeypatch):
     mm = types.ModuleType("comfy.model_management")
     mm.InterruptProcessingException = InterruptProcessingException
 
-    def interrupted():
-        raise InterruptProcessingException()
+    # The flag, and both of upstream's accessors. The throwing one CLEARS it
+    # before raising; the reader does not. Which one comfy-env calls decides
+    # whether the user's click survives to be seen again.
+    state = {"flag": True, "consumed": False}
 
-    mm.throw_exception_if_processing_interrupted = interrupted
+    def processing_interrupted():
+        return state["flag"]
+
+    def throw_exception_if_processing_interrupted():
+        if state["flag"]:
+            state["flag"] = False
+            state["consumed"] = True
+            raise InterruptProcessingException()
+
+    mm.processing_interrupted = processing_interrupted
+    mm.throw_exception_if_processing_interrupted = \
+        throw_exception_if_processing_interrupted
     comfy = types.ModuleType("comfy")
     comfy.model_management = mm
     monkeypatch.setitem(sys.modules, "comfy", comfy)
@@ -180,6 +193,13 @@ def test_cancel_raises_so_the_worker_hears_about_it(monkeypatch):
 
     with pytest.raises(RuntimeError, match="interrupted"):
         pool._handle_progress({"value": 1, "total": 2})
+
+    # The click must still be there. Consuming it here meant that a pack
+    # swallowing the exception spent the user's Stop for nothing, and they
+    # had to press it again.
+    assert state["flag"] is True, "the interrupt flag was consumed"
+    assert state["consumed"] is False, \
+        "comfy-env called the CONSUMING accessor"
 
 
 def test_no_comfyui_is_not_reported_as_a_user_cancel(monkeypatch):
@@ -216,3 +236,123 @@ def test_empty_v3_scan_warns_on_every_startup_not_just_the_first():
         "the cache-hit path returns before warning, so a broken pack is "
         "reported once and never again"
     )
+
+
+# --------------------------------------------------------------------------
+# validate exemption: **kwargs
+# --------------------------------------------------------------------------
+
+def test_a_kwargs_validate_reproduces_the_exemption():
+    """ComfyUI exempts an input if it is NAMED or the function has a catch-all.
+
+    Capturing only the names turned `validate_inputs(cls, **kwargs)` -- which
+    asks to exempt everything -- into no validate at all, so ComfyUI re-imposed
+    every check the author waived and a workflow that submits fine natively was
+    REJECTED once the pack was isolated.
+    """
+    import inspect
+
+    from comfy_env.isolation.metadata import _make_named_validate
+
+    cm, _ = _make_named_validate([], varkw=True)
+    assert cm is not None, "a **kwargs validate must still attach"
+    spec = inspect.getfullargspec(cm.__func__)
+    assert spec.varkw is not None, "the catch-all must survive"
+
+    # the mixed form keeps both halves
+    cm, _ = _make_named_validate(["model_file"], varkw=True)
+    spec = inspect.getfullargspec(cm.__func__)
+    assert "model_file" in spec.args and spec.varkw is not None
+
+    # and a named-only original must NOT gain one: that would exempt every
+    # input including the numeric clamps users rely on
+    cm, _ = _make_named_validate(["model_file"], varkw=False)
+    assert inspect.getfullargspec(cm.__func__).varkw is None
+
+
+# --------------------------------------------------------------------------
+# node state: the gate and the wire must be one predicate
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [
+    {1: "a"},            # int keys -> came back as strings
+    (1, 2, 3),           # tuple -> came back as a list
+    {"s"},               # set: passed the pickle gate, died on the wire
+    b"bytes",            # same
+    [1, {"k": (2, 3)}],  # nested tuple
+])
+def test_state_values_round_trip_with_their_types(value):
+    """The gate asked pickle and the wire was JSON, so a picklable-but-not-JSON
+    value was promised as shippable and then killed the call. Values that DID
+    cross were silently retyped."""
+    from comfy_env import state_sync
+
+    wire = state_sync.encode_value(value)
+    json.dumps(wire)  # must survive the actual transport
+    assert state_sync.decode_value(wire) == value
+    assert type(state_sync.decode_value(wire)) is type(value)
+
+
+def test_json_native_state_is_not_wrapped():
+    """The common frame must stay readable, not become opaque envelopes."""
+    from comfy_env import state_sync
+
+    for v in ("s", 1, 1.5, True, None, {"a": [1, 2]}):
+        assert state_sync.encode_value(v) == v
+
+
+# --------------------------------------------------------------------------
+# a coroutine is not a serialization problem
+# --------------------------------------------------------------------------
+
+def test_a_coroutine_does_not_blame_the_serializer():
+    """The generic pickle message sent authors to write a serializer for a
+    type no serializer can help with. The real cause is an un-awaited
+    `async def`."""
+    from comfy_env.isolation.workers import _ipc_shared
+
+    async def _node():
+        return 1
+
+    coro = _node()
+    try:
+        with pytest.raises(TypeError) as excinfo:
+            _ipc_shared._to_shm_generic(
+                coro, {}, {}, tensor_serializer=None)
+        msg = str(excinfo.value)
+        assert "async def" in msg
+        assert "serialization.py" not in msg, "still blaming the serializer"
+        assert "do not add a serializer" in msg.lower()
+    finally:
+        coro.close()
+
+
+# --------------------------------------------------------------------------
+# forwarded previews
+# --------------------------------------------------------------------------
+
+def test_a_forwarded_preview_rebuilds_into_upstreams_tuple():
+    """The worker cannot put a PIL image on a JSON frame, so it ships
+    (format, base64, max_size); the parent owes upstream a real
+    PreviewImageTuple."""
+    PIL = pytest.importorskip("PIL.Image")
+    import base64
+    import io
+
+    from comfy_env.isolation import pool
+
+    buf = io.BytesIO()
+    PIL.new("RGB", (4, 4), (255, 0, 0)).save(buf, format="PNG")
+    wire = ["PNG", base64.b64encode(buf.getvalue()).decode("ascii"), 512]
+
+    fmt, img, max_size = pool._decode_preview(wire)
+    assert (fmt, max_size) == ("PNG", 512)
+    assert img.size == (4, 4)
+
+
+def test_a_broken_preview_never_costs_the_progress_tick():
+    """A preview is availability, not correctness."""
+    from comfy_env.isolation import pool
+
+    assert pool._decode_preview(None) is None
+    assert pool._decode_preview(["PNG", "not-base64!!", 512]) is None

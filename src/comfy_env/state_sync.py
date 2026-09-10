@@ -11,6 +11,8 @@ cross examined each other's drafts; every rule below carries the reason it won.
 
 from __future__ import annotations
 
+import base64
+import json
 import hashlib
 import pickle
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -286,6 +288,66 @@ def fingerprint(value: Any, cap: int) -> Tuple[Optional[str], str, int]:
     return hashlib.sha256(blob).hexdigest(), "ship", len(blob)
 
 
+#: Envelope key for a value that is picklable but not JSON-native. One key,
+#: distinctive, and length-checked on the way back so it cannot be confused
+#: with an overflow marker or with a pack's own dict.
+_PICKLE_KEY = "__state_pickle_b64__"
+
+#: Types that are JSON-native by construction -- skip the round-trip probe,
+#: which is otherwise two full traversals per attribute per call.
+_JSON_ATOMS = (str, int, float, bool, type(None))
+
+
+def encode_value(value: Any) -> Any:
+    """Wire form of one state value.
+
+    The gate and the wire must be the SAME predicate, and they were not: the
+    gate asked ``pickle.dumps`` (see ``fingerprint``) while the wire was
+    ``json.dumps`` with no ``default=``. So a picklable-but-not-JSON value --
+    ``torch.device``, ``bytes``, a ``set``, a small CPU tensor -- passed the
+    gate, was promised as shippable, and then killed the call on the wire.
+    Every call. Forever, because the rollback meant the seed flag never
+    cleared.
+
+    The inversion was worse than the failure: a value OVER the cap never
+    reached the wire at all, so ``nn.Linear(2048, 2048)`` worked and
+    ``nn.Linear(4, 4)`` did not.
+
+    JSON-native values ride as themselves, so the common frame is unchanged
+    and still readable. Everything else rides as pickle in a base64 envelope,
+    which is exactly what the gate already proved possible. The round-trip
+    equality check -- not merely "does dumps succeed" -- is what also catches
+    the silent half: ``(1, 2, 3)`` came back a list and ``{1: "a"}`` came back
+    with a string key, with nothing logged.
+    """
+    if type(value) in _JSON_ATOMS:
+        return value
+    try:
+        if json.loads(json.dumps(value)) == value:
+            return value
+    except Exception:
+        # unserializable, or an exotic __eq__ (a numpy array returns an array
+        # rather than a bool). Either way: not safely JSON. Pickle it.
+        pass
+    return {_PICKLE_KEY: base64.b64encode(
+        pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")}
+
+
+def decode_value(value: Any) -> Any:
+    """Inverse of :func:`encode_value`. Unknown shapes pass through."""
+    if (isinstance(value, dict) and len(value) == 1
+            and _PICKLE_KEY in value):
+        return pickle.loads(base64.b64decode(value[_PICKLE_KEY]))
+    return value
+
+
+def decode_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Decode an inbound ``self_state`` mapping in place of the wire form."""
+    if not isinstance(state, dict):
+        return state
+    return {k: decode_value(v) for k, v in state.items()}
+
+
 def diff_state(pre: Dict[str, Any], post: Dict[str, Any], cap: int,
                gen: str, mint_handle: Callable[[], int],
                store: Callable[[int, Any], None]) -> Dict[str, Any]:
@@ -325,7 +387,9 @@ def diff_state(pre: Dict[str, Any], post: Dict[str, Any], cap: int,
         if verdict == "ship":
             if pre_fp.get(k) == digest:
                 continue  # byte-identical: parent already holds it
-            out_set[k] = v
+            # Encoded HERE and nowhere else: `pre` and `post` both hold live
+            # values, so the fingerprints above compare like with like.
+            out_set[k] = encode_value(v)
         else:
             handle = mint_handle()
             store(handle, v)

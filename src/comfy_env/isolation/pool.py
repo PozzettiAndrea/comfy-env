@@ -225,19 +225,49 @@ def _handle_progress(request: dict) -> dict:
     except ImportError:
         mm = None  # not running inside ComfyUI -- nothing to cancel
     if mm is not None:
-        try:
-            mm.throw_exception_if_processing_interrupted()
-        except mm.InterruptProcessingException:
+        # READ the flag; do not consume it. throw_exception_if_processing_
+        # interrupted() clears it before raising (model_management.py), so
+        # checking here used to SPEND the user's click -- and if the pack then
+        # swallowed the exception, the click was gone with nothing to show for
+        # it and they had to press Stop again. Leaving it set lets ComfyUI's
+        # own per-node check find it too. Nothing leaks: the flag is reset at
+        # each prompt start (execution.py).
+        if mm.processing_interrupted():
             raise InterruptRequested("Processing interrupted by user")
     try:
         import comfy.utils
         if comfy.utils.PROGRESS_BAR_HOOK:
             value = request.get("value", 0)
             total = request.get("total", 1)
-            comfy.utils.PROGRESS_BAR_HOOK(value, total, None)
+            comfy.utils.PROGRESS_BAR_HOOK(
+                value, total, _decode_preview(request.get("preview")))
     except Exception:
         pass
     return {}
+
+
+def _decode_preview(pv):
+    """Rebuild upstream's PreviewImageTuple from a forwarded preview.
+
+    The worker cannot send a PIL image over a JSON frame, so it ships
+    ``[format, base64_bytes, max_size]``. Upstream wants
+    ``(format, PIL.Image, max_size)`` -- the shape latent_preview produces and
+    main.py's hook routes to the browser.
+
+    PIL is ComfyUI's own dependency, not one comfy-env adds. Returns None on
+    any failure: a preview is availability, not correctness, and losing one
+    must never cost the progress tick it rode in on.
+    """
+    if not pv:
+        return None
+    try:
+        import base64
+        import io
+        from PIL import Image
+        fmt, b64, max_size = pv[0], pv[1], pv[2]
+        return (fmt, Image.open(io.BytesIO(base64.b64decode(b64))), max_size)
+    except Exception:
+        return None
 
 
 #: Fixed VRAM cost of an extra CUDA-using process that ComfyUI's ledger never

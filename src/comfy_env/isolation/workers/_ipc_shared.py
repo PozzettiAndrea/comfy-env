@@ -901,6 +901,20 @@ def _to_shm_generic(obj, registry, visited, *, tensor_serializer, node_output_se
     # (demonstrated: pickling a textured Trimesh imports PIL at
     # serialize time; without PIL the bytes are never produced).
     import pickle
+    # An awaitable is not a serialization problem and must never be reported
+    # as one: the generic message below sends the author to write a serializer
+    # for a type no serializer can help with. Checked here rather than only at
+    # the call site because a coroutine can also arrive nested inside a
+    # returned tuple, which the dispatcher does not await.
+    import inspect as _inspect
+    if _inspect.isawaitable(obj) or _inspect.isasyncgen(obj):
+        raise TypeError(
+            f"comfy-env: this node returned {type(obj).__name__!r}. Its "
+            f"function is `async def` and the isolation worker does not await "
+            f"it. Make the function synchronous -- run your own event loop "
+            f"inside it if you need one. This is NOT a serialization problem: "
+            f"do not add a serializer for this type."
+        )
     try:
         obj_bytes = pickle.dumps(obj)
     except Exception as e:

@@ -63,7 +63,6 @@ from ._ipc_parent import (
     _to_shm,
     _from_shm,
     _cleanup_ipc_cache,
-    _serialize_for_ipc,
 )
 
 # Launch-env builder: a leaf module (isolation/subenv.py), imported DOWNWARD.
@@ -956,8 +955,12 @@ class SubprocessWorker(Worker):
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,
-                    "self_state": _serialize_for_ipc(self_state)
-                    if self_state is not None else None,
+                    # Shipped verbatim. Every value in here was produced by
+                    # state_sync.encode_value in the worker and is already in
+                    # wire form; the parent stores it opaquely and hands it
+                    # back. It has no business interpreting a pack's `self`,
+                    # and cannot -- the types live in the pack's env.
+                    "self_state": self_state,
                     "kwargs": kwargs_meta,
                     # Hidden inputs ride the frame as plain JSON, deliberately
                     # NOT through _to_shm: every sentinel comfy-env forwards is

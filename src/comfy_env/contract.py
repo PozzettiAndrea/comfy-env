@@ -62,6 +62,14 @@ CONTRACT = (
      "kind": "callable", "severity": FATAL, "tier": FLOOR, "side": BOTH,
      "why": "cannot tell how much of the card is free, so admission is blind",
      "since": None},
+    {"module": "comfy.model_management", "attr": "processing_interrupted",
+     "kind": "callable", "severity": FATAL, "tier": FLOOR, "side": HOST,
+     "why": "the NON-consuming read of the cancel flag. The throwing variant "
+            "clears the flag before it raises, so using it to poll spends the "
+            "user's click -- and a pack that then swallows the exception "
+            "leaves them pressing Stop a second time. If this name moves, the "
+            "only safe substitute reintroduces that bug",
+     "since": None},
     {"module": "comfy.model_management", "attr": "free_memory",
      "kind": "callable", "severity": FATAL, "tier": FLOOR, "side": HOST,
      "why": "the only way a worker can ask the host to give VRAM back; "

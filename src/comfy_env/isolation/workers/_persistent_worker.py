@@ -1478,8 +1478,17 @@ def main():
             wlog(f"[worker] model_to_device error: {_e}")
             transport.send({"status": "error", "call_id": _req_call_id, "error": str(_e)})
 
-    class _InterruptedError(RuntimeError):
+    _UNSET = object()  # tells "attribute absent" from "attribute is None"
+
+    class _InterruptedError(BaseException):
         """Raised when the user cancels the current run.
+
+        BaseException, not Exception, and for the same reason upstream made
+        InterruptProcessingException one (model_management.py): a node wrapping
+        its work in a bare `except Exception` would otherwise SWALLOW the
+        cancel, and the user's click is already spent by the time it does.
+        Every handler in this file that must still turn it into an error frame
+        names it explicitly alongside Exception.
 
         Defined at main scope, not inside the progress-hook try: the error
         frame stamper does an isinstance check against it, and a name that
@@ -1801,9 +1810,37 @@ def main():
     # automatically forward updates to the parent, which relays to the ComfyUI frontend.
     try:
         import comfy.utils as _cu
-        def _progress_hook(value, total, preview=None, node_id=None):
+        #: Cap on one forwarded preview. Upstream deliberately BYPASSES its
+        #: own progress throttle whenever a preview is present (comfy/utils.py),
+        #: so a 50-step sampler is 50 unthrottled frames down a JSON socket.
+        #: Over the cap the preview is dropped and the tick still goes.
+        _PREVIEW_MAX_BYTES = 1 << 20
+
+        def _encode_preview(preview):
+            """PreviewImageTuple -> [format, base64, max_size], or None.
+
+            Duck-typed on the object handed to us: no PIL import in the
+            worker, because a worker that produced a preview already has PIL
+            and one that did not must not be made to need it.
+            """
             try:
-                _call_parent("report_progress", value=value, total=total)
+                import base64 as _b64
+                import io as _io
+                fmt = preview[0] or "JPEG"
+                buf = _io.BytesIO()
+                preview[1].save(buf, format=fmt)
+                raw = buf.getvalue()
+                if len(raw) > _PREVIEW_MAX_BYTES:
+                    return None
+                return [fmt, _b64.b64encode(raw).decode("ascii"), preview[2]]
+            except Exception:
+                return None
+
+        def _progress_hook(value, total, preview=None, node_id=None):
+            _pv = _encode_preview(preview) if preview is not None else None
+            try:
+                _call_parent("report_progress", value=value, total=total,
+                             preview=_pv)
             except _InterruptedError:
                 raise
             except RuntimeError as e:
@@ -2256,7 +2293,7 @@ def main():
                                 "result": result_meta, "torch_version": _echo_tv,
                                 "cuda_device_uuid": _echo_uuid})
                 _shm_keeper.keep(shm_registry, _current_call_id)
-            except Exception as e:
+            except (Exception, _InterruptedError) as e:
                 _cleanup_shm(shm_registry)
                 _frame = {"status": "error", "call_id": _current_call_id,
                           "error": str(e),
@@ -2351,7 +2388,10 @@ def main():
                 else:
                     instance = object.__new__(cls)
                 if self_state:
-                    self_state = _deserialize_isolated_objects(self_state)
+                    # Decode BEFORE _pre_state is captured, so the diff at the
+                    # end compares live values against live values and only
+                    # the wire ever carries the encoded form.
+                    self_state = _state_sync.decode_state(self_state)
                     if _state_sync_on:
                         # resolve overflow markers back into live values; a
                         # marker from a previous worker generation is state
@@ -2397,6 +2437,23 @@ def main():
                 #         declared, which the parent shipped alongside each
                 #         value.
                 _hidden = request.get("hidden") or []
+                # V3: fill in cls.SCHEMA. Upstream sets it once at
+                # registration, which never runs in a worker, so it sits at
+                # its class default of None -- and NodeOutput's expand check
+                # reads cls.SCHEMA.enable_expand, so a node returning an
+                # expand graph dies on NoneType while an ordinary one is fine
+                # (the check short-circuits). GET_SCHEMA is an inherited
+                # @final @classmethod: no import, and idempotent, so calling
+                # it here is the same work registration would have done.
+                # Sentinel default distinguishes "V3, unset" from "not V3".
+                if getattr(cls, "SCHEMA", _UNSET) is None:
+                    try:
+                        cls.GET_SCHEMA()
+                    except Exception as _schema_err:
+                        wlog(f"[worker] GET_SCHEMA failed for {class_name}: "
+                             f"{_schema_err} -- expand graphs from this node "
+                             f"will fail")
+
                 if _hidden:
                     _prep = getattr(cls, "PREPARE_CLASS_CLONE", None)
                     if _prep is not None:
@@ -2485,7 +2542,7 @@ def main():
             # Kept until the parent's "consumed" ack (TTL is the fallback)
             _shm_keeper.keep(shm_registry, _current_call_id)
 
-        except Exception as e:
+        except (Exception, _InterruptedError) as e:
             # Cleanup shm on error since host won't read it
             _cleanup_shm(shm_registry)
             _frame = {
