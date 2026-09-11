@@ -2471,6 +2471,8 @@ def main():
                 #         declared, which the parent shipped alongside each
                 #         value.
                 _hidden = request.get("hidden") or []
+                _hidden_v3 = ({"hidden_inputs": {_s: _v for _s, _n, _v in _hidden}}
+                              if _hidden else None)
                 # V3: fill in cls.SCHEMA. Upstream sets it once at
                 # registration, which never runs in a worker, so it sits at
                 # its class default of None -- and NodeOutput's expand check
@@ -2488,21 +2490,41 @@ def main():
                              f"{_schema_err} -- expand graphs from this node "
                              f"will fail")
 
-                if _hidden:
-                    _prep = getattr(cls, "PREPARE_CLASS_CLONE", None)
-                    if _prep is not None:
-                        _clone = _prep({"hidden_inputs":
-                                        {_s: _v for _s, _n, _v in _hidden}})
+                _prep = getattr(cls, "PREPARE_CLASS_CLONE", None)
+                if _prep is not None:
+                    # V3: the same four lines as execution.py:278-285, in the
+                    # same order, hidden or not. Upstream always clones (so
+                    # cls.hidden is a holder of Nones, never None itself) and
+                    # always LOCKS the clone: execute() receives a class whose
+                    # attributes cannot be assigned, and a node that tries
+                    # raises AttributeError in every plain ComfyUI run. An
+                    # unlocked clone here was the one place isolation was
+                    # looser than upstream, so a pack could work isolated and
+                    # break for everyone else. make_locked_method_func is
+                    # borrowed, not imported: comfy_api.latest._io imports
+                    # comfy_api.internal, so any pack defining a V3 node has
+                    # already loaded it (the test suite pins this).
+                    cls.VALIDATE_CLASS()
+                    _clone = _prep(_hidden_v3)
+                    if _hidden:
                         wlog(f"[worker] hidden -> V3 clone: "
                              f"{[_s for _s, _n, _v in _hidden]}")
-                        method = getattr(_clone, method_name)
+                    _lock = getattr(sys.modules.get("comfy_api.internal"),
+                                    "make_locked_method_func", None)
+                    if _lock is not None:
+                        method = _lock(cls, method_name, _clone)
                     else:
-                        for _s, _n, _v in _hidden:
-                            if _n:
-                                inputs[_n] = _v
-                        wlog(f"[worker] hidden -> V1 kwargs: "
-                             f"{[_n for _s, _n, _v in _hidden if _n]}")
-                        method = getattr(instance, method_name)
+                        wlog(f"[worker] WARNING: comfy_api.internal is not "
+                             f"loaded; {class_name}'s class clone is unlocked "
+                             f"(upstream would lock it)")
+                        method = getattr(_clone, method_name)
+                elif _hidden:
+                    for _s, _n, _v in _hidden:
+                        if _n:
+                            inputs[_n] = _v
+                    wlog(f"[worker] hidden -> V1 kwargs: "
+                         f"{[_n for _s, _n, _v in _hidden if _n]}")
+                    method = getattr(instance, method_name)
                 else:
                     method = getattr(instance, method_name)
                 wlog(f"[worker] Calling {method_name}...")

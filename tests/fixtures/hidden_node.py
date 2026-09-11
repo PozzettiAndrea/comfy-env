@@ -46,6 +46,10 @@ class V3SaveNode:
     hidden = None
 
     @classmethod
+    def VALIDATE_CLASS(cls):
+        pass  # upstream checks define_schema/execute exist; a stand-in has neither
+
+    @classmethod
     def PREPARE_CLASS_CLONE(cls, v3_data):
         clone = type(f"{cls.__name__}Clone", (cls,), {})
         clone.hidden = _HiddenHolder((v3_data or {}).get("hidden_inputs") or {})
