@@ -68,17 +68,6 @@ def _warn_dropped_nodes(package_name: str, payload) -> None:
     _warn_node_conformance(package_name, payload)
 
 
-def _lazy_input_names(input_types) -> list:
-    """Names of inputs declared `lazy` in a scanned INPUT_TYPES payload."""
-    out = []
-    for section in ("required", "optional"):
-        for name, entry in (input_types.get(section) or {}).items():
-            if (isinstance(entry, (list, tuple)) and len(entry) > 1
-                    and isinstance(entry[1], dict) and entry[1].get("lazy")):
-                out.append(name)
-    return out
-
-
 def _warn_node_conformance(package_name: str, payload) -> None:
     """One loud line per node whose contract isolation cannot carry.
 
@@ -106,17 +95,7 @@ def _warn_node_conformance(package_name: str, payload) -> None:
                   f"reads a file, a clock or an API, make that an input.",
                   file=sys.stderr, flush=True)
 
-        # Only a regression when the author wrote one: without an override a
-        # native node gets None too (the inherited default is unreachable).
-        if meta.get("has_check_lazy"):
-            lazy = _lazy_input_names(meta.get("input_types") or {})
-            if lazy:
-                print(f"[comfy-env] WARNING: {package_name}: node {name!r} "
-                      f"defines check_lazy_status, which is NOT forwarded, so "
-                      f"lazy input(s) {', '.join(sorted(lazy))} WILL BE None "
-                      f"and the branch you select is never computed. Take "
-                      f"them eagerly and branch inside the node.",
-                      file=sys.stderr, flush=True)
+
 
 
 def _describe_value(name: str, v) -> str:
@@ -1329,6 +1308,33 @@ def _build_v3_proxy_class(
         "_comfy_env_accelerator": meta.get("accelerator"),
     }
 
+    # check_lazy_status -- forwarded, and ONLY when the author wrote one.
+    #
+    # Unlike VALIDATE_INPUTS / IS_CHANGED this is safe to forward: upstream
+    # calls it at execution.py:504-517 for a node it has ALREADY picked to
+    # execute, whose worker is spawning anyway. One round-trip on a warm or
+    # imminent worker, not a cold spawn per node per prompt.
+    #
+    # Built by the same factory as "execute" with the name swapped, so hidden
+    # inputs, the per-call class clone and error translation all come along
+    # unchanged -- upstream feeds this method the same input_data_all it
+    # feeds the real call. Lowercase, and in the proxy's own __dict__: that
+    # is what first_real_override (execution.py:504) walks the MRO for.
+    #
+    # Conditional is load-bearing. Attach unconditionally and every isolated
+    # node pays a round-trip to be told "no questions". And a node that
+    # declares `lazy` WITHOUT writing this method gets None natively too --
+    # ComfyNode's own default is unreachable (first_real_override breaks at
+    # GET_BASE_CLASS(), which for a V3 node IS ComfyNode). Synthesising one
+    # here would make isolation more correct than upstream, so a pack built
+    # only against comfy-env would ship broken for everyone else.
+    if meta.get("has_check_lazy"):
+        attrs["check_lazy_status"] = classmethod(_make_v3_proxy(
+            "check_lazy_status", module_name, class_name,
+            env_dir, package_root, sys_path, env_vars,
+            health_check_timeout, node_name,
+        ))
+
     # Validation exemption (named-arg, parent-side, NEVER forwarded).
     # V3 branch note: execution.py resolves the V3 validate via
     # first_real_override(cls, "validate_inputs") -- the LOWERCASE name.
@@ -1610,6 +1616,20 @@ def build_proxy_class(
         env_dir, package_root, sys_path, env_vars, health_check_timeout,
         dynamic_combo_parents, node_name, _hidden_map,
     )
+
+    # check_lazy_status, forwarded iff the author wrote one -- see the V3
+    # builder for why forwarding is sound here and why conditional matters.
+    # Upstream's V1 test is getattr(obj, "check_lazy_status") on the
+    # INSTANCE (execution.py:506); a plain function in attrs binds as a
+    # method, exactly as FUNCTION does. Reusing _make_proxy is the point:
+    # the hidden-input lift, DynamicCombo re-nesting and state sync all
+    # apply to this call for the same reason they apply to the real one.
+    if meta.get("has_check_lazy"):
+        attrs["check_lazy_status"] = _make_proxy(
+            "check_lazy_status", module_name, class_name,
+            env_dir, package_root, sys_path, env_vars, health_check_timeout,
+            dynamic_combo_parents, node_name, _hidden_map,
+        )
 
     # Validation exemption (named-arg, parent-side, NEVER forwarded). The V1
     # branch of execution.py looks up the UPPERCASE name.
