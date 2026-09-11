@@ -8,13 +8,13 @@ imports isolation code -- it builds proxy classes from the serialized metadata.
 import hashlib
 import os
 import json
-import subprocess
 import sys
 import tempfile
 import time
 import uuid
 
 from .. import state_sync
+from .procgroup import run_with_tree_timeout
 from pathlib import Path
 
 from ..environment.cache import env_label
@@ -27,6 +27,15 @@ from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
 _CACHE_VERSION = "18"  # Bump when _METADATA_SCRIPT or cache format changes
+
+#: Wall-clock cap on one pack's metadata scan (import + INPUT_TYPES for every
+#: node), seconds. Without it a pack that hangs at import held ComfyUI's
+#: startup forever with nothing printed: the one defect no doc could help
+#: with, because the user never reached a prompt. Generous, because a first
+#: import of a torch-heavy pack on a cold disk is legitimately slow; the
+#: cost of a real hang is this long a wait instead of an unbounded one.
+SCAN_TIMEOUT_ENV_VAR = "COMFY_ENV_SCAN_TIMEOUT"
+SCAN_TIMEOUT_DEFAULT = 300.0
 
 
 def _write_cache_atomic(cache_file, cache_key, payload) -> None:
@@ -83,8 +92,9 @@ def _warn_node_conformance(package_name: str, payload) -> None:
         err = meta.get("input_types_error")
         if err:
             print(f"[comfy-env] WARNING: {package_name}: node {name!r} "
-                  f"INPUT_TYPES() raised during the scan and is registered "
-                  f"with ZERO inputs -- every widget and socket is missing: "
+                  f"INPUT_TYPES() raised during the scan; ComfyUI will show "
+                  f"it as a missing node and report the cause when a "
+                  f"workflow uses it (scan is retried on the next start): "
                   f"{err}", file=sys.stderr, flush=True)
 
         if meta.get("fingerprint_args") is not None:
@@ -330,6 +340,11 @@ def _normalize_accel(value, node_name):
 
 nodes = {}
 for name, cls in _class_map.items():
+    # The last of these lines in the captured stderr names the node that
+    # hung, if one does; the parent prints it after killing the scan. Above
+    # the attribute reads, not just INPUT_TYPES: a V3 classproperty like
+    # DESCRIPTION calls GET_SCHEMA, which can hang just as well.
+    print(f"[meta-scan] scanning {name}", file=sys.stderr, flush=True)
     meta = {
         "function": getattr(cls, "FUNCTION", None),
         "category": getattr(cls, "CATEGORY", ""),
@@ -733,14 +748,34 @@ def fetch_metadata(
             for i, p in enumerate(scan_path.split(path_sep)):
                 print(f"[comfy-env]   [{i}] {p}", file=sys.stderr, flush=True)
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            cwd=str(working_dir),
-            env=scan_env,
-        )
+        try:
+            scan_timeout = float(os.environ.get(SCAN_TIMEOUT_ENV_VAR, SCAN_TIMEOUT_DEFAULT))
+        except ValueError:
+            scan_timeout = SCAN_TIMEOUT_DEFAULT
+        # The whole tree, not the direct child: under `pixi run` the Python
+        # doing the scanning is a grandchild, and a plain timeout kill would
+        # leave it running (and, on Windows, block us on its pipe).
+        result, timed_out = run_with_tree_timeout(
+            cmd, scan_timeout, cwd=str(working_dir), env=scan_env)
 
         elapsed = time.perf_counter() - t0
+
+        if timed_out:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            last = None
+            for line in reversed(stderr.splitlines()):
+                if line.startswith("[meta-scan] scanning "):
+                    last = line[len("[meta-scan] scanning "):]
+                    break
+            where = (f"while scanning node {last!r}" if last
+                     else "during import (before any node was scanned)")
+            print(f"[comfy-env] Metadata scan for {package_name} exceeded "
+                  f"{scan_timeout:.0f}s and was killed {where}; its nodes are "
+                  f"not registered this session. Set {SCAN_TIMEOUT_ENV_VAR} to "
+                  f"change the limit.", file=sys.stderr, flush=True)
+            for line in stderr.strip().splitlines()[-10:]:
+                print(f"[comfy-env]   {line}", file=sys.stderr, flush=True)
+            return {"nodes": {}, "display": {}}
 
         # Always print stderr from scan subprocess when debug is on
         if _DEBUG:
@@ -814,10 +849,18 @@ def fetch_metadata(
         _warn_dropped_nodes(package_name, payload)
 
         # --- Write cache (atomic: two ComfyUI processes share this dir) ---
-        try:
-            _write_cache_atomic(cache_file, cache_key, payload)
-        except Exception:
-            pass  # Non-fatal
+        # Except a payload carrying a node whose INPUT_TYPES raised: that
+        # node is unusable this session either way, and a cached failure
+        # would outlive whatever transient cause (a missing file, a model
+        # index fetched at import) produced it. Rescanning next start is the
+        # retry.
+        _has_it_err = any(isinstance(m, dict) and m.get("input_types_error")
+                          for m in (payload.get("nodes") or {}).values())
+        if not _has_it_err:
+            try:
+                _write_cache_atomic(cache_file, cache_key, payload)
+            except Exception:
+                pass  # Non-fatal
 
         return payload
 
@@ -959,6 +1002,23 @@ def _combo_input_names(input_types):
                     and isinstance(entry[0], (list, tuple))):
                 out.append(name)
     return out
+
+
+def _raise_scan_error(class_name: str, err: str) -> None:
+    """The proxy's INPUT_TYPES raises what the real one raised in the scan.
+
+    Registering a node whose INPUT_TYPES failed with zero inputs made it look
+    healthy: it appeared in the menu, rendered with no widgets, and a workflow
+    saved with it lost every widget value on the next save (the frontend
+    serialises a registered node from its live widgets). Raising instead
+    hands the failure to upstream's own handling: /object_info catches per
+    node and logs the traceback (server.py:806-810), the frontend keeps a
+    missing node's saved data verbatim, and validate_prompt reports the real
+    cause under exception_during_validation when the workflow is queued.
+    """
+    raise RuntimeError(
+        f"{class_name}.INPUT_TYPES() raised in its isolated environment "
+        f"during the metadata scan: {err}")
 
 
 def _make_named_validate(names, varkw: bool = False):
@@ -1207,7 +1267,10 @@ def _build_v3_proxy_class(
     # they returned for every node before this existed.
     @classmethod
     def _input_types(cls, _cached=input_types, _ed=env_dir,
-                     _mod=module_name, _cn=class_name):
+                     _mod=module_name, _cn=class_name,
+                     _err=meta.get("input_types_error")):
+        if _err:
+            _raise_scan_error(_cn, _err)
         fresh = _refresh_combo_options(_ed, _mod, _cn)
         if not fresh:
             return _cached
@@ -1531,7 +1594,10 @@ def build_proxy_class(
     # socket round trip to a process that is already running.
     @classmethod
     def _input_types(cls, _cached=input_types, _ed=env_dir,
-                     _mod=module_name, _cn=class_name):
+                     _mod=module_name, _cn=class_name,
+                     _err=meta.get("input_types_error")):
+        if _err:
+            _raise_scan_error(_cn, _err)
         fresh = _refresh_combo_options(_ed, _mod, _cn)
         if not fresh:
             return _cached
