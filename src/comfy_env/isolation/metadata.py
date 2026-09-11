@@ -1024,7 +1024,7 @@ _V3_HIDDEN_ATTRS = ("prompt", "extra_pnginfo", "unique_id",
 
 def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                     self_state, kwargs, node_name, hidden=None,
-                    seed=False, state_id=None, state_dict=None):
+                    state_id=None, state_dict=None):
     """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
 
     Keyword-only on purpose: the two closures this replaces took nine and
@@ -1073,7 +1073,6 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                 self_state=self_state,
                 kwargs=kwargs,
                 hidden=hidden,
-                seed=seed,
                 state_id=state_id,
                 timeout=600.0,
             )
@@ -1595,18 +1594,18 @@ def build_proxy_class(
                     self_state=None, kwargs=kwargs, node_name=nn,
                     hidden=_hidden,
                 )
-            # The seed sentinel and state id are parent-only bookkeeping:
-            # stripped from every outbound state, set on ingest, never written
-            # by the worker. seed=True exactly once per parent instance, which
-            # maps __init__-once onto ComfyUI's own sweep: the sweep drops
-            # this instance, the next one reseeds.
+            # The state id is parent-only bookkeeping: stripped from every
+            # outbound state, never written by the worker. It names this
+            # instance to the worker, which decides for itself whether
+            # __init__ has run there (ComfyUI's sweep drops the instance,
+            # the next one gets a new id, so __init__-once maps onto the
+            # sweep for free).
             _sid = _d.setdefault(state_sync.STATE_ID_KEY, uuid.uuid4().hex[:12])
             return _call_in_worker(
                 worker_spec=(ed, pr, sp, ev, hct),
                 module_name=mod, class_name=cn, method_name=fn,
                 self_state=state_sync.outbound_state(_d),
                 kwargs=kwargs, node_name=nn, hidden=_hidden,
-                seed=state_sync.SEED_SENTINEL not in _d,
                 state_id=_sid, state_dict=_d,
             )
         return proxy

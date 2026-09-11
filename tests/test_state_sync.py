@@ -12,7 +12,7 @@ import pytest
 
 from comfy_env.state_sync import (
     RESERVED_KEYS,
-    SEED_SENTINEL,
+    snapshot_state,
     apply_residency,
     apply_state_out,
     diff_state,
@@ -286,15 +286,16 @@ class TestStateFilter:
         """Byte-diff, not identity: `self.cache['x'] = 1` mutates the same
         object, so identity-diff would silently drop it."""
         cache = {"a": 1}
-        pre = {"cache": dict(cache), "same": "constant"}
+        pre = {"cache": cache, "same": "constant"}   # SAME object, as in the worker
+        snap = snapshot_state(pre, 1024)
         cache["x"] = 1
         post = {"cache": cache, "same": "constant"}
-        out = diff_state(pre, post, 1024, "g", lambda: 1, lambda h, v: None)
+        out = diff_state(snap, post, 1024, "g", lambda: 1, lambda h, v: None)
         assert "cache" in out["set"]
         assert "same" not in out["set"]
 
     def test_deleted_key_propagates(self):
-        out = diff_state({"gone": 1, "kept": 2}, {"kept": 2}, 1024,
+        out = diff_state(snapshot_state({"gone": 1, "kept": 2}, 1024), {"kept": 2}, 1024,
                          "g", lambda: 1, lambda h, v: None)
         assert out["deleted"] == ["gone"]
 
@@ -325,18 +326,18 @@ class TestStateFilter:
         assert verdict == "over_cap" and nbytes == 10 * GIB and digest is None
 
     def test_reserved_keys_never_cross(self):
-        """The sentinel is parent-only: a worker writing it would plant an
+        """The state id is parent-only: a worker writing it would plant an
         attribute the pack author never wrote."""
-        d = {SEED_SENTINEL: True, "_comfy_env_state_id": "x", "real": 1}
+        d = {"_comfy_env_state_id": "x", "real": 1}
         assert set(outbound_state(d)) == {"real"}
-        out = diff_state({}, {SEED_SENTINEL: True, "n": 1}, 1024,
+        out = diff_state({}, {"_comfy_env_state_id": "x", "n": 1}, 1024,
                          "g", lambda: 1, lambda h, v: None)
-        assert SEED_SENTINEL not in out["set"]
+        assert "_comfy_env_state_id" not in out["set"]
 
     def test_marker_round_trip_is_not_reshipped(self):
         """An untouched inbound marker must not be re-minted every call."""
         marker = make_marker("g", 7, "big", "over_cap", 10 * GIB)
-        out = diff_state({"big": marker}, {"big": marker}, 1024,
+        out = diff_state(snapshot_state({"big": marker}, 1024), {"big": marker}, 1024,
                          "g", lambda: pytest.fail("re-minted"), lambda h, v: None)
         assert "big" not in out["set"]
         assert "big" not in out["deleted"]
@@ -355,12 +356,13 @@ class TestApplyStateOut:
         apply_state_out(d, {"set": {}, "deleted": ["gone"], "dropped": []})
         assert "gone" not in d
 
-    def test_sets_the_seed_sentinel(self):
-        """First ingest marks the instance seeded, so __init__ runs once per
-        parent instance and the sweep dropping it reseeds."""
+    def test_ingest_plants_no_bookkeeping(self):
+        """Whether __init__ has run is the worker's book, not the parent's: a
+        parent-side flag survives a worker restart and would tell the new
+        process it had built what it never built."""
         d = {}
         apply_state_out(d, {"set": {}, "deleted": [], "dropped": []})
-        assert d[SEED_SENTINEL] is True
+        assert d == {}
 
     def test_none_is_a_noop(self):
         d = {"x": 1}
@@ -374,8 +376,8 @@ class TestApplyStateOut:
         assert "ok" in d and d.get("_comfy_env_state_id") != "evil"
 
 
-def test_reserved_keys_are_exactly_the_documented_two():
-    assert RESERVED_KEYS == {SEED_SENTINEL, "_comfy_env_state_id"}
+def test_reserved_keys_are_exactly_the_documented_one():
+    assert RESERVED_KEYS == {"_comfy_env_state_id"}
 
 
 def test_fingerprint_ship_path_is_deterministic():

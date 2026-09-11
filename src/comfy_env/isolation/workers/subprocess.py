@@ -905,7 +905,6 @@ class SubprocessWorker(Worker):
         self_state: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
         hidden: Optional[list] = None,
-        seed: bool = False,
         state_id: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> Any:
@@ -950,7 +949,6 @@ class SubprocessWorker(Worker):
                     "type": "call_method",
                     "call_id": call_id,
                     "prompt_gen": _current_prompt_gen(),
-                    "seed": bool(seed),
                     "state_id": state_id,
                     "module": module_name,
                     "class_name": class_name,

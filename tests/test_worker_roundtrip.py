@@ -136,7 +136,7 @@ def test_node_state_survives_with_its_types(worker):
     common = dict(module_name="state_node", class_name="StateNode",
                   method_name="run")
 
-    first = worker.call_method(**common, self_state={}, seed=True, state_id="s1")
+    first = worker.call_method(**common, self_state={}, state_id="s1")
     assert first["calls"] == 1
 
     # what the parent now holds, handed straight back as the next call's state
@@ -149,3 +149,95 @@ def test_node_state_survives_with_its_types(worker):
     assert second["by_int_keys"] == ["int"], "an int key came back as a string"
     assert second["blob_type"] == "bytes", "bytes did not survive the wire"
     assert second["tags_type"] == "set", "a set did not survive the wire"
+
+
+def _restart_in_place(worker):
+    """The socket-unhealthy path: `_ensure_started` kills and respawns
+    without telling anyone. No pool generation bump, no parent-side signal;
+    the only thing that changes is which process answers the next call."""
+    worker._kill_worker()
+    worker._process = None
+
+
+def test_init_reruns_after_restart_when_state_was_process_bound(worker):
+    """A node whose __init__ builds a thread pool survives a worker restart.
+
+    Before: the parent's seed flag was set once and never cleared, so the
+    new process got the old markers and no __init__, then raised "its value
+    is gone and will be recomputed" on every call until ComfyUI restarted.
+    Nothing ever recomputed it.
+    """
+    common = dict(module_name="restart_node", class_name="RestartNode",
+                  method_name="run")
+    parent = {}
+
+    def call(**kw):
+        from comfy_env import state_sync
+        r = worker.call_method(**common, self_state=dict(parent), state_id="r1", kwargs=kw)
+        state_sync.apply_state_out(parent, worker._last_state_out)
+        return r
+
+    assert call(key="a")["calls"] == 1
+    assert call(key="b")["calls"] == 2
+    # the parent holds markers for the two unpicklables, live values for the rest
+    from comfy_env.state_sync import is_overflow_marker
+    assert is_overflow_marker(parent["executor"]) and is_overflow_marker(parent["lock"])
+    assert parent["calls"] == 2 and sorted(parent["cache"]) == ["a", "b"]
+    old_gen = parent["executor"]["gen"]
+
+    _restart_in_place(worker)
+
+    third = call(key="c")
+    # __init__ re-ran (a fresh executor answered), and because a marker had
+    # to be dropped the fresh instance is the whole truth: calls restarts
+    # at 1 and the old cache is gone, not overlaid next to a reset counter
+    assert third["calls"] == 1, "__init__ did not re-run after the restart"
+    assert third["squared"] == 1
+    assert third["cache_keys"] == ["c"], "stale state was overlaid on the fresh __init__"
+    # the parent's copy was repaired, not left holding a dead marker
+    assert parent["executor"]["gen"] != old_gen
+    assert parent["calls"] == 1 and sorted(parent["cache"]) == ["c"]
+
+    # and the new process now remembers the instance: no second __init__
+    assert call(key="d")["calls"] == 2
+
+
+def test_init_reruns_after_restart_but_plain_state_is_kept(worker):
+    """A restart costs a node exactly what it cannot carry, and nothing more:
+    with no process-bound state, the parent's copy is overlaid on the fresh
+    __init__ and the counter continues."""
+    common = dict(module_name="restart_node", class_name="PlainNode",
+                  method_name="run")
+    parent = {}
+
+    def call():
+        from comfy_env import state_sync
+        r = worker.call_method(**common, self_state=dict(parent), state_id="p1")
+        state_sync.apply_state_out(parent, worker._last_state_out)
+        return r
+
+    assert call()["calls"] == 1
+    assert call()["calls"] == 2
+    _restart_in_place(worker)
+    assert call()["calls"] == 3, "a restart reset state that could have been carried"
+
+
+def test_in_place_mutation_ships(worker):
+    """`self.cache[k] = v` reaches the parent.
+
+    Found by the restart test above. The worker fingerprinted the inbound
+    state at diff time, after the call, against the very dict the instance
+    had just mutated: identical bytes on both sides, nothing shipped. The
+    unit test that claimed to cover this copied the inner dict itself, which
+    production never did. A counter (`self.calls += 1` rebinds) shipped; a
+    dict or list mutated in place (the common shape of a node cache) did not.
+    """
+    common = dict(module_name="restart_node", class_name="RestartNode",
+                  method_name="run")
+    parent = {}
+    from comfy_env import state_sync
+    for key in ("a", "b", "c"):
+        worker.call_method(**common, self_state=dict(parent), state_id="m1",
+                           kwargs={"key": key})
+        state_sync.apply_state_out(parent, worker._last_state_out)
+    assert sorted(parent["cache"]) == ["a", "b", "c"]

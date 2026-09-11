@@ -987,10 +987,21 @@ def main():
     # Values that cannot cross the wire (device resident, unpicklable, over
     # cap) stay HERE, keyed by a monotonic handle, represented parent-side by
     # a marker. _STATE_GEN changes on every worker start so a marker from a
-    # dead worker raises a pointed error instead of a silent fresh default.
+    # dead worker is recognised as state this process never held.
     import uuid as _uuid
     _STATE_GEN = _uuid.uuid4().hex[:8]
     _overflow_store = {}          # handle -> (owner_state_id, value)
+    # Which parent instances THIS process has run __init__ for. The sole
+    # truth for "does __init__ run on this call": a fresh process starts
+    # empty, so a restart (any restart, including the socket-unhealthy one
+    # the parent performs without bumping its own generation) reseeds
+    # every instance on first contact. Upstream parity is __init__ once per
+    # instance (execution.py:499); across a process boundary the honest
+    # reading is once per instance PER PROCESS, because __init__-built
+    # resources (a thread pool, a lock) cannot outlive the process that
+    # built them. Bounded by ComfyUI's own instance sweep; a dozen bytes
+    # per entry.
+    _seeded_state_ids = set()
     _overflow_counter = [0]
 
     def _mint_handle():
@@ -2373,40 +2384,25 @@ def main():
 
                 cls = getattr(module, class_name)
                 wlog(f"[worker] Creating instance...")
-                if _state_sync_on and request.get("seed"):
-                    # Run the REAL __init__ once per parent instance: upstream
-                    # parity is class_def() (execution.py:499). Today no
-                    # __init__ ever runs anywhere, so a node reading an
-                    # __init__-set attribute raises. Falls back to the old
-                    # path with a WARN rather than breaking the node.
-                    try:
-                        instance = cls()
-                    except Exception as _se:
-                        wlog(f"[worker] WARNING: {class_name}() raised during "
-                             f"seeding ({_se}); falling back to object.__new__")
-                        instance = object.__new__(cls)
-                else:
-                    instance = object.__new__(cls)
+                _state_id = request.get("state_id") if _state_sync_on else None
+                _stale_dropped = []
                 if self_state:
                     # Decode BEFORE _pre_state is captured, so the diff at the
                     # end compares live values against live values and only
                     # the wire ever carries the encoded form.
                     self_state = _state_sync.decode_state(self_state)
                     if _state_sync_on:
-                        # resolve overflow markers back into live values; a
-                        # marker from a previous worker generation is state
-                        # this process never held, and pretending otherwise is
-                        # the silent-wrong-default this design refuses.
+                        # Resolve overflow markers back into live values. A
+                        # marker from another worker generation is state this
+                        # process never held: it stays in self_state as the
+                        # marker (so the diff below reports it deleted or
+                        # replaced, never silently kept) and is recorded here.
                         for _k in list(self_state.keys()):
                             _v = self_state[_k]
                             if _state_sync.is_overflow_marker(_v):
                                 if _v.get("gen") != _STATE_GEN:
-                                    raise RuntimeError(
-                                        f"node attribute '{_k}' was held in a "
-                                        f"worker that has restarted; its value "
-                                        f"is gone and will be recomputed. "
-                                        f"(gen {_v.get('gen')} != {_STATE_GEN})"
-                                    )
+                                    _stale_dropped.append(_k)
+                                    continue
                                 _held = _overflow_store.get(int(_v.get("handle", -1)))
                                 if _held is None:
                                     raise RuntimeError(
@@ -2414,13 +2410,51 @@ def main():
                                         f"{_v.get('handle')} is unknown (evicted?)"
                                     )
                                 self_state[_k] = _held[1]
-                    instance.__dict__.update(self_state)
+                # __init__ runs iff this process has never seen the instance,
+                # or holds a marker it cannot honour (which, with one worker
+                # per env, is the same event seen from the other side). The
+                # parent has no say: only the process knows what it has built.
+                _reseed = _state_sync_on and (
+                    _state_id not in _seeded_state_ids or bool(_stale_dropped))
+                if _reseed:
+                    try:
+                        instance = cls()
+                    except Exception as _se:
+                        wlog(f"[worker] WARNING: {class_name}() raised during "
+                             f"seeding ({_se}); falling back to object.__new__")
+                        instance = object.__new__(cls)
+                    _seeded_state_ids.add(_state_id)
+                else:
+                    instance = object.__new__(cls)
+                if self_state:
+                    if _stale_dropped:
+                        # Fresh __init__ is the whole truth. Overlaying the
+                        # parent's copy on top would leave, e.g., a
+                        # self.cache_key from the old process next to a
+                        # self.cache __init__ just reset: a state no plain
+                        # ComfyUI run can produce. Losing the parent's copy is
+                        # exactly what a restart costs, and it costs it once.
+                        wlog(f"[worker] {class_name}: attribute(s) "
+                             f"{', '.join(_stale_dropped)} were held by a worker "
+                             f"that has since restarted; __init__ re-ran and "
+                             f"its state replaces the previous one")
+                    else:
+                        instance.__dict__.update(self_state)
                 # The diff baseline is what the PARENT sent, not the post-seed
                 # instance dict: on a seeding call, __init__-set values are new
                 # to the parent and must ship, which they cannot if they count
                 # as "already known".
                 _pre_state = (dict(self_state) if self_state else {}) \
                     if _state_sync_on else None
+                # Fingerprinted NOW, not at diff time: the instance and
+                # _pre_state share their values, and an in-place mutation
+                # (self.cache[k] = v) would otherwise fingerprint identical on
+                # both sides and never ship.
+                _pre_fp = None
+                if _pre_state is not None:
+                    _pre_fp = _state_sync.snapshot_state(_pre_state, int(os.environ.get(
+                        _state_sync.STATE_MAX_BYTES_ENV_VAR,
+                        _state_sync.STATE_MAX_BYTES_DEFAULT)))
                 _state_owner = (request.get("state_id") or "?") if _state_sync_on else None
                 # Hidden inputs. Dispatch on the REAL class, never on which
                 # proxy called: a V3 node can end up behind a V1 proxy when the
@@ -2497,7 +2531,7 @@ def main():
                                 _overflow_store[h] = (_state_owner, v)
 
                             _pending_state_out[0] = _state_sync.diff_state(
-                                _pre_state, dict(instance.__dict__), _cap,
+                                _pre_fp, dict(instance.__dict__), _cap,
                                 _STATE_GEN, _mint_handle, _store)
                             # owner-scoped reap: a handle of THIS instance that
                             # the parent no longer references (and that this

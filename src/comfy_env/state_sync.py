@@ -231,12 +231,12 @@ STATE_ENV_VAR = "COMFY_ENV_NODE_STATE"
 STATE_MAX_BYTES_ENV_VAR = "COMFY_ENV_NODE_STATE_MAX_BYTES"
 STATE_MAX_BYTES_DEFAULT = 8 * 1024 * 1024
 
-#: Parent-only bookkeeping keys. The seed sentinel is set by the PARENT on
-#: first ingest and never crosses as state: a worker writing it would plant an
-#: attribute the pack author never wrote.
-SEED_SENTINEL = "_comfy_env_seeded"
+#: Parent-only bookkeeping key, never crossing as state: a worker writing it
+#: would plant an attribute the pack author never wrote. Whether __init__ has
+#: run is NOT tracked here: only the worker process knows what it has built,
+#: and it keeps that book itself (a restart empties it, which is the point).
 STATE_ID_KEY = "_comfy_env_state_id"
-RESERVED_KEYS = frozenset({SEED_SENTINEL, STATE_ID_KEY})
+RESERVED_KEYS = frozenset({STATE_ID_KEY})
 
 MARKER_KEY = "__comfy_env_overflow__"
 
@@ -348,10 +348,28 @@ def decode_state(state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return {k: decode_value(v) for k, v in state.items()}
 
 
-def diff_state(pre: Dict[str, Any], post: Dict[str, Any], cap: int,
+def snapshot_state(pre: Dict[str, Any], cap: int) -> Dict[str, Optional[str]]:
+    """Worker-side, taken BEFORE the call: the fingerprint of every inbound
+    attribute. ``diff_state`` compares against this, not against ``pre``
+    itself, because ``pre`` and the instance share their values: a node that
+    does ``self.cache[k] = v`` mutates the one dict both hold, and a
+    fingerprint taken afterwards sees nothing to ship."""
+    pre_fp: Dict[str, Optional[str]] = {}
+    for k, v in pre.items():
+        if k in RESERVED_KEYS:
+            continue
+        if is_overflow_marker(v):
+            pre_fp[k] = f"marker:{v.get('handle')}"
+        else:
+            pre_fp[k] = fingerprint(v, cap)[0]
+    return pre_fp
+
+
+def diff_state(pre_fp: Dict[str, Optional[str]], post: Dict[str, Any], cap: int,
                gen: str, mint_handle: Callable[[], int],
                store: Callable[[int, Any], None]) -> Dict[str, Any]:
-    """Worker-side: build ``self_state_out`` from the pre/post instance dicts.
+    """Worker-side: build ``self_state_out`` from the pre-call snapshot and
+    the post-call instance dict.
 
     * ``set``: keys whose serialized bytes differ from the inbound copy, plus
       new keys. Unchanged keys are omitted (the parent keeps its copy), which
@@ -365,15 +383,6 @@ def diff_state(pre: Dict[str, Any], post: Dict[str, Any], cap: int,
     * State returns on error frames too: a non-isolated node that mutates
       ``self`` and then raises keeps the mutation.
     """
-    pre_fp: Dict[str, Optional[str]] = {}
-    for k, v in pre.items():
-        if k in RESERVED_KEYS:
-            continue
-        if is_overflow_marker(v):
-            pre_fp[k] = f"marker:{v.get('handle')}"
-        else:
-            pre_fp[k] = fingerprint(v, cap)[0]
-
     out_set: Dict[str, Any] = {}
     dropped: List[Dict[str, Any]] = []
     for k, v in post.items():
@@ -398,17 +407,14 @@ def diff_state(pre: Dict[str, Any], post: Dict[str, Any], cap: int,
             dropped.append({"name": k, "reason": verdict, "bytes": nbytes,
                             "marker": {"gen": gen, "handle": handle}})
 
-    deleted = [k for k in pre
-               if k not in RESERVED_KEYS and k not in post]
+    deleted = [k for k in pre_fp if k not in post]
     return {"set": out_set, "deleted": deleted, "dropped": dropped}
 
 
 def apply_state_out(instance_dict: Dict[str, Any],
                     state_out: Optional[Dict[str, Any]]) -> None:
     """Parent-side apply: setattr semantics for ``set``, delete for
-    ``deleted``, never touch a key the worker did not mention. Sets the seed
-    sentinel, because a state_out existing means the worker has run the real
-    ``__init__`` (or its fallback) for this instance."""
+    ``deleted``, never touch a key the worker did not mention."""
     if not state_out:
         return
     for k, v in (state_out.get("set") or {}).items():
@@ -417,7 +423,6 @@ def apply_state_out(instance_dict: Dict[str, Any],
     for k in state_out.get("deleted") or []:
         if k not in RESERVED_KEYS:
             instance_dict.pop(k, None)
-    instance_dict[SEED_SENTINEL] = True
 
 
 # ---------------------------------------------------------------------------
