@@ -838,6 +838,19 @@ def main():
         if p not in sys.path:
             sys.path.insert(0, p)
 
+    # A stand-in `server` module, unconditionally, before anything a pack
+    # could import: the real one needs aiohttp (server.py:32) and a
+    # PromptServer nobody constructs here. Sender is plugged in below, once
+    # _call_parent exists; until then send_sync is a no-op. See
+    # server_stub.py for the surface and the survey behind it.
+    try:
+        import server_stub as _server_stub  # staged beside this program
+        _server_stub.install()
+    except Exception as _sse:
+        _server_stub = None
+        wlog(f"[worker] server stand-in not installed ({type(_sse).__name__}: "
+             f"{_sse}); packs importing `server` will fail as before")
+
     # Mirror the host's CLI args BEFORE anything imports comfy. This must sit
     # here, in main's direct body: `import folder_paths` below transitively
     # runs `from comfy.cli_args import args`, and the memory-relevant reads
@@ -1819,33 +1832,81 @@ def main():
     # The subprocess's comfy.utils.PROGRESS_BAR_HOOK is None (server.py never ran here).
     # Setting it lets any ProgressBar created in subprocess code (e.g. stages.py)
     # automatically forward updates to the parent, which relays to the ComfyUI frontend.
+    #: Cap on one forwarded preview. Upstream deliberately BYPASSES its
+    #: own progress throttle whenever a preview is present (comfy/utils.py),
+    #: so a 50-step sampler is 50 unthrottled frames down a JSON socket.
+    #: Over the cap the preview is dropped and the tick still goes.
+    _PREVIEW_MAX_BYTES = 1 << 20
+
+    def _encode_preview(preview):
+        """PreviewImageTuple -> [format, base64, max_size], or None.
+
+        Duck-typed on the object handed to us: no PIL import in the
+        worker, because a worker that produced a preview already has PIL
+        and one that did not must not be made to need it. Shared by the
+        progress hook and the send_sync forwarder.
+        """
+        try:
+            import base64 as _b64
+            import io as _io
+            fmt = preview[0] or "JPEG"
+            buf = _io.BytesIO()
+            preview[1].save(buf, format=fmt)
+            raw = buf.getvalue()
+            if len(raw) > _PREVIEW_MAX_BYTES:
+                return None
+            return [fmt, _b64.b64encode(raw).decode("ascii"), preview[2]]
+        except Exception:
+            return None
+
+    # Plug the server stand-in's sender in now that _call_parent exists.
+    # Forwarded on the callback channel, so only from the request thread
+    # and only inside a call: a pack's background thread calling send_sync
+    # would otherwise interleave frames with the call in flight. Dropped
+    # events are logged once per reason, never raised: a UI note that
+    # cannot be delivered must not fail the node that sent it.
+    if _server_stub is not None:
+        _ui_event_warned = set()
+
+        def _encode_ui_event(method, params):
+            if method != "send_sync":
+                return params
+            _bet = _server_stub._binary_event_types()
+            _ev, _data = params.get("event"), params.get("data")
+            if _ev == _bet.UNENCODED_PREVIEW_IMAGE:
+                params["data"] = {"__preview__": _encode_preview(_data)}
+            elif _ev == _bet.PREVIEW_IMAGE_WITH_METADATA:
+                params["data"] = {"__preview_meta__":
+                                  [_encode_preview(_data[0]), _data[1]]}
+            elif isinstance(_data, (bytes, bytearray)):
+                import base64 as _b64
+                params["data"] = {"__b64__": _b64.b64encode(bytes(_data)).decode("ascii")}
+            else:
+                json.dumps(_data)  # JSON wire; raise here, not mid-frame
+            return params
+
+        def _send_ui_event(method, **params):
+            reason = None
+            if threading.current_thread() is not threading.main_thread():
+                reason = "called from a thread other than the node's"
+            elif _current_call_id is None:
+                reason = "called outside a node call"
+            if reason is None:
+                try:
+                    _call_parent(method, **_encode_ui_event(method, params))
+                    return
+                except _InterruptedError:
+                    raise
+                except Exception as _e:
+                    reason = f"{type(_e).__name__}: {_e}"
+            if reason not in _ui_event_warned:
+                _ui_event_warned.add(reason)
+                wlog(f"[worker] PromptServer.instance.{method} dropped: {reason} "
+                     f"(reported once)")
+        _server_stub.PromptServer.instance._sender = _send_ui_event
+
     try:
         import comfy.utils as _cu
-        #: Cap on one forwarded preview. Upstream deliberately BYPASSES its
-        #: own progress throttle whenever a preview is present (comfy/utils.py),
-        #: so a 50-step sampler is 50 unthrottled frames down a JSON socket.
-        #: Over the cap the preview is dropped and the tick still goes.
-        _PREVIEW_MAX_BYTES = 1 << 20
-
-        def _encode_preview(preview):
-            """PreviewImageTuple -> [format, base64, max_size], or None.
-
-            Duck-typed on the object handed to us: no PIL import in the
-            worker, because a worker that produced a preview already has PIL
-            and one that did not must not be made to need it.
-            """
-            try:
-                import base64 as _b64
-                import io as _io
-                fmt = preview[0] or "JPEG"
-                buf = _io.BytesIO()
-                preview[1].save(buf, format=fmt)
-                raw = buf.getvalue()
-                if len(raw) > _PREVIEW_MAX_BYTES:
-                    return None
-                return [fmt, _b64.b64encode(raw).decode("ascii"), preview[2]]
-            except Exception:
-                return None
 
         def _progress_hook(value, total, preview=None, node_id=None):
             _pv = _encode_preview(preview) if preview is not None else None
@@ -2331,6 +2392,8 @@ def main():
             if _memmgr is not None:
                 _memmgr.cast_epoch_boundary(request.get("prompt_gen"),
                                             log=wlog)
+            if _server_stub is not None:
+                _server_stub.PromptServer.instance.client_id = request.get("client_id")
 
             # Load inputs from shared memory
             kwargs_meta = request.get("kwargs")

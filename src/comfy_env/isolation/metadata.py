@@ -8,6 +8,7 @@ imports isolation code -- it builds proxy classes from the serialized metadata.
 import hashlib
 import os
 import json
+import shutil
 import sys
 import tempfile
 import time
@@ -26,7 +27,7 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "18"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "19"  # Bump when _METADATA_SCRIPT or cache format changes
 
 #: Wall-clock cap on one pack's metadata scan (import + INPUT_TYPES for every
 #: node), seconds. Without it a pack that hangs at import held ComfyUI's
@@ -220,6 +221,16 @@ os.chdir(working_dir)
 _comfyui_base = os.environ.get("COMFYUI_BASE")
 if _comfyui_base and _comfyui_base not in sys.path:
     sys.path.insert(1, _comfyui_base)
+
+# A stand-in `server` module before the pack import, same as the worker: the
+# real one needs aiohttp and a PromptServer nobody builds here. Staged beside
+# this script by the parent; sys.path[0] is this script's directory.
+try:
+    import server_stub as _server_stub
+    _server_stub.install()
+except Exception as _sse:
+    print(f"[meta-scan] server stand-in not installed ({_sse}); packs importing "
+          f"`server` will fail as before", file=sys.stderr, flush=True)
 
 # On Desktop app, redirect folder_paths to the user data dir (for input/output/models)
 _comfyui_user_dir = os.environ.get("COMFYUI_USER_DIR")
@@ -690,15 +701,18 @@ def fetch_metadata(
     # JSON payload into `output_file` so the protocol is decoupled from
     # stdout/stderr (which pixi, torch DLL loaders, and other noise can
     # contaminate, especially on Windows).
-    script_file = None
+    script_dir = None
     output_file = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", prefix="comfy_meta_", delete=False,
-            encoding="utf-8",
-        ) as f:
-            f.write(_METADATA_SCRIPT)
-            script_file = f.name
+        # A private directory, not a lone temp file: the scan script imports
+        # server_stub from beside itself (sys.path[0] is the script's dir),
+        # and that must never be the shared system temp dir, where any
+        # stray .py would shadow a real module for the whole scan.
+        script_dir = tempfile.mkdtemp(prefix="comfy_meta_")
+        script_file = os.path.join(script_dir, "scan.py")
+        Path(script_file).write_text(_METADATA_SCRIPT, encoding="utf-8")
+        shutil.copy2(Path(__file__).parent.parent / "server_stub.py",
+                     os.path.join(script_dir, "server_stub.py"))
 
         out_fd, output_file = tempfile.mkstemp(
             suffix=".json", prefix="comfy_meta_out_",
@@ -868,12 +882,13 @@ def fetch_metadata(
         print(f"[comfy-env] Metadata scan error for {package_name}: {e}", file=sys.stderr, flush=True)
         return {"nodes": {}, "display": {}}
     finally:
-        for path in (script_file, output_file):
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        if output_file and os.path.exists(output_file):
+            try:
+                os.unlink(output_file)
+            except OSError:
+                pass
+        if script_dir:
+            shutil.rmtree(script_dir, ignore_errors=True)
 
 
 # Dynamic combo refresh (parent-side directory rescan)

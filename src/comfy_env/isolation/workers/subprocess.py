@@ -29,6 +29,7 @@ STAGED_WORKER_MODULES = (
     "state_sync.py",
     "mirrored_args.py",
     "contract.py",
+    "server_stub.py",
 )
 from ...state_sync import merge_vram_report
 from ...config import DEFAULT_HEALTH_CHECK_TIMEOUT
@@ -115,6 +116,20 @@ def _current_prompt_gen():
         return prompt_id or None
     except Exception:
         return None
+
+
+def _current_client_id():
+    """The host's PromptServer.instance.client_id, or None outside ComfyUI.
+
+    Shipped with every call so the worker's stand-in `server` module can
+    answer `PromptServer.instance.client_id` with the real value. Borrowed
+    from sys.modules, never imported: the host either is ComfyUI, in which
+    case `server` is loaded, or it is a test, in which case there is nothing
+    to import and nothing to say.
+    """
+    srv = sys.modules.get("server")
+    inst = getattr(getattr(srv, "PromptServer", None), "instance", None)
+    return getattr(inst, "client_id", None) if inst is not None else None
 
 
 def _enter_call_scope(worker):
@@ -949,6 +964,7 @@ class SubprocessWorker(Worker):
                     "type": "call_method",
                     "call_id": call_id,
                     "prompt_gen": _current_prompt_gen(),
+                    "client_id": _current_client_id(),
                     "state_id": state_id,
                     "module": module_name,
                     "class_name": class_name,

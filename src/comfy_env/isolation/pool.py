@@ -246,6 +246,58 @@ def _handle_progress(request: dict) -> dict:
     return {}
 
 
+def _host_server_instance():
+    """ComfyUI's live PromptServer.instance, or None outside ComfyUI."""
+    srv = sys.modules.get("server")
+    return getattr(getattr(srv, "PromptServer", None), "instance", None)
+
+
+def _decode_ui_event_data(event, data):
+    """Undo the worker's wire encoding of a send_sync payload (see the
+    worker's _encode_ui_event): a preview tuple comes back as upstream's
+    PreviewImageTuple, bytes as bytes, JSON as itself."""
+    if isinstance(data, dict):
+        if "__preview__" in data:
+            return _decode_preview(data["__preview__"])
+        if "__preview_meta__" in data:
+            pv, meta = data["__preview_meta__"]
+            return (_decode_preview(pv), meta)
+        if "__b64__" in data:
+            import base64
+            return base64.b64decode(data["__b64__"])
+    return data
+
+
+def _handle_send_sync(request: dict) -> dict:
+    """Parent-side callback: a worker's PromptServer.instance.send_sync.
+
+    `sid` keeps upstream's meaning. None is a broadcast, which is what 229
+    of 240 surveyed call sites ask for; anything else means "the client
+    that queued this", and the only socket id that can name is the host's
+    own client_id, whatever string the pack put there.
+    """
+    inst = _host_server_instance()
+    if inst is None:
+        return {}
+    event = request.get("event")
+    data = _decode_ui_event_data(event, request.get("data"))
+    sid = request.get("sid")
+    inst.send_sync(event, data, None if sid is None else inst.client_id)
+    return {}
+
+
+def _handle_send_progress_text(request: dict) -> dict:
+    """Parent-side callback: a worker's PromptServer.instance.send_progress_text.
+    The host packs the TEXT frame with upstream's own code."""
+    inst = _host_server_instance()
+    if inst is None:
+        return {}
+    sid = request.get("sid")
+    inst.send_progress_text(request.get("text", ""), request.get("node_id", ""),
+                            None if sid is None else inst.client_id)
+    return {}
+
+
 def _decode_preview(pv):
     """Rebuild upstream's PreviewImageTuple from a forwarded preview.
 
@@ -1486,6 +1538,8 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
             "request_vram_budget",
             lambda req, _wk=key: _handle_vram_budget(req, worker_key=_wk))
         worker.register_callback("report_progress", _handle_progress)
+        worker.register_callback("send_sync", _handle_send_sync)
+        worker.register_callback("send_progress_text", _handle_send_progress_text)
         # Clean up stale patchers if worker restarts transparently via _ensure_started()
         worker._on_restart = lambda: _cleanup_stale_patchers(env_dir)
         # Canary handshake: verify each transport tier through the production
