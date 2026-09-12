@@ -171,9 +171,9 @@ def test_send_sync_reaches_the_hosts_prompt_server(worker, host_server):
     # client_id was the host's, read inside the worker
     assert out == ["host-client"] or out == ("host-client",)
     previews = [d for (e, d, sid) in events if e == 2]
-    if previews:  # PIL present in the test env
-        fmt, img, max_size = previews[0]
-        assert fmt == "JPEG" and max_size == 512 and img.size == (4, 4)
+    assert previews, "the preview tuple never arrived (or PIL is missing from the test env)"
+    fmt, img, max_size = previews[0]
+    assert fmt == "JPEG" and max_size == 512 and img.size == (4, 4)
 
 
 def test_send_sync_from_a_thread_is_dropped_not_interleaved(worker, host_server):
