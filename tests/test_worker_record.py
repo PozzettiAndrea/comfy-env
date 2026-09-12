@@ -150,3 +150,64 @@ def test_metadata_reaches_the_pool_only_through_the_accessor():
 
 def test_worker_for_never_creates(clean):
     assert pool.worker_for("/nope") is None and pool._WORKER_POOL == {}
+
+
+# --- which prompt is running -------------------------------------------------
+
+class _Queue:
+    def __init__(self):
+        self.currently_running = {}
+
+
+@pytest.fixture()
+def host_queue(monkeypatch):
+    import types
+    q = _Queue()
+    mod = types.ModuleType("server")
+    mod.PromptServer = type("PromptServer", (), {"instance": types.SimpleNamespace(prompt_queue=q)})
+    monkeypatch.setitem(__import__("sys").modules, "server", mod)
+    return q
+
+
+def test_current_prompt_is_the_queues_running_item(host_queue):
+    host_queue.currently_running[0] = (1, "prompt-abc", {}, {}, [])
+    assert pool._current_prompt() == "prompt-abc"
+
+
+def test_current_prompt_is_none_when_nothing_runs_even_if_the_registry_is_stale(host_queue, monkeypatch):
+    """The bug: the progress registry keeps the last prompt id forever, so
+    the idle sweep believed a finished prompt was still running."""
+    import types
+    stale = types.SimpleNamespace(prompt_id="finished-long-ago")
+    monkeypatch.setitem(__import__("sys").modules, "comfy_execution.progress",
+                        types.SimpleNamespace(get_progress_state=lambda: stale))
+    assert pool._current_prompt() is None
+
+
+import os
+COMFYUI_DIR = os.environ.get("COMFYUI_DIR")
+
+
+@pytest.mark.comfyui
+@pytest.mark.skipif(not COMFYUI_DIR, reason="COMFYUI_DIR not set")
+def test_upstream_queue_fills_and_empties_currently_running():
+    """Pins the upstream structure _current_prompt reads: get() populates
+    currently_running with (number, prompt_id, ...) and task_done() pops."""
+    import sys
+    import types
+    sys.path.insert(0, COMFYUI_DIR)
+    try:
+        import comfy.options
+        comfy.options.enable_args_parsing()
+        if "--cpu" not in sys.argv:
+            sys.argv = [sys.argv[0], "--cpu"]
+        import execution
+        q = execution.PromptQueue(types.SimpleNamespace(queue_updated=lambda: None))
+        q.put((0, "prompt-xyz", {}, {}, []))
+        item, item_id = q.get(timeout=1)
+        assert item[1] == "prompt-xyz"
+        assert [v[1] for v in q.currently_running.values()] == ["prompt-xyz"]
+        q.task_done(item_id, {}, status=None)
+        assert q.currently_running == {}
+    finally:
+        sys.path.remove(COMFYUI_DIR)

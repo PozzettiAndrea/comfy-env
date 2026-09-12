@@ -563,12 +563,32 @@ _IDLE_SWEEP_STARTED = False
 
 
 def _current_prompt():
-    """The running prompt's id, read from ComfyUI's progress registry.
+    """The id of the prompt executing RIGHT NOW, or None.
 
-    Same source as workers/subprocess._current_prompt_gen, kept separate so
-    pool never imports the worker module. None outside a prompt or on trees
-    that predate the registry.
+    Read off ComfyUI's own queue: PromptQueue.currently_running is filled in
+    get() when the executor takes a prompt and emptied in task_done() when
+    it finishes, so it is empty exactly while nothing runs. Borrowed from
+    sys.modules, never imported.
+
+    The progress registry (comfy_execution.progress) is NOT the right
+    source, though it was used here until 2026-09-12: its prompt_id is set
+    at prompt start and never cleared, so "release at once when its prompt
+    is over" fired when the NEXT prompt started with a different id, not
+    when this one ended. It remains the fallback for a host whose server
+    module is not loaded (tests), where it answers None too.
     """
+    srv = sys.modules.get("server")
+    inst = getattr(getattr(srv, "PromptServer", None), "instance", None)
+    queue = getattr(inst, "prompt_queue", None)
+    running = getattr(queue, "currently_running", None)
+    if isinstance(running, dict):
+        for item in running.values():
+            # item is (number, prompt_id, prompt, extra_data, outputs)
+            try:
+                return item[1] or None
+            except (TypeError, IndexError):
+                return None
+        return None
     try:
         from comfy_execution.progress import get_progress_state
         return getattr(get_progress_state(), "prompt_id", None) or None
