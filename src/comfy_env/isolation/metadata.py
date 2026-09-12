@@ -1154,26 +1154,55 @@ def _make_v1_fingerprint(module_name, class_name, env_dir, node_name,
     return IS_CHANGED
 
 
+def _combo_options_of(entry):
+    """The option list of a combo input spec, or None if it is not one.
+
+    Two shapes, both live upstream. The list form `(["a", "b"], {...})` is
+    what V1 packs write by hand; upstream's own graph code calls it the
+    outdated format. The canonical form `("COMBO", {"options": [...]})` is
+    what every V3 `io.Combo.Input` becomes on its way to INPUT_TYPES, and
+    what core V1 nodes like LoadImageOutput write directly. A site that
+    recognises only the first leaves every V3 model dropdown frozen at the
+    scan's listing, and -- because the exemption list is built from the
+    same test -- rejected by upstream's not-in-list check for any file
+    added since. A `remote` combo carries no options (the frontend fetches
+    them from a route) and is not a combo for our purposes.
+    """
+    if not isinstance(entry, (list, tuple)) or not entry:
+        return None
+    head = entry[0]
+    if isinstance(head, (list, tuple)):
+        return list(head)
+    if head == "COMBO" and len(entry) > 1 and isinstance(entry[1], dict):
+        opts = entry[1].get("options")
+        if isinstance(opts, (list, tuple)) and not entry[1].get("remote"):
+            return list(opts)
+    return None
+
+
 def _splice_combo_options(sections, fresh):
     """Overlay fresh option lists onto a cached input-spec snapshot.
 
-    Only the options list is replaced, never the trailing config dict, so
-    tooltips, defaults and `image_upload` survive. An input the worker did
-    not report is left exactly as captured -- the fresh answer is additive,
-    never authoritative about what is absent.
+    Only the options list is replaced, never the config dict around it, so
+    tooltips, defaults, `multiselect` and `image_upload` survive in either
+    shape. An input the worker did not report is left exactly as captured
+    -- the fresh answer is additive, never authoritative about what is
+    absent.
     """
     out = {}
     for section, entries in sections.items():
         new_entries = dict(entries or {})
         for name, opts in (fresh.get(section) or {}).items():
             entry = new_entries.get(name)
-            if not isinstance(entry, (list, tuple)) or not entry:
-                continue
-            if not isinstance(entry[0], (list, tuple)):
+            if _combo_options_of(entry) is None:
                 continue                     # not a combo; leave it alone
             if not opts:
                 continue                     # empty listing keeps the cache
-            new_entries[name] = [list(opts)] + list(entry[1:])
+            if isinstance(entry[0], (list, tuple)):
+                new_entries[name] = [list(opts)] + list(entry[1:])
+            else:
+                cfg = dict(entry[1]); cfg["options"] = list(opts)
+                new_entries[name] = [entry[0], cfg] + list(entry[2:])
         out[section] = new_entries
     return out
 
@@ -1181,17 +1210,15 @@ def _splice_combo_options(sections, fresh):
 def _combo_input_names(input_types):
     """Every input whose options list could change under us.
 
-    An input spec's first element is a list only for a combo, so this is the
-    exact set the refresh can rewrite -- and therefore the exact set whose
-    membership check has to be relaxed. Numeric inputs are not in it, so
-    min/max clamps keep working; that distinction is the whole reason this
-    is a named list and not a **kwargs validate.
+    Exactly the set the refresh can rewrite -- and therefore the exact set
+    whose membership check has to be relaxed. Numeric inputs are not in it,
+    so min/max clamps keep working; that distinction is the whole reason
+    this is a named list and not a **kwargs validate.
     """
     out = []
     for section in ("required", "optional"):
         for name, entry in (input_types.get(section) or {}).items():
-            if (isinstance(entry, (list, tuple)) and entry
-                    and isinstance(entry[0], (list, tuple))):
+            if _combo_options_of(entry) is not None:
                 out.append(name)
     return out
 

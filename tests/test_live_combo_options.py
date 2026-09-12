@@ -151,6 +151,71 @@ def test_combo_inputs_are_found_and_others_are_not():
     assert _combo_input_names(CACHED) == ["mesh"]
 
 
+# --- the canonical shape ----------------------------------------------------
+#
+# Every V3 io.Combo.Input reaches INPUT_TYPES as ("COMBO", {"options": [...]}),
+# and so do core V1 nodes like LoadImageOutput; upstream's own graph code
+# calls the list form "outdated". Until 2026-09-12 every site here recognised
+# only the list form, so a V3 model dropdown was frozen at the scan's listing
+# -- across restarts, because the scan cache is keyed on .py mtimes -- and any
+# file added since was rejected by upstream's not-in-list check, because the
+# exemption list is built from the same test.
+
+CANON = {
+    "required": {
+        "ckpt": ("COMBO", {"options": ["old.safetensors"], "multiselect": False,
+                            "tooltip": "pick one"}),
+        "remote_thing": ("COMBO", {"remote": {"route": "/x"}}),
+        "steps": ("INT", {"default": 20}),
+    }
+}
+
+
+def test_canonical_combo_is_recognised_for_exemption():
+    assert _combo_input_names(CANON) == ["ckpt"]
+
+
+def test_canonical_combo_options_are_replaced_and_the_dict_survives():
+    out = _splice_combo_options(CANON, {"required": {"ckpt": ["new.safetensors"]}})
+    head, cfg = out["required"]["ckpt"][0], out["required"]["ckpt"][1]
+    assert head == "COMBO"
+    assert cfg["options"] == ["new.safetensors"]
+    assert cfg["multiselect"] is False and cfg["tooltip"] == "pick one"
+    assert CANON["required"]["ckpt"][1]["options"] == ["old.safetensors"], "the cache was mutated"
+
+
+def test_remote_combo_is_not_a_combo_for_us():
+    # No options to refresh or exempt: the frontend fetches them from a route
+    # and the author's own validate carries the exemption, as natively.
+    out = _splice_combo_options(CANON, {"required": {"remote_thing": ["x"]}})
+    assert out["required"]["remote_thing"] == CANON["required"]["remote_thing"]
+    assert "remote_thing" not in _combo_input_names(CANON)
+
+
+def test_canonical_combo_goes_live_through_a_real_worker(tmp_path):
+    """The worker side of the same rule, end to end."""
+    import sys
+    from comfy_env.isolation.workers.subprocess import SubprocessWorker
+    (tmp_path / "canon_node.py").write_text(
+        "class Canon:\n"
+        "    @classmethod\n"
+        "    def INPUT_TYPES(cls):\n"
+        "        return {'required': {"
+        "'ckpt': ('COMBO', {'options': ['live.safetensors'], 'multiselect': False}),"
+        "'legacy': (['a'], {}),"
+        "'remote': ('COMBO', {'remote': {'route': '/r'}}),"
+        "'steps': ('INT', {'default': 1})}}\n",
+        encoding="utf-8")
+    w = SubprocessWorker(python=sys.executable, working_dir=tmp_path, name="canon")
+    try:
+        w._ensure_started()   # the ladder never spawns; the test must
+        reply = w.send_command_no_spawn("refresh_input_types", lock_timeout=5.0,
+                                        module="canon_node", class_name="Canon")
+    finally:
+        w.shutdown()
+    assert reply["options"] == {"required": {"ckpt": ["live.safetensors"], "legacy": ["a"]}}
+
+
 def _v1_meta(**over):
     meta = {
         "function": "run", "category": "test", "output_node": False,

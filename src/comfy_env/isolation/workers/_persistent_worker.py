@@ -1324,16 +1324,28 @@ def main():
             pass
         return None
 
-    def _combo_options(value):
+    def _combo_options(entry):
         """Return a JSON-safe option list, or None if this is not a combo.
 
-        Deliberately narrow. An input spec's first element is a list only when
-        it is a combo; everything else -- "IMAGE", ("INT", {...}) -- is left
-        alone. And an option list containing anything but a primitive is
-        refused outright rather than partially converted: the parent splices
-        what comes back, so a half-understood list is worse than none.
+        Two shapes, same as the parent's _combo_options_of: the list form
+        `(["a", "b"], {...})` and the canonical `("COMBO", {"options":
+        [...]})` that every V3 io.Combo becomes (and some V1 nodes write).
+        Everything else -- "IMAGE", ("INT", {...}), a `remote` combo with no
+        options -- is left alone. And an option list containing anything but
+        a primitive is refused outright rather than partially converted: the
+        parent splices what comes back, so a half-understood list is worse
+        than none.
         """
-        if not isinstance(value, (list, tuple)):
+        if not isinstance(entry, (list, tuple)) or not entry:
+            return None
+        head = entry[0]
+        if isinstance(head, (list, tuple)):
+            value = head
+        elif (head == "COMBO" and len(entry) > 1 and isinstance(entry[1], dict)
+                and isinstance(entry[1].get("options"), (list, tuple))
+                and not entry[1].get("remote")):
+            value = entry[1]["options"]
+        else:
             return None
         out = []
         for item in value:
@@ -1371,9 +1383,7 @@ def main():
                 if not isinstance(_entries, dict):
                     continue
                 for _name, _entry in _entries.items():
-                    if not isinstance(_entry, (list, tuple)) or not _entry:
-                        continue
-                    _opts = _combo_options(_entry[0])
+                    _opts = _combo_options(_entry)
                     if _opts is not None:
                         _out.setdefault(_section, {})[_name] = _opts
             return {"status": "ok", "call_id": _cid, "options": _out}
