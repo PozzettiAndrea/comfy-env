@@ -1449,6 +1449,66 @@ def main():
             raise _ValidationRejected(f"Custom validation failed for node: {result}")
         # an ExecutionBlocker, or anything else: passes at validation upstream
 
+    _SIDE_ALLOW = ("ping", "refresh_input_types", "fingerprint")
+
+    def _module_ready(name):
+        """A module the side lane may touch: already imported by a real call
+        and finished importing. A module still initialising is in
+        sys.modules too, and importing it from here would block on the
+        import lock behind the main thread's first call."""
+        m = sys.modules.get(name)
+        if m is None:
+            return None
+        spec = getattr(m, "__spec__", None)
+        if getattr(spec, "_initializing", False):
+            return None
+        return m
+
+    def _side_loop(side):
+        while True:
+            try:
+                req = side.recv()
+            except Exception:
+                return                      # lane closed; the main lane is untouched
+            if not isinstance(req, dict):
+                return
+            sid = req.get("side_id")
+            method = req.get("method")
+            try:
+                if method not in _SIDE_ALLOW:
+                    reply = {"status": "error", "side_id": sid,
+                             "error": f"{method!r} is not served on the side lane"}
+                elif method == "ping":
+                    reply = {"status": "pong", "side_id": sid}
+                elif method == "refresh_input_types":
+                    if "classes" in req:
+                        # one request per env per /object_info pass: every
+                        # class the host registered for this env
+                        out = {}
+                        for mod_name, cls_name in req["classes"] or []:
+                            if _module_ready(mod_name) is None:
+                                continue
+                            r = _handle_refresh_input_types(
+                                {"module": mod_name, "class_name": cls_name})
+                            if r.get("status") == "ok":
+                                out[f"{mod_name}:{cls_name}"] = r.get("options") or {}
+                        reply = {"status": "ok", "side_id": sid, "options": out}
+                    elif _module_ready(req.get("module")) is None:
+                        reply = {"status": "miss", "side_id": sid, "reason": "module not loaded"}
+                    else:
+                        reply = dict(_handle_refresh_input_types(req), side_id=sid)
+                else:  # fingerprint
+                    if _module_ready(req.get("module")) is None:
+                        reply = {"status": "miss", "side_id": sid, "reason": "module not loaded"}
+                    else:
+                        reply = dict(_handle_fingerprint(req), side_id=sid)
+            except Exception as e:
+                reply = {"status": "error", "side_id": sid, "error": str(e)}
+            try:
+                side.send(reply)
+            except Exception:
+                return
+
     def _handle_fingerprint(request):
         """Run a node's REAL IS_CHANGED / fingerprint_inputs on the class.
 
@@ -1727,6 +1787,12 @@ def main():
         Handles interleaved management commands (model_to_device, ping, etc.)
         that may arrive while waiting for the callback_response.
         """
+        if threading.current_thread() is not threading.main_thread():
+            # The main socket has one reader on each side. A callback written
+            # from another thread would race the main loop for the reply and
+            # desync the stream for good, which hangs rather than raises. The
+            # side lane exists so nothing ever needs to do this.
+            raise RuntimeError("_call_parent is main-thread only; use the side lane")
         transport.send({"type": "callback", "method": method, "call_id": _current_call_id, **params})
         while True:
             # recv() raises ConnectionError if the parent went away; None is
@@ -2310,6 +2376,26 @@ def main():
     except Exception as _cme:
         wlog(f"[worker] mirror report failed: {_cme}")
     transport.send(_ready_frame)
+
+    # The side lane: a second connection to the same listener, read by a
+    # daemon thread, so the host can ask cheap questions (dropdown refresh,
+    # fingerprint, ping) while this thread is inside a node call. It serves
+    # an allowlist and nothing else -- never a release, never a device
+    # command: those are main-loop-only because a mid-forward empty_cache
+    # drops pages a kernel is reading -- and it never imports a pack module
+    # (import is the expensive, side-effecting half; a module not yet loaded
+    # by a real call is answered "miss"). It never touches the main socket.
+    _side_transport = None
+    try:
+        _side_sock = _connect(socket_addr)
+        _side_transport = _ipc_shared.SocketTransport(_side_sock)
+        _side_transport.send({"authkey": authkey})
+        threading.Thread(target=_side_loop, args=(_side_transport,),
+                         daemon=True, name="comfy-env-side-lane").start()
+        wlog("[worker] side lane connected")
+    except Exception as _sle:
+        wlog(f"[worker] no side lane ({type(_sle).__name__}: {_sle}); cheap "
+             f"questions wait for the main loop")
     wlog("[worker] Ready")
 
     # --- Pool IPC handshake: create shareable pool and send FD to parent ---

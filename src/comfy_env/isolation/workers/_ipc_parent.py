@@ -72,7 +72,7 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
             # Abstract namespace: kernel-only, no filesystem path that can disappear.
             abstract_name = f"\0comfy_worker_{uuid.uuid4().hex[:SOCKET_ID_LENGTH]}"
             sock.bind(abstract_name)
-            sock.listen(1)
+            sock.listen(2)   # main lane + side lane, see SubprocessWorker.send_side
             return sock, f"abstract://{abstract_name[1:]}"
         else:
             # macOS/other: filesystem sockets (no abstract namespace support).
@@ -88,14 +88,14 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
             except FileNotFoundError:
                 pass
             sock.bind(str(sock_path))
-            sock.listen(1)
+            sock.listen(2)   # main lane + side lane, see SubprocessWorker.send_side
             return sock, f"unix://{sock_path}"
     else:
         # TCP localhost fallback (Windows)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('127.0.0.1', 0))  # OS picks free port
-        sock.listen(1)
+        sock.listen(2)   # main lane + side lane, see SubprocessWorker.send_side
         port = sock.getsockname()[1]
         return sock, f"tcp://127.0.0.1:{port}"
 

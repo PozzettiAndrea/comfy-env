@@ -107,6 +107,8 @@ WORKER_FAULTHANDLER_BASENAME = "comfy_worker_faulthandler.log"
 # always copied alongside by SubprocessWorker)
 TENSOR_KEEPER_TTL = 60.0        # seconds to hold shared tensors before GC
 SOCKET_ACCEPT_TIMEOUT = 60      # seconds to wait for worker to connect
+SIDE_ACCEPT_TIMEOUT = 10        # seconds to wait for the worker's second connection (the side lane)
+SIDE_BACKOFF_SECONDS = 5.0      # after one side-lane timeout, answer "slow" this long without asking
 SOCKET_ID_LENGTH = 12           # hex chars in socket name uuid
 
 # Cache limits

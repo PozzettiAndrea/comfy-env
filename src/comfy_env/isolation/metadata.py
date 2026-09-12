@@ -921,6 +921,41 @@ def fetch_metadata(
             shutil.rmtree(script_dir, ignore_errors=True)
 
 
+#: Every (module, class) the host built a proxy for, per env. One refresh
+#: request per env per /object_info pass answers for all of them, instead of
+#: one round trip per node: node_info calls INPUT_TYPES twice per node, and
+#: forty isolated nodes used to cost forty waits on the event loop.
+_ENV_CLASSES: Dict[str, set] = {}
+
+#: The batched answer per env, valid for a few seconds: an /object_info pass
+#: takes well under that, and between passes a stale memo is invisible
+#: because the next pass refreshes it. Only consulted INSIDE a pass, which
+#: upstream marks with folder_paths.cache_helper.active; a validate-time
+#: INPUT_TYPES call outside a pass asks per class as before.
+_PASS_MEMO: Dict[str, tuple] = {}
+_PASS_MEMO_SECONDS = 2.0
+
+
+def _object_info_pass_active() -> bool:
+    fp = sys.modules.get("folder_paths")
+    return bool(getattr(getattr(fp, "cache_helper", None), "active", False))
+
+
+def _ask(worker, method, **params):
+    """One question on the side lane if the worker has one, else the main
+    lane's no-spawn path. Returns a reply dict or None. Every sentinel the
+    side lane can answer -- dead, slow, busy, timeout -- is a miss here;
+    only "nolane" falls through to the main lane, because that is the one
+    case where the main lane might answer at all."""
+    send_side = getattr(worker, "send_side", None)
+    if send_side is not None:
+        resp = send_side(method, lock_timeout=_REFRESH_LOCK_TIMEOUT, **params)
+        if resp != "nolane":
+            return resp if isinstance(resp, dict) else None
+    resp = worker.send_command_no_spawn(method, lock_timeout=_REFRESH_LOCK_TIMEOUT, **params)
+    return resp if isinstance(resp, dict) else None
+
+
 #: How long the options refresh will wait for a worker's lock before giving
 #: up. Short on purpose: this is cosmetic work on the /object_info path, and
 #: the answer if we lose the race is "use the cached list", which is what the
@@ -964,11 +999,22 @@ def _refresh_combo_options(env_dir, module_name, class_name):
         worker = worker_for(env_dir)
         if worker is None:
             return None                      # rung 3: nothing to ask
-        resp = worker.send_command_no_spawn(
-            "refresh_input_types", lock_timeout=_REFRESH_LOCK_TIMEOUT,
-            module=module_name, class_name=class_name)
-        # "dead" / "busy" are sentinel strings, not responses -- rungs 3 and 2.
-        if not isinstance(resp, dict) or resp.get("status") != "ok":
+        key = str(env_dir)
+        tag = f"{module_name}:{class_name}"
+        if _object_info_pass_active():
+            memo = _PASS_MEMO.get(key)
+            if memo is not None and time.monotonic() - memo[0] < _PASS_MEMO_SECONDS:
+                opts = memo[1].get(tag)
+                return opts if isinstance(opts, dict) and opts else None
+            classes = sorted(_ENV_CLASSES.get(key) or {(module_name, class_name)})
+            resp = _ask(worker, "refresh_input_types", classes=[list(c) for c in classes])
+            if resp is None or resp.get("status") != "ok" or not isinstance(resp.get("options"), dict):
+                return None
+            _PASS_MEMO[key] = (time.monotonic(), resp["options"])
+            opts = resp["options"].get(tag)
+            return opts if isinstance(opts, dict) and opts else None
+        resp = _ask(worker, "refresh_input_types", module=module_name, class_name=class_name)
+        if resp is None or resp.get("status") != "ok":
             return None
         opts = resp.get("options")
         return opts if isinstance(opts, dict) and opts else None
@@ -1053,10 +1099,9 @@ def _forward_fingerprint(env_dir, module_name, class_name, method_name,
                 _log(f"[comfy-env] fingerprint for {node_name}: no idle "
                      f"worker, treating as changed")
             return _CHANGED                                 # rung 3
-        resp = worker.send_command_no_spawn(
-            "fingerprint", lock_timeout=_REFRESH_LOCK_TIMEOUT,
-            module=module_name, class_name=class_name,
-            method_name=method_name, kwargs=kwargs, hidden=hidden or [])
+        resp = _ask(worker, "fingerprint",
+                    module=module_name, class_name=class_name,
+                    method_name=method_name, kwargs=kwargs, hidden=hidden or [])
         # "dead" / "busy" are sentinel strings, not responses: rungs 3 and 2.
         if not isinstance(resp, dict) or resp.get("status") != "ok":
             if _DBG_IO:
@@ -1575,6 +1620,8 @@ def _build_v3_proxy_class(
         info["python_module"] = getattr(cls, "RELATIVE_PYTHON_MODULE", None) or "nodes"
         return info
 
+    _ENV_CLASSES.setdefault(str(env_dir), set()).add((module_name, class_name))
+
     @classmethod
     def _define_schema_stub(cls):
         raise NotImplementedError(
@@ -1893,6 +1940,7 @@ def build_proxy_class(
                 result[s] = e
         return result
     attrs["INPUT_TYPES"] = _input_types
+    _ENV_CLASSES.setdefault(str(env_dir), set()).add((module_name, class_name))
 
     # Hidden inputs travel in their own frame field, never as kwargs.
     #

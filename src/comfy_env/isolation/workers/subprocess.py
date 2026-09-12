@@ -44,6 +44,8 @@ from ...debug import (
 # Shared IPC constants needed directly by SubprocessWorker
 from ._ipc_shared import (
     SOCKET_ACCEPT_TIMEOUT,
+    SIDE_ACCEPT_TIMEOUT,
+    SIDE_BACKOFF_SECONDS,
     _import_pool_from_fd,
     _recv_fd,
     _cleanup_shm,
@@ -202,6 +204,16 @@ class SubprocessWorker(Worker):
         # worker's budget callback evicting this worker's proxy) acquire it.
         self._mem_lock = threading.Lock()
         self._last_new_models = []  # Auto-detected models from last call
+        # The side lane: a second connection the worker opens after its ready
+        # frame, read by a daemon thread in the worker, so cheap questions
+        # (dropdown refresh, fingerprint, ping) get answered while the main
+        # lane is inside a node call. Its own lock, its own ids, its own
+        # back-off; nothing on it can kill the worker. None = no lane, and
+        # send_side answers "nolane" so callers fall back to the main lane.
+        self._side_transport = None
+        self._side_lock = threading.Lock()
+        self._side_id = 0
+        self._side_unresponsive_until = 0.0
         # Harvested per reply by _send_request and read lock-free by the pool;
         # declared here so a fresh process starts with nothing inherited
         # (pool._retire_worker_state resets them on a restart).
@@ -327,6 +339,12 @@ class SubprocessWorker(Worker):
             except OSError:
                 pass
             self._transport = None
+        if self._side_transport:
+            try:
+                self._side_transport.close()
+            except OSError:
+                pass
+            self._side_transport = None
         if self._server_socket:
             try:
                 self._server_socket.close()
@@ -635,35 +653,7 @@ class SubprocessWorker(Worker):
         finally:
             self._server_socket.settimeout(None)
 
-        # Verify the peer before speaking the protocol: same-uid check
-        # where the OS can prove it, then the authkey as the first frame.
-        # A wrong or missing key means SOMETHING ELSE connected to our
-        # socket -- kill everything loudly; never feed its bytes to the
-        # deserializer.
-        if hasattr(socket, "SO_PEERCRED"):  # Linux AF_UNIX
-            try:
-                import struct as _struct
-                creds = client_sock.getsockopt(
-                    socket.SOL_SOCKET, socket.SO_PEERCRED, _struct.calcsize("3i"))
-                _pid, _uid, _gid = _struct.unpack("3i", creds)
-                if _uid != os.getuid():
-                    client_sock.close()
-                    self._kill_worker()
-                    raise RuntimeError(
-                        f"{self.name}: IPC connection from foreign uid {_uid} "
-                        f"rejected (expected {os.getuid()}).")
-            except OSError:
-                pass  # non-AF_UNIX fallback socket; authkey still gates below
-
-        self._transport = SocketTransport(client_sock)
-        auth = self._transport.recv(timeout=SOCKET_ACCEPT_TIMEOUT)
-        if not (isinstance(auth, dict) and auth.get("authkey") == self._authkey):
-            self._transport.close()
-            self._transport = None
-            self._kill_worker()
-            raise RuntimeError(
-                f"{self.name}: IPC handshake failed -- peer did not present "
-                f"the expected authkey. Refusing the connection.")
+        self._transport = self._verify_peer(client_sock)
 
         # Send config to the worker. Include the main process's currently-
         # resolved folder_paths values so the worker's separate folder_paths
@@ -729,6 +719,23 @@ class SubprocessWorker(Worker):
 
         if msg.get("status") != "ready":
             raise RuntimeError(f"{self.name}: Unexpected ready message: {msg}")
+
+        # The side lane. The worker connects a second time right after its
+        # ready frame; the same listener has backlog for it. Same peer check,
+        # same authkey. A worker that never connects it (an older staged
+        # script, a firewall on the TCP fallback) costs a short wait and
+        # then simply has no lane: never a dead worker.
+        self._side_transport = None
+        self._server_socket.settimeout(SIDE_ACCEPT_TIMEOUT)
+        try:
+            side_sock, _ = self._server_socket.accept()
+            self._side_transport = self._verify_peer(side_sock)
+        except socket.timeout:
+            print(f"[{self.name}] no side lane (worker did not connect a second "
+                  f"time within {SIDE_ACCEPT_TIMEOUT}s); dropdowns and "
+                  f"fingerprints wait for the main lane", file=sys.stderr, flush=True)
+        finally:
+            self._server_socket.settimeout(None)
 
         # Which memory manager this worker resolved to. A worker never runs
         # main.py, so this is the legacy ledger unless COMFY_ENV_WORKER_AIMDO
@@ -1311,6 +1318,97 @@ class SubprocessWorker(Worker):
         # back); a kept tensor has nothing left to protect.
         _ipc_parent._parent_tensor_keeper.release_all()
 
+    def _verify_peer(self, client_sock) -> SocketTransport:
+        """Verify a freshly accepted connection before speaking the protocol:
+        same-uid check where the OS can prove it, then the authkey as the
+        first frame. A wrong or missing key means SOMETHING ELSE connected
+        to our socket -- kill everything loudly; never feed its bytes to the
+        deserializer."""
+        if hasattr(socket, "SO_PEERCRED"):  # Linux AF_UNIX
+            try:
+                import struct as _struct
+                creds = client_sock.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, _struct.calcsize("3i"))
+                _pid, _uid, _gid = _struct.unpack("3i", creds)
+                if _uid != os.getuid():
+                    client_sock.close()
+                    self._kill_worker()
+                    raise RuntimeError(
+                        f"{self.name}: IPC connection from foreign uid {_uid} "
+                        f"rejected (expected {os.getuid()}).")
+            except OSError:
+                pass  # non-AF_UNIX fallback socket; authkey still gates below
+        transport = SocketTransport(client_sock)
+        auth = transport.recv(timeout=SOCKET_ACCEPT_TIMEOUT)
+        if not (isinstance(auth, dict) and auth.get("authkey") == self._authkey):
+            transport.close()
+            self._kill_worker()
+            raise RuntimeError(
+                f"{self.name}: IPC handshake failed -- peer did not present "
+                f"the expected authkey. Refusing the connection.")
+        return transport
+
+    def send_side(self, method, lock_timeout=0.25, reply_timeout=1.0, **params):
+        """Ask the worker a cheap question on the side lane, even mid-call.
+
+        The main lane is one request at a time and its reader is whoever
+        holds ``_lock``, so while a node runs nobody is listening and
+        ``send_command_no_spawn`` answers "busy". The side lane has its own
+        reader thread in the worker and its own lock here, so a dropdown
+        refresh or a fingerprint is answered in the GIL gaps of the running
+        node (sub-millisecond when the node is in torch or a syscall, ~10 ms
+        under CPU-bound Python; only native code that never drops the GIL
+        makes it wait). Returns the reply dict, or a sentinel string:
+
+        * ``"dead"``    the worker is gone
+        * ``"nolane"``  this worker has no side lane; the caller may fall
+                        back to the main lane
+        * ``"slow"``    a recent reply timed out; not asked again for
+                        SIDE_BACKOFF_SECONDS, so N nodes never pay N caps
+        * ``"busy"``    another side request is in flight past lock_timeout
+        * ``"timeout"`` no reply within reply_timeout
+
+        Nothing here kills or shuts down the worker, ever. A timed-out
+        request is abandoned; its reply, if it arrives later, carries an
+        older ``side_id`` and is discarded by the next request.
+        """
+        if not self.is_alive():
+            return "dead"
+        transport = self._side_transport
+        if transport is None:
+            return "nolane"
+        if time.monotonic() < self._side_unresponsive_until:
+            return "slow"
+        if not self._side_lock.acquire(timeout=lock_timeout):
+            return "busy"
+        try:
+            self._side_id += 1
+            sid = self._side_id
+            deadline = time.monotonic() + reply_timeout
+            try:
+                # send is a blocking sendall with no timeout of its own
+                transport._sock.settimeout(reply_timeout)
+                transport.send({"method": method, "side_id": sid, **params})
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    frame = transport.recv(timeout=remaining)
+                    if frame is None:
+                        break
+                    if frame.get("side_id", -1) < sid:
+                        continue          # a reply to a request we gave up on
+                    return frame
+            except (socket.timeout, TimeoutError):
+                pass
+            except (ConnectionError, OSError, ValueError):
+                self._side_transport = None   # lane dead; main lane untouched
+                return "dead"
+            self._side_unresponsive_until = time.monotonic() + SIDE_BACKOFF_SECONDS
+            return "timeout"
+        finally:
+            self._side_lock.release()
+
     def send_command_no_spawn(self, method, lock_timeout=2.0, **params):
         """send_command variant for broadcasts: never resurrects a worker.
 
@@ -1363,6 +1461,12 @@ class SubprocessWorker(Worker):
         if self._transport:
             self._transport.close()
             self._transport = None
+        if self._side_transport:
+            try:
+                self._side_transport.close()
+            except OSError:
+                pass
+            self._side_transport = None
 
         if self._server_socket:
             try:
