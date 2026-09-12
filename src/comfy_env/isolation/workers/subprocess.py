@@ -945,7 +945,7 @@ class SubprocessWorker(Worker):
         module_name: str,
         class_name: str,
         method_name: str,
-        self_state: Optional[Dict[str, Any]] = None,
+        self_state: Optional[Dict[str, Any]] = None,   # V1 only: the instance __dict__
         kwargs: Optional[Dict[str, Any]] = None,
         hidden: Optional[list] = None,
         validate_kwargs: Optional[Dict[str, Any]] = None,

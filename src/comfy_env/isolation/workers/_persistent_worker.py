@@ -1013,6 +1013,10 @@ def main():
     _residency_seq = {}
 
     # ------------- node state overflow tier (state_sync design) -------------
+    # V1 NODES ONLY: this tier, _seeded_state_ids and the seed/overlay block
+    # in the call handler all serve the V1 instance's self.__dict__. A V3
+    # node has no instance (execute is a classmethod on a per-call clone)
+    # and its proxy sends self_state=None, so none of it runs for V3.
     # Values that cannot cross the wire (device resident, unpicklable, over
     # cap) stay HERE, keyed by a monotonic handle, represented parent-side by
     # a marker. _STATE_GEN changes on every worker start so a marker from a
@@ -2583,6 +2587,11 @@ def main():
             if request_type == "call_method":
                 class_name = request["class_name"]
                 method_name = request["method_name"]
+                # V1 NODES ONLY from here to the instance overlay below:
+                # self_state is the host-held instance __dict__ of a V1 node.
+                # A V3 proxy always sends None, so _state_sync_on is False
+                # and the instance built is a throwaway object.__new__ that
+                # the V3 dispatch never touches (it calls on the class clone).
                 self_state = request.get("self_state")
                 _state_sync_on = (
                     _state_sync is not None

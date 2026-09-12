@@ -219,8 +219,19 @@ def held_ceiling(p: Any) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Problem 11: node state return
+# Problem 11: node state return  --  V1 NODES ONLY
 # ---------------------------------------------------------------------------
+#
+# V1 NODES ONLY. A V3 node's execute is a classmethod on a per-call class
+# clone; there is no instance and nothing here applies to it. Every proxy
+# built for a V3 node sends self_state=None and this whole section is
+# skipped. (For V1 nodes ComfyUI builds one instance per node and reuses
+# it, so packs keep caches, counters and handles on self; that instance
+# lives on the host and its __dict__ is what crosses.)
+#
+# Everything from here to the "Pinned RAM budgets" rule (STATE_*, markers,
+# outbound_state, encode/decode, snapshot_state, diff_state, apply_state_out)
+# serves the V1 instance and nothing else.
 
 #: sync (default) returns mutated state; off is the pre-2026-09 in-only wire.
 STATE_ENV_VAR = "COMFY_ENV_NODE_STATE"

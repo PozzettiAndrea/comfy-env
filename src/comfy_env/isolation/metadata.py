@@ -1359,6 +1359,10 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                     state_id=None, state_dict=None, validate_kwargs=None):
     """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
 
+    self_state, state_id and state_dict are V1-only: they carry the V1
+    instance's __dict__ out and its mutations back. A V3 proxy passes None
+    for all three (a V3 node has no instance).
+
     Keyword-only on purpose: the two closures this replaces took nine and
     eleven positional single-letter arguments in slightly different orders, and
     being unable to mix them up was the only safety the duplication provided.
@@ -1593,7 +1597,9 @@ def _build_v3_proxy_class(
             # `hidden` is the class default None) and skips dynprompt,
             # which is a live object rather than data.
             _hidden = _v3_hidden_of(cls)
-            # self_state is the literal None, never derived from `cls`.
+            # self_state is the literal None, never derived from `cls`: a V3
+            # node has no instance, so the whole self-state machinery (V1
+            # only) is skipped for it.
             return _call_in_worker(
                 worker_spec=(ed, pr, sp, ev, hct),
                 module_name=mod, class_name=cn, method_name=fn,
@@ -1919,7 +1925,9 @@ def build_proxy_class(
                     self_state=None, kwargs=kwargs, node_name=nn,
                     hidden=_hidden,
                 )
-            # The state id is parent-only bookkeeping: stripped from every
+            # V1 NODES ONLY (this is the V1 proxy; the V3 proxy above sends
+            # self_state=None because a V3 node has no instance). The state
+            # id is parent-only bookkeeping: stripped from every
             # outbound state, never written by the worker. It names this
             # instance to the worker, which decides for itself whether
             # __init__ has run there (ComfyUI's sweep drops the instance,
