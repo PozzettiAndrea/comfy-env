@@ -1444,9 +1444,9 @@ def main():
         if result is True:
             return
         if result is False:
-            raise ValueError(f"{class_name}: VALIDATE_INPUTS rejected the inputs")
+            raise _ValidationRejected("Custom validation failed for node")
         if isinstance(result, str):
-            raise ValueError(f"{class_name}: {result}")
+            raise _ValidationRejected(f"Custom validation failed for node: {result}")
         # an ExecutionBlocker, or anything else: passes at validation upstream
 
     def _handle_fingerprint(request):
@@ -1662,6 +1662,15 @@ def main():
         of every worker whose env lacks comfy."""
         pass
 
+    class _ValidationRejected(ValueError):
+        """The author's VALIDATE_INPUTS said no. Its message is worded exactly
+        as upstream words a submit-time rejection ("Custom validation failed
+        for node" + the author's details), and the error frame carries
+        error_kind "validation" so the host raises a plain ValueError with
+        that sentence, not a WorkerError with a traceback: on the node the
+        user reads the same words they would have read in the submit
+        dialog, one node later."""
+
     def _oom_stats():
         """Three allocator-level integers for an OOM error frame.
 
@@ -1698,6 +1707,9 @@ def main():
         try:
             if isinstance(e, _InterruptedError):
                 fields["error_kind"] = "interrupt"
+                return fields
+            if isinstance(e, _ValidationRejected):
+                fields["error_kind"] = "validation"
                 return fields
             import comfy.model_management as _emm
             if _emm.is_oom(e):

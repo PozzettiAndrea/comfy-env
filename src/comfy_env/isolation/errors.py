@@ -49,12 +49,27 @@ def _resolve_interrupt() -> Optional[type]:
         return None
 
 
+def _resolve_validation() -> Optional[type]:
+    """The author's VALIDATE_INPUTS rejected the inputs at execution. Upstream
+    has no exception class for this (at submit it is a node_errors record),
+    so the host raises the builtin ValueError, whose full_type_name is the
+    bare "ValueError" on the node, carrying upstream's own wording."""
+    return ValueError
+
+
 #: Closed vocabulary. Keys are stable wire tokens, never Python class paths:
 #: the host must not import a class by a name that arrived over the socket.
 DEFAULT_REGISTRY: Dict[str, Callable[[], Optional[type]]] = {
     "oom": _resolve_oom,
     "interrupt": _resolve_interrupt,
+    "validation": _resolve_validation,
 }
+
+#: Kinds whose translated exception carries the worker's bare sentence, not
+#: the sentence plus the worker traceback: the message is FOR the user (it
+#: is the node author's rejection text), and a traceback under it would
+#: turn "file not found: foo.obj" into a stack dump on the node.
+BARE_MESSAGE_KINDS = frozenset({"validation"})
 
 
 def translate_error(exc, *, registry=None):
@@ -78,7 +93,10 @@ def translate_error(exc, *, registry=None):
         cls = resolver()
         if cls is None:
             return exc
-        translated = cls(str(exc))
+        message = str(exc)
+        if kind in BARE_MESSAGE_KINDS and exc.args:
+            message = str(exc.args[0])
+        translated = cls(message)
     except Exception:
         return exc
     translated.__cause__ = exc

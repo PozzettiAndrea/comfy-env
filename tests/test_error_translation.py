@@ -204,3 +204,18 @@ class TestSeamGuards:
         assert issubclass(InterruptRequested, RuntimeError), (
             "InterruptRequested must stay a RuntimeError so old workers' "
             "except RuntimeError fallback still catches the callback error")
+
+
+def test_validation_kind_carries_the_authors_sentence_without_a_traceback():
+    """A rejection from the author's VALIDATE_INPUTS is FOR the user: the
+    host raises a plain ValueError with upstream's submit-time wording, the
+    worker traceback stays on __cause__, off the node."""
+    from comfy_env.isolation.errors import translate_error
+    from comfy_env.isolation.workers.base import WorkerError
+    we = WorkerError("Custom validation failed for node: file not found: foo.obj",
+                     traceback="Traceback (most recent call last): ...",
+                     error_kind="validation")
+    t = translate_error(we)
+    assert type(t) is ValueError
+    assert str(t) == "Custom validation failed for node: file not found: foo.obj"
+    assert "Traceback" not in str(t) and t.__cause__ is we

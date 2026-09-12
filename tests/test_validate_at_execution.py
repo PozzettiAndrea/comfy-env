@@ -114,7 +114,13 @@ def _run(worker, cls, x, validate):
 def test_the_authors_message_is_the_node_error(worker):
     with pytest.raises(WorkerError) as ei:
         _run(worker, "Ranged", -1, {"x": -1, "mesh": "a.obj"})
-    assert "x must be non-negative, got -1" in str(ei.value)
+    assert ei.value.error_kind == "validation"
+    assert ei.value.args[0] == "Custom validation failed for node: x must be non-negative, got -1"
+    # what the host raises on the node: upstream's own wording, no traceback
+    from comfy_env.isolation.errors import translate_error
+    t = translate_error(ei.value)
+    assert type(t) is ValueError and str(t) == ei.value.args[0]
+    assert t.__cause__ is ei.value
 
 
 def test_a_passing_validate_runs_the_node(worker):
@@ -131,7 +137,8 @@ def test_kwargs_are_filtered_to_the_real_argspec(worker):
 def test_bare_false_rejects(worker):
     with pytest.raises(WorkerError) as ei:
         _run(worker, "Blanket", 13, {"x": 13})
-    assert "VALIDATE_INPUTS rejected" in str(ei.value)
+    assert ei.value.error_kind == "validation"
+    assert ei.value.args[0] == "Custom validation failed for node"
 
 
 def test_an_async_body_is_awaited_not_skipped(worker):
