@@ -13,12 +13,13 @@ Contact surface (keep this list in sync with reality):
                                               (model_patcher.py, wrap.py,
                                                environment/setup.py pool patch)
   - folder_paths.get_input_directory          (isolation/metadata.py dynamic
-                                               combos + mtime fingerprint)
+                                               combos)
   - execution.py validate contract: inputs named in the VALIDATE_INPUTS /
     validate_inputs argspec are exempted     (metadata.py synthesized
                                               named-arg validate)
   - execution.py caching contract: IS_CHANGED / fingerprint_inputs consulted
-    once per node per prompt                 (metadata.py mtime fingerprint)
+    once per node per prompt, a raise is NaN, and NaN never equals a stored
+    key                                       (metadata.py _forward_fingerprint)
 
 Needs a ComfyUI checkout: set COMFYUI_DIR. Skipped otherwise.
 """
@@ -144,6 +145,21 @@ def test_execution_validate_exemption_contract():
     src = (Path(COMFYUI_DIR) / "execution.py").read_text(encoding="utf-8")
     assert "validate_function_inputs" in src
     assert "validate_has_kwargs" in src
+
+
+def test_execution_is_changed_contract():
+    """The forwarded fingerprint rests on three upstream facts: the V3 name
+    is found by first_real_override, the V1 name by hasattr on the class,
+    and a failure (or our miss) is float("NaN"), which caching.py folds into
+    a fresh Unhashable so it never equals a stored key. Source-level, for
+    the same reason as above."""
+    src = (Path(COMFYUI_DIR) / "execution.py").read_text(encoding="utf-8")
+    assert 'first_real_override(class_def, "fingerprint_inputs")' in src
+    assert 'hasattr(class_def, "IS_CHANGED")' in src
+    assert 'node["is_changed"] = float("NaN")' in src
+    caching = (Path(COMFYUI_DIR) / "comfy_execution" / "caching.py").read_text(
+        encoding="utf-8")
+    assert "class Unhashable" in caching
 
 
 def test_model_management_surface():

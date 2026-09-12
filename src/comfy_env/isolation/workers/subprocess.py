@@ -511,6 +511,12 @@ class SubprocessWorker(Worker):
         # node has already done all its work.
         env["COMFY_ENV_PARENT_CUDA_IPC"] = "1" if _probe_cuda_ipc() else "0"
 
+        # The host's resolved root log level, so the worker's logger admits
+        # the same records the host's does. Not an args mirror entry: the
+        # level is what setup_logger computed from --verbose, not a flag.
+        import logging as _logging
+        env["COMFY_ENV_HOST_LOG_LEVEL"] = str(_logging.getLogger().level or _logging.INFO)
+
         # Find ComfyUI base and add to sys_path for real folder_paths/comfy modules
         # This works because comfy.options.args_parsing=False by default, so folder_paths
         # auto-detects its base directory from __file__ location
@@ -664,6 +670,13 @@ class SubprocessWorker(Worker):
                 "output_directory":       _fp.get_output_directory(),
                 "temp_directory":         _fp.get_temp_directory(),
                 "user_directory":         _fp.get_user_directory(),
+                # The registry below was BUILT from models_dir at import, but
+                # after that they are independent: the registry is absolute
+                # paths, models_dir is a scalar nobody recomputes. A pack
+                # reading folder_paths.models_dir directly (to carve out its
+                # own subfolder) got the worker's stale default on any
+                # non-default layout. Ship it alongside.
+                "models_dir":             getattr(_fp, "models_dir", None),
                 "folder_names_and_paths": _fnap,
             }
         except Exception:

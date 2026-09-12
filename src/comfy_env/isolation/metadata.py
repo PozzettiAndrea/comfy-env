@@ -27,7 +27,7 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "19"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "20"  # Bump when _METADATA_SCRIPT or cache format changes
 
 #: Wall-clock cap on one pack's metadata scan (import + INPUT_TYPES for every
 #: node), seconds. Without it a pack that hangs at import held ComfyUI's
@@ -97,14 +97,6 @@ def _warn_node_conformance(package_name: str, payload) -> None:
                   f"it as a missing node and report the cause when a "
                   f"workflow uses it (scan is retried on the next start): "
                   f"{err}", file=sys.stderr, flush=True)
-
-        if meta.get("fingerprint_args") is not None:
-            print(f"[comfy-env] WARNING: {package_name}: node {name!r} defines "
-                  f"IS_CHANGED/fingerprint_inputs, which is NOT forwarded "
-                  f"across isolation. ComfyUI will treat this node as never "
-                  f"changing and serve its cached output until restart. If it "
-                  f"reads a file, a clock or an API, make that an input.",
-                  file=sys.stderr, flush=True)
 
 
 
@@ -373,10 +365,14 @@ for name, cls in _class_map.items():
     }
 
     # Validation / fingerprint contracts (captured as ARG NAMES, not code).
-    # The parent synthesizes named-arg replacements: forwarding either to a
-    # worker is banned -- VALIDATE_INPUTS runs at prompt validation and
-    # IS_CHANGED once per node per prompt, so a worker call there cold-spawns
-    # every env before anything executes.
+    # VALIDATE_INPUTS is synthesized parent-side as a named-arg exemption:
+    # it runs at prompt validation, its miss answer would have to be "valid"
+    # or "invalid", and a worker call there would cold-spawn every env before
+    # anything executes. IS_CHANGED / fingerprint_inputs is forwarded over the
+    # no-spawn ladder instead (_forward_fingerprint): asked once per node per
+    # prompt, of a worker that is already alive and idle, and every miss is
+    # the safe answer "changed". The arg list is the attach gate: None means
+    # the pack wrote no fingerprint and the proxy gets none.
     def _named_args(fn):
         """(parameter names, declared **kwargs) -- ComfyUI reads BOTH.
 
@@ -977,6 +973,187 @@ def _refresh_combo_options(env_dir, module_name, class_name):
         return None
 
 
+#: The fingerprint's miss answer. ComfyUI folds a NaN into the cache key as a
+#: value that never equals a stored one (caching.py:50-65, `Unhashable`), so
+#: it reads as "changed, re-run". One module constant is enough: ComfyUI
+#: stores the value per prompt (execution.py:98), it does not need a fresh
+#: object from us.
+_CHANGED = float("nan")
+
+#: Nesting cap for the rung-0 type walk. A PROMPT dict is a few levels deep;
+#: anything deeper than this is not widget data.
+_PRIMITIVE_DEPTH = 32
+
+
+def _is_json_primitive(v) -> bool:
+    return v is None or isinstance(v, (str, int, float, bool))
+
+
+def _all_json_primitive(x, _depth=0) -> bool:
+    """True when `x` is JSON data built only from primitives, by type.
+
+    An isinstance walk and nothing else: no len(), no iteration over an
+    unknown object, no repr, no shape. A tensor, an ExecutionBlocker, a
+    DynamicPrompt or an OpaquePickle is rejected by its type and never read.
+    Dict keys must be str; list and tuple recurse.
+    """
+    if _is_json_primitive(x):
+        return True
+    if _depth > _PRIMITIVE_DEPTH:
+        return False
+    if isinstance(x, dict):
+        return all(isinstance(k, str) and _all_json_primitive(v, _depth + 1)
+                   for k, v in x.items())
+    if isinstance(x, (list, tuple)):
+        return all(_all_json_primitive(v, _depth + 1) for v in x)
+    return False
+
+
+def _forward_fingerprint(env_dir, module_name, class_name, method_name,
+                         kwargs, hidden, node_name=None):
+    """Ask a warm, idle worker for a node's own IS_CHANGED / fingerprint_inputs.
+
+    The dropdown ladder (_refresh_combo_options) with its miss answer turned
+    upside down:
+
+      0. any forwarded input or hidden value is not a JSON primitive: answer
+         "changed" before any lock is touched. A pure type walk on the host.
+      1. the worker for this env is alive AND idle: send the primitives, and
+         hand back the pack's own answer if it is a primitive.
+      2. alive but mid-call: "busy" after a quarter second; answer "changed".
+      3. never started, or dead: answer "changed".
+
+    Every miss is "changed". That inversion is what makes the ladder safe
+    here: a recompute costs time, a frozen cache serves a wrong result.
+    ComfyUI's own failure answer is the same NaN (execution.py:96-98).
+
+    Never spawns (send_command_no_spawn, never send_command or the pool's
+    _get_or_create_worker: a cold start per isolated node on every prompt
+    submit, on the event loop, is the cost this refuses to pay). Never
+    raises into ComfyUI. Holds no pool lock, only the worker's own for the
+    round trip. Does not drop the worker on failure: the next real call
+    goes through _call_in_worker, which already handles a dead socket, and
+    a bad fingerprint must not cost a model cache.
+
+    The reply contract is the worker's _handle_fingerprint: `value` is a
+    primitive, `changed` is the flag for a NaN or non-primitive return (NaN
+    is a flag, not a token, so the wire never depends on json's NaN
+    extension). `None` with no flag is a legitimate "unchanged" answer.
+    """
+    try:
+        if not _all_json_primitive(kwargs) or not _all_json_primitive(hidden):
+            return _CHANGED                                 # rung 0
+        from .pool import _WORKER_POOL
+        entry = _WORKER_POOL.get(str(env_dir))
+        if entry is None:
+            if _DBG_IO:
+                _log(f"[comfy-env] fingerprint for {node_name}: no idle "
+                     f"worker, treating as changed")
+            return _CHANGED                                 # rung 3
+        resp = entry[0].send_command_no_spawn(
+            "fingerprint", lock_timeout=_REFRESH_LOCK_TIMEOUT,
+            module=module_name, class_name=class_name,
+            method_name=method_name, kwargs=kwargs, hidden=hidden or [])
+        # "dead" / "busy" are sentinel strings, not responses: rungs 3 and 2.
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            if _DBG_IO:
+                _log(f"[comfy-env] fingerprint for {node_name}: no idle "
+                     f"worker, treating as changed")
+            return _CHANGED
+        if resp.get("changed"):
+            return _CHANGED
+        value = resp.get("value")
+        return value if _is_json_primitive(value) else _CHANGED
+    except Exception:
+        # An error frame raised by send_command_no_spawn, a socket death,
+        # a reply timeout: all of them are "ask again next prompt".
+        return _CHANGED
+
+
+def _shape_v1_kwargs(kwargs, hmap, dcp):
+    """Shape a V1 proxy's kwargs the way the worker expects: (kwargs, hidden).
+
+    The one site for both halves, shared by the real call, check_lazy_status
+    and the fingerprint. A third copy would be where the two drift.
+
+    Hidden inputs are lifted out of kwargs into their own list, keyed by
+    sentinel and carrying the author's parameter name with them, so the
+    worker can put each value back under the name the node declared (see
+    the _hidden_map comment in build_proxy_class). Then DynamicCombo inputs
+    are nested: flat dotted keys become nested dicts, e.g.
+    {"backend": "grid", "backend.smooth_normals": "true"}
+      -> {"backend": {"backend": "grid", "smooth_normals": "true"}}.
+    """
+    hidden = None
+    if hmap:
+        hidden = [[hmap[k], k, kwargs.pop(k)] for k in list(kwargs) if k in hmap]
+    if dcp:
+        nested = {}
+        for k, v in kwargs.items():
+            if '.' in k:
+                parent, child = k.split('.', 1)
+                if parent in dcp:
+                    nested.setdefault(parent, {})[child] = v
+                    continue
+            if k in dcp:
+                nested.setdefault(k, {})[k] = v
+                continue
+            nested[k] = v
+        kwargs = nested
+    return kwargs, hidden
+
+
+def _v3_hidden_of(cls):
+    """The hidden values ComfyUI hung on a V3 per-call class clone, as the
+    worker's hidden list, or None. getattr-guarded: outside ComfyUI's
+    dispatch `hidden` is the class default None (_io.py:1977)."""
+    holder = getattr(cls, "hidden", None)
+    if holder is None:
+        return None
+    return [[a.upper(), None, v]
+            for a in _V3_HIDDEN_ATTRS
+            for v in (getattr(holder, a, None),)
+            if v is not None] or None
+
+
+def _make_v3_fingerprint(module_name, class_name, env_dir, node_name):
+    """`fingerprint_inputs(cls, **kwargs)` for a V3 proxy.
+
+    `**kwargs`, not the named-arg shape of _make_named_validate: ComfyUI
+    calls the fingerprint as f(**inputs) with every declared input and never
+    reads its argspec (execution.py:300; the only argspec read is :891, for
+    VALIDATE_INPUTS). The pack's real signature decides in the worker; a
+    TypeError there is an error frame, which is NaN, which is what native
+    ComfyUI answers for the same TypeError. Hidden values are read off the
+    clone exactly as the real call reads them.
+    """
+    def fingerprint_inputs(cls, **kwargs):
+        return _forward_fingerprint(
+            env_dir, module_name, class_name, "fingerprint_inputs",
+            kwargs, _v3_hidden_of(cls), node_name)
+    return fingerprint_inputs
+
+
+def _make_v1_fingerprint(module_name, class_name, env_dir, node_name,
+                         dynamic_combo_parents, hidden_map, method_name):
+    """`IS_CHANGED(cls, **kwargs)` for a V1 proxy.
+
+    Same `**kwargs` reasoning as _make_v3_fingerprint. kwargs are shaped by
+    _shape_v1_kwargs exactly as the real call's are. No self_state, no seed,
+    no state id: a fingerprint has no instance; ComfyUI calls it on the
+    class (execution.py:93, :289).
+
+    `method_name` is the scan's view of the REAL class: a V3 node that fell
+    back to a V1 proxy still has to be asked for `fingerprint_inputs`.
+    """
+    def IS_CHANGED(cls, **kwargs):
+        kwargs, hidden = _shape_v1_kwargs(kwargs, hidden_map, dynamic_combo_parents)
+        return _forward_fingerprint(
+            env_dir, module_name, class_name, method_name,
+            kwargs, hidden, node_name)
+    return IS_CHANGED
+
+
 def _splice_combo_options(sections, fresh):
     """Overlay fresh option lists onto a cached input-spec snapshot.
 
@@ -1331,16 +1508,10 @@ def _build_v3_proxy_class(
             # here already carries a populated HiddenHolder. It used to be
             # discarded on the next line; read it instead.
             #
-            # getattr-guarded: outside that dispatch `hidden` is the class
-            # default None (_io.py:1977), and dynprompt is skipped because it
-            # is a live object rather than data.
-            _hidden = None
-            _holder = getattr(cls, "hidden", None)
-            if _holder is not None:
-                _hidden = [[_a.upper(), None, _v]
-                           for _a in _V3_HIDDEN_ATTRS
-                           for _v in (getattr(_holder, _a, None),)
-                           if _v is not None] or None
+            # _v3_hidden_of is getattr-guarded (outside that dispatch
+            # `hidden` is the class default None) and skips dynprompt,
+            # which is a live object rather than data.
+            _hidden = _v3_hidden_of(cls)
             # self_state is the literal None, never derived from `cls`.
             return _call_in_worker(
                 worker_spec=(ed, pr, sp, ev, hct),
@@ -1424,15 +1595,16 @@ def _build_v3_proxy_class(
     if _validate_cm is not None:
         attrs["validate_inputs"] = _validate_cm
 
-    # No staleness fingerprint. It hashed a dynamic input's value by
-    # the mtime of the file it resolved to, so overwriting a mesh in
-    # place re-executed instead of serving the cached result. It needed
-    # a per-input directory spec to resolve that path, and nothing knows
-    # one any more: which inputs are file listings is now the worker's
-    # answer at refresh time, not a fact the parent holds at build time.
-    # Attaching an mtime hash to every combo instead would change caching
-    # for nodes that have nothing to do with files. Recorded as a real
-    # loss rather than quietly dropped.
+    # The pack's own fingerprint, forwarded over the no-spawn ladder, and
+    # ONLY when the author wrote one: a node without a fingerprint keeps
+    # ComfyUI's constant False (execution.py:82-84), exactly as natively.
+    # Lowercase, in the proxy's own __dict__, which is what
+    # first_real_override(class_def, "fingerprint_inputs") (execution.py:76)
+    # walks the MRO for; IS_CHANGED here would be dead code, the same rule
+    # as the validate note above. See _forward_fingerprint for the rungs.
+    if meta.get("fingerprint_args") is not None:
+        attrs["fingerprint_inputs"] = classmethod(_make_v3_fingerprint(
+            module_name, class_name, env_dir, node_name))
 
     return type(class_name, (_comfy_io.ComfyNode,), attrs)
 
@@ -1643,29 +1815,9 @@ def build_proxy_class(
     # Proxy FUNCTION method -- reuses persistent worker across calls
     def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hmap):
         def proxy(self, **kwargs):
-            # Lift hidden inputs out of kwargs into their own channel, keyed
-            # by sentinel and carrying the author's parameter name with them.
-            _hidden = None
-            if hmap:
-                _hidden = [[hmap[k], k, kwargs.pop(k)]
-                           for k in list(kwargs) if k in hmap]
-
-            # Nest DynamicCombo inputs: flat dotted keys -> nested dicts.
-            # e.g. {"backend": "grid", "backend.smooth_normals": "true", ...}
-            #   -> {"backend": {"backend": "grid", "smooth_normals": "true"}, ...}
-            if dcp:
-                nested = {}
-                for k, v in kwargs.items():
-                    if '.' in k:
-                        parent, child = k.split('.', 1)
-                        if parent in dcp:
-                            nested.setdefault(parent, {})[child] = v
-                            continue
-                    if k in dcp:
-                        nested.setdefault(k, {})[k] = v
-                        continue
-                    nested[k] = v
-                kwargs = nested
+            # Hidden lift and DynamicCombo nesting, shared with the
+            # fingerprint so the two cannot drift.
+            kwargs, _hidden = _shape_v1_kwargs(kwargs, hmap, dcp)
 
             _d = self.__dict__ if hasattr(self, "__dict__") else None
             if _d is None:
@@ -1721,15 +1873,18 @@ def build_proxy_class(
     if _validate_cm is not None:
         attrs["VALIDATE_INPUTS"] = _validate_cm
 
-    # No staleness fingerprint. It hashed a dynamic input's value by
-    # the mtime of the file it resolved to, so overwriting a mesh in
-    # place re-executed instead of serving the cached result. It needed
-    # a per-input directory spec to resolve that path, and nothing knows
-    # one any more: which inputs are file listings is now the worker's
-    # answer at refresh time, not a fact the parent holds at build time.
-    # Attaching an mtime hash to every combo instead would change caching
-    # for nodes that have nothing to do with files. Recorded as a real
-    # loss rather than quietly dropped.
+    # The pack's own fingerprint, forwarded over the no-spawn ladder, and
+    # ONLY when the author wrote one (see the V3 builder and
+    # _forward_fingerprint). The V1 branch of execution.py looks up the
+    # UPPERCASE name on the class (:79, :93), so a classmethod. The method
+    # the WORKER calls is keyed on the scan's view of the real class: a V3
+    # node that fell back to this proxy is still asked for
+    # fingerprint_inputs, because that is the name it defines.
+    if meta.get("fingerprint_args") is not None:
+        attrs["IS_CHANGED"] = classmethod(_make_v1_fingerprint(
+            module_name, class_name, env_dir, node_name,
+            dynamic_combo_parents, _hidden_map,
+            "fingerprint_inputs" if meta.get("is_v3") else "IS_CHANGED"))
 
     # Create the class
     proxy_cls = type(class_name, (), attrs)

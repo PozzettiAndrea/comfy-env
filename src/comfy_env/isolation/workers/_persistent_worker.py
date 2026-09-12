@@ -9,6 +9,8 @@ import collections
 import weakref
 import time
 import importlib
+import inspect
+import math
 from types import SimpleNamespace
 
 # Enable faulthandler to dump traceback on SIGSEGV/SIGABRT/etc
@@ -900,6 +902,8 @@ def main():
                 folder_paths.set_temp_directory(_fps["temp_directory"])
             if _fps.get("user_directory"):
                 folder_paths.set_user_directory(_fps["user_directory"])
+            if _fps.get("models_dir"):
+                folder_paths.models_dir = _fps["models_dir"]
             # Rebuild folder_names_and_paths — the models search-paths
             # registry. Extensions were serialized as sorted list; rebuild
             # as set to match folder_paths' expected shape.
@@ -976,10 +980,21 @@ def main():
             except Exception:
                 pass
 
-    # Add our handler to the root logger
+    # Add our handler to the root logger -- and lower the LOGGER's level to
+    # match the host. A handler never sees a record the logger filtered
+    # first, and the root logger's default is WARNING, so without this every
+    # logging.info() a pack emits vanished on isolation while warning() and
+    # above kept working. The host resolves its level in setup_logger
+    # (app/logger.py: min of console and file levels, 15/DETAIL by default)
+    # and ships the number; a worker started outside a host falls back to
+    # INFO rather than staying silent.
     _socket_handler = SocketLogHandler()
     _socket_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
     logging.root.addHandler(_socket_handler)
+    try:
+        logging.root.setLevel(int(os.environ.get("COMFY_ENV_HOST_LOG_LEVEL", logging.INFO)))
+    except (TypeError, ValueError):
+        logging.root.setLevel(logging.INFO)
 
     wlog("[worker] Print and logging forwarding enabled")
 
@@ -1365,6 +1380,65 @@ def main():
         except Exception as _e:
             wlog(f"[worker] refresh_input_types failed: {_e}")
             return {"status": "error", "call_id": _cid, "error": str(_e)}
+
+    def _handle_fingerprint(request):
+        """Run a node's REAL IS_CHANGED / fingerprint_inputs on the class.
+
+        Rung one of the fingerprint ladder (metadata._forward_fingerprint).
+        The parent only asks a worker that is already alive and idle, sends
+        JSON primitives only, and treats every miss as "changed"; this side
+        keeps to the same rule in the other direction.
+
+        Reply contract: {"status": "ok", "value": <primitive>} when the pack
+        returned None, str, int, bool or a non-NaN float; {"status": "ok",
+        "value": None, "changed": True} when it returned NaN or anything
+        else (a dict, a list, a hash object, bytes). NaN travels as the flag,
+        never as a token, so the wire does not lean on json's NaN extension.
+        A raise, or an async fingerprint, is an error frame; the parent turns
+        both into "changed", which is what ComfyUI answers natively for a
+        raising fingerprint (execution.py:96-98).
+
+        Hidden dispatch mirrors the call_method path: the REAL class decides
+        V3 or V1 by whether it has PREPARE_CLASS_CLONE, never the proxy
+        kind. The V3 clone dies with this handler, so a credential never
+        sits on the real class. Called on the class, never an instance, as
+        ComfyUI does (execution.py:93); no _infer_mode, no state, no shm.
+
+        Never raises into the transport.
+        """
+        _cid = request.get("call_id")
+        try:
+            _mod = importlib.import_module(request["module"])
+            _cls = getattr(_mod, request["class_name"])
+            _name = request["method_name"]     # "IS_CHANGED" | "fingerprint_inputs"
+            _kw = dict(request.get("kwargs") or {})
+            _hidden = request.get("hidden") or []
+            _prep = getattr(_cls, "PREPARE_CLASS_CLONE", None)
+            if _hidden and _prep is not None:
+                _target = _prep({"hidden_inputs": {_s: _v for _s, _n, _v in _hidden}})
+            else:
+                for _s, _n, _v in _hidden:
+                    if _n:
+                        _kw[_n] = _v
+                _target = _cls
+            _fn = getattr(_target, _name)
+            _r = _fn(**_kw)
+            if inspect.isawaitable(_r):
+                # Close it so no "coroutine was never awaited" warning leaks.
+                try:
+                    _r.close()
+                except Exception:
+                    pass
+                return {"status": "error", "call_id": _cid,
+                        "error": f"{_name} is async; treated as changed"}
+            if _r is None or isinstance(_r, (str, int, bool)) \
+                    or (isinstance(_r, float) and not math.isnan(_r)):
+                return {"status": "ok", "call_id": _cid, "value": _r}
+            return {"status": "ok", "call_id": _cid, "value": None, "changed": True}
+        except Exception as _e:
+            wlog(f"[worker] fingerprint failed: {type(_e).__name__}: {_e}")
+            return {"status": "error", "call_id": _cid,
+                    "error": f"{type(_e).__name__}: {_e}"}
 
     def _handle_model_partial(request):
         """Byte-quantized partial load/unload against the REAL ModelPatcher.
@@ -2238,6 +2312,15 @@ def main():
 
         if request.get("method") == "refresh_input_types":
             transport.send(_handle_refresh_input_types(request))
+            continue
+
+        # Fingerprint: here in the `method` branch, never in the `type`
+        # branch below. That branch runs _prompt_marks_preamble, shm
+        # reconstruction and state sync, none of which a fingerprint may
+        # touch: it is asked before the prompt's first node runs, so
+        # retiring the previous prompt's marks here would be early.
+        if request.get("method") == "fingerprint":
+            transport.send(_handle_fingerprint(request))
             continue
 
         if request.get("method") == "model_to_device":
