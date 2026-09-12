@@ -921,36 +921,6 @@ def fetch_metadata(
             shutil.rmtree(script_dir, ignore_errors=True)
 
 
-# Dynamic combo refresh (parent-side directory rescan)
-#
-# Isolated nodes are represented in the main process by a proxy whose
-# INPUT_TYPES would otherwise return a snapshot captured once at scan time, so
-# combos built from a filesystem scan (e.g. "list the files in input/cad") never
-# refresh -- newly uploaded files never appear in the dropdown, even on reload.
-#
-# A node opts a combo into live refresh by attaching a marker to its options
-# dict (via io.Combo.Input(extra_dict=...)). Simple single-directory form:
-#     {"comfy_env_dynamic_dir": "cad",
-#      "comfy_env_exts": [".step", ".stp", ".iges", ".igs", ".brep"],
-#      "comfy_env_placeholder": "(no CAD files found in input/cad)"}
-# Richer multi-source form (e.g. a recursive subfolder plus the input root), where
-# each source is {"dir": <subdir>, "recursive": bool, "rel_to_input": bool}:
-#     {"comfy_env_dynamic_dir": "3d",   # trigger; ignored when sources given
-#      "comfy_env_sources": [
-#          {"dir": "3d", "recursive": True,  "rel_to_input": True},
-#          {"dir": "",   "recursive": False, "rel_to_input": False}],
-#      "comfy_env_exts": [...], "comfy_env_placeholder": "..."}
-# All dirs are relative to ComfyUI's input directory; rel_to_input controls whether
-# returned values are relative to the input root (e.g. "3d/foo.obj") or to the
-# scanned dir (e.g. "foo.obj"). The scan is plain os.listdir/os.walk of a ComfyUI
-# input folder -- it needs none of the node's isolated dependencies and runs
-# cheaply in the parent on every /object_info, keeping the fast read path off the
-# (possibly slow/hung) worker.
-
-_DYNAMIC_DIR_KEY = "comfy_env_dynamic_dir"
-_DYNAMIC_SOURCES_KEY = "comfy_env_sources"
-
-
 #: How long the options refresh will wait for a worker's lock before giving
 #: up. Short on purpose: this is cosmetic work on the /object_info path, and
 #: the answer if we lose the race is "use the cached list", which is what the
@@ -1371,15 +1341,6 @@ def _make_named_validate(names, varkw: bool = False, record: bool = False):
     ns: dict = {"_cev_record": _record_validate_kwargs}
     exec(f"def _cev_validate(cls, {sig}):\n{body}", ns)
     return classmethod(ns["_cev_validate"]), names
-
-
-_PACK_FOLDER_REGISTRY: Dict[str, Dict[str, Any]] = {}
-
-
-# provider-json -> (names, {dir: mtime_ns}). The mtime map records EVERY
-# directory visited (core's own cached_filename_list_ trick), so a change at
-# any depth invalidates; a re-check is a handful of stats, not a walk.
-_LIVE_CACHE: Dict[str, Any] = {}
 
 
 # Proxy class builder
