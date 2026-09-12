@@ -27,7 +27,7 @@ from ..debug import (META as _DBG_META, INPUTS_OUTPUTS as _DBG_IO,
 from .subenv import build_isolation_env  # leaf; was a function-body cycle-dodge from .wrap
 
 _DEBUG = _DBG_META  # backward compat -- all metadata debug logging uses META category
-_CACHE_VERSION = "20"  # Bump when _METADATA_SCRIPT or cache format changes
+_CACHE_VERSION = "21"  # Bump when _METADATA_SCRIPT or cache format changes
 
 #: Wall-clock cap on one pack's metadata scan (import + INPUT_TYPES for every
 #: node), seconds. Without it a pack that hangs at import held ComfyUI's
@@ -341,6 +341,38 @@ def _normalize_accel(value, node_name):
     return sorted(out)
 
 
+# Every UPPERCASE class attribute with a JSON-shaped value. What upstream's
+# /object_info reads off a V1 class is an open set (DESCRIPTION,
+# OUTPUT_TOOLTIPS, DEPRECATED, EXPERIMENTAL, DEV_ONLY, API_NODE,
+# SEARCH_ALIASES, ESSENTIALS_CATEGORY, HAS_INTERMEDIATE_OUTPUT at last
+# count, and the executor reads NOT_IDEMPOTENT for cache keys). A hand list
+# drifted twice already, so the scan sweeps instead: anything upstream adds
+# tomorrow comes along. Guarded getattr, because a V3 class that fell back
+# to the V1 proxy has classproperties (DESCRIPTION) that call GET_SCHEMA.
+_SWEEP_SKIP = {"INPUT_TYPES", "RELATIVE_PYTHON_MODULE"}   # callable / set by ComfyUI at load
+_SWEEP_MAX_ITEMS = 200                                     # a data table is not a flag
+
+def _json_shaped(v, depth=0):
+    if v is None or isinstance(v, (str, bool, int, float)):
+        return True
+    if depth == 0 and isinstance(v, (list, tuple)) and len(v) <= _SWEEP_MAX_ITEMS:
+        return all(_json_shaped(x, 1) for x in v)
+    return False
+
+def _sweep_class_attrs(cls):
+    out = {}
+    for attr in dir(cls):
+        if not attr.isupper() or attr.startswith("_") or attr in _SWEEP_SKIP:
+            continue
+        try:
+            v = getattr(cls, attr)
+        except Exception:
+            continue
+        if callable(v) or not _json_shaped(v):
+            continue
+        out[attr] = list(v) if isinstance(v, tuple) else v
+    return out
+
 nodes = {}
 for name, cls in _class_map.items():
     # The last of these lines in the captured stderr names the node that
@@ -362,6 +394,7 @@ for name, cls in _class_map.items():
         # "cuda" / "rocm" / "xpu" / "mps", or None. Meaning: the node
         # REQUIRES one of these backends at execution; absent = CPU-capable.
         "accelerator": _normalize_accel(getattr(cls, "ACCELERATOR", None), name),
+        "class_attrs": _sweep_class_attrs(cls),
     }
 
     # Validation / fingerprint contracts (captured as ARG NAMES, not code).
@@ -1790,6 +1823,14 @@ def build_proxy_class(
         attrs["OUTPUT_IS_LIST"] = tuple(meta["output_is_list"])
     if meta.get("input_is_list") is not None:
         attrs["INPUT_IS_LIST"] = meta["input_is_list"]
+
+    # Everything else upstream reads off the class: DESCRIPTION and
+    # OUTPUT_TOOLTIPS for the help panel, DEPRECATED/EXPERIMENTAL for the
+    # menu, SEARCH_ALIASES for search, NOT_IDEMPOTENT for cache keys, and
+    # whatever it adds next. Swept by the scan (see _sweep_class_attrs in
+    # the scan script); the builder's own settings above win.
+    for _k, _v in (meta.get("class_attrs") or {}).items():
+        attrs.setdefault(_k, _v)
 
     # V3 nodes wrap hidden values in tuples, e.g. ("UNIQUE_ID",), but V1
     # hidden processing in execution.py compares bare strings.  Unwrap them
