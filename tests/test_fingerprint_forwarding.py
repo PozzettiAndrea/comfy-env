@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+import comfy_env.isolation.pool as _pool
+
 from test_call_scope import _worker_source
 from test_live_combo_options import _Worker, pool  # noqa: F401
 from test_metadata_json_payload import _run_scan
@@ -54,21 +56,21 @@ def _forward(md, **over):  # noqa: F811
 
 def test_rung_1_returns_the_packs_own_answer(md, pool):  # noqa: F811
     """Catches a ladder that answers "changed" even when the worker spoke."""
-    pool["/env"] = (_Worker(OK), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker(OK), 1)
     assert _forward(md) == "mtime:42"
 
 
 def test_rung_2_busy_answers_changed_not_unchanged(md, pool):  # noqa: F811
     """Catches the dropdown ladder's miss answer (None, or False) copied
     over: here a miss must be NaN, never a stable key."""
-    pool["/env"] = (_Worker("busy"), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker("busy"), 1)
     got = _forward(md)
     assert _isnan(got)
     assert got is not None and got is not False
 
 
 def test_rung_2_dead_answers_changed(md, pool):  # noqa: F811
-    pool["/env"] = (_Worker("dead"), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker("dead"), 1)
     assert _isnan(_forward(md))
 
 
@@ -87,12 +89,12 @@ def test_rung_3_no_worker_answers_changed_and_never_spawns_one(md, pool, monkeyp
 def test_a_raising_transport_answers_changed(md, pool):  # noqa: F811
     """Catches an implementation that lets a socket death out into
     IsChangedCache.get."""
-    pool["/env"] = (_Worker(RuntimeError("socket died")), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker(RuntimeError("socket died")), 1)
     assert _isnan(_forward(md))
 
 
 def test_an_error_frame_answers_changed(md, pool):  # noqa: F811
-    pool["/env"] = (_Worker({"status": "error", "error": "boom"}), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker({"status": "error", "error": "boom"}), 1)
     assert _isnan(_forward(md))
 
 
@@ -100,7 +102,7 @@ def test_the_lock_wait_is_short_and_the_frame_is_exact(md, pool):  # noqa: F811
     """Catches a second lock budget drifting from the dropdown ladder's, and
     a frame the worker's _handle_fingerprint would not understand."""
     w = _Worker(OK)
-    pool["/env"] = (w, 1)
+    pool["/env"] = _pool.WorkerRecord(w, 1)
     _forward(md, kwargs={"path": "a"}, hidden=[["UNIQUE_ID", "node_id", "7"]])
     (method, lock_timeout, params) = w.calls[0]
     assert method == "fingerprint"
@@ -131,14 +133,14 @@ def test_a_non_primitive_input_is_changed_and_never_sent(md, pool):  # noqa: F81
     """Catches an implementation that serializes first and asks second, or
     that runs prepare_for_ipc_recursive over the inputs."""
     w = _Worker(OK)
-    pool["/env"] = (w, 1)
+    pool["/env"] = _pool.WorkerRecord(w, 1)
     assert _isnan(_forward(md, kwargs={"image": _Untouchable(), "seed": 1}))
     assert w.calls == []
 
 
 def test_a_non_primitive_hidden_value_is_changed_and_never_sent(md, pool):  # noqa: F811
     w = _Worker(OK)
-    pool["/env"] = (w, 1)
+    pool["/env"] = _pool.WorkerRecord(w, 1)
     assert _isnan(_forward(md, hidden=[["DYNPROMPT", None, _Untouchable()]]))
     assert w.calls == []
 
@@ -146,19 +148,19 @@ def test_a_non_primitive_hidden_value_is_changed_and_never_sent(md, pool):  # no
 def test_a_non_primitive_reply_is_changed(md, pool):  # noqa: F811
     """Catches a host that trusts the reply shape: primitives only, in both
     directions."""
-    pool["/env"] = (_Worker({"status": "ok", "value": {"h": 1}}), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker({"status": "ok", "value": {"h": 1}}), 1)
     assert _isnan(_forward(md))
 
 
 def test_changed_flag_beats_value(md, pool):  # noqa: F811
-    pool["/env"] = (_Worker({"status": "ok", "value": "x", "changed": True}), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker({"status": "ok", "value": "x", "changed": True}), 1)
     assert _isnan(_forward(md))
 
 
 def test_none_is_a_legitimate_unchanged_answer(md, pool):  # noqa: F811
     """Catches an implementation that keys on falsiness: None is a stable
     cache key natively (None == None), so it must come back as None."""
-    pool["/env"] = (_Worker({"status": "ok", "value": None}), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker({"status": "ok", "value": None}), 1)
     got = _forward(md)
     assert got is None
 
@@ -167,7 +169,7 @@ def test_nested_json_inputs_are_primitive_enough(md, pool):  # noqa: F811
     """Catches a rung-0 check that refuses dicts: a PROMPT hidden value is a
     dict of dicts and must reach the worker."""
     w = _Worker(OK)
-    pool["/env"] = (w, 1)
+    pool["/env"] = _pool.WorkerRecord(w, 1)
     prompt = {"7": {"class_type": "KSampler", "inputs": {"seed": 42, "l": [1, "a", None]}}}
     assert _forward(md, hidden=[["PROMPT", "prompt", prompt]]) == "mtime:42"
     assert len(w.calls) == 1
@@ -209,7 +211,7 @@ def test_the_v1_fallback_of_a_v3_node_asks_for_fingerprint_inputs(md, pool, tmp_
     the scan's view of the real class: a V3 node behind a V1 proxy defines
     fingerprint_inputs, not IS_CHANGED."""
     w = _Worker(OK)
-    pool[str(tmp_path)] = (w, 1)
+    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
     m = _meta(True)
     m.pop("node_info_v1")          # forces the V1 builder
     m["fingerprint_args"] = ["x"]
@@ -228,7 +230,7 @@ def test_the_proxy_accepts_inputs_the_author_did_not_name(md, pool, tmp_path, is
     passes every declared input as f(**inputs) and never reads the argspec,
     so the host must not raise TypeError on an unnamed one."""
     w = _Worker(OK)
-    pool[str(tmp_path)] = (w, 1)
+    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
     Proxy = _build_with(md, is_v3, tmp_path, fingerprint_args=["path"])
     fn = Proxy.fingerprint_inputs if is_v3 else Proxy.IS_CHANGED
     assert fn(path="a.obj", seed=1) == "mtime:42"
@@ -254,7 +256,7 @@ def test_v1_hidden_inputs_ride_the_hidden_field_not_kwargs(md, pool, tmp_path): 
     worker would then hand a V3 fallback node prompt= and die), and one that
     keys on the spelling `unique_id` instead of the sentinel."""
     w = _Worker(OK)
-    pool[str(tmp_path)] = (w, 1)
+    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
     Proxy = _build_with(
         md, False, tmp_path, fingerprint_args=["x"],
         input_types={"required": {"x": ("INT", {})},
@@ -274,7 +276,7 @@ def test_v1_dotted_dynamiccombo_keys_are_nested_like_the_real_call(md, pool, tmp
     """Catches a fingerprint factory that skips _shape_v1_kwargs: the real
     function receives `backend` as a nested dict, so the fingerprint must."""
     w = _Worker(OK)
-    pool[str(tmp_path)] = (w, 1)
+    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
     combo = ("COMFY_DYNAMICCOMBO_V3", {"options": [
         {"key": "grid", "inputs": {"required": {"smooth_normals": ("BOOLEAN", {})}}}]})
     Proxy = _build_with(
@@ -291,7 +293,7 @@ def test_v3_hidden_are_read_off_the_clone(md, pool, tmp_path):  # noqa: F811
     import types
 
     w = _Worker(OK)
-    pool[str(tmp_path)] = (w, 1)
+    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
     Proxy = _build_with(md, True, tmp_path, fingerprint_args=["x"])
     Clone = type("Clone", (Proxy,), {})
     Clone.hidden = types.SimpleNamespace(

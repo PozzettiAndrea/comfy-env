@@ -20,6 +20,8 @@ import inspect
 
 import pytest
 
+import comfy_env.isolation.pool as _pool
+
 from comfy_env.isolation.metadata import (
     _combo_input_names,
     _make_named_validate,
@@ -58,18 +60,18 @@ FRESH = {"options": {"required": {"mesh": ["a.obj", "b.obj"]}}, "status": "ok"}
 
 
 def test_rung_1_alive_and_idle_answers(pool):
-    pool["/env"] = (_Worker(FRESH), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker(FRESH), 1)
     assert _refresh_combo_options("/env", "m", "C") == FRESH["options"]
 
 
 def test_rung_2_busy_falls_through(pool):
     # send_command_no_spawn returns the sentinel string rather than blocking.
-    pool["/env"] = (_Worker("busy"), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker("busy"), 1)
     assert _refresh_combo_options("/env", "m", "C") is None
 
 
 def test_rung_2_dead_falls_through(pool):
-    pool["/env"] = (_Worker("dead"), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker("dead"), 1)
     assert _refresh_combo_options("/env", "m", "C") is None
 
 
@@ -83,12 +85,12 @@ def test_rung_3_no_worker_never_spawns_one(pool):
 def test_a_raising_worker_is_not_a_raising_dropdown(pool):
     # A raise inside INPUT_TYPES makes core omit the node from /object_info
     # entirely. A stale dropdown is strictly better than a vanished node.
-    pool["/env"] = (_Worker(RuntimeError("socket died")), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker(RuntimeError("socket died")), 1)
     assert _refresh_combo_options("/env", "m", "C") is None
 
 
 def test_worker_error_reply_falls_through(pool):
-    pool["/env"] = (_Worker({"status": "error", "error": "boom"}), 1)
+    pool["/env"] = _pool.WorkerRecord(_Worker({"status": "error", "error": "boom"}), 1)
     assert _refresh_combo_options("/env", "m", "C") is None
 
 
@@ -96,7 +98,7 @@ def test_the_lock_wait_is_short(pool):
     # Cosmetic work on the /object_info path must never stall ComfyUI: if we
     # lose the race the answer is "use the cache", which is where we started.
     w = _Worker(FRESH)
-    pool["/env"] = (w, 1)
+    pool["/env"] = _pool.WorkerRecord(w, 1)
     _refresh_combo_options("/env", "m", "C")
     (method, lock_timeout, params) = w.calls[0]
     assert method == "refresh_input_types"
@@ -277,7 +279,7 @@ def test_input_types_returns_the_cache_when_nothing_answers(pool):
 
 
 def test_input_types_goes_live_when_a_worker_answers(pool):
-    pool["/nonexistent"] = (_Worker(FRESH), 1)
+    pool["/nonexistent"] = _pool.WorkerRecord(_Worker(FRESH), 1)
     cls = _build(_v1_meta())
     got = cls.INPUT_TYPES()
     assert got["required"]["mesh"][0] == ["a.obj", "b.obj"]

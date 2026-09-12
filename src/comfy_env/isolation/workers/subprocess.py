@@ -202,6 +202,13 @@ class SubprocessWorker(Worker):
         # worker's budget callback evicting this worker's proxy) acquire it.
         self._mem_lock = threading.Lock()
         self._last_new_models = []  # Auto-detected models from last call
+        # Harvested per reply by _send_request and read lock-free by the pool;
+        # declared here so a fresh process starts with nothing inherited
+        # (pool._retire_worker_state resets them on a restart).
+        self._last_vram_report = None
+        self._last_state_out = None
+        self._last_held_bytes = None
+        self._pin_release_deferred = None
         self._callback_handlers: Dict[str, Callable] = {}  # Bidirectional RPC callbacks
         self._call_counter = 0  # Monotonic call ID for request correlation
         self._last_ok = 0.0  # time of last successful round-trip (gates the health ping)

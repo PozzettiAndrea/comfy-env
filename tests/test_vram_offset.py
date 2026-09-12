@@ -272,7 +272,6 @@ def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
     pool, mm, calls = pool_mod
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
-    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     pool._WORKER_PATCHERS.clear()
 
     class _W:
@@ -281,7 +280,7 @@ def test_ask_excludes_the_requesters_own_reserve_charge(pool_mod, monkeypatch):
 
         def is_alive(self):
             return True
-    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": (_W(), 1)})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": pool.WorkerRecord(_W(), 1)})
     mm.extra_reserved_memory = lambda: 8 * GB
 
     calls["free_memory"].clear()
@@ -315,8 +314,8 @@ class _AskWorker:
 
 def _ask_fixture(pool, monkeypatch, workers, free_after_evict):
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
-    monkeypatch.setattr(pool, "_WORKER_POOL", {k: (w, 1) for k, w in workers.items()})
-    monkeypatch.setattr(pool, "_WORKER_HELD", {k: 8 * GB for k in workers})
+    recs = {k: pool.WorkerRecord(w, 1, held=8 * GB) for k, w in workers.items()}
+    monkeypatch.setattr(pool, "_WORKER_POOL", recs)
     monkeypatch.setattr(pool, "_worker_charges", lambda: {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: free_after_evict)
     monkeypatch.setattr(pool, "_publish_reserve", lambda **kw: 0)
@@ -370,7 +369,7 @@ def test_a_freed_receipt_lowers_that_workers_high_water(pool_mod, monkeypatch):
 
     pool._ask_idle_workers(4 * GB, requester_key="req")
 
-    assert pool._WORKER_HELD["idle"] == 5 * GB
+    assert pool._WORKER_POOL["idle"].held == 5 * GB
 
 
 def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
@@ -382,7 +381,6 @@ def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
     pool, mm, calls = pool_mod
     monkeypatch.setattr(pool, "_OVERHEAD_REPORTS", {})
     monkeypatch.setattr(pool, "_true_device_free", lambda dev: mm._blind_free)
-    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     pool._WORKER_PATCHERS.clear()
 
     class _W:
@@ -391,7 +389,7 @@ def test_the_reply_discounts_the_requesters_own_charge(pool_mod, monkeypatch):
 
         def is_alive(self):
             return True
-    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": (_W(), 1)})
+    monkeypatch.setattr(pool, "_WORKER_POOL", {"req": pool.WorkerRecord(_W(), 1)})
     mm.EXTRA_RESERVED_VRAM = 8 * GB
     mm.extra_reserved_memory = lambda: mm.EXTRA_RESERVED_VRAM
 

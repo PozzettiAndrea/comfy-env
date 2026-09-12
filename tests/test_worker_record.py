@@ -55,15 +55,12 @@ def _ledgers():
 
 def _seed(key, worker):
     """Put the key into every ledger the way the running code would."""
-    pool._WORKER_POOL[key] = (worker, 1)
+    pool._WORKER_POOL[key] = pool.WorkerRecord(worker, 1, held=123, last_activity=1.0,
+                                               last_prompt="p1", mm_reported=True)
     pool._WORKER_PATCHERS[key] = {"m": object()}
-    pool._WORKER_HELD[key] = 123
-    pool._LAST_ACTIVITY[key] = 1.0
-    pool._LAST_PROMPT[key] = "p1"
     pool._PIN_REPORTS[key] = {"pinned": 1}
     pool._OVERHEAD_REPORTS[key] = {"excess": 1}
     pool._PIN_REGRESSION_SEEN[key] = 1
-    pool._MEMORY_MANAGER_REPORTED.add(key)
 
 
 def _keyed_anywhere(key):
@@ -96,6 +93,9 @@ def test_restart_path_forgets_everything(clean):
     # the pool entry itself is kept (same object, new process); every
     # per-process ledger is gone, and the patchers moved to the stale list
     assert _keyed_anywhere("/env/a") == ["_WORKER_POOL"]
+    rec = pool._WORKER_POOL["/env/a"]
+    assert (rec.held, rec.last_activity, rec.last_prompt, rec.mm_reported) == (0, None, None, False)
+    assert rec.worker is w, "the record is replaced, the worker object is kept"
     assert len(pool._STALE_PATCHERS) == 1
     assert w._last_vram_report is None and w._last_held_bytes is None
 
@@ -113,4 +113,40 @@ def test_dead_branch_forgets_everything(clean, monkeypatch, tmp_path):
     assert worker is fresh
     assert _keyed_anywhere(str(tmp_path)) == ["_WORKER_POOL"], \
         "the replacement inherited the dead process's ledgers"
-    assert pool._WORKER_HELD.get(str(tmp_path), 0) == 0
+    rec = pool._WORKER_POOL[str(tmp_path)]
+    assert rec.worker is fresh and rec.held == 0 and rec.mm_reported is False
+
+
+def test_record_unpacks_like_the_old_tuple(clean):
+    w = _FakeWorker()
+    pool._WORKER_POOL["k"] = pool.WorkerRecord(w, 3)
+    worker, gen = pool._WORKER_POOL["k"]
+    assert worker is w and gen == 3 and pool._WORKER_POOL["k"][0] is w
+
+
+def test_respawn_replaces_the_record_object(clean):
+    """Readers that snapshotted the pool keep a consistent pair; the new
+    process gets a new row."""
+    w = _FakeWorker()
+    old = pool.WorkerRecord(w, 1, held=9)
+    pool._WORKER_POOL["k"] = old
+    pool._cleanup_stale_patchers("k", w)
+    assert pool._WORKER_POOL["k"] is not old
+    assert old.held == 9, "the retired row is left alone, not zeroed under a reader"
+
+
+def test_metadata_reaches_the_pool_only_through_the_accessor():
+    import ast
+    from pathlib import Path
+    import comfy_env.isolation.metadata as md
+    tree = ast.parse(Path(md.__file__).read_text(encoding="utf-8"))
+    names = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module == "pool":
+            names |= {a.name for a in n.names}
+    assert not any(x.startswith("_WORKER") for x in names), names
+    assert "worker_for" in names
+
+
+def test_worker_for_never_creates(clean):
+    assert pool.worker_for("/nope") is None and pool._WORKER_POOL == {}

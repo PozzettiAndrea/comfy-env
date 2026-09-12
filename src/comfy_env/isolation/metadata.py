@@ -960,11 +960,10 @@ def _refresh_combo_options(env_dir, module_name, class_name):
     stale dropdown.
     """
     try:
-        from .pool import _WORKER_POOL
-        entry = _WORKER_POOL.get(str(env_dir))
-        if entry is None:
+        from .pool import worker_for
+        worker = worker_for(env_dir)
+        if worker is None:
             return None                      # rung 3: nothing to ask
-        worker = entry[0]
         resp = worker.send_command_no_spawn(
             "refresh_input_types", lock_timeout=_REFRESH_LOCK_TIMEOUT,
             module=module_name, class_name=class_name)
@@ -1047,14 +1046,14 @@ def _forward_fingerprint(env_dir, module_name, class_name, method_name,
     try:
         if not _all_json_primitive(kwargs) or not _all_json_primitive(hidden):
             return _CHANGED                                 # rung 0
-        from .pool import _WORKER_POOL
-        entry = _WORKER_POOL.get(str(env_dir))
-        if entry is None:
+        from .pool import worker_for
+        worker = worker_for(env_dir)
+        if worker is None:
             if _DBG_IO:
                 _log(f"[comfy-env] fingerprint for {node_name}: no idle "
                      f"worker, treating as changed")
             return _CHANGED                                 # rung 3
-        resp = entry[0].send_command_no_spawn(
+        resp = worker.send_command_no_spawn(
             "fingerprint", lock_timeout=_REFRESH_LOCK_TIMEOUT,
             module=module_name, class_name=class_name,
             method_name=method_name, kwargs=kwargs, hidden=hidden or [])

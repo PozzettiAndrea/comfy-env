@@ -30,7 +30,6 @@ def pool_mod(monkeypatch):
     from comfy_env.isolation import pool
     monkeypatch.setattr(pool, "_RESERVE_BASE", None)
     monkeypatch.setattr(pool, "_RESERVE_PUBLISHED", 0)
-    monkeypatch.setattr(pool, "_WORKER_HELD", {})
     monkeypatch.setattr(pool, "_WORKER_POOL", {})
     monkeypatch.setattr(pool, "_device_total_bytes", lambda: 24 * GB)
     monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: False)
@@ -52,7 +51,7 @@ class _Patcher:
 
 
 def _add_worker(pool, key, loaded=0, alive=True):
-    pool._WORKER_POOL[key] = (_Worker(alive), 1)
+    pool._WORKER_POOL[key] = pool.WorkerRecord(_Worker(alive), 1)
     if loaded:
         pool._WORKER_PATCHERS[key] = {"m": _Patcher(loaded)}
 
@@ -145,11 +144,11 @@ class TestShrinkRule:
         pool, _ = pool_mod
         _add_worker(pool, "a", loaded=6 * GB)
         pool._publish_reserve()
+        pool._forget_reserve("a")
+        assert pool._WORKER_POOL["a"].held == 0
         pool._WORKER_POOL.pop("a")
         pool._WORKER_PATCHERS.pop("a", None)
-        pool._forget_reserve("a")
         assert pool._publish_reserve(shrink_allowed=True) == 400 * 1024 ** 2
-        assert "a" not in pool._WORKER_HELD
 
 
 def test_publish_never_raises_without_comfy(monkeypatch):
@@ -203,7 +202,7 @@ class TestPagerForward:
         pool, mm = pool_mod
         cmm, control, cli = aimdo_stub
         monkeypatch.setattr(pool, "_AIMDO_SEED", None)
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(2 * GB), 1)})
         published = pool._publish_reserve()
         from comfy_env.reserve import AIMDO_DEFAULT_HEADROOM
         assert published == mm.EXTRA_RESERVED_VRAM
@@ -216,7 +215,7 @@ class TestPagerForward:
         cmm, control, cli = aimdo_stub
         cli.args.reserve_vram = 2.0
         monkeypatch.setattr(pool, "_AIMDO_SEED", None)
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(1 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(1 * GB), 1)})
         published = pool._publish_reserve()
         assert control.calls == [2 * GB + (published - 400 * 1024 ** 2)]
 
@@ -226,7 +225,7 @@ class TestPagerForward:
         pool, mm = pool_mod
         cmm, control, cli = aimdo_stub
         cmm.aimdo_enabled = False
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(2 * GB), 1)})
         pool._publish_reserve()
         assert control.calls == []
 
@@ -240,7 +239,7 @@ class TestPagerForward:
         control.lib = types.SimpleNamespace(
             set_simple_vram_headroom=lambda b: control.calls.append(("lib", int(b))))
         monkeypatch.setattr(pool, "_AIMDO_SEED", None)
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(2 * GB), 1)})
         pool._publish_reserve()
         assert len(control.calls) == 1 and control.calls[0][0] == "lib"
 
@@ -254,7 +253,7 @@ class TestPagerForward:
             raise RuntimeError("comfy-aimdo is not initialized")
         control.set_simple_vram_headroom = boom
         monkeypatch.setattr(pool, "_blind_free_is_process_local", lambda: True)
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(2 * GB), 1)})
         published = pool._publish_reserve()
         assert published > 400 * 1024 ** 2
         assert mm.EXTRA_RESERVED_VRAM == published
@@ -264,7 +263,7 @@ class TestPagerForward:
         ComfyUI write: only on change."""
         pool, mm = pool_mod
         cmm, control, cli = aimdo_stub
-        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": (_HeldWorker(2 * GB), 1)})
+        monkeypatch.setattr(pool, "_WORKER_POOL", {"w": pool.WorkerRecord(_HeldWorker(2 * GB), 1)})
         pool._publish_reserve()
         pool._publish_reserve()
         assert len(control.calls) == 1

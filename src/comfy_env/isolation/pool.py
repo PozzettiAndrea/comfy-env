@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,7 +33,50 @@ _CLEANUP_DONE = False
 # Persistent worker pool -- one worker per isolation env, reused across calls.
 # Workers auto-restart on crash (native segfault, etc.).
 # ---------------------------------------------------------------------------
-_WORKER_POOL: Dict[str, Any] = {}  # str(env_dir) -> (SubprocessWorker, generation)
+@dataclass
+class WorkerRecord:
+    """Everything the pool knows about one worker PROCESS, in one row.
+
+    Born in one place (_get_or_create_worker, after verify_transport) and
+    REPLACED, never mutated in place, when the process is replaced: readers
+    that took a snapshot (`entries = dict(_WORKER_POOL)`) keep a consistent
+    (worker, generation) pair, exactly as the old tuple gave them. A late
+    write into a retired record is lost, which is correct for `held` (the
+    process is gone) and harmless for `last_activity` (the idle planner
+    treats None as not-idle).
+
+    Lock discipline is unchanged by the record: _POOL_LOCK guards
+    membership of _WORKER_POOL only. Every field here is a plain attribute
+    read lock-free by the reserve arithmetic and the budget callback, which
+    run on other workers' call threads and must not wait behind a spawn.
+    There is no per-record lock; do not add one.
+
+    Iterable and indexable as (worker, generation), because that tuple was a
+    de facto API (`worker, gen = entry`, `entry[0]`) across the pool, the
+    proxies and the tests.
+
+    Not in the record, on purpose: the patchers (_WORKER_PATCHERS, their own
+    lifecycle with the stale list and the generation filter), and the
+    memory floor's report ledgers (_PIN_REPORTS carries a "host" row and is
+    consumed whole by state_sync; _OVERHEAD_REPORTS and _PIN_REGRESSION_SEEN
+    likewise). Those are retired per key by _retire_worker_state.
+    """
+    worker: Any
+    generation: int
+    held: int = 0                          # reserve charge, bytes
+    last_activity: Optional[float] = None  # time.monotonic() of the last call boundary
+    last_prompt: Any = None                # the prompt that last used it
+    mm_reported: bool = False              # memory-manager line printed once
+
+    def __iter__(self):
+        yield self.worker
+        yield self.generation
+
+    def __getitem__(self, i):
+        return (self.worker, self.generation)[i]
+
+
+_WORKER_POOL: Dict[str, WorkerRecord] = {}  # str(env_dir) -> WorkerRecord
 _WORKER_PATCHERS: Dict[str, Dict[str, Any]] = {}  # str(env_dir) -> {model_id: SubprocessModelPatcher}
 _STALE_PATCHERS: List[Any] = []  # Keeps stale patchers alive until free_memory finishes
 _POOL_LOCK = threading.Lock()
@@ -498,14 +542,11 @@ _RESERVE_PUBLISHED = 0
 #: What each worker currently holds on the card, as IT measured it. Current,
 #: not a high water mark: the reserve declares only what the host cannot see,
 #: and reclaim from a worker is what covers the rest.
-_WORKER_HELD: Dict[str, int] = {}
 
 
 #: When each worker last finished a call, for the idle release policy.
-_LAST_ACTIVITY: Dict[str, float] = {}
 #: Which prompt each worker last served, so a worker whose prompt is over is
 #: released at once instead of after the idle timer.
-_LAST_PROMPT: Dict[str, Any] = {}
 
 #: The host pager's own headroom seed (--reserve-vram, else aimdo's default),
 #: read once: the reserve is forwarded into the pager as seed plus what
@@ -537,10 +578,13 @@ def _current_prompt():
 
 def _note_activity(env_dir) -> None:
     """Mark a worker as active now. Cheap enough for every node boundary."""
-    _LAST_ACTIVITY[str(env_dir)] = time.monotonic()
+    rec = _WORKER_POOL.get(str(env_dir))
+    if rec is None:
+        return
+    rec.last_activity = time.monotonic()
     prompt = _current_prompt()
     if prompt is not None:
-        _LAST_PROMPT[str(env_dir)] = prompt
+        rec.last_prompt = prompt
 
 
 def _idle_sweep_loop() -> None:
@@ -598,20 +642,22 @@ def _release_idle_workers() -> None:
         with _POOL_LOCK:
             entries = dict(_WORKER_POOL)
         states = {}
-        for key, (worker, _gen) in entries.items():
+        for key, rec in entries.items():
+            worker = rec.worker
             states[key] = {
                 "alive": worker.is_alive(),
                 "advertises": getattr(worker, "supports_full_release", False),
                 "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
-                "idle_since": _LAST_ACTIVITY.get(key),
-                "holding": _WORKER_HELD.get(key, 0) > 0,
-                "last_prompt": _LAST_PROMPT.get(key),
+                "idle_since": rec.last_activity,
+                "holding": rec.held > 0,
+                "last_prompt": rec.last_prompt,
             }
         due = state_sync.plan_idle_release(
             states, time.monotonic(), current_prompt=_current_prompt(),
             under_pressure=_card_is_tight())
         for key in due:
-            worker, _gen = entries[key]
+            rec = entries[key]
+            worker = rec.worker
             try:
                 reply = worker.send_command_no_spawn("full_release",
                                                      lock_timeout=2.0)
@@ -621,9 +667,9 @@ def _release_idle_workers() -> None:
             if reply == "busy":
                 continue
             receipt = (reply or {}).get("receipt") if isinstance(reply, dict) else None
-            _WORKER_HELD[key] = 0
-            _LAST_ACTIVITY[key] = time.monotonic()
-            _LAST_PROMPT.pop(key, None)
+            rec.held = 0
+            rec.last_activity = time.monotonic()
+            rec.last_prompt = None
             _log(f"[comfy-env] idle release: {Path(key).name} gave back "
                  f"{(receipt or {}).get('freed_bytes', 0) / 1e9:.2f}GB")
         if due:
@@ -643,8 +689,8 @@ def _worker_charges() -> Dict[str, int]:
     """
     process_local = _blind_free_is_process_local()
     charges: Dict[str, int] = {}
-    for key, entry in list(_WORKER_POOL.items()):
-        worker = entry[0] if entry else None
+    for key, rec in list(_WORKER_POOL.items()):
+        worker = rec.worker
         if worker is not None and not worker.is_alive():
             continue
         residency = 0
@@ -661,7 +707,7 @@ def _worker_charges() -> Dict[str, int]:
                         patcher.model, "model_loaded_weight_memory", 0))
                 except Exception:
                     pass
-        _WORKER_HELD[key] = residency
+        rec.held = residency
         charges[key] = reserve.charge(residency, process_local,
                                       floor=_WORKER_FIXED_VRAM_COST)
     return charges
@@ -903,19 +949,21 @@ def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
     with _POOL_LOCK:
         entries = dict(_WORKER_POOL)
     states = {}
-    for key, (worker, _gen) in entries.items():
+    for key, rec in entries.items():
+        worker = rec.worker
         states[key] = {
             "alive": worker.is_alive(),
             "advertises": getattr(worker, "supports_partial_release", False),
             "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
-            "held": _WORKER_HELD.get(key, 0),
+            "held": rec.held,
         }
     plan = state_sync.plan_pressure_release(states, shortfall,
                                             requester=str(requester_key)
                                             if requester_key else None)
     freed_total = 0
     for key, ask in plan:
-        worker, _gen = entries[key]
+        rec = entries[key]
+        worker = rec.worker
         try:
             reply = worker.send_command_no_spawn("partial_release", size=int(ask),
                                                  lock_timeout=2.0)
@@ -929,7 +977,7 @@ def _ask_idle_workers(shortfall: int, requester_key=None) -> int:
         freed_total += freed
         # The worker measured this much gone, so our copy of what it holds
         # follows. The next census overwrites it either way.
-        _WORKER_HELD[key] = max(0, _WORKER_HELD.get(key, 0) - freed)
+        rec.held = max(0, rec.held - freed)
         _log(f"[comfy-env] admission ask: {Path(key).name} gave back "
              f"{freed / 1e9:.2f}GB of {ask / 1e9:.2f}GB asked")
     if freed_total:
@@ -988,7 +1036,9 @@ def _forget_reserve(env_dir) -> None:
     Called on real worker removal only, because a dead worker's memory is
     gone with it and nothing should still be declared for it.
     """
-    _WORKER_HELD.pop(str(env_dir), None)
+    rec = _WORKER_POOL.get(str(env_dir))
+    if rec is not None:
+        rec.held = 0
 
 
 def _worker_held_bytes() -> int:
@@ -1019,7 +1069,7 @@ def _worker_held_bytes() -> int:
     keys = set(_WORKER_POOL) | {k for k, v in list(_WORKER_PATCHERS.items()) if v}
     for key in keys:
         entry = _WORKER_POOL.get(key)
-        worker = entry[0] if entry else None
+        worker = entry.worker if entry else None
         models = []
         for p in list(_WORKER_PATCHERS.get(key, {}).values()):
             try:
@@ -1178,7 +1228,7 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     need += _WORKER_FIXED_VRAM_COST + requester_excess
 
     _inflight = sum(1 for _e in list(_WORKER_POOL.values())
-                    if getattr(_e[0], "_calls_in_flight", 0) > 0)
+                    if getattr(_e.worker, "_calls_in_flight", 0) > 0)
     if need > true_free:
         # Always on: this is the moment the host is about to evict on a
         # worker's behalf (or fail to). Silent, it is indistinguishable from
@@ -1269,7 +1319,12 @@ def _cleanup_stale_patchers(env_dir, worker=None):
     The stale references are cleared on the next _register_new_patchers call.
     """
     key = str(env_dir)
-    _retire_worker_state(key, worker)   # everything per-process, one place
+    rec = _WORKER_POOL.get(key)
+    if rec is not None:
+        # a fresh row for the fresh process; readers holding the old one
+        # keep a consistent view and their late writes are lost on purpose
+        _WORKER_POOL[key] = WorkerRecord(rec.worker, rec.generation)
+    _retire_worker_state(key, worker)   # the shared ledgers, one place
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
@@ -1501,6 +1556,14 @@ def _check_host_contract() -> None:
 
 
 
+def worker_for(env_dir) -> Optional[Any]:
+    """The live SubprocessWorker for an env, or None. Lock-free by design:
+    the callers are the no-spawn ladders on the aiohttp loop, which must
+    never wait behind a spawn. Never creates one."""
+    rec = _WORKER_POOL.get(str(env_dir))
+    return rec.worker if rec is not None else None
+
+
 def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
                           env_vars: Optional[dict] = None,
                           health_check_timeout: float = DEFAULT_HEALTH_CHECK_TIMEOUT):
@@ -1568,7 +1631,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         # doctrine with an asterisk (the old COMFY_ENV_TRANSPORT_PROBE=0
         # opt-out meant "assume every tier works, unverified").
         worker.verify_transport()
-        _WORKER_POOL[key] = (worker, gen)
+        _WORKER_POOL[key] = WorkerRecord(worker, gen)
     # Deliberately outside _POOL_LOCK: this imports comfy modules and formats
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
@@ -1580,7 +1643,6 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 
 #: Env dirs already reported, so the routine line fires once per env rather
 #: than once per node execution.
-_MEMORY_MANAGER_REPORTED: set = set()
 
 
 
@@ -1595,9 +1657,11 @@ def _report_memory_manager(worker, env_dir) -> None:
     nothing announcing it. See :mod:`comfy_env.memory_manager`.
     """
     key = str(env_dir)
-    if key in _MEMORY_MANAGER_REPORTED:
-        return
-    _MEMORY_MANAGER_REPORTED.add(key)
+    rec = _WORKER_POOL.get(key)
+    if rec is not None:
+        if rec.mm_reported:
+            return
+        rec.mm_reported = True
     try:
         from ..memory_manager import describe
 
@@ -1691,13 +1755,12 @@ def _retire_worker_state(env_dir, worker=None) -> None:
     because the two callers differ on whether they must stay alive.
     """
     key = str(env_dir)
-    _MEMORY_MANAGER_REPORTED.discard(key)
     _PIN_REPORTS.pop(key, None)
     _OVERHEAD_REPORTS.pop(key, None)
     _PIN_REGRESSION_SEEN.pop(key, None)
-    _forget_reserve(key)
-    _LAST_ACTIVITY.pop(key, None)
-    _LAST_PROMPT.pop(key, None)
+    # The record's own per-process fields (held, activity, prompt, reported)
+    # go with the record: the crash path pops it, the restart path replaces
+    # it. Neither writes into the retired row.
     if worker is not None:
         for attr in ("_last_vram_report", "_last_held_bytes", "_pin_release_deferred"):
             try:
@@ -1710,13 +1773,12 @@ def _remove_worker(env_dir):
     """Remove a dead worker from the pool (called after crash)."""
     key = str(env_dir)
     with _POOL_LOCK:
-        entry = _WORKER_POOL.pop(key, None)
+        rec = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
-    _retire_worker_state(key, entry[0] if entry else None)
-    if entry is not None:
-        worker, _ = entry
+    _retire_worker_state(key, rec.worker if rec else None)
+    if rec is not None:
         try:
-            worker.shutdown()
+            rec.worker.shutdown()
         except Exception:
             pass
 
