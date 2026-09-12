@@ -1,10 +1,14 @@
-"""Contract: the exporter must retain a tensor it exported an IPC handle for.
+"""Contract: the clone made for a re-exported CUDA tensor is kept until end of call.
 
-CUDA IPC inverts the POSIX rule: there is no cross-process refcount, so the
-EXPORTER keeps the allocation alive until the importer maps it.
+The clone is created inside _serialize_cuda_ipc and returned as handles only,
+so the keeper is its only Python reference for the call's duration. (torch's
+CudaIPCSentDataLimbo keeps the exported block alive for the importer even
+after the last Python reference goes; the keep is belt-and-braces, not the
+cross-process refcount, which torch does have.)
 
 Not GPU coverage -- reduce_tensor is stubbed, so no handle is ever created or
-mapped. This is a regression pin on one line: the keep() beside the clone.
+mapped. This is a regression pin on one line: the keep() beside the clone,
+and on its release at end of call.
 """
 
 import pytest
@@ -124,3 +128,31 @@ def test_import_cache_is_bounded(monkeypatch):
         "import cache grew without bound -- each entry pins exporter VRAM"
     )
     assert len(S._cuda_ipc_metadata_cache) <= S.MAX_IPC_CACHE_SIZE
+
+
+def test_kept_tensors_are_released_at_end_of_call():
+    """Review 2026-09-12: both keepers pruned only inside keep(), so the last
+    call's inputs (and, in tensor_utils, its 256 MB result) stayed pinned
+    until the NEXT isolated call -- indefinitely while ComfyUI idled. The
+    tensor_utils keeper is gone; this one is emptied by end_call()."""
+    import sys
+    from comfy_env.isolation.workers.subprocess import SubprocessWorker
+    keeper = _ipc_parent._parent_tensor_keeper
+    keeper.release_all()
+    keeper.keep(torch.zeros(4))
+    assert len(keeper) == 1
+    w = SubprocessWorker(python=sys.executable, name="keeper-test")
+    try:
+        w.end_call()
+    finally:
+        w.shutdown()
+    assert len(keeper) == 0, "a kept tensor outlived the call it was kept for"
+
+
+def test_the_result_path_keeps_nothing():
+    """prepare_for_ipc_recursive used to keep every tensor it touched."""
+    import inspect
+    from comfy_env.isolation import tensor_utils
+    assert not hasattr(tensor_utils, "TensorKeeper")
+    assert not hasattr(tensor_utils, "keep_tensor")
+    assert "keep" not in inspect.getsource(tensor_utils.prepare_for_ipc_recursive)

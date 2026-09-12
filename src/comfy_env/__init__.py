@@ -85,7 +85,6 @@ _INTERNAL = {
     "Worker": "comfy_env.isolation.workers",
     "WorkerError": "comfy_env.isolation.workers",
     "SubprocessWorker": "comfy_env.isolation.workers.subprocess",
-    "TensorKeeper": "comfy_env.isolation.tensor_utils",
 }
 
 

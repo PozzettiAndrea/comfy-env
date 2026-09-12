@@ -105,7 +105,16 @@ def _create_server_socket() -> Tuple[socket.socket, str]:
 # Tensor lifecycle management (parent side)
 
 class _TensorKeeper:
-    """Hold shared tensor references to prevent GC before worker reads them."""
+    """Hold a shared tensor from its serialization until the call ends.
+
+    Two things are kept here and only here: a CPU tensor exported through
+    shared memory (the worker maps it during the call), and the clone made
+    for a CUDA tensor that could not be re-exported. The TTL is the crash
+    fallback; the normal release is ``release_all()`` from the worker's
+    ``end_call``, so nothing outlives the call it was kept for. Before that
+    existed the last call's inputs stayed pinned until the next call, i.e.
+    for as long as ComfyUI idled.
+    """
     def __init__(self, retention_seconds=TENSOR_KEEPER_TTL):
         self.retention_seconds = retention_seconds
         self._keeper = _deque()
@@ -117,6 +126,14 @@ class _TensorKeeper:
             self._keeper.append((now, t))
             while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
                 self._keeper.popleft()
+
+    def release_all(self):
+        with self._lock:
+            self._keeper.clear()
+
+    def __len__(self):
+        with self._lock:
+            return len(self._keeper)
 
 
 _parent_tensor_keeper = _TensorKeeper()
@@ -248,9 +265,12 @@ def _serialize_cuda_ipc(t) -> dict:
         func, args = reductions.reduce_tensor(t)
     except RuntimeError as e:
         if "received from another process" in str(e):
-            # CUDA IPC has no cross-process refcount: the EXPORTER keeps the
-            # allocation alive until the importer maps it. We return handles
-            # and no tensor, so the keeper is the clone's only reference.
+            # A storage torch imported from another process cannot be
+            # re-exported, so we export a clone. We return handles and no
+            # tensor, so the keeper is the clone's only Python reference
+            # until end of call. (torch's own CudaIPCSentDataLimbo keeps the
+            # exported block alive for the importer even after that; the
+            # keep is belt-and-braces, not the refcount.)
             t = t.clone()
             _parent_tensor_keeper.keep(t)
             func, args = reductions.reduce_tensor(t)

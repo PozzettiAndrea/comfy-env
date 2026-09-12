@@ -1,41 +1,24 @@
-"""Tensor utilities for IPC - prevents GC races and handles CUDA re-share."""
+"""Tensor utilities for IPC: the clone-on-foreign-storage rule for CUDA re-share.
 
-import collections
+There used to be a keeper here too, holding every call's inputs AND results
+for 60 s. Review (2026-09-12) found it held nothing that needed holding: the
+caller's kwargs own the inputs for the call's duration, torch's CUDA IPC has a
+cross-process refcount (CudaIPCSentDataLimbo) that parks an exported block
+until the importer releases it, and results are the host's own memory. What it
+did do was pin the last call's tensors, a 256 MB result measured, until the
+next isolated call, indefinitely while ComfyUI idled. The one keep that is
+load-bearing lives at the serialization point in workers/_ipc_parent.py and
+is released at end of call.
+"""
+
 import logging
-import threading
-import time
 from typing import Any
 
 # _ipc_shared is a standalone leaf (imports nothing from comfy_env), so this
 # can be a top-level DOWNWARD import rather than a function-body bandage.
-from .workers._ipc_shared import _cuda_ipc_metadata_cache, TENSOR_KEEPER_TTL
+from .workers._ipc_shared import _cuda_ipc_metadata_cache
 
 logger = logging.getLogger("comfy_env")
-
-
-class TensorKeeper:
-    """Keep tensor references during IPC to prevent premature GC."""
-
-    def __init__(self, retention_seconds: float = TENSOR_KEEPER_TTL):
-        self.retention_seconds = retention_seconds
-        self._keeper: collections.deque = collections.deque()
-        self._lock = threading.Lock()
-
-    def keep(self, t: Any) -> None:
-        try:
-            import torch
-            if not isinstance(t, torch.Tensor): return
-        except ImportError: return
-
-        now = time.time()
-        with self._lock:
-            self._keeper.append((now, t))
-            while self._keeper and now - self._keeper[0][0] > self.retention_seconds:
-                self._keeper.popleft()
-
-
-_tensor_keeper = TensorKeeper()
-keep_tensor = lambda t: _tensor_keeper.keep(t)
 
 
 def prepare_tensor_for_ipc(t: Any) -> Any:
@@ -69,13 +52,11 @@ def prepare_tensor_for_ipc(t: Any) -> Any:
 
 
 def prepare_for_ipc_recursive(obj: Any) -> Any:
-    """Recursively prepare tensors for IPC and keep references."""
+    """Recursively prepare tensors for IPC."""
     try:
         import torch
         if isinstance(obj, torch.Tensor):
-            prepared = prepare_tensor_for_ipc(obj)
-            keep_tensor(prepared)
-            return prepared
+            return prepare_tensor_for_ipc(obj)
         elif isinstance(obj, list): return [prepare_for_ipc_recursive(x) for x in obj]
         elif isinstance(obj, tuple): return tuple(prepare_for_ipc_recursive(x) for x in obj)
         elif isinstance(obj, dict): return {k: prepare_for_ipc_recursive(v) for k, v in obj.items()}

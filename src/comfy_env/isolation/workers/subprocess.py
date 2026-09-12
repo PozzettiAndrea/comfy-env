@@ -1294,6 +1294,9 @@ class SubprocessWorker(Worker):
     def end_call(self) -> None:
         with self._mem_lock:
             self._calls_in_flight = max(0, self._calls_in_flight - 1)
+        # The worker has mapped every shared input by now (its reply came
+        # back); a kept tensor has nothing left to protect.
+        _ipc_parent._parent_tensor_keeper.release_all()
 
     def send_command_no_spawn(self, method, lock_timeout=2.0, **params):
         """send_command variant for broadcasts: never resurrects a worker.

@@ -13,8 +13,6 @@ from .workers import (
     SubprocessWorker,
 )
 from .tensor_utils import (
-    TensorKeeper,
-    keep_tensor,
     prepare_tensor_for_ipc,
     prepare_for_ipc_recursive,
 )
@@ -27,8 +25,6 @@ __all__ = [
     "WorkerError",
     "SubprocessWorker",
     # Tensor utilities
-    "TensorKeeper",
-    "keep_tensor",
     "prepare_tensor_for_ipc",
     "prepare_for_ipc_recursive",
 ]
