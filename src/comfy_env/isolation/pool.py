@@ -1512,6 +1512,11 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     """
     global _WORKER_GENERATION
     key = str(env_dir)
+    # Before the lock and before any spawn: a host that cannot support the
+    # floor should say so now, not after a worker has been started,
+    # registered and its transport verified. Cached per verdict, so this
+    # is one dict lookup on every call after the first.
+    _check_host_contract()
     with _POOL_LOCK:
         entry = _WORKER_POOL.get(key)
         if entry is not None:
@@ -1569,7 +1574,6 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
     _report_memory_manager(worker, env_dir)
-    _check_host_contract()
     _start_idle_sweep()
     _install_pressure_hook()
     return worker, gen

@@ -985,9 +985,10 @@ def main():
     # first, and the root logger's default is WARNING, so without this every
     # logging.info() a pack emits vanished on isolation while warning() and
     # above kept working. The host resolves its level in setup_logger
-    # (app/logger.py: min of console and file levels, 15/DETAIL by default)
-    # and ships the number; a worker started outside a host falls back to
-    # INFO rather than staying silent.
+    # (app/logger.py: the min of the console level and any file levels;
+    # INFO under default args, since no file output is configured without
+    # --verbose) and ships the number; a worker started outside a host
+    # falls back to INFO rather than staying silent.
     _socket_handler = SocketLogHandler()
     _socket_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
     logging.root.addHandler(_socket_handler)

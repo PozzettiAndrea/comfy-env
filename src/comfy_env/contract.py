@@ -163,51 +163,12 @@ CONTRACT = (
      "since": None},
     {"module": "folder_paths", "attr": "get_input_directory",
      "kind": "callable", "severity": FATAL, "tier": FLOOR, "side": BOTH,
-     "why": "the containment fence for dynamic-combo sources resolves against "
-            "it (_contained_root). Absent, a pack-supplied source dir has "
-            "nothing to be fenced against and the listing served to the "
-            "browser is no longer bounded by input/",
+     "why": "the host snapshots it into every worker's folder_paths (the "
+            "worker adopts the host's input/ via set_input_directory) and "
+            "the input_files dropdown source resolves relative to it. Absent, "
+            "a worker keeps its own input/ and an isolated loader looks where "
+            "nobody uploads",
      "since": None},
-    {"module": "folder_paths", "attr": "get_filename_list",
-     "kind": "callable", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "resolves a model-category combo live on every /object_info, and "
-            "is the function the scan shim wraps to detect one at all; absent, "
-            "every such dropdown freezes at its scan-time values",
-     "since": None},
-    {"module": "folder_paths", "attr": "map_legacy",
-     "kind": "callable", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "translates a retired category name a pack still asks for "
-            "(unet -> diffusion_models, clip -> text_encoders); absent, those "
-            "packs' combos bind to nothing and freeze",
-     "since": "ComfyUI 2024-08-17"},
-    {"module": "folder_paths", "attr": "add_model_folder_path",
-     "kind": "callable", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "the scan shim wraps it to journal a pack's own category "
-            "registrations into the private registry; absent, a pack that "
-            "registers its own model dir gets a frozen combo",
-     "since": None},
-    {"module": "folder_paths", "attr": "recursive_search",
-     "kind": "callable", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "replays a pack-registered category through core's own walk "
-            "rather than a second copy that would drift; absent, private "
-            "registry combos freeze",
-     "since": None},
-    {"module": "folder_paths", "attr": "filter_files_extensions",
-     "kind": "callable", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "the extension filter paired with recursive_search. NOTE the "
-            "semantics are load bearing and have been inverted once upstream "
-            "(8d049782, 2023-10-14): an EMPTY set now means 'accept every "
-            "file', and metadata.py passes `exts or set()` relying on exactly "
-            "that. Presence is checkable here; the meaning is not, so if this "
-            "ever reverts the symptom is empty combos, not an error",
-     "since": "ComfyUI 8d049782, 2023-10-14 for empty-set-means-all"},
-    {"module": "folder_paths", "attr": "cache_helper",
-     "kind": "attr", "severity": DEGRADE, "tier": FLOOR, "side": HOST,
-     "why": "the request-scoped listing cache server.py holds open across a "
-            "whole /object_info. comfy-env does not call it, it free-rides on "
-            "it: absent, every per-node get_filename_list re-walks the disk "
-            "and /object_info slows in proportion to nodes x categories",
-     "since": "ComfyUI 2024-09-19"},
     {"module": "folder_paths", "attr": "set_input_directory",
      "kind": "callable", "severity": FATAL, "tier": FLOOR, "side": WORKER,
      "why": "one of the four setters the worker uses to adopt the host's "
