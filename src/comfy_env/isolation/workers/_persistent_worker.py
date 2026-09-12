@@ -1391,6 +1391,59 @@ def main():
             wlog(f"[worker] refresh_input_types failed: {_e}")
             return {"status": "error", "call_id": _cid, "error": str(_e)}
 
+    def _run_author_validate(cls, clone, kwargs, class_name):
+        """Run the author's VALIDATE_INPUTS / validate_inputs before FUNCTION.
+
+        Upstream ran it at submit, in the host, with the widget literals
+        (linked inputs as None). The body lives here, so the host's stand-in
+        kept only the signature (the exemptions upstream reads) and recorded
+        what it was handed; this is where the real body sees it. The
+        message it returns becomes the node's error, which is where an
+        isolated node's failure landed before too, as a traceback.
+
+        Same rules as execution.py's validate_inputs: kwargs filtered to the
+        function's argspec unless it takes **kwargs; V3 resolved through
+        first_real_override on the locked clone; True passes, False and a
+        string reject, anything else (an ExecutionBlocker) passes; an async
+        body is awaited.
+        """
+        _internal = sys.modules.get("comfy_api.internal")
+        fn = None
+        is_v3 = False
+        if _internal is not None and clone is not None:
+            fn = _internal.first_real_override(cls, "validate_inputs")
+            is_v3 = fn is not None
+        if fn is None:
+            fn = getattr(cls, "VALIDATE_INPUTS", None)
+        if fn is None or not callable(fn):
+            return
+        try:
+            spec = inspect.getfullargspec(fn)
+        except TypeError:
+            spec = None
+        if spec is not None and spec.varkw is None:
+            kwargs = {k: v for k, v in kwargs.items() if k in spec.args}
+        call = fn
+        if is_v3:
+            _lock = getattr(_internal, "make_locked_method_func", None)
+            if _lock is not None:
+                call = _lock(cls, "validate_inputs", clone)
+        wlog(f"[worker] validate_inputs for {class_name}: {sorted(kwargs)}")
+        result = call(**kwargs)
+        if inspect.isawaitable(result):
+            import asyncio as _asyncio
+
+            async def _await(r):
+                return await r
+            result = _asyncio.run(_await(result))
+        if result is True:
+            return
+        if result is False:
+            raise ValueError(f"{class_name}: VALIDATE_INPUTS rejected the inputs")
+        if isinstance(result, str):
+            raise ValueError(f"{class_name}: {result}")
+        # an ExecutionBlocker, or anything else: passes at validation upstream
+
     def _handle_fingerprint(request):
         """Run a node's REAL IS_CHANGED / fingerprint_inputs on the class.
 
@@ -2647,6 +2700,7 @@ def main():
                              f"will fail")
 
                 _prep = getattr(cls, "PREPARE_CLASS_CLONE", None)
+                _clone = None
                 if _prep is not None:
                     # V3: the same four lines as execution.py:278-285, in the
                     # same order, hidden or not. Upstream always clones (so
@@ -2683,6 +2737,11 @@ def main():
                     method = getattr(instance, method_name)
                 else:
                     method = getattr(instance, method_name)
+                # The author's VALIDATE_INPUTS, with the view upstream gave
+                # the host's stand-in at submit. See _run_author_validate.
+                if request.get("validate_kwargs") is not None:
+                    _run_author_validate(cls, _clone, request["validate_kwargs"],
+                                         class_name)
                 wlog(f"[worker] Calling {method_name}...")
                 try:
                     with _infer_mode():

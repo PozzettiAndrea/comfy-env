@@ -948,6 +948,7 @@ class SubprocessWorker(Worker):
         self_state: Optional[Dict[str, Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
         hidden: Optional[list] = None,
+        validate_kwargs: Optional[Dict[str, Any]] = None,
         state_id: Optional[str] = None,
         timeout: Optional[float] = None,
     ) -> Any:
@@ -994,6 +995,11 @@ class SubprocessWorker(Worker):
                     "prompt_gen": _current_prompt_gen(),
                     "client_id": _current_client_id(),
                     "state_id": state_id,
+                    # What the host's stand-in VALIDATE_INPUTS was handed at
+                    # submit, for the worker to run the author's real one
+                    # against before the function; None when the author
+                    # wrote no validate or this is not the FUNCTION call.
+                    "validate_kwargs": validate_kwargs,
                     "module": module_name,
                     "class_name": class_name,
                     "method_name": method_name,

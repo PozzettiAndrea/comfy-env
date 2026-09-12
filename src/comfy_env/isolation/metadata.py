@@ -5,6 +5,7 @@ and extract class metadata (INPUT_TYPES, RETURN_TYPES, etc.). The main process n
 imports isolation code -- it builds proxy classes from the serialized metadata.
 """
 
+import collections
 import hashlib
 import os
 import json
@@ -1273,14 +1274,69 @@ def _raise_scan_error(class_name: str, err: str) -> None:
         f"during the metadata scan: {err}")
 
 
-def _make_named_validate(names, varkw: bool = False):
+# --- execute-time validation ------------------------------------------------
+#
+# Upstream runs a node's VALIDATE_INPUTS at submit, in the host, with the
+# widget literals (linked inputs arrive as None). The author's body lives in
+# the worker, and forwarding it at submit means either spawning the worker
+# or talking to one that happens to be warm and idle, on the HTTP event
+# loop, with a timeout whose only honest failure mode kills the worker.
+# Review (2026-09-12) settled on the other order: the host's stand-in keeps
+# the exemptions upstream reads off its signature and RECORDS what it was
+# handed, keyed by the executing context that wraps both the validate call
+# and the later FUNCTION call; the FUNCTION call ships the record; the
+# worker runs the author's real validate with that view immediately before
+# the function, and raises the author's message as the node error. Always
+# runs, on a worker that is spawning anyway; the message lands at the node
+# instead of at submit, which is where an isolated node's failure landed
+# before, only now it is the author's sentence and not a traceback.
+#
+# Bounded: records live per prompt and the four most recent prompts are
+# kept, because a prompt rejected on some other node never executes and
+# would otherwise leave its records behind.
+_VALIDATE_RECORDS: "collections.OrderedDict[str, Dict[str, Dict[str, Any]]]" = collections.OrderedDict()
+_VALIDATE_MAX_PROMPTS = 4
+
+
+def _executing_context():
+    try:
+        from comfy_execution.utils import get_executing_context
+        return get_executing_context()
+    except Exception:
+        return None
+
+
+def _record_validate_kwargs(kw: Dict[str, Any]) -> None:
+    ctx = _executing_context()
+    pid = getattr(ctx, "prompt_id", None)
+    if not pid:
+        return
+    store = _VALIDATE_RECORDS.get(pid)
+    if store is None:
+        store = _VALIDATE_RECORDS[pid] = {}
+        while len(_VALIDATE_RECORDS) > _VALIDATE_MAX_PROMPTS:
+            _VALIDATE_RECORDS.popitem(last=False)
+    # keyed by node, not list index: validation ran once with the widget
+    # literals, and every index of a list-mapped call sees the same ones
+    store[str(ctx.node_id)] = kw
+
+
+def _take_validate_kwargs():
+    ctx = _executing_context()
+    pid = getattr(ctx, "prompt_id", None)
+    if not pid:
+        return None
+    return (_VALIDATE_RECORDS.get(pid) or {}).get(str(ctx.node_id))
+
+
+def _make_named_validate(names, varkw: bool = False, record: bool = False):
     """A classmethod `f(cls, a=None, b=None, ..., **kwargs) -> True` carrying
     EXACTLY the original's exemptions.
 
     The signature is the whole point: execution.py exempts an input from its
     built-in min/max/combo checks iff the input's name appears in the validate
     function's argspec, OR the function declares a catch-all
-    (execution.py:889-893, applied at :1019).
+    (execution.py, validate_inputs).
 
     So `varkw` is reproduced, never invented. Adding `**kwargs` to a validate
     the author wrote with explicit names would exempt every input including
@@ -1291,29 +1347,32 @@ def _make_named_validate(names, varkw: bool = False):
     waived, and a workflow that submits fine natively is rejected once the
     pack is isolated.
 
+    With `record` (the author wrote a validate body) the stand-in also
+    records what it received, for the worker to hand to the real body at
+    execution -- see the section comment above.
+
     Names that are not identifiers are skipped -- they could not be exempted
     this way anyhow.
     """
     names = [n for n in names if isinstance(n, str) and n.isidentifier()
-             and n not in ("cls", "self", "s")]
+             and n not in ("cls", "self", "s", "_cev_record")]
     if not names and not varkw:
         return None, []
     sig = ", ".join(p for p in (
         ", ".join(f"{n}=None" for n in names),
         "**kwargs" if varkw else "",
     ) if p)
-    ns: dict = {}
-    exec(f"def _cev_validate(cls, {sig}):\n    return True\n", ns)
+    if record:
+        got = "{" + ", ".join(f"{n!r}: {n}" for n in names) + "}"
+        body = (f"    _cev_record({{**{got}, **kwargs}})\n" if varkw
+                else f"    _cev_record({got})\n") + "    return True\n"
+    else:
+        body = "    return True\n"
+    ns: dict = {"_cev_record": _record_validate_kwargs}
+    exec(f"def _cev_validate(cls, {sig}):\n{body}", ns)
     return classmethod(ns["_cev_validate"]), names
 
 
-# --- Provider resolution (parent-side re-listing) ---------------------------
-
-# Per-pack private category registry. NEVER written into ComfyUI's global
-# folder_names_and_paths: the global feeds /models, the asset seeder, upload
-# routing, and is snapshot-pushed wholesale into EVERY worker. Host-defined
-# categories always win; recorded registrations are unioned across packs
-# (core unions paths for shared category names, so must we).
 _PACK_FOLDER_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 
@@ -1336,7 +1395,7 @@ _V3_HIDDEN_ATTRS = ("prompt", "extra_pnginfo", "unique_id",
 
 def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                     self_state, kwargs, node_name, hidden=None,
-                    state_id=None, state_dict=None):
+                    state_id=None, state_dict=None, validate_kwargs=None):
     """Run one node call in the pack's worker. Shared by the V1 and V3 proxies.
 
     Keyword-only on purpose: the two closures this replaces took nine and
@@ -1386,6 +1445,7 @@ def _call_in_worker(*, worker_spec, module_name, class_name, method_name,
                 kwargs=kwargs,
                 hidden=hidden,
                 state_id=state_id,
+                validate_kwargs=validate_kwargs,
                 timeout=600.0,
             )
         finally:
@@ -1558,7 +1618,7 @@ def _build_v3_proxy_class(
             f"schema lives in the isolation env. If this is reached, a code path is "
             f"bypassing the proxy's shadowed classmethods.")
 
-    def _make_v3_proxy(fn, mod, cn, ed, pr, sp, ev, hct, nn):
+    def _make_v3_proxy(fn, mod, cn, ed, pr, sp, ev, hct, nn, validate=False):
         def proxy(cls, **kwargs):
             # V3 hidden inputs never travel as kwargs. ComfyUI puts them in
             # v3_data["hidden_inputs"], and PREPARE_CLASS_CLONE hangs them on
@@ -1578,6 +1638,7 @@ def _build_v3_proxy_class(
                 module_name=mod, class_name=cn, method_name=fn,
                 self_state=None, kwargs=kwargs, node_name=nn,
                 hidden=_hidden,
+                validate_kwargs=_take_validate_kwargs() if validate else None,
             )
         return proxy
 
@@ -1589,6 +1650,7 @@ def _build_v3_proxy_class(
             func_name, module_name, class_name,
             env_dir, package_root, sys_path, env_vars,
             health_check_timeout, node_name,
+            validate=meta.get("validate_args") is not None,
         )),
         "FUNCTION": "execute",
         "RETURN_TYPES": return_types,
@@ -1651,7 +1713,8 @@ def _build_v3_proxy_class(
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(
-        _exempt, varkw=bool(meta.get("validate_varkw")))
+        _exempt, varkw=bool(meta.get("validate_varkw")),
+        record=meta.get("validate_args") is not None)
     if _validate_cm is not None:
         attrs["validate_inputs"] = _validate_cm
 
@@ -1881,7 +1944,7 @@ def build_proxy_class(
                    if isinstance(v, str) and v != "DYNPROMPT"}
 
     # Proxy FUNCTION method -- reuses persistent worker across calls
-    def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hmap):
+    def _make_proxy(fn, mod, cn, ed, pr, sp, ev, hct, dcp, nn, hmap, validate=False):
         def proxy(self, **kwargs):
             # Hidden lift and DynamicCombo nesting, shared with the
             # fingerprint so the two cannot drift.
@@ -1908,6 +1971,7 @@ def build_proxy_class(
                 self_state=state_sync.outbound_state(_d),
                 kwargs=kwargs, node_name=nn, hidden=_hidden,
                 state_id=_sid, state_dict=_d,
+                validate_kwargs=_take_validate_kwargs() if validate else None,
             )
         return proxy
 
@@ -1915,6 +1979,7 @@ def build_proxy_class(
         func_name, module_name, class_name,
         env_dir, package_root, sys_path, env_vars, health_check_timeout,
         dynamic_combo_parents, node_name, _hidden_map,
+        validate=meta.get("validate_args") is not None,
     )
 
     # check_lazy_status, forwarded iff the author wrote one -- see the V3
@@ -1937,7 +2002,8 @@ def build_proxy_class(
     _exempt = list(_marked) + [a for a in (meta.get("validate_args") or [])
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(
-        _exempt, varkw=bool(meta.get("validate_varkw")))
+        _exempt, varkw=bool(meta.get("validate_varkw")),
+        record=meta.get("validate_args") is not None)
     if _validate_cm is not None:
         attrs["VALIDATE_INPUTS"] = _validate_cm
 
