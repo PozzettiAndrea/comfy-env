@@ -12,6 +12,7 @@ import atexit
 import glob
 import os
 import re
+import signal
 import shutil
 import sys
 import tempfile
@@ -150,15 +151,29 @@ def _cleanup_stale_workers():
             except Exception:
                 pass
 
-    # Worker processes whose parent is gone.
+    # Worker processes whose HOST is gone. The host pid is in the worker's
+    # temp-dir name (workers/subprocess.py); the immediate parent is no use,
+    # because a worker runs under a pixi wrapper: killed wrapper -> ppid 1
+    # (exists), dead host -> live wrapper (exists). Older workers without a
+    # host pid in the name fall back to the parent test.
+    host_in_name = re.compile(r"comfyui_pvenv_(\d+)_")
     for proc in psutil.process_iter(['pid', 'ppid', 'cmdline']):
         try:
             cmdline = proc.info.get('cmdline') or []
-            if any('persistent_worker.py' in arg for arg in cmdline):
-                parent_pid = proc.info.get('ppid')
-                if parent_pid and not psutil.pid_exists(parent_pid):
-                    print(f"[comfy-env] Killing orphaned worker (parent {parent_pid} dead): {proc.pid}")
-                    proc.kill()
+            if not any('persistent_worker.py' in arg for arg in cmdline):
+                continue
+            m = next((host_in_name.search(arg) for arg in cmdline
+                      if host_in_name.search(arg)), None)
+            owner = int(m.group(1)) if m else proc.info.get('ppid')
+            if owner == os.getpid() or (owner and psutil.pid_exists(owner)):
+                continue
+            print(f"[comfy-env] Killing orphaned worker ({'host' if m else 'parent'} "
+                  f"{owner} dead): {proc.pid}")
+            # the tree: the wrapper (if alive) and the python are one group
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError, AttributeError):
+                proc.kill()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 

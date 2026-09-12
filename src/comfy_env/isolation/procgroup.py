@@ -30,16 +30,30 @@ def popen_in_own_group(cmd: List[str], **kw) -> subprocess.Popen:
 
 
 def kill_process_tree(proc: subprocess.Popen) -> None:
-    """Kill ``proc`` and every descendant. Safe on an already-dead process."""
-    if proc.poll() is not None:
-        return
+    """Kill ``proc`` and every descendant. Safe on an already-dead process.
+
+    Two things this must not do, both found in review. It must not return
+    early because ``proc`` itself has exited: under a wrapper the leader
+    can be gone (crashed, killed by an earlier path) while its Python child
+    is alive in the same group, and that child is the one holding the GPU.
+    And it must not treat a failed ``killpg`` as "nothing to kill": if
+    ``proc`` was not started in its own group, ``killpg(proc.pid)`` raises
+    ESRCH and a caller that swallowed it would have killed nothing at all,
+    which is worse than the plain ``kill()`` it replaced. So: the group
+    first, and if there is no such group, the process itself.
+    """
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        capture_output=True)
-    else:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        # not a group leader (or the group is already empty): fall back to
+        # the process, which is what the caller asked for at minimum
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
+            proc.kill()
+        except (OSError, ProcessLookupError):
             pass
 
 

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from .base import InterruptRequested, Worker, WorkerError
+from ..procgroup import kill_process_tree, popen_in_own_group
 
 #: Pure leaf modules copied beside the worker program so the worker can use
 #: them even when comfy_env itself is not importable in its environment.
@@ -180,7 +181,11 @@ class SubprocessWorker(Worker):
         if not self.python.exists():
             raise FileNotFoundError(f"Python not found: {self.python}")
 
-        self._temp_dir = Path(tempfile.mkdtemp(prefix='comfyui_pvenv_'))
+        # The host pid is in the name so the startup reaper can tell an
+        # orphan by whether ITS HOST is alive, not its immediate parent: a
+        # worker under a dead pixi wrapper has ppid 1, and one under a live
+        # wrapper whose host died has a live ppid. Neither test works.
+        self._temp_dir = Path(tempfile.mkdtemp(prefix=f'comfyui_pvenv_{os.getpid()}_'))
         self._process: Optional[subprocess.Popen] = None
         self._shutdown = False
         self._lock = threading.RLock()  # Reentrant: VRAM eviction callbacks re-enter via send_command
@@ -288,15 +293,26 @@ class SubprocessWorker(Worker):
             print(f"[{self.name}] Socket health check exception: {e}", file=sys.stderr, flush=True)
             return False
 
+    def _kill_tree(self) -> None:
+        """The one way a worker process is killed: the whole tree, then reap.
+
+        Every kill path (health-check restart, accept timeout after spawn,
+        the reply timeout, shutdown) goes through here, because a kill that
+        reaches only the pixi wrapper leaves the real worker running.
+        """
+        if not self._process:
+            return
+        try:
+            kill_process_tree(self._process)
+            self._process.wait(timeout=5)
+        except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+            pass
+
     def _kill_worker(self) -> None:
         """Kill the worker process and clean up resources."""
         self._last_ok = 0.0  # the new process has proven nothing yet
         if self._process:
-            try:
-                self._process.kill()
-                self._process.wait(timeout=5)
-            except (OSError, ProcessLookupError):
-                pass
+            self._kill_tree()
             self._process = None
         if self._transport:
             try:
@@ -587,7 +603,13 @@ class SubprocessWorker(Worker):
                 print(f"[SubprocessWorker] WARNING: socket file missing before worker spawn!", flush=True)
                 if _DBG_WORKER:
                     print(f"[SubprocessWorker] socket dir={os.path.dirname(_sock_path)} dir_exists={os.path.isdir(os.path.dirname(_sock_path))}", flush=True)
-        self._process = subprocess.Popen(
+        # Its own process group, so that every kill path below reaches the
+        # whole tree. The worker runs under `pixi run`, which does not exec:
+        # a plain kill() on this handle killed the wrapper and left the
+        # Python grandchild alive, holding its VRAM, invisible to the pool
+        # (its parent became pid 1) and to the host's Ctrl-C. Ctrl-C now
+        # reaches a worker through the atexit teardown, which is _kill_tree.
+        self._process = popen_in_own_group(
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -601,11 +623,7 @@ class SubprocessWorker(Worker):
         try:
             client_sock, _ = self._server_socket.accept()
         except socket.timeout:
-            try:
-                self._process.kill()
-                self._process.wait(timeout=5)
-            except (OSError, ProcessLookupError):
-                pass
+            self._kill_tree()
             raise RuntimeError(f"{self.name}: Worker failed to connect (timeout). Check stderr output above.")
         finally:
             self._server_socket.settimeout(None)
@@ -891,11 +909,8 @@ class SubprocessWorker(Worker):
                 ) from e
 
         if response is None:
-            # Timeout - kill process
-            try:
-                self._process.kill()
-            except (OSError, ProcessLookupError):
-                pass
+            # Timeout - kill the whole tree, not just the pixi wrapper
+            self._kill_tree()
             self._shutdown = True
             raise TimeoutError(f"{self.name}: call_id={call_id} timed out after {timeout}s")
 
@@ -1352,8 +1367,7 @@ class SubprocessWorker(Worker):
                 self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
-                    self._process.kill()
-                    self._process.wait(timeout=5)
+                    self._kill_tree()
                 except Exception:
                     pass
 
