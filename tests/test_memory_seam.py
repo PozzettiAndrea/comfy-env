@@ -432,13 +432,19 @@ class TestResidencyPeakSeam:
             "re-applies a stale census")
 
     def test_death_clears_the_overhead_ledger(self):
+        """Both replacement paths retire the report through one helper; the
+        helper is what pops it. (Behavioural coverage of all three paths is
+        in test_worker_record.py.)"""
         tree = _tree(POOL)
         for fname in ("_remove_worker", "_cleanup_stale_patchers"):
             fn = next(n for n in ast.walk(tree)
                       if isinstance(n, ast.FunctionDef) and n.name == fname)
-            assert "_OVERHEAD_REPORTS.pop" in ast.unparse(fn), (
-                f"{fname} no longer pops the overhead report; a dead worker "
-                f"books phantom scratch forever")
+            assert "_retire_worker_state(" in ast.unparse(fn), (
+                f"{fname} no longer retires the process's ledgers; a dead "
+                f"worker books phantom scratch forever")
+        helper = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == "_retire_worker_state")
+        assert "_OVERHEAD_REPORTS.pop" in ast.unparse(helper)
 
     def test_echo_sites_route_through_apply_echo(self):
         """The peak rules live in ONE pure function; a direct peak write at

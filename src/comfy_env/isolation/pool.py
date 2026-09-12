@@ -1249,7 +1249,7 @@ def _handle_vram_budget(request: dict, worker_key=None) -> dict:
     return reply
 
 
-def _cleanup_stale_patchers(env_dir):
+def _cleanup_stale_patchers(env_dir, worker=None):
     """Mark stale SubprocessModelPatchers for cleanup.
 
     Called when a worker is replaced (crash/restart).  We clear the patcher
@@ -1269,8 +1269,7 @@ def _cleanup_stale_patchers(env_dir):
     The stale references are cleared on the next _register_new_patchers call.
     """
     key = str(env_dir)
-    _OVERHEAD_REPORTS.pop(key, None)  # the replaced process's scratch is gone
-    _PIN_REPORTS.pop(key, None)       # and its pins; parity with _remove_worker
+    _retire_worker_state(key, worker)   # everything per-process, one place
     old_patchers = _WORKER_PATCHERS.pop(key, None)
     if not old_patchers:
         return
@@ -1523,8 +1522,8 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
             worker, gen = entry
             if worker.is_alive():
                 return worker, gen
-            # Dead -- clean up stale patchers before replacing worker
-            _cleanup_stale_patchers(env_dir)
+            # Dead -- retire everything per-process before replacing it
+            _cleanup_stale_patchers(env_dir, worker)
             try:
                 worker.shutdown()
             except Exception:
@@ -1561,7 +1560,7 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
         worker.register_callback("send_sync", _handle_send_sync)
         worker.register_callback("send_progress_text", _handle_send_progress_text)
         # Clean up stale patchers if worker restarts transparently via _ensure_started()
-        worker._on_restart = lambda: _cleanup_stale_patchers(env_dir)
+        worker._on_restart = lambda: _cleanup_stale_patchers(env_dir, worker)
         # Canary handshake: verify each transport tier through the production
         # serialization path; demotes GPU zero-copy for this worker if its
         # round-trip fails. A CPU-tier failure raises (broken IPC).
@@ -1669,32 +1668,57 @@ def _report_memory_manager(worker, env_dir) -> None:
         _log(f"[comfy-env] memory manager report failed: {exc}")
 
 
+def _retire_worker_state(env_dir, worker=None) -> None:
+    """Forget everything the pool knows about one worker PROCESS.
+
+    Three paths replace a process and every one of them must come through
+    here: _remove_worker after a crash, the dead-worker branch of
+    _get_or_create_worker, and the socket-unhealthy restart inside
+    _ensure_started (which keeps the SubprocessWorker object and fires
+    _on_restart). Before this helper the three cleared different subsets:
+    the dead branch left the old process's reserve charge on the new one,
+    the restart path left its last VRAM report on the worker object, and
+    _LAST_PROMPT and _PIN_REGRESSION_SEEN were never cleared at all, so a
+    replacement under the same env key inherited a stale "last logged"
+    figure and skipped its first regression line.
+
+    Everything per-process goes: the reserve high-water (this is the one
+    place a SHRINK is allowed, because the process is gone), the pin and
+    overhead reports (the key must be ABSENT from the allocator's input, not
+    retained at 0), the activity clock, the manager-reported flag (the new
+    process may resolve a different manager), and the harvest fields the
+    pool keeps on the worker object. Patchers are handled by the caller,
+    because the two callers differ on whether they must stay alive.
+    """
+    key = str(env_dir)
+    _MEMORY_MANAGER_REPORTED.discard(key)
+    _PIN_REPORTS.pop(key, None)
+    _OVERHEAD_REPORTS.pop(key, None)
+    _PIN_REGRESSION_SEEN.pop(key, None)
+    _forget_reserve(key)
+    _LAST_ACTIVITY.pop(key, None)
+    _LAST_PROMPT.pop(key, None)
+    if worker is not None:
+        for attr in ("_last_vram_report", "_last_held_bytes", "_pin_release_deferred"):
+            try:
+                setattr(worker, attr, None)
+            except Exception:
+                pass
+
+
 def _remove_worker(env_dir):
     """Remove a dead worker from the pool (called after crash)."""
     key = str(env_dir)
-    # A replacement worker may resolve to a different manager (for example a
-    # failed aimdo init this time), so let it be reported afresh.
-    _MEMORY_MANAGER_REPORTED.discard(key)
-    # Dead worker's pin report and grant leave the ledger: its key must be
-    # ABSENT from the allocator's input (not retained at 0), so its share
-    # redistributes on the next budget RPC.
-    _PIN_REPORTS.pop(key, None)
-    # Dead worker's overhead died with it; a retained entry would book ~1 GB
-    # of phantom scratch per crash in a restart loop.
-    _OVERHEAD_REPORTS.pop(key, None)
-    # Its reserve high-water goes too, and this is the one place a SHRINK is
-    # allowed: the process is gone, so the memory is provably back.
-    _forget_reserve(key)
-    _LAST_ACTIVITY.pop(key, None)
     with _POOL_LOCK:
         entry = _WORKER_POOL.pop(key, None)
         _WORKER_PATCHERS.pop(key, None)
-        if entry is not None:
-            worker, _ = entry
-            try:
-                worker.shutdown()
-            except Exception:
-                pass
+    _retire_worker_state(key, entry[0] if entry else None)
+    if entry is not None:
+        worker, _ = entry
+        try:
+            worker.shutdown()
+        except Exception:
+            pass
 
 
 def _shutdown_all_workers():
