@@ -2088,14 +2088,45 @@ def main():
     # The subprocess's comfy.utils.PROGRESS_BAR_HOOK is None (server.py never ran here).
     # Setting it lets any ProgressBar created in subprocess code (e.g. stages.py)
     # automatically forward updates to the parent, which relays to the ComfyUI frontend.
-    #: Cap on one forwarded preview. Upstream deliberately BYPASSES its
-    #: own progress throttle whenever a preview is present (comfy/utils.py),
-    #: so a 50-step sampler is 50 unthrottled frames down a JSON socket.
-    #: Over the cap the preview is dropped and the tick still goes.
+    #: Cap on one forwarded preview, measured AFTER the fit below. Upstream
+    #: deliberately BYPASSES its own progress throttle whenever a preview is
+    #: present (comfy/utils.py), so a 50-step sampler is 50 unthrottled
+    #: frames down a JSON socket. A fitted frame is tens of KB, so this only
+    #: bites a pack that passes max_size=None with a huge image, which
+    #: floods the browser natively too. Over the cap the preview is dropped
+    #: and the tick still goes.
     _PREVIEW_MAX_BYTES = 1 << 20
+
+    def _fit_preview(image, max_size):
+        """What server.send_image does before it sends: ImageOps.contain to
+        a max_size box, BILINEAR (LANCZOS on a PIL without Resampling).
+
+        Written out on the image's own methods rather than imported, so
+        the worker needs no PIL of its own; PIL's Resampling enum is
+        borrowed from the pack's already-loaded module when present.
+        """
+        if max_size is None:
+            return image
+        w, h = image.size
+        if w <= 0 or h <= 0:
+            return image
+        scale = min(max_size / w, max_size / h)
+        size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        if size == (w, h):
+            return image
+        _pil = sys.modules.get("PIL.Image")
+        _res = getattr(_pil, "Resampling", None)
+        resampling = _res.BILINEAR if _res is not None else getattr(_pil, "LANCZOS", 1)
+        return image.resize(size, resampling)
 
     def _encode_preview(preview):
         """PreviewImageTuple -> [format, base64, max_size], or None.
+
+        Fitted to max_size here, exactly as the host's send_image would
+        have, so the frame that crosses is the frame the browser gets and
+        a full-resolution preview with a max_size costs a thumbnail, not
+        a dropped frame. max_size stays in the tuple for fidelity; the
+        host's own contain on an already-fitted image changes nothing.
 
         Duck-typed on the object handed to us: no PIL import in the
         worker, because a worker that produced a preview already has PIL
@@ -2106,8 +2137,9 @@ def main():
             import base64 as _b64
             import io as _io
             fmt = preview[0] or "JPEG"
+            img = _fit_preview(preview[1], preview[2])
             buf = _io.BytesIO()
-            preview[1].save(buf, format=fmt)
+            img.save(buf, format=fmt, quality=95, compress_level=1)
             raw = buf.getvalue()
             if len(raw) > _PREVIEW_MAX_BYTES:
                 return None
