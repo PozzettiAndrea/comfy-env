@@ -2088,15 +2088,6 @@ def main():
     # The subprocess's comfy.utils.PROGRESS_BAR_HOOK is None (server.py never ran here).
     # Setting it lets any ProgressBar created in subprocess code (e.g. stages.py)
     # automatically forward updates to the parent, which relays to the ComfyUI frontend.
-    #: Cap on one forwarded preview, measured AFTER the fit below. Upstream
-    #: deliberately BYPASSES its own progress throttle whenever a preview is
-    #: present (comfy/utils.py), so a 50-step sampler is 50 unthrottled
-    #: frames down a JSON socket. A fitted frame is tens of KB, so this only
-    #: bites a pack that passes max_size=None with a huge image, which
-    #: floods the browser natively too. Over the cap the preview is dropped
-    #: and the tick still goes.
-    _PREVIEW_MAX_BYTES = 1 << 20
-
     def _fit_preview(image, max_size):
         """What server.send_image does before it sends: ImageOps.contain to
         a max_size box, BILINEAR (LANCZOS on a PIL without Resampling).
@@ -2123,10 +2114,11 @@ def main():
         """PreviewImageTuple -> [format, base64, max_size], or None.
 
         Fitted to max_size here, exactly as the host's send_image would
-        have, so the frame that crosses is the frame the browser gets and
-        a full-resolution preview with a max_size costs a thumbnail, not
-        a dropped frame. max_size stays in the tuple for fidelity; the
-        host's own contain on an already-fitted image changes nothing.
+        have, so the frame that crosses is the frame the browser gets.
+        max_size stays in the tuple for fidelity; the host's own contain
+        on an already-fitted image changes nothing. No size cap: upstream
+        sends every previewed frame unthrottled at whatever size the pack
+        chose, and isolation is not stricter than native.
 
         Duck-typed on the object handed to us: no PIL import in the
         worker, because a worker that produced a preview already has PIL
@@ -2140,10 +2132,7 @@ def main():
             img = _fit_preview(preview[1], preview[2])
             buf = _io.BytesIO()
             img.save(buf, format=fmt, quality=95, compress_level=1)
-            raw = buf.getvalue()
-            if len(raw) > _PREVIEW_MAX_BYTES:
-                return None
-            return [fmt, _b64.b64encode(raw).decode("ascii"), preview[2]]
+            return [fmt, _b64.b64encode(buf.getvalue()).decode("ascii"), preview[2]]
         except Exception:
             return None
 

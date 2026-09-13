@@ -6,8 +6,8 @@ calls hook(value, total, preview, node_id=...), preview is
 (format, PIL.Image, max_size), and server.send_image fits the image into a
 max_size box (ImageOps.contain) before it goes to the browser. The worker
 does that same fit before the frame crosses, so a full-resolution preview
-with a max_size costs a thumbnail on the socket, not a dropped frame; the
-1 MiB cap on a forwarded frame only bites when max_size is None. The
+with a max_size costs a thumbnail on the socket, and one without a
+max_size crosses at full size, as it goes to the browser natively. The
 send_sync preview path had an end-to-end test; this path (ProgressBar ->
 worker hook -> report_progress -> _handle_progress -> PROGRESS_BAR_HOOK)
 did not.
@@ -106,10 +106,10 @@ def test_a_huge_preview_with_a_max_size_is_a_thumbnail_not_a_dropped_frame(host_
     assert fmt == "PNG" and max_size == 512 and img.size == (512, 512)
 
 
-def test_a_huge_preview_with_no_max_size_is_dropped_and_the_tick_still_goes(host_hook):
-    """The one case the cap still guards: no fit requested, frame far over
-    1 MiB. Natively this floods the browser; here the image is left out and
-    the progress value still arrives."""
+def test_a_huge_preview_with_no_max_size_crosses_at_full_size(host_hook):
+    """No fit requested, several MB of PNG: it arrives whole, as natively
+    it would reach the browser whole. Isolation adds no size policy."""
     seen = _run(host_hook, "BigPreviewer", max_size=0, fmt="PNG")
     assert [(v, t) for v, t, p in seen] == [(1, 1)]
-    assert seen[-1][2] is None
+    fmt, img, max_size = seen[-1][2]
+    assert fmt == "PNG" and max_size is None and img.size == (2048, 2048)

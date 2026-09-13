@@ -19,8 +19,8 @@ class Previewer:
 
 
 class BigPreviewer:
-    """One frame of 2048x2048 noise: several MB as PNG, well over the
-    forwarded-preview cap at full size, a thumbnail once fitted."""
+    """One frame of 2048x2048 noise: several MB as PNG at full size, a
+    thumbnail once fitted."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"max_size": ("INT", {"default": 512}),
