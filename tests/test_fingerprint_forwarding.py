@@ -206,22 +206,24 @@ def test_forwarder_attaches_only_when_the_scan_saw_a_fingerprint(md, pool_stub, 
     assert pool_stub["worker"].seen == [], "a round trip was paid at build time"
 
 
-def test_the_v1_fallback_of_a_v3_node_asks_for_fingerprint_inputs(md, pool, tmp_path):  # noqa: F811
-    """Catches a method name keyed on which proxy was built instead of on
-    the scan's view of the real class: a V3 node behind a V1 proxy defines
-    fingerprint_inputs, not IS_CHANGED."""
-    w = _Worker(OK)
-    pool[str(tmp_path)] = _pool.WorkerRecord(w, 1)
+def test_a_v3_node_without_a_captured_schema_raises_instead_of_becoming_v1(md, pool, tmp_path):  # noqa: F811
+    """A V3 node is built as a V3 stand-in or not at all. The old path built
+    a V1 proxy for it and printed one line: a different node, silently."""
     m = _meta(True)
-    m.pop("node_info_v1")          # forces the V1 builder
-    m["fingerprint_args"] = ["x"]
-    Proxy = md.build_proxy_class(
-        node_name="MyNode", meta=m, env_dir=tmp_path,
-        package_root=tmp_path, sys_path=[], env_vars={},
-    )
-    assert "IS_CHANGED" in Proxy.__dict__
-    Proxy.IS_CHANGED(x=1)
-    assert w.calls[0][2]["method_name"] == "fingerprint_inputs"
+    m.pop("node_info_v1")
+    m["v3_capture_error"] = "GET_NODE_INFO_V1 exploded"
+    with pytest.raises(RuntimeError, match="GET_NODE_INFO_V1 exploded"):
+        md.build_proxy_class(node_name="MyNode", meta=m, env_dir=tmp_path,
+                             package_root=tmp_path, sys_path=[], env_vars={})
+
+
+def test_a_failing_v3_builder_raises_instead_of_becoming_v1(md, pool, tmp_path, monkeypatch):  # noqa: F811
+    def boom(*a, **k):
+        raise ValueError("schema did not round-trip")
+    monkeypatch.setattr(md, "_build_v3_proxy_class", boom)
+    with pytest.raises(ValueError, match="did not round-trip"):
+        md.build_proxy_class(node_name="MyNode", meta=_meta(True), env_dir=tmp_path,
+                             package_root=tmp_path, sys_path=[], env_vars={})
 
 
 @pytest.mark.parametrize("is_v3", [False, True], ids=["v1", "v3"])

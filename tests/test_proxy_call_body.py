@@ -35,9 +35,9 @@ def md(monkeypatch):
     monkeypatch.setitem(sys.modules, "comfy", comfy_pkg)
     monkeypatch.setitem(sys.modules, "comfy.model_management", mm)
 
-    # Without comfy_api the V3 builder silently falls back to a V1 proxy, so
-    # the v3 parametrization would quietly test V1 twice. Only ComfyNode is
-    # touched (used as the base class).
+    # The V3 builder needs comfy_api on the host (and raises without it), so
+    # the v3 parametrization stubs the one thing it touches: ComfyNode, the
+    # base class.
     class _ComfyNode:
         pass
 

@@ -54,7 +54,7 @@ NODE = """
         SEARCH_ALIASES = ["thing", "doer"]
         NOT_IDEMPOTENT = True
         FOO_FLAG_UPSTREAM_ADDS_TOMORROW = "carried"
-        BIG_TABLE = list(range(10_000))       # data, not a flag
+        BIG_TABLE = list(range(10_000))       # big, and copied anyway
         HELPER = staticmethod(lambda: None)   # callable, not a flag
         BROKEN = _RaisingProp()               # raising classproperty
         lowercase = "not swept"
@@ -78,10 +78,10 @@ def test_upstream_read_attributes_reach_the_proxy(tmp_path):
     assert Proxy.FOO_FLAG_UPSTREAM_ADDS_TOMORROW == "carried", "the sweep, not a list"
 
 
-def test_the_sweep_is_bounded_and_guarded(tmp_path):
+def test_the_sweep_is_guarded_not_bounded(tmp_path):
     payload = _scan(tmp_path, NODE)
     swept = payload["nodes"]["Flags"]["class_attrs"]
-    assert "BIG_TABLE" not in swept, "a 10k-element list is data, not a flag"
+    assert swept["BIG_TABLE"] == list(range(10_000)), "no size cap: the list crosses whole"
     assert "HELPER" not in swept
     assert "BROKEN" not in swept, "a raising attribute must not kill the scan"
     assert "lowercase" not in swept

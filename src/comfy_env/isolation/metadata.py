@@ -349,15 +349,16 @@ def _normalize_accel(value, node_name):
 # SEARCH_ALIASES, ESSENTIALS_CATEGORY, HAS_INTERMEDIATE_OUTPUT at last
 # count, and the executor reads NOT_IDEMPOTENT for cache keys). A hand list
 # drifted twice already, so the scan sweeps instead: anything upstream adds
-# tomorrow comes along. Guarded getattr, because a V3 class that fell back
-# to the V1 proxy has classproperties (DESCRIPTION) that call GET_SCHEMA.
+# tomorrow comes along. Guarded getattr, because a classproperty can raise
+# (a V3 DESCRIPTION calls GET_SCHEMA). No size cap: a scan of the top 500
+# packs (13,072 node classes, 2026-09-13) found no uppercase literal over
+# 118 items, and a list nobody reads costs its strings and nothing else.
 _SWEEP_SKIP = {"INPUT_TYPES", "RELATIVE_PYTHON_MODULE"}   # callable / set by ComfyUI at load
-_SWEEP_MAX_ITEMS = 200                                     # a data table is not a flag
 
 def _json_shaped(v, depth=0):
     if v is None or isinstance(v, (str, bool, int, float)):
         return True
-    if depth == 0 and isinstance(v, (list, tuple)) and len(v) <= _SWEEP_MAX_ITEMS:
+    if depth == 0 and isinstance(v, (list, tuple)):
         return all(_json_shaped(x, 1) for x in v)
     return False
 
@@ -480,8 +481,10 @@ for name, cls in _class_map.items():
             meta["not_idempotent"] = bool(getattr(cls, "NOT_IDEMPOTENT", False))
             meta["accept_all_inputs"] = bool(getattr(cls, "ACCEPT_ALL_INPUTS", False))
         except Exception as e:
-            # degrade gracefully: build the V1 proxy for this node instead
-            meta["is_v3"] = False
+            # A V3 node whose schema cannot be captured is a broken node,
+            # natively too (/object_info calls the same method). It stays
+            # V3 and the proxy build raises; it is never built as V1.
+            meta["v3_capture_error"] = str(e)
             print(f"[meta-scan] V3 capture failed for {name}: {e}", file=sys.stderr, flush=True)
 
     nodes[name] = meta
@@ -1911,8 +1914,8 @@ def build_proxy_class(
 ) -> type:
     """Build a proxy class from metadata that delegates execution to subprocess.
 
-    V3-scanned nodes (is_v3 + node_info_v1 captured) get a V3-native proxy --
-    see _build_v3_proxy_class. V1 nodes keep the classic V1 proxy below, with
+    V3-scanned nodes get a V3-native proxy (see _build_v3_proxy_class) or
+    raise; they are never built as V1. V1 nodes get the classic V1 proxy below, with
     its DynamicCombo-flattening/nesting compatibility hacks.
 
     Nodes declaring an ACCELERATOR the machine lacks get a visible
@@ -1921,14 +1924,19 @@ def build_proxy_class(
     if not _accelerator_available(meta.get("accelerator")):
         return _build_unavailable_stub(node_name, meta)
 
-    if meta.get("is_v3") and meta.get("node_info_v1") is not None:
-        try:
-            return _build_v3_proxy_class(
-                node_name, meta, env_dir, package_root, sys_path,
-                env_vars, health_check_timeout)
-        except Exception as e:
-            print(f"[comfy-env] V3 proxy build failed for {node_name}, "
-                  f"falling back to V1 proxy: {e}", file=sys.stderr, flush=True)
+    if meta.get("is_v3"):
+        # A V3 node is built as a V3 stand-in or not at all. A V1-shaped
+        # stand-in for it would load and run and be a different node
+        # (no DynamicCombo expansion, V1 hidden inputs, V1 wiring), which
+        # nobody looking at the graph could tell. Natively a V3 pack that
+        # cannot load shows as failed with a traceback; so does this.
+        if meta.get("node_info_v1") is None:
+            raise RuntimeError(
+                f"{node_name}: V3 node whose schema the metadata scan could "
+                f"not capture ({meta.get('v3_capture_error', 'no node_info_v1')})")
+        return _build_v3_proxy_class(
+            node_name, meta, env_dir, package_root, sys_path,
+            env_vars, health_check_timeout)
 
     func_name = meta["function"]
     module_name = meta["module_name"]
@@ -2106,15 +2114,12 @@ def build_proxy_class(
     # The pack's own fingerprint, forwarded over the no-spawn ladder, and
     # ONLY when the author wrote one (see the V3 builder and
     # _forward_fingerprint). The V1 branch of execution.py looks up the
-    # UPPERCASE name on the class (:79, :93), so a classmethod. The method
-    # the WORKER calls is keyed on the scan's view of the real class: a V3
-    # node that fell back to this proxy is still asked for
-    # fingerprint_inputs, because that is the name it defines.
+    # UPPERCASE name on the class, so a classmethod. This proxy is only
+    # ever built for a V1 node, so the worker is asked for IS_CHANGED.
     if meta.get("fingerprint_args") is not None:
         attrs["IS_CHANGED"] = classmethod(_make_v1_fingerprint(
             module_name, class_name, env_dir, node_name,
-            dynamic_combo_parents, _hidden_map,
-            "fingerprint_inputs" if meta.get("is_v3") else "IS_CHANGED"))
+            dynamic_combo_parents, _hidden_map, "IS_CHANGED"))
 
     # Create the class
     proxy_cls = type(class_name, (), attrs)
