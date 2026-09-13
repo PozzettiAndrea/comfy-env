@@ -203,3 +203,168 @@ def test_upstream_validate_prompt_records_under_the_executing_context(tmp_path):
     finally:
         nodes.NODE_CLASS_MAPPINGS.pop("_CEV_Ranged", None)
         sys.path.remove(COMFYUI_DIR)
+
+
+# --- the early path: a warm worker rejects at submit -------------------------
+#
+# Once the worker for a node exists, a bad widget value is rejected at the
+# click, as natively. The stand-in becomes async (upstream awaits it, and
+# reads the same argspec off it), records as before, then asks the worker on
+# the side lane. Reject-only: every miss (cold, module not imported, busy,
+# slow) is True, and the execute-time run remains the guarantee.
+
+import asyncio
+
+
+def test_async_stand_in_keeps_the_argspec_and_asks(ctx):
+    import inspect
+    asked = []
+    cm, names = md._make_named_validate(["mesh", "x"], varkw=True, record=True,
+                                        ask=lambda kw: (asked.append(kw), (True, "nope"))[1])
+    fn = cm.__func__
+    assert inspect.iscoroutinefunction(fn)
+    spec = inspect.getfullargspec(fn)
+    assert spec.args == ["cls", "mesh", "x"] and spec.varkw == "kwargs"
+    ctx["ctx"] = _Ctx("p1", "7")
+    assert asyncio.run(fn(object, mesh="a.obj", x=-1, extra=1)) == "nope"
+    assert asked == [{"mesh": "a.obj", "x": -1, "extra": 1}]
+    assert md._take_validate_kwargs() is None, "answered at submit: the execute-time run is skipped"
+    assert md._VALIDATE_RECORDS["p1"]["7"] == {"mesh": "a.obj", "x": -1, "extra": 1}, "still recorded"
+
+
+def test_a_verdict_skips_the_execute_time_run(ctx):
+    md._VALIDATE_VERDICTS.clear()
+    cm, _ = md._make_named_validate(["x"], record=True, ask=lambda kw: (False, True))
+    ctx["ctx"] = _Ctx("p1", "7")
+    asyncio.run(cm.__func__(object, x=1))
+    assert md._take_validate_kwargs() == {"x": 1}, "a miss leaves the execute-time run in place"
+    cm2, _ = md._make_named_validate(["x"], record=True, ask=lambda kw: (True, True))
+    asyncio.run(cm2.__func__(object, x=1))
+    assert md._take_validate_kwargs() is None, "the body already ran at submit"
+
+
+class _LaneWorker:
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+
+    def send_side(self, method, **params):
+        self.calls.append((method, params))
+        return self.reply
+
+
+@pytest.fixture()
+def lane_pool(monkeypatch, ctx):
+    import comfy_env.isolation.pool as pool
+    monkeypatch.setattr(pool, "_WORKER_POOL", {})
+    md._VALIDATE_VERDICTS.clear()
+    ctx["ctx"] = _Ctx("p1", "7")
+
+    def put(reply):
+        w = _LaneWorker(reply)
+        pool._WORKER_POOL["/env"] = pool.WorkerRecord(w, 1)
+        return w
+    return put
+
+
+def test_early_validate_returns_the_authors_sentence(lane_pool):
+    w = lane_pool({"status": "ok", "ok": False, "message": "Custom validation failed for node: no"})
+    assert md._early_validate("/env", "m", "C", {"x": 1}) == (True, "Custom validation failed for node: no")
+    assert w.calls[0][0] == "validate" and w.calls[0][1]["kwargs"] == {"x": 1}
+
+
+def test_early_validate_accept_is_true_and_recorded(lane_pool):
+    lane_pool({"status": "ok", "ok": True})
+    assert md._early_validate("/env", "m", "C", {"x": 1}) == (True, True)
+
+
+@pytest.mark.parametrize("reply", ["dead", "nolane", "slow", "busy", "timeout",
+                                   {"status": "miss"}, {"status": "error", "error": "x"}])
+def test_every_miss_is_true_and_leaves_the_execute_time_run(lane_pool, reply):
+    lane_pool(reply)
+    assert md._early_validate("/env", "m", "C", {"x": 1}) == (False, True)
+
+
+def test_no_worker_is_true_and_never_spawns(monkeypatch, ctx):
+    import comfy_env.isolation.pool as pool
+    monkeypatch.setattr(pool, "_WORKER_POOL", {})
+    assert md._early_validate("/env", "m", "C", {"x": 1}) == (False, True)
+    assert pool._WORKER_POOL == {}
+
+
+def test_warm_worker_rejects_on_the_side_lane(worker):
+    """Real worker, real side lane. Cold (module not imported): miss. After
+    one real call: the author's verdict, in upstream's words."""
+    worker._ensure_started()
+    r = worker.send_side("validate", module="validate_node", class_name="Ranged",
+                         kwargs={"x": -1, "mesh": "a.obj"})
+    assert r["status"] == "miss"
+    _run(worker, "Ranged", 1, None)          # imports the module
+    r = worker.send_side("validate", module="validate_node", class_name="Ranged",
+                         kwargs={"x": -1, "mesh": "a.obj"})
+    assert r == {"status": "ok", "side_id": r["side_id"], "ok": False,
+                 "message": "Custom validation failed for node: x must be non-negative, got -1"}
+    assert worker.send_side("validate", module="validate_node", class_name="Ranged",
+                            kwargs={"x": 1, "mesh": "a.obj"})["ok"] is True
+    assert worker.send_side("validate", module="validate_node", class_name="Async",
+                            kwargs={"x": 7})["ok"] is False, "an async body is awaited on the lane too"
+    assert worker.send_side("validate", module="validate_node", class_name="Blanket",
+                            kwargs={"x": 13})["message"] == "Custom validation failed for node"
+
+
+@pytest.mark.comfyui
+@pytest.mark.skipif(not COMFYUI_DIR, reason="COMFYUI_DIR not set")
+def test_upstream_rejects_at_submit_when_the_worker_is_warm(tmp_path):
+    """ComfyUI's own validate_prompt, a proxy built from a real scan, and a
+    real warm worker in the pool: the prompt is rejected at submit with a
+    native custom_validation_failed carrying the author's sentence, and the
+    execute-time run for that node is skipped."""
+    import asyncio
+    import shutil
+    import comfy_env.isolation.pool as pool
+    sys.path.insert(0, COMFYUI_DIR)
+    try:
+        import comfy.options
+        comfy.options.enable_args_parsing()
+        sys.argv = [sys.argv[0], "--cpu"]
+        import execution
+        import nodes
+        from comfy_execution.utils import CurrentNodeContext
+    finally:
+        pass
+    pkg = tmp_path / "vpack"
+    pkg.mkdir()
+    shutil.copy(FIXTURES / "validate_node.py", pkg / "node.py")
+    (pkg / "__init__.py").write_text("from .node import *\n", encoding="utf-8")
+    env_dir = tmp_path / "env"; (env_dir / "bin").mkdir(parents=True)
+    (env_dir / "bin" / "python").symlink_to(sys.executable)
+    payload = md.fetch_metadata(env_dir, "vpack", tmp_path)
+    meta = dict(payload["nodes"]["Ranged"]); meta["output_node"] = True
+    Proxy = md.build_proxy_class(node_name="Ranged", meta=meta, env_dir=env_dir,
+                                 package_root=tmp_path, sys_path=[], env_vars={})
+    nodes.NODE_CLASS_MAPPINGS["_CEV_Ranged"] = Proxy
+    # a real warm worker for that env, module imported by a real call
+    w = SubprocessWorker(python=sys.executable, working_dir=tmp_path, name="warm")
+    saved = dict(pool._WORKER_POOL)
+    try:
+        w.call_method(module_name="vpack.node", class_name="Ranged", method_name="run",
+                      kwargs={"x": 1}, timeout=60.0)
+        pool._WORKER_POOL[str(env_dir)] = pool.WorkerRecord(w, 1)
+        md._VALIDATE_RECORDS.clear(); md._VALIDATE_VERDICTS.clear()
+        prompt = {"7": {"class_type": "_CEV_Ranged", "inputs": {"x": -1, "mesh": "zzz.obj"}}}
+        valid, err, good, errs = asyncio.run(execution.validate_prompt("prompt-warm", prompt, None))
+        assert not valid
+        e = errs["7"]["errors"][0]
+        assert e["type"] == "custom_validation_failed"
+        assert "x must be non-negative, got -1" in e["details"]
+        with CurrentNodeContext("prompt-warm", "7", 0):
+            assert md._take_validate_kwargs() is None, "verdict delivered; no second run"
+        # and a good value passes at submit
+        prompt = {"7": {"class_type": "_CEV_Ranged", "inputs": {"x": 2, "mesh": "zzz.obj"}}}
+        valid, *_ = asyncio.run(execution.validate_prompt("prompt-warm-2", prompt, None))
+        assert valid
+    finally:
+        w.shutdown()
+        pool._WORKER_POOL.clear(); pool._WORKER_POOL.update(saved)
+        nodes.NODE_CLASS_MAPPINGS.pop("_CEV_Ranged", None)
+        sys.path.remove(COMFYUI_DIR)

@@ -1449,7 +1449,7 @@ def main():
             raise _ValidationRejected(f"Custom validation failed for node: {result}")
         # an ExecutionBlocker, or anything else: passes at validation upstream
 
-    _SIDE_ALLOW = ("ping", "refresh_input_types", "fingerprint")
+    _SIDE_ALLOW = ("ping", "refresh_input_types", "fingerprint", "validate")
 
     def _module_ready(name):
         """A module the side lane may touch: already imported by a real call
@@ -1497,6 +1497,24 @@ def main():
                         reply = {"status": "miss", "side_id": sid, "reason": "module not loaded"}
                     else:
                         reply = dict(_handle_refresh_input_types(req), side_id=sid)
+                elif method == "validate":
+                    # The author's validate body, at submit, for a warm worker:
+                    # reject-only. ok=False carries the sentence upstream shows
+                    # in the submit dialog; any error is a miss, never a reject.
+                    _m = _module_ready(req.get("module"))
+                    if _m is None:
+                        reply = {"status": "miss", "side_id": sid, "reason": "module not loaded"}
+                    else:
+                        _vcls = getattr(_m, req["class_name"])
+                        _vprep = getattr(_vcls, "PREPARE_CLASS_CLONE", None)
+                        _vclone = _vprep(None) if _vprep is not None else None
+                        try:
+                            _run_author_validate(_vcls, _vclone, dict(req.get("kwargs") or {}),
+                                                 req["class_name"])
+                            reply = {"status": "ok", "side_id": sid, "ok": True}
+                        except _ValidationRejected as _vr:
+                            reply = {"status": "ok", "side_id": sid, "ok": False,
+                                     "message": str(_vr)}
                 else:  # fingerprint
                     if _module_ready(req.get("module")) is None:
                         reply = {"status": "miss", "side_id": sid, "reason": "module not loaded"}

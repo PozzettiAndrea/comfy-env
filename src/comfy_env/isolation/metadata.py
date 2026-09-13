@@ -6,6 +6,7 @@ imports isolation code -- it builds proxy classes from the serialized metadata.
 """
 
 import collections
+import functools
 import hashlib
 import os
 import json
@@ -1335,15 +1336,72 @@ def _record_validate_kwargs(kw: Dict[str, Any]) -> None:
     store[str(ctx.node_id)] = kw
 
 
+#: Verdicts the side lane already delivered at submit, keyed like the
+#: records: when one exists the execute-time run is skipped, so a validate
+#: body runs once per submit, not twice.
+_VALIDATE_VERDICTS: "collections.OrderedDict[str, set]" = collections.OrderedDict()
+
+
+def _record_validate_verdict() -> None:
+    ctx = _executing_context()
+    pid = getattr(ctx, "prompt_id", None)
+    if not pid:
+        return
+    seen = _VALIDATE_VERDICTS.get(pid)
+    if seen is None:
+        seen = _VALIDATE_VERDICTS[pid] = set()
+        while len(_VALIDATE_VERDICTS) > _VALIDATE_MAX_PROMPTS:
+            _VALIDATE_VERDICTS.popitem(last=False)
+    seen.add(str(ctx.node_id))
+
+
 def _take_validate_kwargs():
     ctx = _executing_context()
     pid = getattr(ctx, "prompt_id", None)
     if not pid:
         return None
+    if str(ctx.node_id) in (_VALIDATE_VERDICTS.get(pid) or ()):
+        return None      # the body already ran at submit, on the side lane
     return (_VALIDATE_RECORDS.get(pid) or {}).get(str(ctx.node_id))
 
 
-def _make_named_validate(names, varkw: bool = False, record: bool = False):
+def _early_validate(env_dir, module_name, class_name, kwargs):
+    """Ask a WARM worker to run the author's validate body now, at submit.
+
+    Reject-only, never spawns, never waits past the side lane's cap.
+    Returns ``(answered, verdict)``: ``answered`` says whether the body
+    actually ran (so the caller, on the loop thread where upstream's
+    executing context lives, can record that and spare the execute-time
+    run); ``verdict`` is the author's rejection (a string, which upstream
+    shows in the submit dialog as a native custom_validation_failed) or
+    True. Not askable -- cold worker, module not yet imported, lane busy or
+    slow -- is ``(False, True)``: not rejected here, and the execute-time run
+    remains the guarantee. So once the worker for a node exists, a bad
+    widget value is rejected at the click, as natively; before it exists,
+    at the node. Runs in an executor: the stand-in is async and upstream
+    awaits it, so the event loop is never blocked.
+    """
+    try:
+        from .pool import worker_for
+        worker = worker_for(env_dir)
+        if worker is None:
+            return False, True
+        send_side = getattr(worker, "send_side", None)
+        if send_side is None:
+            return False, True
+        resp = send_side("validate", lock_timeout=_REFRESH_LOCK_TIMEOUT,
+                         module=module_name, class_name=class_name, kwargs=kwargs)
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            return False, True
+        if resp.get("ok") is False:
+            return True, str(resp.get("message") or "Custom validation failed for node")
+        return True, True
+    except Exception:
+        return False, True
+
+
+def _make_named_validate(names, varkw: bool = False, record: bool = False,
+                         ask=None):
     """A classmethod `f(cls, a=None, b=None, ..., **kwargs) -> True` carrying
     EXACTLY the original's exemptions.
 
@@ -1363,7 +1421,10 @@ def _make_named_validate(names, varkw: bool = False, record: bool = False):
 
     With `record` (the author wrote a validate body) the stand-in also
     records what it received, for the worker to hand to the real body at
-    execution -- see the section comment above.
+    execution -- see the section comment above -- and, given `ask`, becomes
+    `async def` and asks a warm worker for the verdict right now on the side
+    lane (see _early_validate). Upstream awaits a coroutine validate and
+    reads the same argspec off it, so the exemptions are unchanged.
 
     Names that are not identifiers are skipped -- they could not be exempted
     this way anyhow.
@@ -1378,12 +1439,29 @@ def _make_named_validate(names, varkw: bool = False, record: bool = False):
     ) if p)
     if record:
         got = "{" + ", ".join(f"{n!r}: {n}" for n in names) + "}"
-        body = (f"    _cev_record({{**{got}, **kwargs}})\n" if varkw
-                else f"    _cev_record({got})\n") + "    return True\n"
+        got = f"{{**{got}, **kwargs}}" if varkw else got
+        if ask is not None:
+            # The verdict is recorded HERE, on the loop thread: upstream's
+            # executing context is a contextvar and does not follow the
+            # call into the executor thread.
+            body = (f"    _kw = {got}\n"
+                    f"    _cev_record(_kw)\n"
+                    f"    _loop = _cev_asyncio.get_running_loop()\n"
+                    f"    _answered, _verdict = await _loop.run_in_executor(None, _cev_ask, _kw)\n"
+                    f"    if _answered:\n"
+                    f"        _cev_verdict()\n"
+                    f"    return _verdict\n")
+            head = "async def"
+        else:
+            body = f"    _cev_record({got})\n    return True\n"
+            head = "def"
     else:
         body = "    return True\n"
-    ns: dict = {"_cev_record": _record_validate_kwargs}
-    exec(f"def _cev_validate(cls, {sig}):\n{body}", ns)
+        head = "def"
+    import asyncio as _asyncio
+    ns: dict = {"_cev_record": _record_validate_kwargs, "_cev_ask": ask,
+                "_cev_verdict": _record_validate_verdict, "_cev_asyncio": _asyncio}
+    exec(f"{head} _cev_validate(cls, {sig}):\n{body}", ns)
     return classmethod(ns["_cev_validate"]), names
 
 
@@ -1727,7 +1805,8 @@ def _build_v3_proxy_class(
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(
         _exempt, varkw=bool(meta.get("validate_varkw")),
-        record=meta.get("validate_args") is not None)
+        record=meta.get("validate_args") is not None,
+        ask=functools.partial(_early_validate, env_dir, module_name, class_name))
     if _validate_cm is not None:
         attrs["validate_inputs"] = _validate_cm
 
@@ -2019,7 +2098,8 @@ def build_proxy_class(
                                if a not in _marked]
     _validate_cm, _ = _make_named_validate(
         _exempt, varkw=bool(meta.get("validate_varkw")),
-        record=meta.get("validate_args") is not None)
+        record=meta.get("validate_args") is not None,
+        ask=functools.partial(_early_validate, env_dir, module_name, class_name))
     if _validate_cm is not None:
         attrs["VALIDATE_INPUTS"] = _validate_cm
 
