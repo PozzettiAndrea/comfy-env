@@ -111,3 +111,36 @@ called on that pool. Neither the Stream-Ordered Memory Allocation section
 of the programming guide nor the driver API reference for
 `cuMemPoolExportPointer` mentions this ordering constraint, and the error
 code gives no hint. Suggest documenting it, or removing the dependency.
+
+## Root cause (found 2026-09-13)
+
+Not a limit: a stack-buffer overflow in libcuda's user-mode wrapper for
+the RM control `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECTS_FROM_FD` (0x3d0c),
+libcuda.so.580.126.20 file offset 0x479c50. Full evidence in `whyfive/`.
+
+* The importer splits the allocation into 32 MiB chunks, one RM handle
+  each (`count = ceil(size / 32 MiB)`), and hands them to the kernel in
+  batches of 128 through the 652-byte on-stack params struct
+  (`objects[128]`, upstream `NV0000_CTRL_OS_UNIX_IMPORT_OBJECTS_TO_FD_MAX_OBJECTS`).
+* `numObjects = min(128, count - index)` and `index += 128` are right,
+  but the `memcpy` that fills `objects[]` uses `count * 4` (the total),
+  computed once at 0x479ccc and reused at 0x479d18, for every batch.
+* Frame layout puts the saved rbx at `objects[164..165]` and the return
+  address at `objects[176..177]`. So 129..164 chunks (4097..5248 MiB)
+  overflow into padding and fields rewritten afterwards, silently;
+  165 chunks (5249..5280 MiB) corrupts the caller's object pointer
+  (`segfault at d4`, `mov 0xd4(%rbx)` with rbx NULL); 176+ chunks
+  (>= 5632 MiB) smash the return address (`ip 0`, seen at 6144/8192).
+* Confirmed from outside: the boundary is 5248 MiB to the byte, does not
+  move under 8/12/16 GiB of GPU pressure, is per single allocation
+  (3 x 4096, 5248 + 1024 import fine), follows chunk *count* (an
+  unaligned 16 MiB allocation ahead of a 5248 MiB one pushes it to 165
+  chunks and it crashes), and the VMM path (`cuMemCreate` /
+  `cuMemImportFromShareableHandle` / `cuMemMap`) imports 8192 and
+  16384 MiB fine.
+* Fix is one operand: the memcpy length should be `numObjects * 4`.
+
+Consequence for callers: a single pool-IPC allocation is only sound at
+<= 128 chunks, i.e. <= 4096 MiB *after* 32 MiB alignment of its start;
+4097..5248 MiB "works" by corrupting dead stack bytes. Cap at 4064 MiB
+unless alignment is controlled, split larger, or use the VMM path.
