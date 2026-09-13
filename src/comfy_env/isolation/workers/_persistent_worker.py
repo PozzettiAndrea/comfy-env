@@ -157,13 +157,31 @@ if _DBG_VRAM:
 
 # Shared Memory Serialization
 
-# Pin to single CPU core before importing torch to prevent TSC non-monotonicity
-# during libc10_cuda.so static initialization (WSL has imprecise per-core TSC sync).
-# See: https://github.com/pytorch/pytorch/issues/129992
-_affinity_pinned = False
-if sys.platform == "linux":
+# On WSL2 ONLY, pin to one CPU core for the duration of `import torch`: WSL's
+# per-core TSC is imprecisely synchronised, and libc10_cuda.so's static
+# initialisation reads it, so a process migrating between cores mid-import
+# can see time go backwards and hang (pytorch#129992). On real Linux the TSC
+# is synchronised and the pin is pure cost -- and until 2026-09-13 it was
+# applied on every Linux, to core 0 specifically, so N workers spawning in
+# parallel queued their torch imports on ONE core (6 envs: 6.3-7.1 s pinned,
+# 2.3-2.9 s unpinned, measured). When pinning, each worker takes its own core
+# (pid modulo cpu count) so parallel spawns on WSL still spread out.
+# COMFY_ENV_AFFINITY_PIN=1/0 overrides the detection either way.
+def _is_wsl():
     try:
-        os.sched_setaffinity(0, {0})
+        with open("/proc/version", encoding="utf-8", errors="replace") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+_affinity_pinned = False
+_pin_env = os.environ.get("COMFY_ENV_AFFINITY_PIN", "").strip().lower()
+if sys.platform == "linux" and (_pin_env in ("1", "true", "yes")
+                                or (_pin_env not in ("0", "false", "no") and _is_wsl())):
+    try:
+        _ncpu = len(os.sched_getaffinity(0)) or 1
+        os.sched_setaffinity(0, {sorted(os.sched_getaffinity(0))[os.getpid() % _ncpu]})
         _affinity_pinned = True
     except OSError:
         pass

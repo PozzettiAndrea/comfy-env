@@ -102,3 +102,40 @@ def test_every_kill_site_goes_through_the_helper():
     assert "self._process.kill()" not in src
     assert src.count("self._kill_tree()") >= 4
     assert "popen_in_own_group(" in src
+
+
+# --- the import-time CPU pin ---------------------------------------------
+
+def test_affinity_pin_is_wsl_only():
+    """The worker pinned itself to core 0 before `import torch` on EVERY
+    Linux, for a WSL2 TSC bug (pytorch#129992). So N workers spawning in
+    parallel queued their torch imports on one core: 6 envs took 6.3-7.1 s
+    pinned and 2.3-2.9 s unpinned. Pinned only on WSL now, and to a core of
+    its own."""
+    import ast
+    from comfy_env.isolation.workers.subprocess import _PERSISTENT_WORKER_SCRIPT
+    tree = ast.parse(_PERSISTENT_WORKER_SCRIPT)
+    pins = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute) and n.func.attr == "sched_setaffinity"]
+    assert len(pins) == 2, "one pin at import time, one release after"
+    src = ast.unparse(tree)
+    assert "_is_wsl()" in src and "COMFY_ENV_AFFINITY_PIN" in src
+    assert "sched_setaffinity(0, {0})" not in src, "pinned to core 0 unconditionally again"
+
+
+def test_worker_is_not_pinned_on_plain_linux(tmp_path):
+    """Real worker: its affinity after startup covers every core the host
+    has (the release step restores the full set; the pin never happened)."""
+    import os
+    import sys
+    from comfy_env.isolation.workers.subprocess import SubprocessWorker
+    if sys.platform != "linux":
+        pytest.skip("Linux affinity")
+    (tmp_path / "aff.py").write_text(
+        "import os\ndef cores():\n    return sorted(os.sched_getaffinity(0))\n", encoding="utf-8")
+    w = SubprocessWorker(python=sys.executable, working_dir=tmp_path, name="aff")
+    try:
+        cores = w.call_module(module="aff", func="cores")
+    finally:
+        w.shutdown()
+    assert cores == sorted(os.sched_getaffinity(0))
