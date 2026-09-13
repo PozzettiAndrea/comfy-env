@@ -555,7 +555,7 @@ class TestBootstrapSeam:
         tree = _tree(POOL)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
-                  and n.name == "_get_or_create_worker")
+                  and n.name == "_spawn_worker")
         parents = {}
         for node in ast.walk(fn):
             for child in ast.iter_child_nodes(node):
@@ -597,7 +597,7 @@ class TestBootstrapSeam:
         tree = _tree(POOL)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
-                  and n.name == "_get_or_create_worker")
+                  and n.name == "_spawn_worker")
         parents = {}
         for node in ast.walk(fn):
             for child in ast.iter_child_nodes(node):
@@ -625,7 +625,7 @@ class TestBootstrapSeam:
         tree = _tree(POOL)
         fn = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef)
-                  and n.name == "_get_or_create_worker")
+                  and n.name == "_spawn_worker")
         for node in ast.walk(fn):
             if (isinstance(node, ast.Assign)
                     and isinstance(node.targets[0], ast.Subscript)

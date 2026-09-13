@@ -702,6 +702,9 @@ def forward_cast_need(largest_tensor: Optional[int],
 #: latency on the next call. Holding too long costs the host that VRAM for
 #: the whole idle period, which is the case this exists to fix.
 IDLE_RELEASE_SECONDS = 60.0
+#: How long a worker may sit idle, holding nothing, before its process is
+#: exited (ADR-0019). Override with COMFY_ENV_IDLE_REAP_SECONDS; 0 disables.
+IDLE_REAP_SECONDS = 1800.0
 
 
 def plan_pressure_release(workers, shortfall, requester=None):
@@ -781,6 +784,39 @@ def plan_idle_release(workers, now, min_idle=IDLE_RELEASE_SECONDS,
         since = state.get("idle_since")
         timer_due = since is not None and (now - since) >= min_idle
         if not prompt_over and not timer_due:
+            continue
+        out.append(key)
+    return out
+
+
+def plan_idle_reap(workers, now, min_idle=IDLE_REAP_SECONDS, current_prompt=None):
+    """Which idle workers should lose their process. Pure.
+
+    ``workers`` maps key to {"alive", "in_flight", "idle_since", "holding",
+    "last_prompt", "registered_models"}. A candidate is alive, not mid
+    call, holds nothing (the release sweep ran first, or it never held), has
+    been quiet for ``min_idle``, and is not the worker of the prompt that is
+    running now: a worker can sit idle for a long time inside one prompt
+    while another node bakes, and killing it there only buys a respawn.
+
+    A worker with a registered model is never a candidate. The loader's
+    cached output is a stand-in that only that process can serve; ComfyUI
+    never considered that output evictable, so reaping the process behind
+    it turns the next cache-hit prompt into "please reload the model node".
+    """
+    if min_idle is None or min_idle <= 0:
+        return []
+    out = []
+    for key, state in sorted((workers or {}).items()):
+        if not state.get("alive") or state.get("in_flight"):
+            continue
+        if state.get("holding") or state.get("registered_models"):
+            continue
+        last_prompt = state.get("last_prompt")
+        if current_prompt is not None and last_prompt == current_prompt:
+            continue
+        since = state.get("idle_since")
+        if since is None or (now - since) < min_idle:
             continue
         out.append(key)
     return out

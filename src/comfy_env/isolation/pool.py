@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 import time
 from pathlib import Path
@@ -77,6 +78,13 @@ class WorkerRecord:
 
 
 _WORKER_POOL: Dict[str, WorkerRecord] = {}  # str(env_dir) -> WorkerRecord
+#: Envs whose worker is being spawned right now: str(env_dir) -> Future that
+#: resolves to (worker, generation) or raises the spawn error. Membership is
+#: guarded by _POOL_LOCK; the spawn itself runs with the lock RELEASED, so
+#: two cold envs referenced by one prompt start in parallel and a second
+#: caller for the same env waits on the first's future instead of spawning
+#: a twin (measured: six envs 6.3 s serial, 2.9 s parallel, 2026-09-13).
+_WARMING: Dict[str, Any] = {}
 _WORKER_PATCHERS: Dict[str, Dict[str, Any]] = {}  # str(env_dir) -> {model_id: SubprocessModelPatcher}
 _STALE_PATCHERS: List[Any] = []  # Keeps stale patchers alive until free_memory finishes
 _POOL_LOCK = threading.Lock()
@@ -611,6 +619,71 @@ def _idle_sweep_loop() -> None:
     while True:
         time.sleep(IDLE_SWEEP_INTERVAL_SECONDS)
         _release_idle_workers()
+        _reap_idle_workers()
+
+
+IDLE_REAP_ENV_VAR = "COMFY_ENV_IDLE_REAP_SECONDS"
+
+
+def _idle_reap_seconds() -> float:
+    """The reaper's window: env override, else the state_sync default. 0 or
+    a non-number disables. Read every sweep, so it can be changed live."""
+    raw = os.environ.get(IDLE_REAP_ENV_VAR, "").strip()
+    if not raw:
+        return state_sync.IDLE_REAP_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+def _reap_idle_workers() -> None:
+    """Exit workers that have been idle past the reap window (ADR-0019).
+
+    Runs after the release sweep, which is the order the ADR asks for: a
+    worker gives its VRAM back first, and only a worker holding nothing is
+    a candidate to lose its process. What a reaped worker costs is one
+    cold start on its next use, indistinguishable from the first; until
+    then it costs its RAM and CUDA context for nothing, which is what the
+    reaper takes back. The one thing a process holds that the host cannot
+    rebuild is a REGISTERED model: the loader's cached output is a stand-in
+    that only that process can serve, so a worker with a stand-in on the
+    books is never reaped (the planner's rule, not a guess here).
+
+    Reaping goes through _remove_worker, the crash path: the same retire,
+    the same patcher handling, the same "worker gone, treat as offloaded"
+    answer to upstream eviction. A deliberate death is a crash with a log
+    line that says why.
+    """
+    window = _idle_reap_seconds()
+    if window <= 0:
+        return
+    try:
+        with _POOL_LOCK:
+            entries = dict(_WORKER_POOL)
+            registered = {k for k, v in list(_WORKER_PATCHERS.items()) if v}
+        states = {}
+        for key, rec in entries.items():
+            worker = rec.worker
+            states[key] = {
+                "alive": worker.is_alive(),
+                "in_flight": getattr(worker, "_calls_in_flight", 0) > 0,
+                "idle_since": rec.last_activity,
+                "holding": rec.held > 0,
+                "last_prompt": rec.last_prompt,
+                "registered_models": key in registered,
+            }
+        due = state_sync.plan_idle_reap(states, time.monotonic(), min_idle=window,
+                                        current_prompt=_current_prompt())
+        for key in due:
+            with _POOL_LOCK:
+                if _WORKER_POOL.get(key) is not entries[key]:
+                    continue    # replaced or removed since the snapshot
+            _log(f"[comfy-env] idle reap: {Path(key).name} exited after "
+                 f"{window:.0f}s idle; the next call starts it again")
+            _remove_worker(key)
+    except Exception as exc:
+        _log(f"[comfy-env] idle reap sweep failed: {exc}")
 
 
 def _start_idle_sweep() -> None:
@@ -1324,9 +1397,10 @@ def _cleanup_stale_patchers(env_dir, worker=None):
 
     Called when a worker is replaced (crash/restart).  We clear the patcher
     registry so they won't be re-registered.  The patchers themselves stay in
-    ComfyUI's current_loaded_models -- the safety net in _send_device_command
-    handles "not registered" IPC errors gracefully, and free_memory will
-    remove them during its normal unload loop.
+    ComfyUI's current_loaded_models -- a stand-in whose worker is gone
+    answers upstream's eviction as already offloaded (``_worker_gone`` in
+    model_patcher.py), and free_memory removes it during its normal unload
+    loop.
 
     We must NOT modify current_loaded_models here because this callback can
     fire inside free_memory's iteration (via model_unload -> send_command ->
@@ -1591,6 +1665,12 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
 
     Returns (worker, generation) tuple.  The generation is a monotonically
     increasing integer used to detect stale ModelPatchers after worker restart.
+
+    The lock guards membership of the pool and of _WARMING only. The spawn
+    (process start, ready frame, transport canary: seconds) runs with the
+    lock released, so a caller for a DIFFERENT env is not queued behind it;
+    a caller for the SAME env finds the future in _WARMING and waits on it,
+    which is what keeps the old one-spawn-per-env guarantee.
     """
     global _WORKER_GENERATION
     key = str(env_dir)
@@ -1605,53 +1685,36 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
             worker, gen = entry
             if worker.is_alive():
                 return worker, gen
-            # Dead -- retire everything per-process before replacing it
-            _cleanup_stale_patchers(env_dir, worker)
-            try:
-                worker.shutdown()
-            except Exception:
-                pass
-        _WORKER_GENERATION += 1
-        gen = _WORKER_GENERATION
-        # Reserve bootstrap: the budget owner's advance payment. Injected
-        # only when the host explicitly set --reserve-vram, read from the
-        # SAME attribute the budget reply forwards (never recomputed from
-        # the GB float flag: one computation, one owner, and the unit trap
-        # of exporting "8" where bytes are owed dies structurally). Guarded
-        # not-in so pack [env_vars] wins.
-        #
-        # This block was previously adjacent to the pin-split bootstrap and
-        # was deleted along with it on the first attempt; the seam tests
-        # caught it. It is unrelated to the pin split and has no gate.
-        try:
-            import comfy.model_management as _rmm
-            from comfy.cli_args import args as _rargs
-            if getattr(_rargs, "reserve_vram", None) is not None \
-                    and state_sync.RESERVE_ENV_VAR not in (env_vars or {}):
-                env_vars = dict(env_vars or {})
-                env_vars[state_sync.RESERVE_ENV_VAR] = str(
-                    int(_rmm.EXTRA_RESERVED_VRAM))
-        except Exception:
-            pass
-        worker = _create_worker(env_dir, working_dir, sys_path, env_vars, health_check_timeout)
-        # Register bidirectional RPC callbacks. The budget callback carries
-        # this worker's key so the pin allocator knows who is asking.
-        worker.register_callback(
-            "request_vram_budget",
-            lambda req, _wk=key: _handle_vram_budget(req, worker_key=_wk))
-        worker.register_callback("report_progress", _handle_progress)
-        worker.register_callback("send_sync", _handle_send_sync)
-        worker.register_callback("send_progress_text", _handle_send_progress_text)
-        # Clean up stale patchers if worker restarts transparently via _ensure_started()
-        worker._on_restart = lambda: _cleanup_stale_patchers(env_dir, worker)
-        # Canary handshake: verify each transport tier through the production
-        # serialization path; demotes GPU zero-copy for this worker if its
-        # round-trip fails. A CPU-tier failure raises (broken IPC).
-        # Unconditional -- a correctness check with an off switch is a
-        # doctrine with an asterisk (the old COMFY_ENV_TRANSPORT_PROBE=0
-        # opt-out meant "assume every tier works, unverified").
-        worker.verify_transport()
-        _WORKER_POOL[key] = WorkerRecord(worker, gen)
+        future = _WARMING.get(key)
+        if future is not None:
+            owner = False
+        else:
+            owner = True
+            future = Future()
+            _WARMING[key] = future
+            if entry is not None:
+                # Dead -- retire everything per-process before replacing it
+                _cleanup_stale_patchers(env_dir, entry.worker)
+                try:
+                    entry.worker.shutdown()
+                except Exception:
+                    pass
+            _WORKER_GENERATION += 1
+            gen = _WORKER_GENERATION
+    if not owner:
+        return future.result()
+    try:
+        worker = _spawn_worker(key, env_dir, working_dir, sys_path, env_vars,
+                               health_check_timeout)
+        with _POOL_LOCK:
+            _WORKER_POOL[key] = WorkerRecord(worker, gen)
+            _WARMING.pop(key, None)
+        future.set_result((worker, gen))
+    except BaseException as exc:
+        with _POOL_LOCK:
+            _WARMING.pop(key, None)
+        future.set_exception(exc)
+        raise
     # Deliberately outside _POOL_LOCK: this imports comfy modules and formats
     # strings, and it is idempotent per env, so it must not be held across
     # worker creation.
@@ -1659,6 +1722,49 @@ def _get_or_create_worker(env_dir: Path, working_dir: Path, sys_path: list[str],
     _start_idle_sweep()
     _install_pressure_hook()
     return worker, gen
+
+
+def _spawn_worker(key, env_dir, working_dir, sys_path, env_vars, health_check_timeout):
+    """Start one worker process and verify it. Runs with no lock held."""
+    # Reserve bootstrap: the budget owner's advance payment. Injected
+    # only when the host explicitly set --reserve-vram, read from the
+    # SAME attribute the budget reply forwards (never recomputed from
+    # the GB float flag: one computation, one owner, and the unit trap
+    # of exporting "8" where bytes are owed dies structurally). Guarded
+    # not-in so pack [env_vars] wins.
+    #
+    # This block was previously adjacent to the pin-split bootstrap and
+    # was deleted along with it on the first attempt; the seam tests
+    # caught it. It is unrelated to the pin split and has no gate.
+    try:
+        import comfy.model_management as _rmm
+        from comfy.cli_args import args as _rargs
+        if getattr(_rargs, "reserve_vram", None) is not None \
+                and state_sync.RESERVE_ENV_VAR not in (env_vars or {}):
+            env_vars = dict(env_vars or {})
+            env_vars[state_sync.RESERVE_ENV_VAR] = str(
+                int(_rmm.EXTRA_RESERVED_VRAM))
+    except Exception:
+        pass
+    worker = _create_worker(env_dir, working_dir, sys_path, env_vars, health_check_timeout)
+    # Register bidirectional RPC callbacks. The budget callback carries
+    # this worker's key so the pin allocator knows who is asking.
+    worker.register_callback(
+        "request_vram_budget",
+        lambda req, _wk=key: _handle_vram_budget(req, worker_key=_wk))
+    worker.register_callback("report_progress", _handle_progress)
+    worker.register_callback("send_sync", _handle_send_sync)
+    worker.register_callback("send_progress_text", _handle_send_progress_text)
+    # Clean up stale patchers if worker restarts transparently via _ensure_started()
+    worker._on_restart = lambda: _cleanup_stale_patchers(env_dir, worker)
+    # Canary handshake: verify each transport tier through the production
+    # serialization path; demotes GPU zero-copy for this worker if its
+    # round-trip fails. A CPU-tier failure raises (broken IPC).
+    # Unconditional -- a correctness check with an off switch is a
+    # doctrine with an asterisk (the old COMFY_ENV_TRANSPORT_PROBE=0
+    # opt-out meant "assume every tier works, unverified").
+    worker.verify_transport()
+    return worker
 
 
 #: Env dirs already reported, so the routine line fires once per env rather
