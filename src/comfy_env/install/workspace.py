@@ -96,9 +96,19 @@ def _resolve_workspace_torch(
             f"wheels matching {cu_tag_bootstrap}/torch{torch_version.rsplit('.', 1)[0]}/cp{py_short}."
         )
     else:
-        log(
-            f"[comfy-env] Bootstrap interpreter has python {python_version}; "
-            f"no torch importable, will rely on cuda-wheels resolver to pick a combo."
+        # A Python with no torch is not a ComfyUI's: ComfyUI imports torch
+        # unconditionally, and a CPU-only ComfyUI still has a CPU torch. So
+        # this can only mean install.py was run with some other interpreter.
+        # An env built from it is keyed `py3XX-notorch` and stamped for a host
+        # that has no torch, which no real host ever is, so nothing can bind
+        # it -- a gigabyte of the wrong torch in a directory nothing will use.
+        # Refuse here, before any disk is touched, and say what to run.
+        raise RuntimeError(
+            f"[comfy-env] The interpreter running this install (python "
+            f"{python_version}, {sys.executable}) has no torch, so it is not a "
+            f"ComfyUI's. Envs are keyed on the ComfyUI interpreter's python, "
+            f"torch and CUDA, and one built without them can never be bound. "
+            f"Run install.py with the python that runs ComfyUI's main.py."
         )
 
     if sys.platform == "darwin":

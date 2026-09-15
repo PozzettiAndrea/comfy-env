@@ -140,8 +140,9 @@ def _abi_tag():
         else:
             parts.append(backend)
     else:
-        # No torch in the bootstrap: the comfyui feature stays torch-less, so
-        # there is no ABI to pin beyond the interpreter.
+        # No torch in this interpreter, so it is not a ComfyUI's. install()
+        # refuses before it gets here; this branch is what `comfy-env info`
+        # shows when asked from the wrong python, and it says so by name.
         parts.append("notorch")
 
     # Join WITHOUT the pixi sanitizer. This string is only ever a directory
