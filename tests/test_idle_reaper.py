@@ -135,6 +135,25 @@ def test_reaping_a_real_worker_and_the_next_call_starts_a_fresh_one(clean, no_pr
 
 def _pid_alive(pid):
     import os
+    import sys
+    if sys.platform == "win32":
+        # os.kill(pid, 0) is OpenProcess on Windows, and that succeeds on a
+        # TERMINATED process for as long as any handle to it is held -- the
+        # reaper's own Popen object, until it is collected. So the old check
+        # reported a reaped worker as alive for the whole 10 s wait. Ask for
+        # the exit code instead: STILL_ACTIVE means alive, anything else is
+        # a corpse with a handle.
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            k32.GetExitCodeProcess(h, ctypes.byref(code))
+            return code.value == 259                  # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
     try:
         os.kill(pid, 0)
     except OSError:

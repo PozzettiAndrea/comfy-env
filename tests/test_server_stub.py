@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import comfy_env.isolation.metadata as md
+from conftest import fake_python_env
 from comfy_env import server_stub
 from comfy_env.isolation.pool import _handle_send_sync, _handle_send_progress_text
 from comfy_env.isolation.workers import WorkerError
@@ -131,9 +132,7 @@ def test_scan_registers_a_pack_that_imports_server(tmp_path):
         (FIXTURES / "server_user_node.py").read_text(encoding="utf-8")
         + "\nNODE_CLASS_MAPPINGS = {'ServerUser': ServerUser}\nNODE_DISPLAY_NAME_MAPPINGS = {}\n",
         encoding="utf-8")
-    env_dir = tmp_path / "env"
-    (env_dir / "bin").mkdir(parents=True)
-    (env_dir / "bin" / "python").symlink_to(sys.executable)
+    env_dir = fake_python_env(tmp_path)
     payload = md.fetch_metadata(env_dir, "server_pkg", tmp_path)
     assert "ServerUser" in payload["nodes"], payload
 

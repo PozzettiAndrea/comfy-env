@@ -79,16 +79,7 @@ def test_tree_timeout_returns_the_partial_stderr():
 # the scan, end to end through fetch_metadata
 # --------------------------------------------------------------------------
 
-def _fake_env(tmp_path: Path) -> Path:
-    """An env dir whose python is this interpreter."""
-    env_dir = tmp_path / "env"
-    if sys.platform == "win32":
-        env_dir.mkdir()
-        (env_dir / "python.exe").symlink_to(sys.executable)
-    else:
-        (env_dir / "bin").mkdir(parents=True)
-        (env_dir / "bin" / "python").symlink_to(sys.executable)
-    return env_dir
+from conftest import fake_python_env as _fake_env
 
 
 def _pack(tmp_path: Path, name: str, body: str, init_extra: str = "") -> Path:
