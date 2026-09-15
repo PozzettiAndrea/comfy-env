@@ -33,7 +33,7 @@ from ..config import (
     CONFIG_FILE_NAME,
 )
 from ..environment.cache import get_env_name
-from .helpers import InstallLog, _log_subprocess, _run_streaming, _patch_uv_platform_py
+from .helpers import InstallLog, _log_subprocess, _run_pixi, _patch_uv_platform_py
 
 
 _PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
@@ -864,7 +864,6 @@ def install_workspace(
         pixi_env = dict(os.environ)
         pixi_env["UV_PYTHON_INSTALL_DIR"] = str(workspace_dir / "_no_python")
         pixi_env["UV_PYTHON_PREFERENCE"] = "only-system"
-        pixi_env["PIXI_NO_PROGRESS"] = "true"
 
         # Install each stale env independently. One failure doesn't stop the
         # others by default (we collect and raise at the end), so users see all
@@ -890,10 +889,11 @@ def install_workspace(
             # -v adds pixi's phase lines to install.log ("installing from
             # remote: torch ...", "Installed 48 packages in 180ms",
             # "environment in 1.18s"), about nine lines per install, which is
-            # what a post-mortem wants. Through a pipe pixi draws no progress
-            # bar at any verbosity; it self-suppresses when stderr is not a
-            # terminal.
-            result = _run_streaming(
+            # what a post-mortem wants. The bar itself is _run_pixi's job:
+            # pixi draws it only on a terminal, so on one it gets a pty and
+            # the log gets a reduced transcript; off one it gets a pipe and
+            # draws nothing, as it always did.
+            result = _run_pixi(
                 [PIXI, "install", "-v", "--manifest-path", str(env_manifest)],
                 log=log, cwd=env_manifest_dir, env=pixi_env,
             )
