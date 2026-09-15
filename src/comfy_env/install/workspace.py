@@ -33,7 +33,7 @@ from ..config import (
     CONFIG_FILE_NAME,
 )
 from ..environment.cache import get_env_name
-from .helpers import _make_tee_log, _log_subprocess, _run_streaming, _patch_uv_platform_py
+from .helpers import InstallLog, _log_subprocess, _run_streaming, _patch_uv_platform_py
 
 
 _PYTORCH_PACKAGES = {"torch", "torchvision", "torchaudio"}
@@ -714,8 +714,7 @@ def install_workspace(
             f"derivation check: {', '.join(derive)} (others clean, skipped)"
         )
 
-    log_path = workspace_dir / "install.log"
-    tee_log = _make_tee_log(log, log_path)
+    tee_log = InstallLog(log)
 
     try:
         log = tee_log
@@ -839,6 +838,7 @@ def install_workspace(
         log(f"[comfy-env] Writing {len(to_install)} per-env manifest(s):")
         for env_name, _plugin, _cf, cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            tee_log.begin(env_name, env_manifest_dir)
             write_env_pixi_toml(
                 env_manifest_dir=env_manifest_dir,
                 env_name=env_name,
@@ -853,6 +853,7 @@ def install_workspace(
                 comfyui_dir=comfyui_dir,
             )
             log(f"  - {env_name}: {env_manifest_dir / 'pixi.toml'}")
+            tee_log.end()
 
         if dry_run:
             log("[comfy-env] dry_run -- skipping `pixi install`")
@@ -884,6 +885,7 @@ def install_workspace(
         for env_name, _plugin, _cf, _cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
             env_manifest = env_manifest_dir / "pixi.toml"
+            tee_log.begin(env_name, env_manifest_dir)
             log(f"[comfy-env] Running `pixi install -v --manifest-path {env_manifest}` ...")
             # -v adds pixi's phase lines to install.log ("installing from
             # remote: torch ...", "Installed 48 packages in 180ms",
@@ -902,6 +904,7 @@ def install_workspace(
                     f"[comfy-env] {env_name}: pixi install FAILED (exit {result.returncode}). "
                     f"Continuing with remaining envs."
                 )
+            tee_log.end()
 
         if install_failures:
             raise RuntimeError(
@@ -1008,6 +1011,7 @@ def install_workspace(
             if _pin:
                 _hd[_pkg] = _pin
         for env_name, _plugin, cf, _cfg in to_install:
+            tee_log.begin(env_name, get_env_manifest_dir(env_name, comfyui_dir))
             # Provenance carries the combo tier for cuda envs: envs stamped
             # ":fallback" are re-derived on every install run so they upgrade
             # themselves the moment their missing wheel is published.
@@ -1028,15 +1032,19 @@ def install_workspace(
                 host_derived=_hd,
                 log=log,
             )
+            tee_log.end()
 
         # Record each env's derivation identity + fast key IN ITS OWN
         # DIRECTORY so subsequent runs skip it individually. Only written
         # after pixi install + post-steps all succeed -- a failed install
         # leaves no hash and forces a retry.
         for env_name, _plugin, cf, _cfg in to_install:
+            env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
+            tee_log.begin(env_name, env_manifest_dir)
             _write_hash_file(
-                get_env_manifest_dir(env_name, comfyui_dir) / _INSTALL_HASH_FILE,
+                env_manifest_dir / _INSTALL_HASH_FILE,
                 env_identity[env_name], fast_keys[env_name], log)
+            tee_log.end()
         try:
             legacy_hash = workspace_dir / _INSTALL_HASH_FILE
             if legacy_hash.is_file():
@@ -1045,7 +1053,8 @@ def install_workspace(
         except OSError:
             pass
 
-        log(f"[comfy-env] Install log: {log_path}")
+        for env_name, path in tee_log.paths.items():
+            log(f"[comfy-env] Install log: {env_name} -> {path}")
         return workspace_dir
     finally:
         try:

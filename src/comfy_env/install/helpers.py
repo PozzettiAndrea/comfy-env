@@ -44,26 +44,68 @@ def _patch_uv_platform_py(log: Callable[[str], None] = print) -> None:
             log(f"[comfy-env] Patched {platform_py} for conda-forge compat")
 
 
-def _make_tee_log(log_callback: Callable[[str], None], log_path: Path) -> Callable[[str], None]:
-    """Tee logs to both the original callback and a file."""
-    import datetime
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = open(log_path, "w", encoding="utf-8")
-    fh.write(f"# comfy-env install log - {datetime.datetime.now().isoformat()}\n")
-    fh.write(f"# Python: {sys.executable} ({sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro})\n")
-    fh.write(f"# Platform: {sys.platform}\n\n")
-    fh.flush()
+class InstallLog:
+    """The install log: one file per env, at `<env manifest dir>/install.log`.
 
-    def tee(msg):
-        log_callback(msg)
+    Every line goes to the console. Lines emitted while an env's section is
+    open also go to that env's file. Lines emitted before any section opens
+    -- workspace discovery, GPU detection, the wheel combo -- are the shared
+    preamble, replayed into each env's file the first time its section
+    opens, so every file reads as the complete story of that one env from
+    the top. Workspace-level lines after sections have begun (the orphan
+    notice, legacy cleanup) reach the console only; they are about the
+    workspace, not any env.
+
+    A section is opened with `begin(env, manifest_dir)` and closed with
+    `end()`. Each env is written in several passes -- manifest, pixi
+    install, stamp, identity -- so `begin` truncates on the first open and
+    appends after that. `file` is the open handle, for callers that want
+    the file and not the console (the post-mortem subprocess dump).
+    """
+
+    def __init__(self, console: Callable[[str], None]):
+        self._console = console
+        self._preamble: list[str] = []
+        self._fh = None
+        self._opened: set[str] = set()
+        self.paths: dict[str, Path] = {}
+
+    def __call__(self, msg: str) -> None:
+        self._console(msg)
         sys.stdout.flush()
-        fh.write(msg + "\n")
-        fh.flush()
+        if self._fh is not None:
+            self._fh.write(msg + "\n")
+            self._fh.flush()
+        elif not self._opened:
+            self._preamble.append(msg)
 
-    tee.file = fh
-    tee.close = fh.close
-    tee.path = log_path
-    return tee
+    @property
+    def file(self):
+        return self._fh
+
+    def begin(self, env_name: str, manifest_dir: Path) -> None:
+        import datetime
+        self.end()
+        path = Path(manifest_dir) / "install.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        first = env_name not in self._opened
+        self._fh = open(path, "w" if first else "a", encoding="utf-8")
+        if first:
+            self._opened.add(env_name)
+            self.paths[env_name] = path
+            self._fh.write(f"# comfy-env install log for {env_name} - {datetime.datetime.now().isoformat()}\n")
+            self._fh.write(f"# Python: {sys.executable} ({sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro})\n")
+            self._fh.write(f"# Platform: {sys.platform}\n\n")
+            for line in self._preamble:
+                self._fh.write(line + "\n")
+        self._fh.flush()
+
+    def end(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    close = end
 
 
 def _log_subprocess(log: Callable, result, label: str = "") -> None:
