@@ -881,19 +881,20 @@ def install_workspace(
             log(f"  - {env_name} ({', '.join(parts)})")
 
         install_failures: List[str] = []
-        from .progress import InstallProgress
-        for _i, (env_name, _plugin, _cf, _cfg) in enumerate(to_install, 1):
+        for env_name, _plugin, _cf, _cfg in to_install:
             env_manifest_dir = get_env_manifest_dir(env_name, comfyui_dir)
             env_manifest = env_manifest_dir / "pixi.toml"
-            log(f"[comfy-env] Running `pixi install --manifest-path {env_manifest}` ...")
-            # pixi tells us nothing through a pipe (see progress.py), so the
-            # bar counts what lands on disk against what pixi.lock declares.
-            with InstallProgress(env_manifest_dir, env_name, _i, len(to_install),
-                                 log=log) as _prog:
-                result = _run_streaming(
-                    [PIXI, "install", "--manifest-path", str(env_manifest)],
-                    log=_prog.wrap_log(log), cwd=env_manifest_dir, env=pixi_env,
-                )
+            log(f"[comfy-env] Running `pixi install -v --manifest-path {env_manifest}` ...")
+            # -v adds pixi's phase lines to install.log ("installing from
+            # remote: torch ...", "Installed 48 packages in 180ms",
+            # "environment in 1.18s"), about nine lines per install, which is
+            # what a post-mortem wants. Through a pipe pixi draws no progress
+            # bar at any verbosity; it self-suppresses when stderr is not a
+            # terminal.
+            result = _run_streaming(
+                [PIXI, "install", "-v", "--manifest-path", str(env_manifest)],
+                log=log, cwd=env_manifest_dir, env=pixi_env,
+            )
             _log_subprocess(log, result, f"pixi install ({env_name})")
             if result.returncode != 0:
                 install_failures.append(env_name)
